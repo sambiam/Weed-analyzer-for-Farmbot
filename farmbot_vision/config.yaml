@@ -1,0 +1,63 @@
+name: FarmBot Vision
+version: "0.1.0"
+slug: farmbot_vision
+description: Lightweight canopy analysis and safe FarmBot plant-radius recommendations
+url: https://github.com/sambiam/Weed-analyzer-for-Farmbot
+arch:
+  - aarch64
+  - amd64
+homeassistant: ">=2026.7.0"
+startup: application
+boot: auto
+init: false
+ingress: true
+ingress_port: 8099
+ingress_entry: /
+panel_icon: mdi:sprout
+panel_title: FarmBot Vision
+panel_admin: true
+homeassistant_api: true
+host_network: false
+full_access: false
+docker_api: false
+apparmor: true
+tmpfs: true
+backup: cold
+watchdog: http://[HOST]:[PORT:8099]/health
+image: ghcr.io/sambiam/farmbot-vision
+options:
+  selected_config_entry_id: ""
+  mode: observe
+  schedule_enabled: false
+  schedule_time: "03:00"
+  safety_margin_mm: 20.0
+  calibration_uncertainty_mm: 10.0
+  minimum_auto_confidence: 0.90
+  maximum_daily_radius_growth_mm: 50.0
+  maximum_single_update_percent: 40.0
+  minimum_observations_for_curve: 5
+  maximum_system_load_percent: 80
+  minimum_free_memory_mb: 512
+  diagnostic_retention_days: 14
+  failed_analysis_retention_days: 60
+  successful_mask_retention_days: 7
+  heartbeat_minutes: 15
+  image_lookback_hours: 72
+schema:
+  selected_config_entry_id: str
+  mode: list(observe|recommend|auto_radius)
+  schedule_enabled: bool
+  schedule_time: str
+  safety_margin_mm: float(0,200)
+  calibration_uncertainty_mm: float(0,100)
+  minimum_auto_confidence: float(0.5,1)
+  maximum_daily_radius_growth_mm: float(1,500)
+  maximum_single_update_percent: float(1,200)
+  minimum_observations_for_curve: int(2,100)
+  maximum_system_load_percent: int(20,100)
+  minimum_free_memory_mb: int(128,4096)
+  diagnostic_retention_days: int(0,365)
+  failed_analysis_retention_days: int(1,365)
+  successful_mask_retention_days: int(0,90)
+  heartbeat_minutes: int(5,60)
+  image_lookback_hours: int(1,720)

@@ -1,0 +1,37 @@
+configuration:
+  selected_config_entry_id:
+    name: FarmBot config entry ID
+    description: Select this in the Ingress interface after the companion integration is available.
+  mode:
+    name: Operating mode
+    description: Observe only, recommend changes, or automatically apply safe radius increases.
+  schedule_enabled:
+    name: Enable daily schedule
+  schedule_time:
+    name: Daily analysis time
+  safety_margin_mm:
+    name: Safety margin (mm)
+  calibration_uncertainty_mm:
+    name: Calibration uncertainty (mm)
+  minimum_auto_confidence:
+    name: Minimum automatic confidence
+  maximum_daily_radius_growth_mm:
+    name: Maximum daily growth (mm)
+  maximum_single_update_percent:
+    name: Maximum single increase (percent)
+  minimum_observations_for_curve:
+    name: Minimum curve observations
+  maximum_system_load_percent:
+    name: Maximum system load (percent)
+  minimum_free_memory_mb:
+    name: Minimum free memory (MB)
+  diagnostic_retention_days:
+    name: Diagnostic retention (days)
+  failed_analysis_retention_days:
+    name: Failed artifact retention (days)
+  successful_mask_retention_days:
+    name: Successful mask retention (days)
+  heartbeat_minutes:
+    name: Heartbeat interval (minutes)
+  image_lookback_hours:
+    name: Image lookback (hours)
