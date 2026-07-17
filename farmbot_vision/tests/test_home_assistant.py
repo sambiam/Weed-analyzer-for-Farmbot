@@ -1,5 +1,6 @@
 import httpx
 import pytest
+
 from farmbot_vision.home_assistant import HomeAssistantClient, StaleRadiusError
 from farmbot_vision.models import ApplyRadiusRequest
 

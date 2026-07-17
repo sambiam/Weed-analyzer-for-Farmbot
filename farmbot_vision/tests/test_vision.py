@@ -5,6 +5,7 @@ from datetime import UTC, datetime
 import cv2
 import numpy as np
 from conftest import jpeg
+
 from farmbot_vision.models import Decision, PlantSeed
 from farmbot_vision.vision import ClassicalVisionEngine, decode_jpeg, register_translation
 
