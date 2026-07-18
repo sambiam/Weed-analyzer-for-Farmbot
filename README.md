@@ -25,10 +25,3 @@ Version 0.2.1 fixes duplicate-slash Home Assistant Ingress requests and keeps ma
 On a 4 GB Raspberry Pi 4 use the default 960×720 with the free-memory gate at 512 MB and CPU gate at 80%. Relative pixel workload: 640×480 = 1×, 960×720 = 2.25×, 1280×960 = 4×.
 
 License: MIT.
-
-## Upgrade from 0.2.0
-
-Install app version 0.2.1 and restart the app. Close the old FarmBot Vision
-browser tab and reopen the Web UI so Home Assistant creates a fresh Ingress
-session. This release fixes duplicate-slash Ingress requests and tolerates one
-malformed vision event without reconnecting the event subscription.
