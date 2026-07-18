@@ -7,8 +7,45 @@ import httpx
 import pytest
 from pydantic import ValidationError
 
-from farmbot_vision.home_assistant import HomeAssistantClient, StaleRadiusError
-from farmbot_vision.models import ApplyRadiusRequest, VisionRequestEvent
+from farmbot_vision.home_assistant import (
+    HomeAssistantClient,
+    HomeAssistantError,
+    StaleRadiusError,
+)
+from farmbot_vision.models import ApplyRadiusRequest, InventoryRequest, VisionRequestEvent
+
+
+@pytest.mark.asyncio
+async def test_unexpected_server_error_is_retried_then_raised(monkeypatch: pytest.MonkeyPatch):
+    """A bare 500 from Home Assistant must not crash the caller uncaught.
+
+    ``response.raise_for_status()`` raises ``httpx.HTTPStatusError`` for any
+    status outside the special-cased sets; it must be retried like a network
+    error and surfaced as ``HomeAssistantError`` so route handlers can map it
+    to a clean response instead of an unhandled ASGI exception.
+    """
+
+    calls = 0
+
+    async def handler(_request):
+        nonlocal calls
+        calls += 1
+        return httpx.Response(500, json={"error": "boom"})
+
+    sleeps = []
+
+    async def fake_sleep(delay):
+        sleeps.append(delay)
+
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+    client = HomeAssistantClient(token="test", base_url="http://test")
+    await client._http.aclose()
+    client._http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    with pytest.raises(HomeAssistantError):
+        await client.inventory(InventoryRequest(config_entry_id="entry"))
+    assert calls == 3
+    assert sleeps == [1, 2]
+    await client.close()
 
 
 @pytest.mark.asyncio

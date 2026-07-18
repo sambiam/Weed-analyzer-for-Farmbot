@@ -226,12 +226,38 @@ async def retention_cleanup() -> None:
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    LOGGER.info(
+        "FarmBot Vision %s starting: selected_config_entry_id=%s mode=%s "
+        "analysis_resolution=%s",
+        __version__,
+        settings.selected_config_entry_id or "(not set)",
+        settings.mode.value,
+        settings.resolution.label,
+    )
+    if not settings.selected_config_entry_id:
+        LOGGER.warning(
+            "No FarmBot config entry ID configured; scheduled/heartbeat status reports and "
+            "the calibration page will not work until one is set in the add-on options"
+        )
     tasks = [
-        asyncio.create_task(event_listener()),
-        asyncio.create_task(heartbeat()),
-        asyncio.create_task(scheduler()),
-        asyncio.create_task(retention_cleanup()),
+        asyncio.create_task(event_listener(), name="event_listener"),
+        asyncio.create_task(heartbeat(), name="heartbeat"),
+        asyncio.create_task(scheduler(), name="scheduler"),
+        asyncio.create_task(retention_cleanup(), name="retention_cleanup"),
     ]
+
+    def _log_task_failure(task: asyncio.Task) -> None:
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            LOGGER.error(
+                "Background task %s crashed and will not restart: %s", task.get_name(), exc,
+                exc_info=exc,
+            )
+
+    for task in tasks:
+        task.add_done_callback(_log_task_failure)
     yield
     for task in tasks:
         task.cancel()
@@ -479,6 +505,12 @@ async def vision_images(entry_id: str) -> JSONResponse:
             )
         )
     except HomeAssistantError as exc:
+        LOGGER.warning(
+            "GET /api/vision/images failed: entry_id=%s (%s): %s",
+            entry_id,
+            type(exc).__name__,
+            exc,
+        )
         raise HTTPException(502, "could not load images") from exc
     images = [
         {"id": i.id, "created_at": i.created_at.isoformat(), "x": i.meta.x, "y": i.meta.y}
@@ -505,6 +537,13 @@ async def vision_image(entry_id: str, image_id: int) -> Response:
             settings.max_image_payload_bytes,
         )
     except HomeAssistantError as exc:
+        LOGGER.warning(
+            "GET /api/vision/image/%s.jpg failed: entry_id=%s (%s): %s",
+            image_id,
+            entry_id,
+            type(exc).__name__,
+            exc,
+        )
         raise HTTPException(502, "could not load image") from exc
     return Response(base64.b64decode(response.image_base64), media_type="image/jpeg")
 

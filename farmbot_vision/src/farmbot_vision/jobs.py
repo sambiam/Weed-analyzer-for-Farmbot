@@ -283,7 +283,7 @@ class JobManager:
                 entry_id, job_id, "idle", start_wall, start_cpu, all_measurements, "completed"
             )
         except Exception as exc:
-            LOGGER.error("Analysis failed: %s", type(exc).__name__)
+            LOGGER.exception("Analysis failed for entry_id=%s: %s", entry_id, exc)
             return await self._finish(
                 entry_id,
                 job_id,
@@ -303,6 +303,13 @@ class JobManager:
         measurements: list | None = None,
     ) -> None:
         measurements = measurements or []
+        LOGGER.debug(
+            "Reporting status to Home Assistant: entry_id=%s job_id=%s status=%s message=%s",
+            entry_id,
+            job_id,
+            status,
+            message,
+        )
         try:
             await self.client.report_status(
                 VisionStatus(
@@ -318,8 +325,17 @@ class JobManager:
                     message=message,
                 )
             )
-        except HomeAssistantError:
-            LOGGER.warning("Could not report job status to Home Assistant")
+        except HomeAssistantError as exc:
+            # If this keeps failing, HA-side entities (Vision Available, Vision
+            # Status, ...) will never leave their unavailable/disconnected state
+            # even though jobs are running -- the reason is always logged here.
+            LOGGER.warning(
+                "Could not report job status to Home Assistant: entry_id=%s status=%s (%s): %s",
+                entry_id,
+                status,
+                type(exc).__name__,
+                exc,
+            )
 
     async def _finish(
         self,

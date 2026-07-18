@@ -95,6 +95,13 @@ class StaleRadiusError(HomeAssistantError):
     pass
 
 
+def _snippet(text: str, limit: int = 300) -> str:
+    """Truncate response text for logging so a large payload (e.g. a base64
+    image on an unexpected-shape response) never floods the log."""
+    text = text.replace("\n", " ").strip()
+    return text if len(text) <= limit else f"{text[:limit]}… ({len(text)} bytes total)"
+
+
 class HomeAssistantClient:
     def __init__(
         self,
@@ -107,6 +114,19 @@ class HomeAssistantClient:
         self.base_url = base_url.rstrip("/")
         self.ws_url = ws_url
         self.timeout = timeout
+        if not self._token:
+            LOGGER.warning(
+                "No Home Assistant token configured (SUPERVISOR_TOKEN is unset/empty); "
+                "every request to %s will be rejected with 401",
+                self.base_url,
+            )
+        else:
+            LOGGER.info(
+                "Home Assistant client configured: base_url=%s ws_url=%s token_length=%d",
+                self.base_url,
+                self.ws_url,
+                len(self._token),
+            )
         self._http = httpx.AsyncClient(
             timeout=timeout,
             headers={"Authorization": f"Bearer {self._token}", "Content-Type": "application/json"},
@@ -129,11 +149,24 @@ class HomeAssistantClient:
             url += "?return_response"
         last_error: Exception | None = None
         for attempt in range(3):
+            LOGGER.debug("Calling Home Assistant service %s (attempt %d/3)", action, attempt + 1)
             try:
                 response = await self._http.post(url, json=body)
                 if response.status_code in {409, 412}:
+                    LOGGER.info(
+                        "Home Assistant service %s reported a stale radius (HTTP %d)",
+                        action,
+                        response.status_code,
+                    )
                     raise StaleRadiusError("FarmBot radius changed; inventory refresh required")
                 if response.status_code in {400, 401, 403, 422}:
+                    LOGGER.error(
+                        "Home Assistant service %s rejected the request with a non-retryable "
+                        "HTTP %d: %s",
+                        action,
+                        response.status_code,
+                        _snippet(response.text),
+                    )
                     raise HomeAssistantError(
                         f"non-retryable Home Assistant response {response.status_code}"
                     )
@@ -144,12 +177,35 @@ class HomeAssistantClient:
                 elif isinstance(data, dict) and "service_response" in data:
                     data = data["service_response"]
                 return model.model_validate(data) if model else data
-            except (httpx.TimeoutException, httpx.NetworkError) as exc:
+            except (httpx.TimeoutException, httpx.NetworkError, httpx.HTTPStatusError) as exc:
                 last_error = exc
+                status = getattr(getattr(exc, "response", None), "status_code", None)
+                LOGGER.warning(
+                    "Home Assistant service %s failed on attempt %d/3 (%s%s); %s",
+                    action,
+                    attempt + 1,
+                    type(exc).__name__,
+                    f" HTTP {status}" if status is not None else "",
+                    "retrying" if attempt < 2 else "giving up",
+                )
                 if attempt < 2:
                     await asyncio.sleep(2**attempt)
             except (json.JSONDecodeError, ValidationError) as exc:
+                LOGGER.error(
+                    "Home Assistant service %s returned a response that does not match the "
+                    "expected contract (%s): %s; raw response: %s",
+                    action,
+                    type(exc).__name__,
+                    exc if isinstance(exc, json.JSONDecodeError) else _validation_summary(exc),
+                    _snippet(response.text),
+                )
                 raise HomeAssistantError("malformed FarmBot integration response") from exc
+        LOGGER.error(
+            "Home Assistant service %s failed after 3 attempts; last error: %s: %s",
+            action,
+            type(last_error).__name__ if last_error else "unknown",
+            last_error,
+        )
         raise HomeAssistantError("Home Assistant temporarily unavailable") from last_error
 
     async def list_bots(self) -> BotList:
@@ -195,8 +251,10 @@ class HomeAssistantClient:
 
     async def vision_events(self) -> AsyncIterator[VisionRequestEvent]:
         while True:
+            LOGGER.info("Vision event listener: connecting to %s", self.ws_url)
             try:
                 async with websockets.connect(self.ws_url, open_timeout=10) as socket:
+                    LOGGER.debug("Vision event listener: WebSocket transport open, awaiting handshake")
                     try:
                         auth_required = json.loads(await socket.recv())
                     except json.JSONDecodeError as exc:
@@ -205,7 +263,9 @@ class HomeAssistantClient:
                         not isinstance(auth_required, dict)
                         or auth_required.get("type") != "auth_required"
                     ):
-                        raise HomeAssistantConnectionError("unexpected WebSocket handshake")
+                        raise HomeAssistantConnectionError(
+                            f"unexpected WebSocket handshake: {_snippet(str(auth_required))}"
+                        )
                     await socket.send(json.dumps({"type": "auth", "access_token": self._token}))
                     try:
                         auth = json.loads(await socket.recv())
@@ -215,8 +275,10 @@ class HomeAssistantClient:
                         ) from exc
                     if not isinstance(auth, dict) or auth.get("type") != "auth_ok":
                         raise HomeAssistantAuthenticationError(
-                            "Home Assistant WebSocket authentication failed"
+                            "Home Assistant WebSocket authentication failed: "
+                            f"{_snippet(str(auth))}"
                         )
+                    LOGGER.info("Vision event listener: WebSocket authenticated")
                     await socket.send(
                         json.dumps(
                             {
@@ -230,17 +292,26 @@ class HomeAssistantClient:
                         try:
                             message = json.loads(raw)
                         except (json.JSONDecodeError, TypeError):
-                            LOGGER.warning("Vision event skipped: malformed JSON")
+                            LOGGER.warning(
+                                "Vision event skipped: malformed JSON (%s)", _snippet(str(raw))
+                            )
                             continue
                         if not isinstance(message, dict):
-                            LOGGER.warning("Vision event skipped: malformed message")
+                            LOGGER.warning(
+                                "Vision event skipped: malformed message (%s)",
+                                _snippet(str(message)),
+                            )
                             continue
                         if message.get("type") == "result" and message.get("id") == 1:
                             if not message.get("success"):
                                 raise HomeAssistantSubscriptionError(
-                                    "vision event subscription rejected"
+                                    "vision event subscription rejected: "
+                                    f"{_snippet(str(message.get('error')))}"
                                 )
-                            LOGGER.debug("Vision event subscription active")
+                            LOGGER.info(
+                                "Vision event listener: subscribed to farmbot_vision_request "
+                                "and connected"
+                            )
                             continue
                         if message.get("type") != "event":
                             continue
@@ -263,21 +334,29 @@ class HomeAssistantClient:
                             event.device_id is not None,
                         )
                         yield event
-                    raise HomeAssistantConnectionError("WebSocket connection closed")
-            except HomeAssistantAuthenticationError:
-                LOGGER.warning("Vision event authentication failure")
+                    raise HomeAssistantConnectionError("WebSocket connection closed by peer")
+            except HomeAssistantAuthenticationError as exc:
+                LOGGER.warning("Vision event listener: authentication failure: %s", exc)
                 await asyncio.sleep(15)
-            except HomeAssistantSubscriptionError:
-                LOGGER.warning("Vision event subscription failure")
+            except HomeAssistantSubscriptionError as exc:
+                LOGGER.warning("Vision event listener: subscription failure: %s", exc)
                 await asyncio.sleep(15)
-            except (OSError, websockets.WebSocketException):
-                LOGGER.warning("Vision event WebSocket connection failure")
+            except (OSError, websockets.WebSocketException) as exc:
+                LOGGER.warning(
+                    "Vision event listener: WebSocket connection failure (%s): %s",
+                    type(exc).__name__,
+                    exc,
+                )
                 await asyncio.sleep(15)
-            except HomeAssistantConnectionError:
-                LOGGER.warning("Vision event WebSocket connection failure")
+            except HomeAssistantConnectionError as exc:
+                LOGGER.warning("Vision event listener: connection failure: %s", exc)
                 await asyncio.sleep(15)
-            except HomeAssistantError:
-                LOGGER.warning("Vision event connection failure")
+            except HomeAssistantError as exc:
+                LOGGER.warning(
+                    "Vision event listener: unexpected failure (%s): %s",
+                    type(exc).__name__,
+                    exc,
+                )
                 await asyncio.sleep(15)
 
 
