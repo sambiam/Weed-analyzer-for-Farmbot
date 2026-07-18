@@ -254,7 +254,9 @@ class HomeAssistantClient:
             LOGGER.info("Vision event listener: connecting to %s", self.ws_url)
             try:
                 async with websockets.connect(self.ws_url, open_timeout=10) as socket:
-                    LOGGER.debug("Vision event listener: WebSocket transport open, awaiting handshake")
+                    LOGGER.debug(
+                        "Vision event listener: WebSocket transport open, awaiting handshake"
+                    )
                     try:
                         auth_required = json.loads(await socket.recv())
                     except json.JSONDecodeError as exc:
@@ -275,8 +277,7 @@ class HomeAssistantClient:
                         ) from exc
                     if not isinstance(auth, dict) or auth.get("type") != "auth_ok":
                         raise HomeAssistantAuthenticationError(
-                            "Home Assistant WebSocket authentication failed: "
-                            f"{_snippet(str(auth))}"
+                            f"Home Assistant WebSocket authentication failed: {_snippet(str(auth))}"
                         )
                     LOGGER.info("Vision event listener: WebSocket authenticated")
                     await socket.send(

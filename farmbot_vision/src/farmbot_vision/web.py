@@ -227,8 +227,7 @@ async def retention_cleanup() -> None:
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     LOGGER.info(
-        "FarmBot Vision %s starting: selected_config_entry_id=%s mode=%s "
-        "analysis_resolution=%s",
+        "FarmBot Vision %s starting: selected_config_entry_id=%s mode=%s analysis_resolution=%s",
         __version__,
         settings.selected_config_entry_id or "(not set)",
         settings.mode.value,
@@ -252,7 +251,9 @@ async def lifespan(_: FastAPI):
         exc = task.exception()
         if exc is not None:
             LOGGER.error(
-                "Background task %s crashed and will not restart: %s", task.get_name(), exc,
+                "Background task %s crashed and will not restart: %s",
+                task.get_name(),
+                exc,
                 exc_info=exc,
             )
 
