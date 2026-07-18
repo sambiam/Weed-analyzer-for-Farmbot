@@ -61,10 +61,31 @@ class ImageMeta(StrictModel):
 
 
 class InventoryImage(StrictModel):
+    """An image entry from ``farmbot.get_vision_inventory``.
+
+    The documented contract nests coordinates under ``meta`` and always sends
+    ``processed``. At least one companion integration build in the wild
+    instead places ``x``/``y``/``z``/``name`` directly on the image object and
+    omits ``processed`` entirely. ``_normalize`` accepts both shapes rather
+    than rejecting every image in an otherwise-valid inventory response.
+    """
+
     id: int
     created_at: datetime
-    processed: bool
+    processed: bool = True
     meta: ImageMeta
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize(cls, data: object) -> object:
+        if not isinstance(data, dict) or "meta" in data:
+            return data
+        flat_keys = {"x", "y", "z", "name"} & data.keys()
+        if not flat_keys:
+            return data
+        data = dict(data)
+        data["meta"] = {key: data.pop(key) for key in flat_keys}
+        return data
 
 
 class CurveData(StrictModel):

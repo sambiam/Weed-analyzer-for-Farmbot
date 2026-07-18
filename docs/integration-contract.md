@@ -24,7 +24,12 @@ Response fields:
 
 - `device_id`, `generated_at`
 - `plants[]`: `id`, `name`, `openfarm_slug`, `x`, `y`, `z`, `radius`, `plant_stage`, nullable `planted_at`, nullable `spread_curve_id`
-- `images[]`: `id`, `created_at`, `processed`, and `meta` containing `x`, `y`, `z`, optional `name`
+- `images[]`: `id`, `created_at`, `processed`, and `meta` containing `x`, `y`, `z`, optional `name`.
+  The app also tolerates a non-conforming shape observed from at least one companion
+  integration build in production: `x`/`y`/`z`/`name` sent flat on the image object
+  instead of nested under `meta`, and `processed` omitted entirely (treated as `true`).
+  This is a compatibility shim in `InventoryImage._normalize`, not the target contract —
+  new integration work should still emit the nested/complete shape above.
 - `curves[]`: `id`, `name`, `type` (must be `spread`), and day-string to diameter mapping `data`
 - `camera_calibration`: `available`, nullable positive `pixels_per_mm_x/y`, nullable `rotation_degrees`, nullable `offset_x_mm/y`, and (v2) `reference_width`, `reference_height`, `basis` (`reference_image` or `native_frame`)
 

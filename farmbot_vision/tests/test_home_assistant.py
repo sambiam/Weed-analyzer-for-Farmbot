@@ -49,6 +49,48 @@ async def test_unexpected_server_error_is_retried_then_raised(monkeypatch: pytes
 
 
 @pytest.mark.asyncio
+async def test_inventory_accepts_flat_image_coordinates():
+    """A companion integration build observed in production sends image
+    coordinates flat on the image object (``x``/``y``/``z``) with no
+    ``processed`` flag, instead of the documented nested ``meta`` object.
+    The inventory call must still succeed rather than rejecting every image.
+    """
+
+    async def handler(_request):
+        return httpx.Response(
+            200,
+            json={
+                "changed_states": [],
+                "service_response": {
+                    "device_id": "device_28660",
+                    "generated_at": "2026-07-18T14:37:40.984259+00:00",
+                    "plants": [],
+                    "images": [
+                        {
+                            "id": 1,
+                            "created_at": "2026-07-18T14:00:00+00:00",
+                            "x": 2600,
+                            "y": 230,
+                            "z": 0,
+                        }
+                    ],
+                    "curves": [],
+                    "camera_calibration": {"available": False},
+                },
+            },
+        )
+
+    client = HomeAssistantClient(token="test", base_url="http://test")
+    await client._http.aclose()
+    client._http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    inventory = await client.inventory(InventoryRequest(config_entry_id="entry"))
+    assert inventory.images[0].processed is True
+    assert inventory.images[0].meta.x == 2600
+    assert inventory.images[0].meta.y == 230
+    await client.close()
+
+
+@pytest.mark.asyncio
 async def test_stale_current_radius_conflict():
     async def handler(_request):
         return httpx.Response(409, json={"error": "stale radius"})
