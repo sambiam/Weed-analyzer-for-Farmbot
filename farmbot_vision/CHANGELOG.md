@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.2 - 2026-07-18
+
+- Fixed AppArmor access for the complete Python shared-library tree and its native dependencies on Home Assistant OS and Supervised installations.
+
 ## 0.1.1 - 2026-07-18
 
 - Fixed a startup crash (`libpython3.12.so.1.0: cannot open shared object file`) caused by the AppArmor profile not covering `/usr/local/lib`, where the official Python image installs its shared library; also added the `m` (mmap-exec) permission required to load compiled extensions such as NumPy and OpenCV.

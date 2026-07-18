@@ -14,10 +14,13 @@ profile farmbot_vision flags=(attach_disconnected,mediate_deleted) {
   /bin/sh ix,
   /usr/local/bin/python3.12 ix,
   /usr/local/bin/python ix,
-  /usr/local/lib/libpython3.12.so* mr,
-  /usr/local/lib/python3.12/** mr,
-  /usr/lib/** r,
-  /lib/** r,
+  # Python, NumPy, and OpenCV load shared objects from the complete
+  # /usr/local/lib tree.  `m` is required for executable mmap of those
+  # objects; without it the loader reports them as "not found".
+  /usr/local/lib/** mr,
+  /usr/lib/** mr,
+  /lib/** mr,
+  /usr/local/lib/python312.zip r,
   /etc/ssl/certs/** r,
   /etc/hosts r,
   /etc/resolv.conf r,
