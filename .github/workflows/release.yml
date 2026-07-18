@@ -11,6 +11,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Read add-on version from config.yaml
+        id: addon_version
+        run: |
+          VERSION=$(grep -m1 '^version:' farmbot_vision/config.yaml | sed -E 's/version: *"?([^"]*)"?/\1/')
+          if [ -z "$VERSION" ]; then
+            echo "::error::Could not read version from farmbot_vision/config.yaml"
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
       - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
@@ -23,8 +32,13 @@ jobs:
         with:
           images: ghcr.io/sambiam/farmbot-vision
           tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
+            # The tag Supervisor pulls MUST match config.yaml's `version` field
+            # exactly, so it is sourced from config.yaml rather than the Git
+            # release tag name (which need not be semver, e.g. V1.0_alpha).
+            type=raw,value=${{ steps.addon_version.outputs.version }}
+            type=raw,value=${{ github.event.release.tag_name }}
+            # config.yaml uses the registry default tag for normal releases.
+            type=raw,value=latest,enable=${{ github.event.release.prerelease == false }}
       - uses: docker/build-push-action@v6
         with:
           context: farmbot_vision
@@ -33,7 +47,7 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
-            BUILD_VERSION=${{ github.event.release.tag_name }}
+            BUILD_VERSION=${{ steps.addon_version.outputs.version }}
             BUILD_ARCH=aarch64|amd64
           provenance: mode=max
           sbom: true
