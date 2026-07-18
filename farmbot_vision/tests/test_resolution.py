@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 
 import pytest
+
 from farmbot_vision.resolution import (
     DEFAULT_RESOLUTION,
     AnalysisResolution,

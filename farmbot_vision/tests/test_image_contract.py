@@ -6,6 +6,7 @@ import httpx
 import numpy as np
 import pytest
 from conftest import encode_jpeg, vision_image_dict
+
 from farmbot_vision.home_assistant import HomeAssistantClient
 from farmbot_vision.models import VisionImage, VisionImageRequest
 

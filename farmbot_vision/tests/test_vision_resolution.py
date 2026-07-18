@@ -6,6 +6,7 @@ import cv2
 import numpy as np
 import pytest
 from conftest import encode_jpeg, synthetic_plant
+
 from farmbot_vision.models import Calibration, PlantSeed
 from farmbot_vision.vision import ClassicalVisionEngine, resize_prior_mask
 

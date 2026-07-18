@@ -3,9 +3,10 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-import farmbot_vision.web as web
 import pytest
 import yaml
+
+import farmbot_vision.web as web
 
 
 async def asgi_request(

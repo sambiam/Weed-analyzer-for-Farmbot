@@ -5,6 +5,7 @@ from datetime import UTC, datetime
 from uuid import uuid4
 
 import pytest
+
 from farmbot_vision.database import Database
 from farmbot_vision.models import (
     Calibration,
@@ -163,9 +164,8 @@ async def test_second_run_is_rejected_while_locked(tmp_path):
 
 
 def test_resource_gate_blocks_low_memory(tmp_path, monkeypatch):
-    from farmbot_vision.jobs import JobManager
-
     from farmbot_vision import jobs as jobs_module
+    from farmbot_vision.jobs import JobManager
 
     database = Database(tmp_path / "db.sqlite")
     manager = JobManager(Settings(minimum_free_memory_mb=999999), database, client=None)

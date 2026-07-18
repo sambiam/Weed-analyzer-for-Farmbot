@@ -5,9 +5,10 @@ import json
 
 import httpx
 import pytest
+from pydantic import ValidationError
+
 from farmbot_vision.home_assistant import HomeAssistantClient, StaleRadiusError
 from farmbot_vision.models import ApplyRadiusRequest, VisionRequestEvent
-from pydantic import ValidationError
 
 
 @pytest.mark.asyncio
