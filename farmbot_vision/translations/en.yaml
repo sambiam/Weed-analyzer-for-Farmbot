@@ -5,6 +5,13 @@ configuration:
   mode:
     name: Operating mode
     description: Observe only, recommend changes, or automatically apply safe radius increases.
+  analysis_resolution:
+    name: Analysis resolution
+    description: >-
+      Processed image size for canopy analysis. 960x720 is the recommended
+      default for a 4 GB Raspberry Pi 4. Higher resolutions cost more CPU and
+      memory (relative pixel work 1x / 2.25x / 4x). Changing this requires
+      restarting the app.
   schedule_enabled:
     name: Enable daily schedule
   schedule_time:

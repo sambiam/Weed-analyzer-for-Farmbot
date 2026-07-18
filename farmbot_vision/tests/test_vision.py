@@ -99,10 +99,17 @@ def test_camera_translation_registration():
     assert response > 0.5
 
 
-def test_decode_resizes_to_processing_limit():
-    large = np.zeros((960, 1280, 3), np.uint8)
-    cv2.circle(large, (640, 480), 200, (0, 255, 0), -1)
-    ok, encoded = cv2.imencode(".jpg", large)
+def test_decode_keeps_processed_resolution_and_caps_at_ceiling():
+    # The integration already resized to the processed size; the app keeps it.
+    processed = np.zeros((960, 1280, 3), np.uint8)
+    cv2.circle(processed, (640, 480), 200, (0, 255, 0), -1)
+    ok, encoded = cv2.imencode(".jpg", processed)
+    assert ok
+    assert decode_jpeg(encoded.tobytes()).shape[:2] == (960, 1280)
+
+    # Anything above the 1280x960 ceiling is defensively downscaled.
+    oversized = np.zeros((1200, 1600, 3), np.uint8)
+    ok, encoded = cv2.imencode(".jpg", oversized)
     assert ok
     decoded = decode_jpeg(encoded.tobytes())
-    assert decoded.shape[:2] == (480, 640)
+    assert decoded.shape[1] <= 1280 and decoded.shape[0] <= 960
