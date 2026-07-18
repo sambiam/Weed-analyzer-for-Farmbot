@@ -60,8 +60,8 @@ def main() -> None:
     if "analysis_resolution" not in translations.get("configuration", {}):
         fail("translations missing analysis_resolution description")
 
-    if config.get("version") != "0.2.0":
-        fail("config.yaml version must be 0.2.0")
+    if config.get("version") != "0.2.1":
+        fail("config.yaml version must be 0.2.1")
 
     print("config schema check passed: analysis_resolution consistent, default 960x720")
 

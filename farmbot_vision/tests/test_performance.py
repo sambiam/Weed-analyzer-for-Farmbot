@@ -2,7 +2,6 @@ from datetime import UTC, datetime
 from time import perf_counter
 
 from conftest import jpeg
-
 from farmbot_vision.vision import ClassicalVisionEngine
 
 

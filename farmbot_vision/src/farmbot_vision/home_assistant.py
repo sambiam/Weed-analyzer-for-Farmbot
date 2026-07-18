@@ -79,6 +79,18 @@ class HomeAssistantError(RuntimeError):
     pass
 
 
+class HomeAssistantConnectionError(HomeAssistantError):
+    """The event WebSocket could not be established or remained open."""
+
+
+class HomeAssistantAuthenticationError(HomeAssistantError):
+    """Home Assistant rejected WebSocket authentication."""
+
+
+class HomeAssistantSubscriptionError(HomeAssistantError):
+    """Home Assistant rejected the vision event subscription."""
+
+
 class StaleRadiusError(HomeAssistantError):
     pass
 
@@ -185,13 +197,26 @@ class HomeAssistantClient:
         while True:
             try:
                 async with websockets.connect(self.ws_url, open_timeout=10) as socket:
-                    auth_required = json.loads(await socket.recv())
-                    if auth_required.get("type") != "auth_required":
-                        raise HomeAssistantError("unexpected WebSocket handshake")
+                    try:
+                        auth_required = json.loads(await socket.recv())
+                    except json.JSONDecodeError as exc:
+                        raise HomeAssistantConnectionError("malformed WebSocket handshake") from exc
+                    if (
+                        not isinstance(auth_required, dict)
+                        or auth_required.get("type") != "auth_required"
+                    ):
+                        raise HomeAssistantConnectionError("unexpected WebSocket handshake")
                     await socket.send(json.dumps({"type": "auth", "access_token": self._token}))
-                    auth = json.loads(await socket.recv())
-                    if auth.get("type") != "auth_ok":
-                        raise HomeAssistantError("Home Assistant WebSocket authentication failed")
+                    try:
+                        auth = json.loads(await socket.recv())
+                    except json.JSONDecodeError as exc:
+                        raise HomeAssistantConnectionError(
+                            "malformed WebSocket authentication response"
+                        ) from exc
+                    if not isinstance(auth, dict) or auth.get("type") != "auth_ok":
+                        raise HomeAssistantAuthenticationError(
+                            "Home Assistant WebSocket authentication failed"
+                        )
                     await socket.send(
                         json.dumps(
                             {
@@ -202,14 +227,65 @@ class HomeAssistantClient:
                         )
                     )
                     async for raw in socket:
-                        message = json.loads(raw)
-                        if message.get("type") == "event":
-                            yield VisionRequestEvent.model_validate(message["event"]["data"])
-            except (
-                OSError,
-                websockets.WebSocketException,
-                ValidationError,
-                json.JSONDecodeError,
-            ) as exc:
-                LOGGER.warning("Vision event connection interrupted: %s", type(exc).__name__)
+                        try:
+                            message = json.loads(raw)
+                        except (json.JSONDecodeError, TypeError):
+                            LOGGER.warning("Vision event skipped: malformed JSON")
+                            continue
+                        if not isinstance(message, dict):
+                            LOGGER.warning("Vision event skipped: malformed message")
+                            continue
+                        if message.get("type") == "result" and message.get("id") == 1:
+                            if not message.get("success"):
+                                raise HomeAssistantSubscriptionError(
+                                    "vision event subscription rejected"
+                                )
+                            LOGGER.debug("Vision event subscription active")
+                            continue
+                        if message.get("type") != "event":
+                            continue
+                        event_data = message.get("event", {})
+                        data = event_data.get("data") if isinstance(event_data, dict) else None
+                        try:
+                            event = VisionRequestEvent.model_validate(data)
+                        except ValidationError as exc:
+                            LOGGER.warning(
+                                "Vision event skipped: validation failed (%s)",
+                                _validation_summary(exc),
+                            )
+                            continue
+                        LOGGER.debug(
+                            "FarmBot Vision request accepted: config_entry_id=%s mode=%s "
+                            "plant_count=%d device_id_supplied=%s",
+                            event.config_entry_id,
+                            event.mode,
+                            len(event.plant_ids),
+                            event.device_id is not None,
+                        )
+                        yield event
+                    raise HomeAssistantConnectionError("WebSocket connection closed")
+            except HomeAssistantAuthenticationError:
+                LOGGER.warning("Vision event authentication failure")
                 await asyncio.sleep(15)
+            except HomeAssistantSubscriptionError:
+                LOGGER.warning("Vision event subscription failure")
+                await asyncio.sleep(15)
+            except (OSError, websockets.WebSocketException):
+                LOGGER.warning("Vision event WebSocket connection failure")
+                await asyncio.sleep(15)
+            except HomeAssistantConnectionError:
+                LOGGER.warning("Vision event WebSocket connection failure")
+                await asyncio.sleep(15)
+            except HomeAssistantError:
+                LOGGER.warning("Vision event connection failure")
+                await asyncio.sleep(15)
+
+
+def _validation_summary(exc: ValidationError) -> str:
+    """Return field/type-only details suitable for a safe warning log."""
+
+    details = []
+    for error in exc.errors()[:4]:
+        location = ".".join(str(part) for part in error.get("loc", ())) or "event"
+        details.append(f"{location}:{error.get('type', 'validation_error')}")
+    return ", ".join(details) or "validation_error"

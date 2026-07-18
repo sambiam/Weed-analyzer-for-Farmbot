@@ -64,6 +64,7 @@ class JobManager:
     ) -> dict:
         if self.lock.locked():
             self.current["queue_length"] = 1
+            LOGGER.info("Analysis request rejected: another analysis is already running")
             return {"accepted": False, "reason": "analysis already running"}
         entry_id = entry_id or self.settings.selected_config_entry_id
         mode = mode or self.settings.mode

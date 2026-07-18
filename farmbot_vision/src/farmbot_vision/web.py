@@ -17,6 +17,7 @@ from fastapi.responses import (
     RedirectResponse,
     Response,
 )
+from starlette.types import ASGIApp, Receive, Scope, Send
 
 from . import (
     ALGORITHM_VERSION,
@@ -44,6 +45,33 @@ settings = Settings.load()
 database = Database(settings.data_dir / "farmbot_vision.db")
 client = HomeAssistantClient()
 jobs = JobManager(settings, database, client)
+
+
+def _normalize_leading_slashes(value: str) -> str:
+    """Collapse only duplicate slashes at the beginning of an ASGI path."""
+
+    return f"/{value.lstrip('/')}" if value.startswith("//") else value
+
+
+class NormalizeIngressPathMiddleware:
+    """Normalize duplicate leading slashes before FastAPI route matching."""
+
+    def __init__(self, app: ASGIApp):
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] in {"http", "websocket"}:
+            path = scope.get("path", "")
+            raw_path = scope.get("raw_path", b"")
+            normalized_path = _normalize_leading_slashes(path)
+            normalized_raw_path = (
+                b"/" + raw_path.lstrip(b"/") if raw_path.startswith(b"//") else raw_path
+            )
+            if normalized_path != path or normalized_raw_path != raw_path:
+                scope = dict(scope)
+                scope["path"] = normalized_path
+                scope["raw_path"] = normalized_raw_path
+        await self.app(scope, receive, send)
 
 
 # Lightweight vanilla-JS point selection and plant-centre overlay for the
@@ -213,11 +241,15 @@ async def lifespan(_: FastAPI):
 app = FastAPI(
     title="FarmBot Vision", version=__version__, lifespan=lifespan, docs_url=None, redoc_url=None
 )
+app.add_middleware(NormalizeIngressPathMiddleware)
 
 
 def ingress_base(request: Request) -> str:
     value = request.headers.get("X-Ingress-Path", "./").strip()
-    return f"{value.rstrip('/')}/" if value not in {"", ".", "./"} else "./"
+    if value in {"", ".", "./"}:
+        return "./"
+    value = _normalize_leading_slashes(value).rstrip("/")
+    return f"{value}/"
 
 
 def layout(request: Request, body: str, title: str = "FarmBot Vision") -> HTMLResponse:
@@ -526,7 +558,7 @@ async def artifact(name: str) -> FileResponse:
 
 
 @app.post("/recommendations/{measurement_id}/{action}")
-async def recommendation(measurement_id: str, action: str) -> RedirectResponse:
+async def recommendation(request: Request, measurement_id: str, action: str) -> RedirectResponse:
     if action not in {"approve", "reject"}:
         raise HTTPException(400)
     row = database.connection.execute(
@@ -552,4 +584,9 @@ async def recommendation(measurement_id: str, action: str) -> RedirectResponse:
             )
         )
     database.record_decision(measurement_id, action, {})
-    return RedirectResponse("../../../", status_code=303)
+    # The ingress prefix is dynamic; returning it explicitly prevents a
+    # relative redirect from climbing above the Home Assistant session path.
+    destination = ingress_base(request)
+    if destination == "./":
+        destination = "../../../"
+    return RedirectResponse(destination, status_code=303)

@@ -54,7 +54,7 @@ jobs:
           load: ${{ matrix.arch == 'amd64' }}
           tags: farmbot-vision:test-${{ matrix.arch }}
           build-args: |
-            BUILD_VERSION=0.2.0
+            BUILD_VERSION=0.2.1
             BUILD_ARCH=${{ matrix.arch }}
       - name: Smoke-test container health endpoint (amd64)
         if: matrix.arch == 'amd64'
@@ -68,6 +68,10 @@ jobs:
             sleep 2
           done
           cat health.json
+          curl --path-as-is -fsS http://127.0.0.1:8099/ > dashboard.html
+          curl --path-as-is -fsS http://127.0.0.1:8099// > duplicate-dashboard.html
+          grep -q 'FarmBot Vision' dashboard.html
+          grep -q 'FarmBot Vision' duplicate-dashboard.html
           # Health must report single-thread OpenCV and the selected resolution.
           python - <<'PY'
           import json

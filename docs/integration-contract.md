@@ -74,7 +74,24 @@ Input fields: `config_entry_id`, `available`, `status` (`idle|running|warning|er
 
 ## `farmbot_vision_request` event
 
-Event data: `{"config_entry_id":"string","plant_ids":[],"mode":"observe|recommend|auto_radius"}`. An empty plant list means all eligible plants. The integration should not emit overlapping requests repeatedly.
+Event data:
+
+```json
+{
+  "config_entry_id": "string",
+  "device_id": "string",
+  "plant_ids": [],
+  "mode": "recommend"
+}
+```
+
+`device_id` is optional for backward compatibility. `mode` must be one of
+`observe`, `recommend`, or `auto_radius`; every `plant_ids` value must be a
+positive integer. An empty plant list means all eligible plants. The app
+rejects unknown event fields. A malformed event is logged with sanitized field
+and error-type details and skipped without reconnecting the active subscription,
+so a later valid event is still processed. The integration should not emit
+overlapping requests repeatedly.
 
 ## Exact companion-integration work still required
 

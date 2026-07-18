@@ -3,7 +3,6 @@ from __future__ import annotations
 import numpy as np
 import pytest
 from conftest import vision_image_dict
-
 from farmbot_vision.calibration import (
     resolve_calibration,
     scale_reference_to_processed,

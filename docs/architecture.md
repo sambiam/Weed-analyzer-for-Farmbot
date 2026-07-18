@@ -9,7 +9,14 @@ FarmBot API ← companion Home Assistant integration ← Core service actions/ev
 
 The companion integration owns authentication, token refresh, resource retrieval, image download, write validation, and FarmBot mutations. FarmBot Vision owns analysis, local observations, proposals, and operator review. The boundary is deliberately typed and versionable.
 
-FastAPI serves a relative-link, `X-Ingress-Path`-aware interface on internal port 8099. An asynchronous event listener and optional low-frequency scheduler feed a single job lock. Images are fetched and released sequentially. CPU-heavy OpenCV work runs outside the event loop, with a 60-second timeout and resource checks between images.
+FastAPI serves a relative-link, `X-Ingress-Path`-aware interface on internal
+port 8099. `NormalizeIngressPathMiddleware` rewrites only duplicate leading
+slashes in HTTP and WebSocket ASGI scopes before route matching; it does not
+redirect, alter query strings, or log the temporary Ingress path. An
+asynchronous event listener and optional low-frequency scheduler feed a single
+job lock. Images are fetched and released sequentially. CPU-heavy OpenCV work
+runs outside the event loop, with a 60-second timeout and resource checks
+between images.
 
 The `ImageAnalysisEngine` abstraction isolates the classical implementation so a small ONNX or TFLite engine can be added later without changing jobs or persistence. No inference runtime ships.
 

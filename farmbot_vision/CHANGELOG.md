@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.2.1 - 2026-07-18
+
+Runtime fixes for Home Assistant Ingress and FarmBot Vision events.
+
+- Removed the explicit root `ingress_entry` so Home Assistant uses its default
+  Ingress entry path.
+- Added ASGI middleware that rewrites duplicate leading slashes internally,
+  including `//` and `///settings`, without redirects or query-string changes.
+- Kept dashboard, calibration, image, artifact, and recommendation links
+  relative so they remain inside a dynamic Ingress session.
+- Accepted the companion event's optional `device_id` and validated every
+  requested plant ID as a positive integer while continuing to reject unknown
+  fields.
+- Skipped malformed JSON and invalid individual events in place so they do not
+  close the active WebSocket subscription; connection, authentication, and
+  subscription failures retain bounded reconnect handling.
+- Added sanitized event observability and job-lock rejection logging.
+
 ## 0.2.0 - 2026-07-18
 
 Configurable analysis resolution and the revised high-resolution image

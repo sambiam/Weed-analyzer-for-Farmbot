@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 from datetime import datetime
 from enum import StrEnum
-from typing import Literal
+from typing import Annotated, Literal
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -280,8 +280,16 @@ class VisionStatus(StrictModel):
 
 
 class VisionRequestEvent(StrictModel):
+    """A request emitted by the companion FarmBot Home Assistant integration.
+
+    An empty ``plant_ids`` list means that all eligible plants should be
+    considered. ``device_id`` was added by the companion integration but is
+    optional so older event producers remain compatible.
+    """
+
     config_entry_id: str
-    plant_ids: list[int] = Field(default_factory=list)
+    device_id: str | None = None
+    plant_ids: list[Annotated[int, Field(gt=0, strict=True)]] = Field(default_factory=list)
     mode: Literal["observe", "recommend", "auto_radius"]
 
 

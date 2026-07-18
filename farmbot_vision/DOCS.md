@@ -1,5 +1,27 @@
 # FarmBot Vision documentation
 
+## Upgrading from 0.2.0
+
+Install app version **0.2.1**, then restart the app. Close the old FarmBot
+Vision browser tab and reopen the Web UI so Home Assistant creates a fresh
+Ingress session. The companion integration does not need to be changed.
+
+This release removes the explicit root Ingress entry and normalizes duplicate
+leading slashes at the ASGI boundary. Dashboard and calibration URLs are
+relative to the current `X-Ingress-Path`, so they remain inside temporary
+Ingress sessions. The app never logs the complete `X-Ingress-Path` value.
+
+The accepted `farmbot_vision_request` data is:
+
+```json
+{"config_entry_id":"string","device_id":"string","plant_ids":[],"mode":"recommend"}
+```
+
+`device_id` may be omitted, `plant_ids` must contain positive integers, and an
+empty list means all eligible plants. Unknown fields remain rejected. A single
+malformed JSON or invalid event is skipped in place; it does not reconnect the
+WebSocket, and subsequent valid events continue to be processed.
+
 ## Before enabling it
 
 FarmBot Vision requires Home Assistant Core 2026.7 or newer and a companion FarmBot integration that provides the actions in `docs/integration-contract.md`. Start in **Observe** mode. Do not use early experimental output as the sole input to destructive weeding.
@@ -86,6 +108,8 @@ For future labelled-model work, back up the app and export selected overlay/mask
 
 ## Troubleshooting
 
+- **Ingress dashboard shows `{"detail":"Not Found"}` or logs show `GET // HTTP/1.1 404 Not Found`:** verify the installed app is at least **0.2.1**, restart it, close the old browser tab, and reopen the Web UI for a fresh Ingress session.
+- **Logs show `Vision event connection interrupted: ValidationError`:** verify the app is at least **0.2.1** so `VisionRequestEvent` accepts the optional `device_id` and invalid individual events are handled locally.
 - **No bots or inventory:** upgrade the companion integration and reauthenticate it in Home Assistant.
 - **Calibration required:** complete manual calibration or supply it from the integration.
 - **No vegetation connected:** verify image coordinates, rotation, lighting, and HSV suitability.
