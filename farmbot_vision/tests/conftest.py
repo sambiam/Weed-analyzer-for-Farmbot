@@ -2,7 +2,15 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import os
+import tempfile
 from datetime import UTC, datetime
+
+# ``farmbot_vision.web`` creates its SQLite database during import. CI and
+# local test hosts do not provide Home Assistant's writable /data mount, so
+# give the whole test collection an isolated data directory before test
+# modules are imported.
+os.environ["FARMV_DATA_DIR"] = tempfile.mkdtemp(prefix="farmbot-vision-tests-")
 
 import cv2
 import numpy as np
