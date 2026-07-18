@@ -1,10 +1,11 @@
 FROM python:3.12.11-slim-bookworm@sha256:519591d6871b7bc437060736b9f7456b8731f1499a57e22e6c285135ae657bf7
 
-ARG BUILD_VERSION="0.1.2"
+ARG BUILD_VERSION="0.1.3"
 ARG BUILD_ARCH="amd64"
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
+    LD_LIBRARY_PATH=/usr/local/lib \
     OMP_NUM_THREADS=1 \
     OPENBLAS_NUM_THREADS=1 \
     MKL_NUM_THREADS=1 \
@@ -26,7 +27,10 @@ RUN pip install --no-cache-dir --requirement requirements.txt
 COPY src ./src
 COPY run.sh ./run.sh
 RUN chmod 0755 ./run.sh && mkdir -p /data && chown -R farmvision:farmvision /app /data
-USER farmvision
+# Home Assistant stores /data/options.json as root-only (0600).  The app must
+# run as root to read Supervisor-managed options; AppArmor still confines the
+# container to the paths and capabilities declared in apparmor.txt.
+USER root
 EXPOSE 8099
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8099/health', timeout=3)"
 CMD ["./run.sh"]

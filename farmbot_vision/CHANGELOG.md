@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.3 - 2026-07-18
+
+- Run the app container as root so it can read Home Assistant's root-only `/data/options.json`.
+
 ## 0.1.2 - 2026-07-18
 
 - Fixed AppArmor access for the complete Python shared-library tree and its native dependencies on Home Assistant OS and Supervised installations.
