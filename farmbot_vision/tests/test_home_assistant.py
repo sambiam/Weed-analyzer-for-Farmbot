@@ -91,6 +91,47 @@ async def test_inventory_accepts_flat_image_coordinates():
 
 
 @pytest.mark.asyncio
+async def test_inventory_accepts_unrecognized_camera_calibration_basis():
+    """A companion integration build observed in production sends a
+    ``camera_calibration.basis`` value outside the two documented literals.
+
+    ``basis`` here is informational only -- ``calibration.py`` never reads
+    ``CameraCalibration.basis`` (unlike ``ProcessedCalibration.basis``, which
+    is load-bearing) -- so an unrecognized value must degrade to ``None``
+    rather than failing the whole inventory response.
+    """
+
+    async def handler(_request):
+        return httpx.Response(
+            200,
+            json={
+                "changed_states": [],
+                "service_response": {
+                    "device_id": "device_28660",
+                    "generated_at": "2026-07-18T15:10:43.264781+00:00",
+                    "plants": [],
+                    "images": [],
+                    "curves": [],
+                    "camera_calibration": {
+                        "available": True,
+                        "pixels_per_mm_x": 3.1,
+                        "pixels_per_mm_y": 3.1,
+                        "basis": "native",
+                    },
+                },
+            },
+        )
+
+    client = HomeAssistantClient(token="test", base_url="http://test")
+    await client._http.aclose()
+    client._http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    inventory = await client.inventory(InventoryRequest(config_entry_id="entry"))
+    assert inventory.camera_calibration.basis is None
+    assert inventory.camera_calibration.pixels_per_mm_x == 3.1
+    await client.close()
+
+
+@pytest.mark.asyncio
 async def test_stale_current_radius_conflict():
     async def handler(_request):
         return httpx.Response(409, json={"error": "stale radius"})

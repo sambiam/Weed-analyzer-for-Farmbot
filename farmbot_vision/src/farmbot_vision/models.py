@@ -8,7 +8,7 @@ from enum import StrEnum
 from typing import Annotated, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from .resolution import MAX_PROCESSED_HEIGHT, MAX_PROCESSED_WIDTH
 
@@ -114,6 +114,18 @@ class CameraCalibration(StrictModel):
     reference_width: int | None = Field(default=None, ge=1)
     reference_height: int | None = Field(default=None, ge=1)
     basis: Literal["reference_image", "native_frame"] | None = None
+
+    @field_validator("basis", mode="before")
+    @classmethod
+    def _tolerate_unknown_basis(cls, value: object) -> object:
+        # ``basis`` here is informational only -- calibration.py never reads
+        # it (unlike ProcessedCalibration.basis, which is load-bearing) -- so
+        # a value from a companion integration build that doesn't match the
+        # two known literals degrades to "unknown" instead of failing the
+        # whole inventory response.
+        if value not in ("reference_image", "native_frame", None):
+            return None
+        return value
 
     @model_validator(mode="after")
     def complete_when_available(self) -> CameraCalibration:

@@ -193,11 +193,12 @@ class HomeAssistantClient:
             except (json.JSONDecodeError, ValidationError) as exc:
                 LOGGER.error(
                     "Home Assistant service %s returned a response that does not match the "
-                    "expected contract (%s): %s; raw response: %s",
+                    "expected contract (%s): %s",
                     action,
                     type(exc).__name__,
-                    exc if isinstance(exc, json.JSONDecodeError) else _validation_summary(exc),
-                    _snippet(response.text),
+                    exc
+                    if isinstance(exc, json.JSONDecodeError)
+                    else _contract_validation_summary(exc),
                 )
                 raise HomeAssistantError("malformed FarmBot integration response") from exc
         LOGGER.error(
@@ -362,10 +363,35 @@ class HomeAssistantClient:
 
 
 def _validation_summary(exc: ValidationError) -> str:
-    """Return field/type-only details suitable for a safe warning log."""
+    """Return field/type-only details suitable for a safe warning log.
+
+    Deliberately omits the offending value: event payloads arrive over the
+    WebSocket unauthenticated-content-wise and have carried secrets in tests
+    (see test_malformed_and_invalid_events_are_skipped_then_valid_event_is_yielded).
+    """
 
     details = []
     for error in exc.errors()[:4]:
         location = ".".join(str(part) for part in error.get("loc", ())) or "event"
         details.append(f"{location}:{error.get('type', 'validation_error')}")
+    return ", ".join(details) or "validation_error"
+
+
+def _contract_validation_summary(exc: ValidationError) -> str:
+    """Return field, type, and offending value for a Home Assistant service response.
+
+    Unlike ``_validation_summary``, this includes the actual invalid value:
+    the response comes from our own authenticated call to Home Assistant, not
+    from an untrusted event payload, so there is no secret-leak risk, and the
+    value is essential to diagnosing a contract mismatch without another
+    round trip against the real integration.
+    """
+
+    details = []
+    for error in exc.errors()[:6]:
+        location = ".".join(str(part) for part in error.get("loc", ())) or "(root)"
+        details.append(
+            f"{location}:{error.get('type', 'validation_error')}="
+            f"{_snippet(repr(error.get('input')), 120)}"
+        )
     return ", ".join(details) or "validation_error"
