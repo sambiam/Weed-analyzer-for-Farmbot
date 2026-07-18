@@ -1,5 +1,39 @@
 # Changelog
 
+## 0.2.0 - 2026-07-18
+
+Configurable analysis resolution and the revised high-resolution image
+contract (contract **farmbot-vision-v2**).
+
+- Added the `analysis_resolution` app option (`640x480`, `960x720`, `1280x960`)
+  with a new default of **960x720**. Existing installations migrate to the
+  default automatically. Changing it requires an app restart.
+- Added a typed `Resolution` model (width, height, pixel count, label,
+  relative workload) and rejected any non-allowlisted dimensions.
+- Raised the image request/response ceiling to 1280x960 and extended the
+  `VisionImage` contract with source/oriented/processed dimensions, resize
+  scales, optional `source_sha256` and optional `processed_calibration`.
+- Validated returned images fully: checksum over the returned JPEG, decoded
+  dimensions, JPEG format, resize-scale consistency, aspect ratio, no
+  upscaling, and size limits. Base64 image data is never logged.
+- Calibration now always corresponds to the exact processed pixels, selected
+  in preference order: processed calibration → reference calibration scaled to
+  the resolution → compatible manual calibration → none. A native 2592x1944
+  scale is never applied to a resized frame.
+- Manual calibration is now tied to config entry, image, processed resolution,
+  pixel points, separation and version, with an interactive point-and-overlay
+  calibration page (no external tools, no frontend build toolchain).
+- Without valid calibration the app produces pixel-only diagnostics, marks the
+  result uncalibrated, and refuses every write and approval.
+- Made morphology kernels and area thresholds resolution-aware so the physical
+  plant radius stays stable across all three presets; historical masks from a
+  different resolution are safely rescaled or rejected.
+- Preserved single-job / single-image / single-thread processing and the
+  CPU/memory gates; health now reports the selected resolution, pixel count and
+  contract version. Dashboard shows full resolution/calibration provenance.
+- Added database migration 2 (additive columns only; existing data preserved).
+- Declared minimum companion integration version **1.2.0**.
+
 ## 0.1.3 - 2026-07-18
 
 - Run the app container as root so it can read Home Assistant's root-only `/data/options.json`.

@@ -17,12 +17,12 @@ try:
 except ImportError:  # pragma: no cover - Windows development hosts
     resource = None
 
+from . import CONTRACT_VERSION
+from .calibration import resolve_calibration
 from .database import Database
 from .home_assistant import HomeAssistantClient, HomeAssistantError, StaleRadiusError
 from .models import (
     ApplyRadiusRequest,
-    Calibration,
-    CameraCalibration,
     Decision,
     InventoryRequest,
     OperatingMode,
@@ -100,22 +100,18 @@ class JobManager:
                 )
             )
             self.current["progress"] = "Inventory loaded"
-            calibration = self._calibration(entry_id, inventory.camera_calibration)
-            if calibration is None:
-                return await self._finish(
-                    entry_id,
-                    job_id,
-                    "warning",
-                    start_wall,
-                    start_cpu,
-                    [],
-                    "calibration required; automatic updates refused",
-                )
+            resolution = self.settings.resolution
+            manual_calibration = self.db.active_calibration(entry_id)
             engine = ClassicalVisionEngine(
                 self.settings.safety_margin_mm, self.settings.calibration_uncertainty_mm
             )
             wanted = [p for p in inventory.plants if not plant_ids or p.id in plant_ids]
             all_measurements = []
+            self.current["resolution"] = resolution.as_dict()
+            self.current["images_processed"] = 0
+            self.current["uncalibrated_images"] = 0
+            self.current["calibration_warnings"] = []
+            self.current["calibration_source"] = None
             artifacts = self.settings.data_dir / "artifacts"
             artifacts.mkdir(parents=True, exist_ok=True)
             for image_number, image_info in enumerate(
@@ -130,11 +126,62 @@ class JobManager:
                 self.current["progress"] = (
                     f"Processing image {image_number + 1}/{len(inventory.images)}"
                 )
+                # Request the configured resolution; images are fetched one at a time.
                 response = await self.client.image(
-                    VisionImageRequest(config_entry_id=entry_id, image_id=image_info.id),
+                    VisionImageRequest(
+                        config_entry_id=entry_id,
+                        image_id=image_info.id,
+                        max_width=self.settings.analysis_width,
+                        max_height=self.settings.analysis_height,
+                    ),
                     self.settings.max_image_payload_bytes,
                 )
                 image_bytes = base64.b64decode(response.image_base64, validate=True)
+                resolved = resolve_calibration(
+                    response,
+                    inventory.camera_calibration,
+                    manual_calibration,
+                    resolution,
+                    self.settings.calibration_uncertainty_mm,
+                )
+                self.current["calibration_source"] = resolved.source
+                for warning in resolved.warnings:
+                    if warning not in self.current["calibration_warnings"]:
+                        self.current["calibration_warnings"].append(warning)
+                self.current["source_dimensions"] = (
+                    [response.source_width, response.source_height]
+                    if response.source_width
+                    else None
+                )
+                self.current["oriented_dimensions"] = (
+                    [response.oriented_width, response.oriented_height]
+                    if response.oriented_width
+                    else None
+                )
+                self.current["processed_dimensions"] = [response.width, response.height]
+                self.current["resize_scales"] = (
+                    [response.resize_scale_x, response.resize_scale_y]
+                    if response.resize_scale_x
+                    else None
+                )
+                self.current["images_processed"] += 1
+
+                overlay_path = artifacts / f"{job_id}-{response.image_id}-overlay.jpg"
+
+                if resolved.calibration is None:
+                    # No valid metric calibration: pixel-only diagnostics, no
+                    # measurement, no write (Part 6).
+                    self.current["uncalibrated_images"] += 1
+                    result = await asyncio.wait_for(
+                        asyncio.to_thread(engine.diagnostic_only, image_bytes),
+                        timeout=60,
+                    )
+                    if result.overlay_jpeg:
+                        overlay_path.write_bytes(result.overlay_jpeg)
+                    del image_bytes, result
+                    continue
+
+                calibration = self.db.record_calibration(entry_id, resolved.calibration)
                 seeds = [
                     PlantSeed(
                         plant_id=plant.id,
@@ -170,8 +217,8 @@ class JobManager:
                     ),
                     timeout=60,
                 )
+                del image_bytes, previous_masks
                 decided = [decide(item, mode, self.settings) for item in result.measurements]
-                overlay_path = artifacts / f"{job_id}-{response.image_id}-overlay.jpg"
                 if result.overlay_jpeg:
                     overlay_path.write_bytes(result.overlay_jpeg)
                 ownership = None
@@ -201,9 +248,14 @@ class JobManager:
                 decided = persisted
                 self.db.save_measurements(decided)
                 all_measurements.extend(decided)
+                skip_reasons = self.current.setdefault("skip_reasons", {})
+                for plant_id, reason in result.skipped.items():
+                    skip_reasons[str(plant_id)] = reason
+                del result
                 if mode == OperatingMode.AUTO_RADIUS:
                     for item in decided:
-                        if item.decision != Decision.APPLIED:
+                        # Never write without a valid calibration (Part 6).
+                        if item.decision != Decision.APPLIED or not item.calibrated:
                             continue
                         try:
                             await self.client.apply_radius(
@@ -240,21 +292,6 @@ class JobManager:
                 [],
                 f"analysis failed: {type(exc).__name__}",
             )
-
-    def _calibration(self, entry_id: str, remote: CameraCalibration) -> Calibration | None:
-        manual = self.db.active_calibration(entry_id)
-        if remote.available:
-            calibration = Calibration(
-                source="farmbot",
-                pixels_per_mm_x=remote.pixels_per_mm_x or 1,
-                pixels_per_mm_y=remote.pixels_per_mm_y or 1,
-                rotation_degrees=remote.rotation_degrees or 0,
-                offset_x_mm=remote.offset_x_mm or 0,
-                offset_y_mm=remote.offset_y_mm or 0,
-                uncertainty_mm=self.settings.calibration_uncertainty_mm,
-            )
-            return self.db.save_calibration(entry_id, calibration)
-        return manual
 
     async def _status(
         self,
@@ -297,18 +334,32 @@ class JobManager:
             peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
         else:
             peak = psutil.Process().memory_info().rss / 1024 / 1024
+        skip_reasons = self.current.get("skip_reasons", {})
         result = {
             "id": str(job_id),
             "status": status,
             "message": message,
             "completed_at": datetime.now(UTC).isoformat(),
             "plants_analysed": len(measurements),
+            "plants_measured": sum(1 for m in measurements if m.calibrated),
             "recommendations": sum(m.decision == Decision.RECOMMENDED for m in measurements),
             "automatically_applied": sum(m.decision == Decision.APPLIED for m in measurements),
             "uncertain": sum(m.decision == Decision.UNCERTAIN for m in measurements),
+            "skipped": len(skip_reasons),
+            "skip_reasons": skip_reasons,
             "cpu_seconds": round(time.process_time() - start_cpu, 3),
             "peak_memory_mb": round(peak, 1),
             "duration_seconds": round((datetime.now(UTC) - start_wall).total_seconds(), 3),
+            "analysis_resolution": self.settings.resolution.as_dict(),
+            "images_processed": self.current.get("images_processed", 0),
+            "uncalibrated_images": self.current.get("uncalibrated_images", 0),
+            "calibration_source": self.current.get("calibration_source"),
+            "calibration_warnings": self.current.get("calibration_warnings", []),
+            "source_dimensions": self.current.get("source_dimensions"),
+            "oriented_dimensions": self.current.get("oriented_dimensions"),
+            "processed_dimensions": self.current.get("processed_dimensions"),
+            "resize_scales": self.current.get("resize_scales"),
+            "contract_version": CONTRACT_VERSION,
         }
         self.last = result
         self.current = {"status": "idle", "queue_length": 0, "progress": message}

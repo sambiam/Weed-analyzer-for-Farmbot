@@ -4,14 +4,19 @@ import json
 import os
 from pathlib import Path
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from .models import OperatingMode
+from .resolution import DEFAULT_RESOLUTION, AnalysisResolution, Resolution
 
 
 class Settings(BaseModel):
     selected_config_entry_id: str = ""
     mode: OperatingMode = OperatingMode.OBSERVE
+    # Existing installations without this option validate to the new default.
+    # Changing it takes effect only after the app is restarted; settings are
+    # loaded once at startup (see Settings.load and web.settings).
+    analysis_resolution: AnalysisResolution = DEFAULT_RESOLUTION
     schedule_enabled: bool = False
     schedule_time: str = "03:00"
     safety_margin_mm: float = Field(default=20, ge=0)
@@ -29,6 +34,27 @@ class Settings(BaseModel):
     image_lookback_hours: int = Field(default=72, ge=1, le=720)
     max_image_payload_bytes: int = 5 * 1024 * 1024
     data_dir: Path = Path("/data")
+
+    @field_validator("analysis_resolution", mode="before")
+    @classmethod
+    def _coerce_resolution(cls, value: object) -> object:
+        # A blank or missing option (older installs) falls back to the default
+        # rather than raising, so upgrades never break on first boot.
+        if value in (None, ""):
+            return DEFAULT_RESOLUTION
+        return value
+
+    @property
+    def resolution(self) -> Resolution:
+        return Resolution(self.analysis_resolution)
+
+    @property
+    def analysis_width(self) -> int:
+        return self.resolution.width
+
+    @property
+    def analysis_height(self) -> int:
+        return self.resolution.height
 
     @classmethod
     def load(cls) -> Settings:

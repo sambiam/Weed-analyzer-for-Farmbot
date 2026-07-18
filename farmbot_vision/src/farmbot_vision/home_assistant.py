@@ -28,6 +28,52 @@ from .models import (
 LOGGER = logging.getLogger(__name__)
 T = TypeVar("T", bound=BaseModel)
 
+# JPEG Start-Of-Frame markers carry the image dimensions. Everything except
+# these and the standalone markers below has a two-byte length we can skip.
+_SOF_MARKERS = frozenset(
+    range(0xC0, 0xD0)  # SOF0..SOF15
+) - {0xC4, 0xC8, 0xCC}  # DHT, JPG, DAC are not frame headers
+_STANDALONE = frozenset({0xD8, 0xD9, *range(0xD0, 0xD8), 0x01})
+
+
+def _jpeg_dimensions(data: bytes) -> tuple[int, int] | None:
+    """Return (width, height) from a JPEG's SOF marker without decoding pixels.
+
+    Deliberately dependency-free so image validation never pulls OpenCV into
+    the Home Assistant client. Returns ``None`` for malformed data.
+    """
+    if len(data) < 2 or data[0] != 0xFF or data[1] != 0xD8:
+        return None
+    index = 2
+    length = len(data)
+    while index + 1 < length:
+        if data[index] != 0xFF:
+            return None
+        # Skip any fill bytes (0xFF padding) before the marker code.
+        while index < length and data[index] == 0xFF:
+            index += 1
+        if index >= length:
+            return None
+        marker = data[index]
+        index += 1
+        if marker in _STANDALONE:
+            continue
+        if index + 1 >= length:
+            return None
+        segment_length = (data[index] << 8) | data[index + 1]
+        if segment_length < 2:
+            return None
+        if marker in _SOF_MARKERS:
+            if index + 6 >= length:
+                return None
+            height = (data[index + 3] << 8) | data[index + 4]
+            width = (data[index + 5] << 8) | data[index + 6]
+            if width <= 0 or height <= 0:
+                return None
+            return width, height
+        index += segment_length
+    return None
+
 
 class HomeAssistantError(RuntimeError):
     pass
@@ -104,6 +150,9 @@ class HomeAssistantClient:
         result = await self._service("get_vision_image", request, VisionImage)
         if not isinstance(result, VisionImage):
             raise HomeAssistantError("malformed image response")
+        # Do not accept a frame larger than what was requested or the ceiling.
+        if result.width > request.max_width or result.height > request.max_height:
+            raise HomeAssistantError("image response exceeds requested dimensions")
         if len(result.image_base64) > (max_payload_bytes * 4 // 3 + 8):
             raise HomeAssistantError("image response exceeds configured limit")
         try:
@@ -112,8 +161,15 @@ class HomeAssistantClient:
             raise HomeAssistantError("image response contains malformed base64") from exc
         if len(decoded) > max_payload_bytes:
             raise HomeAssistantError("decoded image exceeds configured limit")
+        if not decoded.startswith(b"\xff\xd8"):
+            raise HomeAssistantError("image response is not JPEG data")
         if hashlib.sha256(decoded).hexdigest().lower() != result.sha256.lower():
             raise HomeAssistantError("image checksum mismatch")
+        dimensions = _jpeg_dimensions(decoded)
+        if dimensions is None:
+            raise HomeAssistantError("image response contains malformed JPEG data")
+        if dimensions != (result.width, result.height):
+            raise HomeAssistantError("decoded image dimensions do not match the response")
         return result
 
     async def apply_radius(self, request: ApplyRadiusRequest) -> dict[str, Any]:

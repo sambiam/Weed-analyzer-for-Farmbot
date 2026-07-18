@@ -1,6 +1,10 @@
 # Companion FarmBot integration contract
 
-Required companion integration version: a future release implementing contract **farmbot-vision-v1**. The existing integration is not changed in this repository.
+Contract version: **farmbot-vision-v2**. Minimum compatible companion FarmBot
+integration release: **1.2.0** (the release that implements the returned-JPEG
+checksum, source/oriented/processed dimensions, resize scales and processed
+calibration). Version 1.2.0 of the companion integration in the sibling
+`Farmbot-for-Home-Assistant` repository implements this contract.
 
 All actions are in the `farmbot` domain. Response actions must support Home Assistant service response data. Unknown, invalid, or unauthorised fields must fail rather than be coerced. Timestamps are ISO-8601. The integration remains the only component that talks to FarmBot APIs.
 
@@ -22,15 +26,27 @@ Response fields:
 - `plants[]`: `id`, `name`, `openfarm_slug`, `x`, `y`, `z`, `radius`, `plant_stage`, nullable `planted_at`, nullable `spread_curve_id`
 - `images[]`: `id`, `created_at`, `processed`, and `meta` containing `x`, `y`, `z`, optional `name`
 - `curves[]`: `id`, `name`, `type` (must be `spread`), and day-string to diameter mapping `data`
-- `camera_calibration`: `available`, nullable positive `pixels_per_mm_x/y`, nullable `rotation_degrees`, nullable `offset_x_mm/y`
+- `camera_calibration`: `available`, nullable positive `pixels_per_mm_x/y`, nullable `rotation_degrees`, nullable `offset_x_mm/y`, and (v2) `reference_width`, `reference_height`, `basis` (`reference_image` or `native_frame`)
 
-When `available` is true both pixel scales are required. Image metadata coordinates are defined as the ground coordinate at image centre.
+When `available` is true both pixel scales are required. This is the **reference** (normalized) calibration: `pixels_per_mm_*` are stated relative to `reference_width` x `reference_height`. The app scales them to the processed resolution — a native scale is never applied directly to a resized frame. Image metadata coordinates are defined as the ground coordinate at image centre.
 
 ## `farmbot.get_vision_image`
 
-Input: `{"config_entry_id":"string","image_id":456,"max_width":640,"max_height":480}`.
+Input: `{"config_entry_id":"string","image_id":456,"max_width":960,"max_height":720}`. `max_width`/`max_height` are the app's configured analysis resolution and are at most 1280 x 960.
 
-Response: `image_id`, `content_type` (only `image/jpeg` in v1), lowercase hex `sha256`, `width`, `height`, `image_base64`, and `meta` containing `x`, `y`, `z`, `created_at`. The integration must resize before base64 encoding and must not return signed URLs. The app fetches sequentially and validates hash, encoding, dimensions, and payload size.
+Response (contract v2):
+
+- `image_id`, `content_type` (only `image/jpeg`)
+- lowercase hex `sha256` **over the returned JPEG bytes** (the app verifies the bytes it receives)
+- optional `source_sha256` over the original download (format-checked only; never verified because the original is not shipped)
+- `source_width`, `source_height` (before EXIF orientation)
+- `oriented_width`, `oriented_height` (after EXIF orientation)
+- `width`, `height` (processed, ≤ requested and ≤ 1280 x 960)
+- `resize_scale_x` = `width / oriented_width`, `resize_scale_y` = `height / oriented_height`
+- `image_base64`, and `meta` containing `x`, `y`, `z`, `created_at`
+- optional `processed_calibration`: `{available, pixels_per_mm_x, pixels_per_mm_y, rotation_degrees, offset_x_mm, offset_y_mm, basis:"processed_image", width, height}` where `width`/`height` equal the returned image
+
+The integration must resize before base64 encoding and must not return signed URLs. The app fetches sequentially and independently validates the checksum, base64, JPEG format, decoded dimensions, resize-scale consistency, aspect ratio, absence of upscaling, and payload/dimension limits. Older v1 responses (no `source_*`/`oriented_*`/`resize_scale_*`) are accepted as a legacy path but yield pixel-only diagnostics with no metric writes.
 
 ## `farmbot.apply_vision_radius`
 
@@ -71,4 +87,13 @@ Event data: `{"config_entry_id":"string","plant_ids":[],"mode":"observe|recommen
 7. Add status entities or diagnostics with update de-duplication.
 8. Emit the request event from integration services/UI controls.
 9. Add contract, malformed-response, authentication, reauthentication, stale-write, and permission tests.
-10. Declare the minimum companion version once that integration release exists.
+10. Declare the minimum companion version once that integration release exists. **Done: companion 1.2.0 implements contract farmbot-vision-v2.**
+
+## Contract v2 summary of required integration capabilities
+
+1. `sha256` computed over the returned (re-encoded) JPEG bytes.
+2. `source_width/height`, `oriented_width/height`, processed `width/height`.
+3. `resize_scale_x/y` equal to processed÷oriented in each axis.
+4. `processed_calibration` (basis `processed_image`) when calibration is known, plus reference dimensions on `camera_calibration`.
+
+The minimum compatible companion integration version implementing all four is **1.2.0**.

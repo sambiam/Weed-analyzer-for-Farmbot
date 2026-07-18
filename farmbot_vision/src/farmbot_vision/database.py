@@ -51,6 +51,35 @@ MIGRATIONS = [
       details_json TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
     );
     """,
+    # Migration 2 (contract v2): add resolution/scaling provenance to
+    # calibrations and measurements. ADD COLUMN is non-destructive and keeps
+    # every existing row; older rows simply have NULL in the new columns.
+    """
+    ALTER TABLE calibrations ADD COLUMN analysis_resolution TEXT;
+    ALTER TABLE calibrations ADD COLUMN image_id INTEGER;
+    ALTER TABLE calibrations ADD COLUMN processed_width INTEGER;
+    ALTER TABLE calibrations ADD COLUMN processed_height INTEGER;
+    ALTER TABLE calibrations ADD COLUMN source_width INTEGER;
+    ALTER TABLE calibrations ADD COLUMN source_height INTEGER;
+    ALTER TABLE calibrations ADD COLUMN oriented_width INTEGER;
+    ALTER TABLE calibrations ADD COLUMN oriented_height INTEGER;
+    ALTER TABLE calibrations ADD COLUMN resize_scale_x REAL;
+    ALTER TABLE calibrations ADD COLUMN resize_scale_y REAL;
+    ALTER TABLE calibrations ADD COLUMN basis TEXT;
+    ALTER TABLE calibrations ADD COLUMN calibration_version TEXT;
+    ALTER TABLE calibrations ADD COLUMN point_a_x REAL;
+    ALTER TABLE calibrations ADD COLUMN point_a_y REAL;
+    ALTER TABLE calibrations ADD COLUMN point_b_x REAL;
+    ALTER TABLE calibrations ADD COLUMN point_b_y REAL;
+    ALTER TABLE calibrations ADD COLUMN separation_mm REAL;
+    ALTER TABLE calibrations ADD COLUMN transformed_from_id INTEGER;
+    ALTER TABLE measurements ADD COLUMN analysis_resolution TEXT;
+    ALTER TABLE measurements ADD COLUMN processed_width INTEGER;
+    ALTER TABLE measurements ADD COLUMN processed_height INTEGER;
+    ALTER TABLE measurements ADD COLUMN calibration_source TEXT;
+    ALTER TABLE measurements ADD COLUMN calibrated INTEGER NOT NULL DEFAULT 1;
+    ALTER TABLE measurements ADD COLUMN contract_version TEXT;
+    """,
 ]
 
 
@@ -105,35 +134,86 @@ class Database:
                         "INSERT INTO schema_version(version) VALUES (?)", (number,)
                     )
 
+    # Sources that represent a user-owned manual calibration (vs a per-image
+    # derived calibration recorded only for measurement provenance).
+    _MANUAL_SOURCES = ("manual", "manual_transformed")
+
     def save_calibration(self, entry_id: str, calibration: Calibration) -> Calibration:
+        """Persist a user manual calibration as the active one for the bot."""
         with self.connection:
             self.connection.execute(
-                "UPDATE calibrations SET active=0 WHERE config_entry_id=?", (entry_id,)
+                "UPDATE calibrations SET active=0 WHERE config_entry_id=? "
+                "AND source IN ('manual','manual_transformed')",
+                (entry_id,),
             )
-            cursor = self.connection.execute(
-                """INSERT INTO calibrations(config_entry_id,source,pixels_per_mm_x,pixels_per_mm_y,
-                   rotation_degrees,offset_x_mm,offset_y_mm,uncertainty_mm)
-                   VALUES(?,?,?,?,?,?,?,?)""",
-                (
-                    entry_id,
-                    calibration.source,
-                    calibration.pixels_per_mm_x,
-                    calibration.pixels_per_mm_y,
-                    calibration.rotation_degrees,
-                    calibration.offset_x_mm,
-                    calibration.offset_y_mm,
-                    calibration.uncertainty_mm,
-                ),
-            )
+            return self._insert_calibration(entry_id, calibration, active=1)
+
+    def record_calibration(self, entry_id: str, calibration: Calibration) -> Calibration:
+        """Record a derived (processed/reference) calibration for provenance.
+
+        Does not touch the active manual calibration; it only mints a version
+        row so a measurement can reference the exact calibration it used.
+        """
+        with self.connection:
+            return self._insert_calibration(entry_id, calibration, active=0)
+
+    def _insert_calibration(
+        self, entry_id: str, calibration: Calibration, *, active: int
+    ) -> Calibration:
+        cursor = self.connection.execute(
+            """INSERT INTO calibrations(active,config_entry_id,source,pixels_per_mm_x,
+                   pixels_per_mm_y,rotation_degrees,offset_x_mm,offset_y_mm,uncertainty_mm,
+                   analysis_resolution,image_id,processed_width,processed_height,source_width,
+                   source_height,oriented_width,oriented_height,resize_scale_x,resize_scale_y,basis,
+                   calibration_version,point_a_x,point_a_y,point_b_x,point_b_y,separation_mm,
+                   transformed_from_id)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                active,
+                entry_id,
+                calibration.source,
+                calibration.pixels_per_mm_x,
+                calibration.pixels_per_mm_y,
+                calibration.rotation_degrees,
+                calibration.offset_x_mm,
+                calibration.offset_y_mm,
+                calibration.uncertainty_mm,
+                calibration.analysis_resolution,
+                calibration.image_id,
+                calibration.processed_width,
+                calibration.processed_height,
+                calibration.source_width,
+                calibration.source_height,
+                calibration.oriented_width,
+                calibration.oriented_height,
+                calibration.resize_scale_x,
+                calibration.resize_scale_y,
+                calibration.basis,
+                calibration.calibration_version,
+                calibration.point_a_x,
+                calibration.point_a_y,
+                calibration.point_b_x,
+                calibration.point_b_y,
+                calibration.separation_mm,
+                calibration.transformed_from_id,
+            ),
+        )
         return calibration.model_copy(update={"version_id": cursor.lastrowid})
 
     def active_calibration(self, entry_id: str) -> Calibration | None:
+        """Return the active user manual calibration for a bot, if any."""
         row = self.connection.execute(
-            "SELECT * FROM calibrations WHERE config_entry_id=? AND active=1 ORDER BY id DESC LIMIT 1",
+            "SELECT * FROM calibrations WHERE config_entry_id=? AND active=1 "
+            "AND source IN ('manual','manual_transformed') ORDER BY id DESC LIMIT 1",
             (entry_id,),
         ).fetchone()
         if not row:
             return None
+        keys = row.keys()
+
+        def _opt(name: str) -> object:
+            return row[name] if name in keys else None
+
         return Calibration(
             version_id=row["id"],
             source=row["source"],
@@ -143,6 +223,24 @@ class Database:
             offset_x_mm=row["offset_x_mm"],
             offset_y_mm=row["offset_y_mm"],
             uncertainty_mm=row["uncertainty_mm"],
+            analysis_resolution=_opt("analysis_resolution"),
+            image_id=_opt("image_id"),
+            processed_width=_opt("processed_width"),
+            processed_height=_opt("processed_height"),
+            source_width=_opt("source_width"),
+            source_height=_opt("source_height"),
+            oriented_width=_opt("oriented_width"),
+            oriented_height=_opt("oriented_height"),
+            resize_scale_x=_opt("resize_scale_x"),
+            resize_scale_y=_opt("resize_scale_y"),
+            basis=_opt("basis"),
+            calibration_version=_opt("calibration_version"),
+            point_a_x=_opt("point_a_x"),
+            point_a_y=_opt("point_a_y"),
+            point_b_x=_opt("point_b_x"),
+            point_b_y=_opt("point_b_y"),
+            separation_mm=_opt("separation_mm"),
+            transformed_from_id=_opt("transformed_from_id"),
         )
 
     def save_measurements(self, measurements: Iterable[Measurement]) -> None:
@@ -170,6 +268,12 @@ class Database:
                     int(m.applied),
                     m.mask_path,
                     m.overlay_path,
+                    m.analysis_resolution,
+                    m.processed_width,
+                    m.processed_height,
+                    m.calibration_source,
+                    int(m.calibrated),
+                    m.contract_version,
                 )
             )
         with self.connection:
@@ -178,7 +282,9 @@ class Database:
                 image_id,image_timestamp,current_radius_mm,typical_canopy_radius_mm,
                 maximum_accepted_canopy_radius_mm,recommended_protection_radius_mm,confidence,
                 calibration_version_id,transform_json,algorithm_version,decision,reason,ambiguous,applied,
-                mask_path,overlay_path) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                mask_path,overlay_path,analysis_resolution,processed_width,processed_height,
+                calibration_source,calibrated,contract_version)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 values,
             )
 

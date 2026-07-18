@@ -12,6 +12,13 @@ def decide(
 ) -> Measurement:
     current = measurement.current_radius_mm
     proposed = measurement.recommended_protection_radius_mm
+    if not measurement.calibrated:
+        return measurement.model_copy(
+            update={
+                "decision": Decision.OBSERVED,
+                "reason": "uncalibrated: no millimetre measurement, no write",
+            }
+        )
     if measurement.ambiguous:
         return measurement.model_copy(
             update={
