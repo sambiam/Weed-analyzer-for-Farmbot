@@ -369,3 +369,37 @@ async def test_subscription_failure_reconnects(monkeypatch: pytest.MonkeyPatch):
     assert event.mode == "recommend"
     assert sleeps == [15]
     await client.close()
+
+
+@pytest.mark.asyncio
+async def test_websocket_connect_sends_supervisor_authorization_header(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """The Supervisor /core/websocket proxy authorizes the add-on from the
+    supervisor token on the HTTP upgrade, like the REST proxy. Without the
+    Bearer header the upgrade is rejected (websockets InvalidStatus) before the
+    in-band auth exchange, so the listener never connects. Guard that the token
+    is presented on the handshake."""
+    socket = FakeSocket(
+        websocket_messages(
+            json.dumps(
+                {
+                    "type": "event",
+                    "event": {"data": {"config_entry_id": "entry", "mode": "recommend"}},
+                }
+            )
+        )
+    )
+    captured: dict = {}
+
+    def fake_connect(*args, **kwargs):
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        return socket
+
+    monkeypatch.setattr("farmbot_vision.home_assistant.websockets.connect", fake_connect)
+    client = HomeAssistantClient(token="supervisor-token")
+    event = await anext(client.vision_events())
+    assert event.config_entry_id == "entry"
+    assert captured["kwargs"]["additional_headers"] == {"Authorization": "Bearer supervisor-token"}
+    await client.close()
