@@ -6,7 +6,7 @@ from collections.abc import Iterable
 from datetime import UTC, datetime
 from pathlib import Path
 
-from .models import Calibration, Measurement
+from .models import Calibration, Measurement, OriginLocation
 
 MIGRATIONS = [
     """
@@ -79,6 +79,12 @@ MIGRATIONS = [
     ALTER TABLE measurements ADD COLUMN calibration_source TEXT;
     ALTER TABLE measurements ADD COLUMN calibrated INTEGER NOT NULL DEFAULT 1;
     ALTER TABLE measurements ADD COLUMN contract_version TEXT;
+    """,
+    # Migration 3: FarmBot-style origin location (garden<->pixel reflection).
+    # Existing rows have NULL and are read back as TOP_LEFT, preserving the
+    # exact transform every prior calibration produced.
+    """
+    ALTER TABLE calibrations ADD COLUMN origin_location TEXT;
     """,
 ]
 
@@ -166,8 +172,8 @@ class Database:
                    analysis_resolution,image_id,processed_width,processed_height,source_width,
                    source_height,oriented_width,oriented_height,resize_scale_x,resize_scale_y,basis,
                    calibration_version,point_a_x,point_a_y,point_b_x,point_b_y,separation_mm,
-                   transformed_from_id)
-                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   transformed_from_id,origin_location)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 active,
                 entry_id,
@@ -196,6 +202,7 @@ class Database:
                 calibration.point_b_y,
                 calibration.separation_mm,
                 calibration.transformed_from_id,
+                str(calibration.origin_location),
             ),
         )
         return calibration.model_copy(update={"version_id": cursor.lastrowid})
@@ -241,6 +248,7 @@ class Database:
             point_b_y=_opt("point_b_y"),
             separation_mm=_opt("separation_mm"),
             transformed_from_id=_opt("transformed_from_id"),
+            origin_location=_opt("origin_location") or OriginLocation.TOP_LEFT,
         )
 
     def save_measurements(self, measurements: Iterable[Measurement]) -> None:

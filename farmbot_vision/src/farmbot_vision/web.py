@@ -25,6 +25,7 @@ from . import (
     MINIMUM_INTEGRATION_VERSION,
     __version__,
 )
+from .calibration import from_farmbot_calibration
 from .curves import fit_monotonic_curve
 from .database import Database
 from .home_assistant import HomeAssistantClient, HomeAssistantError
@@ -34,6 +35,7 @@ from .models import (
     Calibration,
     InventoryRequest,
     OperatingMode,
+    OriginLocation,
     VisionImageRequest,
 )
 from .settings import Settings
@@ -87,39 +89,68 @@ _CALIBRATION_JS = r"""
   const W=canvas.width, H=canvas.height;
   function entry(){return document.getElementById('entry_id').value.trim();}
   function num(id){return parseFloat(document.getElementById(id).value)||0;}
+  function method(){return document.getElementById('method').value;}
+  function origin(){return document.getElementById('origin').value;}
+  function originSigns(o){
+    return [(o==='top_right'||o==='bottom_right')?-1:1,
+            (o==='bottom_left'||o==='bottom_right')?-1:1];
+  }
+  // Toggle which method-specific inputs are shown.
+  function syncMethod(){
+    const fb=method()==='farmbot';
+    document.getElementById('group_points').style.display=fb?'none':'';
+    document.getElementById('group_farmbot').style.display=fb?'':'none';
+    updatePpm();
+  }
   function redraw(){
     ctx.clearRect(0,0,W,H);
     if(img) ctx.drawImage(img,0,0,W,H);
+    if(method()==='farmbot') return;
     if(A){ctx.fillStyle='#2ecc40';ctx.beginPath();ctx.arc(A[0],A[1],5,0,7);ctx.fill();}
     if(B){ctx.fillStyle='#0074d9';ctx.beginPath();ctx.arc(B[0],B[1],5,0,7);ctx.fill();}
     if(A&&B){ctx.strokeStyle='#fff';ctx.beginPath();ctx.moveTo(A[0],A[1]);ctx.lineTo(B[0],B[1]);ctx.stroke();}
   }
-  function updatePpm(){
-    const d=num('distance');
-    if(A&&B&&d>0){
-      const px=Math.hypot(B[0]-A[0],B[1]-A[1]);
-      const ppm=px/d;
-      ppmEl.textContent='Pixels per millimetre: '+ppm.toFixed(4);
-      document.getElementById('save').disabled=!document.getElementById('confirm').checked;
-      return ppm;
+  // Returns [ppmX, ppmY] at the processed (canvas) resolution, or null.
+  function currentPpm(){
+    if(method()==='farmbot'){
+      const s=num('fb_scale'), rw=num('fb_refw'), rh=num('fb_refh');
+      if(s>0&&rw>0&&rh>0){const p=1/s; return [p*W/rw, p*H/rh];}
+      return null;
     }
-    ppmEl.textContent='Pixels per millimetre: —';
-    return 0;
+    const d=num('distance');
+    if(A&&B&&d>0){const px=Math.hypot(B[0]-A[0],B[1]-A[1]); const p=px/d; return [p,p];}
+    return null;
   }
-  function gardenToPixel(px,py,ppm,rot,offx,offy){
+  function updatePpm(){
+    const ppm=currentPpm();
+    if(ppm){
+      ppmEl.textContent='Pixels per millimetre: '+ppm[0].toFixed(4)+' × '+ppm[1].toFixed(4);
+      document.getElementById('save').disabled=!document.getElementById('confirm').checked;
+    }else{
+      ppmEl.textContent='Pixels per millimetre: —';
+      document.getElementById('save').disabled=true;
+    }
+    return ppm;
+  }
+  function gardenToPixel(px,py,ppmX,ppmY,rot,offx,offy,o){
     let dx=px-meta.x+offx, dy=py-meta.y+offy;
     let t=rot*Math.PI/180;
     let rx=dx*Math.cos(t)-dy*Math.sin(t), ry=dx*Math.sin(t)+dy*Math.cos(t);
-    return [W/2+rx*ppm, H/2+ry*ppm];
+    const s=originSigns(o);
+    return [W/2+s[0]*rx*ppmX, H/2+s[1]*ry*ppmY];
   }
   canvas.addEventListener('click',function(e){
+    if(method()==='farmbot') return;
     const rect=canvas.getBoundingClientRect();
     const x=(e.clientX-rect.left)*(W/rect.width);
     const y=(e.clientY-rect.top)*(H/rect.height);
     if(!A||B){A=[x,y];B=null;}else{B=[x,y];}
     redraw();updatePpm();
   });
-  document.getElementById('distance').addEventListener('input',updatePpm);
+  ['method','origin','distance','fb_scale','fb_refw','fb_refh'].forEach(function(id){
+    const el=document.getElementById(id);
+    el.addEventListener(id==='method'?'change':'input',id==='method'?syncMethod:updatePpm);
+  });
   document.getElementById('confirm').addEventListener('change',updatePpm);
   document.getElementById('load').addEventListener('click',async function(){
     status.textContent='Loading…';
@@ -151,28 +182,39 @@ _CALIBRATION_JS = r"""
   });
   document.getElementById('overlay').addEventListener('click',function(){
     const ppm=updatePpm();
-    if(!ppm){status.textContent='Set points and separation first';return;}
+    if(!ppm){status.textContent='Enter calibration values first';return;}
     redraw();
     ctx.strokeStyle='#ff4136';ctx.fillStyle='#ff4136';ctx.font='12px sans-serif';
+    const meanPpm=(ppm[0]+ppm[1])/2;
     plants.forEach(function(p){
-      const c=gardenToPixel(p.x,p.y,ppm,num('rotation'),num('offx'),num('offy'));
-      ctx.beginPath();ctx.arc(c[0],c[1],Math.max(4,(p.radius||0)*ppm),0,7);ctx.stroke();
+      const c=gardenToPixel(p.x,p.y,ppm[0],ppm[1],num('rotation'),num('offx'),num('offy'),origin());
+      ctx.beginPath();ctx.arc(c[0],c[1],Math.max(4,(p.radius||0)*meanPpm),0,7);ctx.stroke();
       ctx.fillText(p.id,c[0]+4,c[1]-4);
     });
     status.textContent='Overlaid '+plants.length+' plant centres — confirm alignment.';
   });
   document.getElementById('save').addEventListener('click',function(){
     const ppm=updatePpm();
-    if(!ppm||!A||!B){status.textContent='Set both points and a separation';return;}
+    if(!ppm){status.textContent='Enter calibration values first';return;}
     const o=sel.options[sel.selectedIndex];
     const f=document.createElement('form');f.method='post';f.action='calibration';
-    const fields={entry_id:entry(),ax:A[0],ay:A[1],bx:B[0],by:B[1],
-      distance_mm:num('distance'),rotation:num('rotation'),offset_x:num('offx'),
-      offset_y:num('offy'),image_id:o?o.value:''};
+    const fields={entry_id:entry(),method:method(),rotation:num('rotation'),
+      offset_x:num('offx'),offset_y:num('offy'),origin_location:origin(),
+      image_id:o?o.value:''};
+    if(method()==='farmbot'){
+      fields.coordinate_scale=num('fb_scale');
+      fields.reference_width=num('fb_refw');
+      fields.reference_height=num('fb_refh');
+    }else{
+      if(!A||!B){status.textContent='Set both points and a separation';return;}
+      fields.ax=A[0];fields.ay=A[1];fields.bx=B[0];fields.by=B[1];
+      fields.distance_mm=num('distance');
+    }
     for(const k in fields){const i=document.createElement('input');i.type='hidden';
       i.name=k;i.value=fields[k];f.appendChild(i);}
     document.body.appendChild(f);f.submit();
   });
+  syncMethod();
 })();
 """
 
@@ -462,13 +504,14 @@ async def calibration_page(request: Request) -> HTMLResponse:
             f"{calibration.pixels_per_mm_x:.4f}×{calibration.pixels_per_mm_y:.4f} px/mm, "
             f"resolution={calibration.processed_width}x{calibration.processed_height}, "
             f"rotation={calibration.rotation_degrees}°, "
+            f"origin={calibration.origin_location}, "
             f"offsets=({calibration.offset_x_mm},{calibration.offset_y_mm}) mm"
         )
     body = f"""<section class=card><h2>Manual calibration</h2>
-<p>Interactively calibrate against a recent FarmBot image at the configured analysis
-resolution ({escape(resolution.label)}). Select an image, click point A then point B on
-two features a known distance apart, enter that distance, then overlay the known plant
-centres and confirm several align before saving. No external tools are needed.</p>
+<p>Calibrate against a recent FarmBot image at the configured analysis
+resolution ({escape(resolution.label)}). Either measure two features a known distance
+apart, or copy the values from FarmBot's own camera calibration. In both cases overlay the
+known plant centres and confirm several align before saving. No external tools are needed.</p>
 {warning_html}
 <p class=muted>Current: {escape(current)}</p>
 <div class=grid>
@@ -476,12 +519,33 @@ centres and confirm several align before saving. No external tools are needed.</
 <label>FarmBot config entry ID<br><input id=entry_id value="{escape(settings.selected_config_entry_id)}"></label>
 <p><button type=button id=load>Load recent images</button></p>
 <label>Image<br><select id=image></select></label>
+<label>Method<br><select id=method>
+<option value=points>Measure two points</option>
+<option value=farmbot>FarmBot calibration values</option>
+</select></label>
+<div id=group_points>
 <p class=muted>Click point A (green), then point B (blue) on the image.</p>
 <label>Known separation A→B (mm)<br><input id=distance type=number min=0.1 step=any></label>
+</div>
+<div id=group_farmbot>
+<p class=muted>In FarmBot open Photos → Camera calibration and copy each value below. The
+app rescales the mm/pixel scale at the measured resolution to its own analysis resolution.</p>
+<label>Pixel coordinate scale (mm/pixel)<br><input id=fb_scale type=number min=0 step=any></label>
+<label>Measured at width (px)<br><input id=fb_refw type=number min=1 step=1 value=2592></label>
+<label>Measured at height (px)<br><input id=fb_refh type=number min=1 step=1 value=1944></label>
+</div>
 <p id=ppm class=muted>Pixels per millimetre: —</p>
-<label>Rotation (degrees)<br><input id=rotation type=number step=any value=0></label>
+<label>Camera rotation (degrees)<br><input id=rotation type=number step=any value=0></label>
+<label>Origin location in image<br><select id=origin>
+<option value=top_left>Top left</option>
+<option value=top_right>Top right</option>
+<option value=bottom_left>Bottom left</option>
+<option value=bottom_right>Bottom right</option>
+</select></label>
 <label>Offset X (mm)<br><input id=offx type=number step=any value=0></label>
 <label>Offset Y (mm)<br><input id=offy type=number step=any value=0></label>
+<p class=muted>Leave offsets at 0 unless the overlay is shifted. FarmBot's camera offset is
+already folded into the image-centre coordinate, so entering it again would double-count.</p>
 <p><button type=button id=overlay>Overlay plant centres</button></p>
 <label><input type=checkbox id=confirm> Plant centres align in this image</label>
 <p><button type=button id=save disabled>Save calibration</button></p>
@@ -552,18 +616,58 @@ async def vision_image(entry_id: str, image_id: int) -> Response:
 @app.post("/calibration")
 async def save_calibration(
     entry_id: str = Form(...),
-    ax: float = Form(...),
-    ay: float = Form(...),
-    bx: float = Form(...),
-    by: float = Form(...),
-    distance_mm: float = Form(...),
+    method: str = Form("points"),
     rotation: float = Form(0),
     offset_x: float = Form(0),
     offset_y: float = Form(0),
+    origin_location: str = Form("top_left"),
     image_id: int | None = Form(None),
+    # Two-point method.
+    ax: float | None = Form(None),
+    ay: float | None = Form(None),
+    bx: float | None = Form(None),
+    by: float | None = Form(None),
+    distance_mm: float | None = Form(None),
+    # FarmBot calibration-values method.
+    coordinate_scale: float | None = Form(None),
+    reference_width: int | None = Form(None),
+    reference_height: int | None = Form(None),
 ) -> RedirectResponse:
-    scale = manual_scale((ax, ay), (bx, by), distance_mm)
     resolution = settings.resolution
+    try:
+        origin = OriginLocation(origin_location)
+    except ValueError as exc:
+        raise HTTPException(400, "invalid origin location") from exc
+
+    if method == "farmbot":
+        if coordinate_scale is None or reference_width is None or reference_height is None:
+            raise HTTPException(
+                400, "FarmBot calibration requires a scale and the resolution it was measured at"
+            )
+        try:
+            calibration = from_farmbot_calibration(
+                coordinate_scale_mm_per_px=coordinate_scale,
+                reference_width=reference_width,
+                reference_height=reference_height,
+                processed_width=resolution.width,
+                processed_height=resolution.height,
+                rotation_degrees=rotation,
+                offset_x_mm=offset_x,
+                offset_y_mm=offset_y,
+                origin_location=origin,
+                uncertainty_mm=settings.calibration_uncertainty_mm,
+                analysis_resolution=resolution.value,
+                image_id=image_id,
+            )
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        database.save_calibration(entry_id, calibration)
+        return RedirectResponse("settings", status_code=303)
+
+    # Default: interactive two-point method.
+    if None in (ax, ay, bx, by, distance_mm):
+        raise HTTPException(400, "two-point calibration requires both points and a separation")
+    scale = manual_scale((ax, ay), (bx, by), distance_mm)
     database.save_calibration(
         entry_id,
         Calibration(
@@ -573,6 +677,7 @@ async def save_calibration(
             rotation_degrees=rotation,
             offset_x_mm=offset_x,
             offset_y_mm=offset_y,
+            origin_location=origin,
             uncertainty_mm=settings.calibration_uncertainty_mm,
             analysis_resolution=resolution.value,
             image_id=image_id,

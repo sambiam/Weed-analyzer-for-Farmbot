@@ -11,7 +11,7 @@ import cv2
 import numpy as np
 
 from . import ALGORITHM_VERSION, CONTRACT_VERSION
-from .models import AnalysisResult, Calibration, Decision, Measurement, PlantSeed
+from .models import AnalysisResult, Calibration, Decision, Measurement, OriginLocation, PlantSeed
 from .resolution import MAX_PROCESSED_HEIGHT, MAX_PROCESSED_WIDTH
 
 cv2.setNumThreads(1)
@@ -432,9 +432,13 @@ def garden_to_pixel(
     theta = math.radians(calibration.rotation_degrees)
     rx = dx * math.cos(theta) - dy * math.sin(theta)
     ry = dx * math.sin(theta) + dy * math.cos(theta)
+    # Origin location applies the garden<->pixel axis reflection (FarmBot's
+    # "Origin Location in Image"). TOP_LEFT gives (+1, +1), i.e. the original
+    # behaviour, so uncalibrated and legacy calibrations are unchanged.
+    origin = OriginLocation(calibration.origin_location)
     return (
-        width / 2 + rx * calibration.pixels_per_mm_x,
-        height / 2 + ry * calibration.pixels_per_mm_y,
+        width / 2 + origin.sign_x * rx * calibration.pixels_per_mm_x,
+        height / 2 + origin.sign_y * ry * calibration.pixels_per_mm_y,
     )
 
 

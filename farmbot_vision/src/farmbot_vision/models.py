@@ -341,6 +341,33 @@ class Decision(StrEnum):
     SKIPPED = "skipped"
 
 
+class OriginLocation(StrEnum):
+    """Which image corner FarmBot treats as the coordinate origin.
+
+    FarmBot's camera calibration exposes this as ``Origin Location in Image``.
+    It encodes the *reflection* between garden axes and pixel axes -- something
+    a pure rotation cannot represent -- so a camera mounted rotated or mirrored
+    still maps garden coordinates onto the right pixels. ``TOP_LEFT`` is the
+    identity (garden +x -> right, garden +y -> down) and is the historical
+    behaviour, so it is the default for every calibration that predates this
+    field. The two independent sign flips below are applied to the rotated,
+    scaled pixel offset from the image centre (see ``vision.garden_to_pixel``).
+    """
+
+    TOP_LEFT = "top_left"
+    TOP_RIGHT = "top_right"
+    BOTTOM_LEFT = "bottom_left"
+    BOTTOM_RIGHT = "bottom_right"
+
+    @property
+    def sign_x(self) -> int:
+        return -1 if self in (OriginLocation.TOP_RIGHT, OriginLocation.BOTTOM_RIGHT) else 1
+
+    @property
+    def sign_y(self) -> int:
+        return -1 if self in (OriginLocation.BOTTOM_LEFT, OriginLocation.BOTTOM_RIGHT) else 1
+
+
 CalibrationSource = Literal[
     "processed_image",
     "reference_scaled",
@@ -366,6 +393,9 @@ class Calibration(StrictModel):
     rotation_degrees: float = 0
     offset_x_mm: float = 0
     offset_y_mm: float = 0
+    # Which image corner is the coordinate origin (garden<->pixel reflection).
+    # Defaults to TOP_LEFT so every existing calibration keeps its behaviour.
+    origin_location: OriginLocation = OriginLocation.TOP_LEFT
     uncertainty_mm: float = Field(default=10, ge=0)
     # Resolution / transform provenance (contract v2).
     analysis_resolution: str | None = None

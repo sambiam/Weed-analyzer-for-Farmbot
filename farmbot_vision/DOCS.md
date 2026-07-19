@@ -52,15 +52,31 @@ dimensions; (3) a compatible manual calibration; (4) none. A native-resolution
 scale is never applied directly to a resized frame.
 
 If no integration calibration is available, open **Calibration**, pick a recent
-FarmBot image (shown at the configured resolution), click point A and point B on
-two features a known distance apart, enter that separation, preview the
-resulting pixels-per-millimetre, adjust rotation and offsets, then overlay the
-known plant centres and confirm several align before saving. No external tools
-are needed. Manual calibration records the config entry, image, processed
-resolution, pixel points, separation and version; when the resolution changes it
-is only reused if the scaling relationship is fully known (and then a transformed
-calibration is recorded), otherwise recalibration is required. Automatic writes
-and approvals are refused without valid calibration.
+FarmBot image (shown at the configured resolution) and use either method:
+
+- **Measure two points:** click point A and point B on two features a known
+  distance apart and enter that separation.
+- **FarmBot calibration values:** copy FarmBot's own camera calibration
+  (**Pixel coordinate scale** in mm/pixel, the resolution it was measured at,
+  **Camera rotation**, and **Origin location in image**). FarmBot's scale is
+  stated for its native frame, so it is inverted to pixels-per-millimetre and
+  rescaled to the analysis resolution exactly as reference calibration is — a
+  native scale is never applied directly to a resized frame, so the numbers can
+  be copied verbatim.
+
+Both methods then set rotation, origin location and any offset correction,
+overlay the known plant centres, and require confirmation that several align
+before saving. **Origin location** encodes the garden↔pixel axis reflection
+(`top_left` is the identity and default), letting a rotated or mirrored camera
+mount map correctly — something rotation alone cannot express. FarmBot's camera
+offset is already folded into the image-centre coordinate, so the offset fields
+default to 0 and should only be used to correct a residual shift seen in the
+overlay. No external tools are needed. Manual calibration records the config
+entry, image, processed resolution, pixel points, separation and version; when
+the resolution changes it is only reused if the scaling relationship is fully
+known (and then a transformed calibration is recorded), otherwise recalibration
+is required. Automatic writes and approvals are refused without valid
+calibration.
 
 The transformation assumes image metadata `x,y` is the image's ground centre.
 Rotation is applied in the image plane; offsets are in millimetres. Every

@@ -18,7 +18,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
-from .models import Calibration, CameraCalibration, VisionImage
+from .models import Calibration, CameraCalibration, OriginLocation, VisionImage
 from .resolution import Resolution
 
 # How closely two aspect ratios must agree before a reference scale is trusted.
@@ -132,6 +132,59 @@ def scale_reference_to_processed(
         calibration_version=f"reference@{ref_w}x{ref_h}",
         basis="reference_scaled",
         **_provenance(image, resolution),
+    )
+
+
+def from_farmbot_calibration(
+    *,
+    coordinate_scale_mm_per_px: float,
+    reference_width: int,
+    reference_height: int,
+    processed_width: int,
+    processed_height: int,
+    rotation_degrees: float,
+    offset_x_mm: float,
+    offset_y_mm: float,
+    origin_location: OriginLocation,
+    uncertainty_mm: float,
+    analysis_resolution: str,
+    image_id: int | None = None,
+) -> Calibration:
+    """Convert FarmBot's native camera-calibration numbers into a manual
+    calibration that targets the processed resolution.
+
+    FarmBot states its ``Pixel coordinate scale`` in millimetres per pixel,
+    measured at the resolution it calibrated against (``reference_width`` x
+    ``reference_height`` -- typically the native camera frame). This app
+    analyses a *resized* frame, so the scale must be inverted to
+    pixels-per-millimetre and then rescaled to the processed resolution exactly
+    as :func:`scale_reference_to_processed` does. A native scale is never
+    applied directly to a resized frame, so pasting FarmBot's value verbatim
+    (which would otherwise be silently wrong by the resize ratio) is safe here.
+    """
+    if not (math.isfinite(coordinate_scale_mm_per_px) and coordinate_scale_mm_per_px > 0):
+        raise ValueError("pixel coordinate scale must be a positive number of mm per pixel")
+    if reference_width < 1 or reference_height < 1:
+        raise ValueError("measured-at resolution must be positive")
+    reference_ppm = 1.0 / coordinate_scale_mm_per_px
+    ppm_x = reference_ppm * processed_width / reference_width
+    ppm_y = reference_ppm * processed_height / reference_height
+    if not (_finite_positive(ppm_x) and _finite_positive(ppm_y)):
+        raise ValueError("converted pixel scale is not positive and finite")
+    return Calibration(
+        source="manual",
+        pixels_per_mm_x=ppm_x,
+        pixels_per_mm_y=ppm_y,
+        rotation_degrees=rotation_degrees,
+        offset_x_mm=offset_x_mm,
+        offset_y_mm=offset_y_mm,
+        origin_location=origin_location,
+        uncertainty_mm=uncertainty_mm,
+        analysis_resolution=analysis_resolution,
+        image_id=image_id,
+        processed_width=processed_width,
+        processed_height=processed_height,
+        calibration_version=f"farmbot@{reference_width}x{reference_height}",
     )
 
 

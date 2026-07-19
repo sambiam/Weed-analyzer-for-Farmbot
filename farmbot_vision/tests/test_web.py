@@ -150,6 +150,55 @@ def test_direct_asgi_middleware_normalizes_scope_without_touching_query():
     assert captured["headers"] == scope["headers"]
 
 
+@pytest.mark.asyncio
+async def test_save_calibration_farmbot_values_branch():
+    from farmbot_vision.models import OriginLocation
+
+    response = await web.save_calibration(
+        entry_id="botFB",
+        method="farmbot",
+        rotation=-31.9,
+        offset_x=0,
+        offset_y=0,
+        origin_location="top_right",
+        image_id=None,
+        coordinate_scale=0.242,
+        reference_width=2592,
+        reference_height=1944,
+    )
+    assert response.status_code == 303
+    calibration = web.database.active_calibration("botFB")
+    assert calibration is not None
+    assert calibration.source == "manual"
+    assert calibration.origin_location == OriginLocation.TOP_RIGHT
+    assert calibration.rotation_degrees == -31.9
+    width = web.settings.resolution.width
+    assert calibration.pixels_per_mm_x == pytest.approx((1 / 0.242) * width / 2592)
+
+
+@pytest.mark.asyncio
+async def test_save_calibration_farmbot_requires_scale():
+    with pytest.raises(web.HTTPException) as exc:
+        await web.save_calibration(entry_id="botFB", method="farmbot")
+    assert exc.value.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_save_calibration_rejects_unknown_origin():
+    with pytest.raises(web.HTTPException) as exc:
+        await web.save_calibration(
+            entry_id="botFB",
+            method="points",
+            origin_location="middle",
+            ax=1,
+            ay=1,
+            bx=20,
+            by=1,
+            distance_mm=5,
+        )
+    assert exc.value.status_code == 400
+
+
 def test_app_config_uses_default_ingress_entry():
     config = yaml.safe_load((Path(__file__).parents[1] / "config.yaml").read_text())
     assert config["ingress"] is True

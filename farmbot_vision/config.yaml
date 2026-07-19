@@ -1,5 +1,5 @@
 name: FarmBot Vision
-version: "0.2.1"
+version: "0.3.0"
 slug: farmbot_vision
 description: Lightweight canopy analysis and safe FarmBot plant-radius recommendations
 url: https://github.com/sambiam/Weed-analyzer-for-Farmbot

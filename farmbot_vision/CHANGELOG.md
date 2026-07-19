@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.3.0 - 2026-07-19
+
+Manual calibration can now mirror FarmBot's own camera calibration.
+
+- Added a **FarmBot calibration values** method to the calibration page: enter
+  FarmBot's `Pixel coordinate scale` (mm/pixel) and the resolution it was
+  measured at, plus camera rotation and origin location. The scale is inverted
+  to pixels-per-millimetre and rescaled to the analysis resolution through the
+  same path as reference calibration, so a native scale is never applied
+  directly to a resized frame and the numbers can be copied verbatim.
+- Added **Origin location in image** (`top_left`/`top_right`/`bottom_left`/
+  `bottom_right`) to the calibration model and `garden_to_pixel`. This encodes
+  the garden↔pixel axis reflection FarmBot expresses, which a pure rotation
+  cannot; `top_left` is the identity and default, so every existing calibration
+  is unchanged. Available to both calibration methods.
+- Offset fields now carry guidance that FarmBot's camera offset is already
+  folded into the image-centre coordinate and should stay 0 unless the overlay
+  shows a residual shift.
+- Non-destructive migration 3 adds the `origin_location` column; migrated rows
+  read back as `top_left`.
+
 ## 0.2.1 - 2026-07-18
 
 Runtime fixes for Home Assistant Ingress and FarmBot Vision events.
