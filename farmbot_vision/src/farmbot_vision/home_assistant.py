@@ -148,6 +148,7 @@ class HomeAssistantClient:
         if return_response:
             url += "?return_response"
         last_error: Exception | None = None
+        last_body: str = ""
         for attempt in range(3):
             LOGGER.debug("Calling Home Assistant service %s (attempt %d/3)", action, attempt + 1)
             try:
@@ -179,14 +180,21 @@ class HomeAssistantClient:
                 return model.model_validate(data) if model else data
             except (httpx.TimeoutException, httpx.NetworkError, httpx.HTTPStatusError) as exc:
                 last_error = exc
-                status = getattr(getattr(exc, "response", None), "status_code", None)
+                err_response = getattr(exc, "response", None)
+                status = getattr(err_response, "status_code", None)
+                # A 5xx means the integration handler raised while processing an
+                # otherwise-valid request; its response body carries the actual
+                # error and is the only way to root-cause it from here, so log it
+                # instead of discarding it (400/422 already log the body above).
+                last_body = _snippet(err_response.text) if err_response is not None else ""
                 LOGGER.warning(
-                    "Home Assistant service %s failed on attempt %d/3 (%s%s); %s",
+                    "Home Assistant service %s failed on attempt %d/3 (%s%s); %s%s",
                     action,
                     attempt + 1,
                     type(exc).__name__,
                     f" HTTP {status}" if status is not None else "",
                     "retrying" if attempt < 2 else "giving up",
+                    f"; integration response: {last_body}" if last_body else "",
                 )
                 if attempt < 2:
                     await asyncio.sleep(2**attempt)
@@ -202,10 +210,11 @@ class HomeAssistantClient:
                 )
                 raise HomeAssistantError("malformed FarmBot integration response") from exc
         LOGGER.error(
-            "Home Assistant service %s failed after 3 attempts; last error: %s: %s",
+            "Home Assistant service %s failed after 3 attempts; last error: %s: %s%s",
             action,
             type(last_error).__name__ if last_error else "unknown",
             last_error,
+            f"; integration response: {last_body}" if last_body else "",
         )
         raise HomeAssistantError("Home Assistant temporarily unavailable") from last_error
 
