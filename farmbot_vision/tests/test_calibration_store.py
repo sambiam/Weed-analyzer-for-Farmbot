@@ -48,9 +48,7 @@ def test_saving_a_second_bot_keeps_the_first(tmp_path):
 
 def test_rejects_nonpositive_scale():
     with pytest.raises(ValueError):
-        FarmbotCalibrationInput(
-            coordinate_scale=0, reference_width=2592, reference_height=1944
-        )
+        FarmbotCalibrationInput(coordinate_scale=0, reference_width=2592, reference_height=1944)
 
 
 def test_missing_file_returns_none(tmp_path):

@@ -97,9 +97,7 @@ async def test_event_listener_targets_new_image_and_uses_configured_mode(
     monkeypatch: pytest.MonkeyPatch,
 ):
     async def events():
-        yield VisionRequestEvent(
-            config_entry_id="entry-1", device_id="device_42", image_id=99
-        )
+        yield VisionRequestEvent(config_entry_id="entry-1", device_id="device_42", image_id=99)
 
     calls = []
 

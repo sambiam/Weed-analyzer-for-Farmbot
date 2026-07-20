@@ -76,9 +76,7 @@ class JobManager:
         if not entry_id:
             return {"accepted": False, "reason": "select a FarmBot before analysis"}
         async with self.lock:
-            return await self._run_locked(
-                entry_id, mode, plant_ids or [], image_ids or [], trigger
-            )
+            return await self._run_locked(entry_id, mode, plant_ids or [], image_ids or [], trigger)
 
     async def _run_locked(
         self,
@@ -148,9 +146,7 @@ class JobManager:
                 if not available:
                     LOGGER.warning("Analysis paused: %s", resource_reason)
                     break
-                self.current["progress"] = (
-                    f"Processing image {image_number + 1}/{len(images)}"
-                )
+                self.current["progress"] = f"Processing image {image_number + 1}/{len(images)}"
                 # Request the configured resolution; images are fetched one at a time.
                 response = await self.client.image(
                     VisionImageRequest(

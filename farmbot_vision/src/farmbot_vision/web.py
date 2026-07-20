@@ -639,7 +639,7 @@ def _origin_options(selected: str) -> str:
         "bottom_right": "Bottom right",
     }
     return "".join(
-        f'<option value={value}{" selected" if value == selected else ""}>{escape(label)}</option>'
+        f"<option value={value}{' selected' if value == selected else ''}>{escape(label)}</option>"
         for value, label in labels.items()
     )
 
