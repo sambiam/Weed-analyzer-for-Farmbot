@@ -263,7 +263,18 @@ class HomeAssistantClient:
         while True:
             LOGGER.info("Vision event listener: connecting to %s", self.ws_url)
             try:
-                async with websockets.connect(self.ws_url, open_timeout=10) as socket:
+                # The Supervisor's /core/websocket proxy authorizes the add-on
+                # from the supervisor token on the HTTP upgrade request itself,
+                # exactly like the REST proxy. Without this header the upgrade is
+                # rejected with a non-101 status (surfacing as websockets
+                # InvalidStatus) before the in-band auth_required/auth_ok
+                # exchange ever happens, so the listener can never connect. Mirror
+                # the REST client and send the token on the handshake.
+                async with websockets.connect(
+                    self.ws_url,
+                    open_timeout=10,
+                    additional_headers={"Authorization": f"Bearer {self._token}"},
+                ) as socket:
                     LOGGER.debug(
                         "Vision event listener: WebSocket transport open, awaiting handshake"
                     )
