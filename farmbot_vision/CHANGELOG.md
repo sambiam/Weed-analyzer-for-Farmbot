@@ -1,5 +1,45 @@
 # Changelog
 
+## 0.5.0 - 2026-07-20
+
+Calibration is rebuilt around FarmBot's own coordinate model.
+
+- **FarmBot calibration is now the only method.** The legacy "measure two
+  points" method is removed. Enter FarmBot's `Pixel coordinate scale`, the
+  resolution it was measured at, camera rotation, origin location and any
+  residual offset.
+- **Composite photo-row view.** The calibration page stitches one photo row
+  (images sharing an X coordinate) into a single FarmBot-style image in
+  coordinate space, with plant **and weed** centres overlaid and labelled
+  (plant name · crop; weeds in red). A row selector switches between rows, and
+  only one row is loaded at a time to bound memory. The composite updates live
+  as the calibration values are edited, replacing the old flick-through-and-
+  click-overlay-per-image workflow.
+- **Alignment fixed to match FarmBot.** `garden_to_pixel` now inverts FarmBot's
+  own pixel↔coordinate model: the metric offset from the image centre is scaled
+  and reflected by the origin, then rotated **in pixel space about the image
+  centre** (mirroring FarmBot physically rotating each photo to align it). With
+  no camera rotation the map is unchanged, so existing calibrations keep their
+  behaviour; rotated cameras now overlay correctly instead of drifting.
+- **Calibration persists across restarts.** Saved FarmBot values are written to
+  a JSON store in the persistent `/data` volume and restore the active
+  calibration automatically at startup — no re-entry after a restart — while
+  staying fully editable in the app.
+- **Weed points added to the inventory contract.** `get_vision_inventory` may
+  now include a `weeds` list; it defaults to empty so older companion
+  integrations still validate.
+
+## 0.4.0 - 2026-07-20
+
+- New-photo integration events now target and analyse only the completed image.
+- Automatic image jobs queue behind an active job instead of being discarded.
+- The only loaded FarmBot config entry is selected automatically when the app
+  option is blank.
+- Heartbeats are sent immediately at startup and at most five minutes apart,
+  including for installations retaining the former 15-minute option, so Home
+  Assistant vision entities remain available within the integration's
+  ten-minute timeout.
+
 ## 0.3.0 - 2026-07-19
 
 Manual calibration can now mirror FarmBot's own camera calibration.

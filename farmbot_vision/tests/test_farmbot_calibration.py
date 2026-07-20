@@ -104,3 +104,33 @@ def test_origin_round_trips_through_database(tmp_path):
     active = database.active_calibration("bot")
     assert active is not None
     assert active.origin_location == OriginLocation.BOTTOM_RIGHT
+
+
+def test_plant_at_image_centre_maps_to_pixel_centre():
+    # A plant at the image-centre ground coordinate lands at the pixel centre,
+    # regardless of rotation (rotation is about the centre).
+    cal = _cal(OriginLocation.TOP_LEFT, rotation=37.0)
+    px, py = garden_to_pixel(1000, 1000, 1000, 1000, 960, 720, cal)
+    assert px == pytest.approx(960 / 2)
+    assert py == pytest.approx(720 / 2)
+
+
+def test_rotation_is_applied_about_the_image_centre():
+    # With a 90 degree camera rotation, a plant 100 mm east of centre no longer
+    # projects straight right: the image is rotated to align, so the offset lands
+    # on the vertical axis. This is the behaviour the old garden-delta rotation
+    # (which never rotated the image) got wrong.
+    cal = _cal(OriginLocation.TOP_LEFT, rotation=90.0)
+    px, py = garden_to_pixel(1100, 1000, 1000, 1000, 960, 720, cal)
+    # 100 mm * 2 px/mm = 200 px, rotated by -90 deg about centre: +x -> -y.
+    assert px == pytest.approx(960 / 2)
+    assert py == pytest.approx(720 / 2 - 200)
+
+
+def test_zero_rotation_matches_legacy_scale_map():
+    # With no rotation the transform is the plain scaled offset from centre, so
+    # every pre-rotation calibration keeps its exact behaviour.
+    cal = _cal(OriginLocation.TOP_LEFT, rotation=0.0)
+    px, py = garden_to_pixel(1100, 1050, 1000, 1000, 960, 720, cal)
+    assert px == pytest.approx(960 / 2 + 100 * 2)
+    assert py == pytest.approx(720 / 2 + 50 * 2)

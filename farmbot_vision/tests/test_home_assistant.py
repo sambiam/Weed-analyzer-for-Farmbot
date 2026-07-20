@@ -173,6 +173,19 @@ def test_vision_request_event_contract(mode):
     assert without_device.device_id is None
 
 
+def test_automatic_photo_event_uses_app_mode_and_targets_one_image():
+    event = VisionRequestEvent.model_validate(
+        {
+            "config_entry_id": "entry",
+            "device_id": "device_42",
+            "plant_ids": [],
+            "image_id": 3043473,
+        }
+    )
+    assert event.mode is None
+    assert event.image_id == 3043473
+
+
 @pytest.mark.parametrize(
     "payload",
     [
@@ -180,6 +193,8 @@ def test_vision_request_event_contract(mode):
         {"config_entry_id": "entry", "plant_ids": [-1], "mode": "recommend"},
         {"config_entry_id": "entry", "plant_ids": [True], "mode": "recommend"},
         {"config_entry_id": "entry", "plant_ids": [], "mode": "invalid"},
+        {"config_entry_id": "entry", "image_id": 0},
+        {"config_entry_id": "entry", "image_id": True},
         {"config_entry_id": "entry", "plant_ids": [], "mode": "recommend", "unexpected": 1},
     ],
 )

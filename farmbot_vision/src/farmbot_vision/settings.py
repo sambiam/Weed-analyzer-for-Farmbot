@@ -30,7 +30,9 @@ class Settings(BaseModel):
     diagnostic_retention_days: int = Field(default=14, ge=0)
     failed_analysis_retention_days: int = Field(default=60, ge=1)
     successful_mask_retention_days: int = Field(default=7, ge=0)
-    heartbeat_minutes: int = Field(default=15, ge=5)
+    # Must stay comfortably below the integration's default ten-minute
+    # availability timeout. The heartbeat task also reports immediately.
+    heartbeat_minutes: int = Field(default=5, ge=1)
     image_lookback_hours: int = Field(default=72, ge=1, le=720)
     max_image_payload_bytes: int = 5 * 1024 * 1024
     data_dir: Path = Path("/data")

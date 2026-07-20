@@ -53,6 +53,24 @@ class Plant(StrictModel):
     spread_curve_id: int | None = None
 
 
+class WeedPoint(StrictModel):
+    """A FarmBot ``Weed`` point returned alongside the plant inventory.
+
+    Weeds are separate from :class:`Plant` in FarmBot (they are map points of
+    type ``Weed`` rather than plants), so they are carried on their own list.
+    ``name`` is optional because FarmBot weeds are often unnamed. The list
+    defaults to empty on :class:`Inventory`, so a companion integration that
+    does not yet emit ``weeds`` still validates.
+    """
+
+    id: int
+    name: str | None = None
+    x: float
+    y: float
+    z: float = 0
+    radius: float = Field(default=0, ge=0)
+
+
 class ImageMeta(StrictModel):
     x: float
     y: float
@@ -178,6 +196,9 @@ class Inventory(StrictModel):
     images: list[InventoryImage]
     curves: list[CurveData]
     camera_calibration: CameraCalibration
+    # FarmBot ``Weed`` points. Optional for backward compatibility: a companion
+    # integration that predates the weed contract simply omits it.
+    weeds: list[WeedPoint] = Field(default_factory=list)
 
 
 class VisionImageRequest(StrictModel):
@@ -310,6 +331,7 @@ class VisionStatus(StrictModel):
     automatically_applied: int = Field(ge=0)
     uncertain: int = Field(ge=0)
     message: str = Field(max_length=240)
+    app_version: str | None = None
 
 
 class VisionRequestEvent(StrictModel):
@@ -323,7 +345,10 @@ class VisionRequestEvent(StrictModel):
     config_entry_id: str
     device_id: str | None = None
     plant_ids: list[Annotated[int, Field(gt=0, strict=True)]] = Field(default_factory=list)
-    mode: Literal["observe", "recommend", "auto_radius"]
+    # Manual requests specify a mode. Automatic new-photo requests omit it so
+    # the app's configured operating mode remains the source of truth.
+    mode: Literal["observe", "recommend", "auto_radius"] | None = None
+    image_id: int | None = Field(default=None, gt=0, strict=True)
 
 
 class OperatingMode(StrEnum):

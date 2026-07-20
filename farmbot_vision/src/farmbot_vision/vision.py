@@ -418,6 +418,18 @@ class ClassicalVisionEngine(ImageAnalysisEngine):
         )
 
 
+# Sign of the rotation applied when mapping garden coordinates into the
+# *unrotated* processed image. FarmBot calibrates a ``Camera rotation`` and
+# physically rotates each photo by it to align the frame with the garden axes
+# (see FarmBot's plant_detection/P2C.py, which rotates the image and only then
+# maps pixels<->coordinates linearly). We overlay on the unrotated image, so we
+# apply the inverse rotation about the image centre. This constant selects the
+# rotation direction; it is verified against real FarmBot images in the
+# composite calibration view (flip it if a rotated camera overlays the wrong
+# way).
+ROTATION_SIGN = 1.0
+
+
 def garden_to_pixel(
     plant_x: float,
     plant_y: float,
@@ -427,19 +439,29 @@ def garden_to_pixel(
     height: int,
     calibration: Calibration,
 ) -> tuple[float, float]:
+    """Map a garden coordinate to a pixel in the unrotated processed image.
+
+    This is the algebraic inverse of FarmBot's own pixel->coordinate model. The
+    metric offset from the image centre is scaled to pixels and reflected by the
+    origin location *first* (garden<->pixel axis reflection), then rotated in
+    pixel space by the inverse of the camera rotation -- exactly mirroring
+    FarmBot rotating the image to align it before applying a pure scale. With
+    ``rotation_degrees == 0`` this reduces to the historical identity map, so
+    every origin/offset behaviour is preserved.
+    """
     dx = plant_x - image_x + calibration.offset_x_mm
     dy = plant_y - image_y + calibration.offset_y_mm
-    theta = math.radians(calibration.rotation_degrees)
-    rx = dx * math.cos(theta) - dy * math.sin(theta)
-    ry = dx * math.sin(theta) + dy * math.cos(theta)
-    # Origin location applies the garden<->pixel axis reflection (FarmBot's
-    # "Origin Location in Image"). TOP_LEFT gives (+1, +1), i.e. the original
-    # behaviour, so uncalibrated and legacy calibrations are unchanged.
     origin = OriginLocation(calibration.origin_location)
-    return (
-        width / 2 + origin.sign_x * rx * calibration.pixels_per_mm_x,
-        height / 2 + origin.sign_y * ry * calibration.pixels_per_mm_y,
-    )
+    # Pixel-space offset from centre, with the origin reflection applied before
+    # rotation (in the garden->pixel direction).
+    vx = origin.sign_x * dx * calibration.pixels_per_mm_x
+    vy = origin.sign_y * dy * calibration.pixels_per_mm_y
+    # Rotate by -rotation about the centre (inverse of the image-align rotation).
+    theta = math.radians(ROTATION_SIGN * calibration.rotation_degrees)
+    cos_t, sin_t = math.cos(theta), math.sin(theta)
+    rx = cos_t * vx + sin_t * vy
+    ry = -sin_t * vx + cos_t * vy
+    return (width / 2 + rx, height / 2 + ry)
 
 
 def manual_scale(

@@ -7,6 +7,7 @@ import pytest
 import yaml
 
 import farmbot_vision.web as web
+from farmbot_vision.models import BotList, VisionRequestEvent
 
 
 async def asgi_request(
@@ -66,7 +67,7 @@ async def test_duplicate_slashes_reach_health_and_settings():
 
     status, _, body = await asgi_request("///settings")
     assert status == 200
-    assert b"Manual calibration" in body
+    assert b"FarmBot calibration" in body
 
     status, _, body = await asgi_request("/health")
     assert status == 200
@@ -89,6 +90,50 @@ async def test_post_duplicate_path_works(monkeypatch: pytest.MonkeyPatch):
     status, headers, _ = await asgi_request("//analyse", method="POST")
     assert status == 303
     assert headers[b"location"] == b"./"
+
+
+@pytest.mark.asyncio
+async def test_event_listener_targets_new_image_and_uses_configured_mode(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    async def events():
+        yield VisionRequestEvent(
+            config_entry_id="entry-1", device_id="device_42", image_id=99
+        )
+
+    calls = []
+
+    async def fake_run(**kwargs):
+        calls.append(kwargs)
+        return {"accepted": True}
+
+    monkeypatch.setattr(web.client, "vision_events", events)
+    monkeypatch.setattr(web.jobs, "run", fake_run)
+    monkeypatch.setattr(web.settings, "mode", web.OperatingMode.RECOMMEND)
+    await web.event_listener()
+    assert calls == [
+        {
+            "entry_id": "entry-1",
+            "mode": web.OperatingMode.RECOMMEND,
+            "plant_ids": [],
+            "image_ids": [99],
+            "trigger": "new_image",
+            "queue_if_busy": True,
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_startup_auto_selects_only_loaded_farmbot(monkeypatch: pytest.MonkeyPatch):
+    async def list_bots():
+        return BotList.model_validate(
+            {"bots": [{"config_entry_id": "entry-1", "device_id": "42", "name": "FarmBot"}]}
+        )
+
+    monkeypatch.setattr(web.settings, "selected_config_entry_id", "")
+    monkeypatch.setattr(web.client, "list_bots", list_bots)
+    await web.resolve_config_entry()
+    assert web.settings.selected_config_entry_id == "entry-1"
 
 
 @pytest.mark.asyncio
@@ -115,7 +160,7 @@ async def test_ingress_html_uses_relative_links_without_logging_session(
     )
     settings_html = settings_body.decode()
     assert "fetch('api/vision/images" in settings_html
-    assert "img.src='api/vision/image/" in settings_html
+    assert "image.src='api/vision/image/" in settings_html
     assert "f.action='calibration'" in settings_html
     assert 'href="/settings"' not in settings_html
 
@@ -156,12 +201,10 @@ async def test_save_calibration_farmbot_values_branch():
 
     response = await web.save_calibration(
         entry_id="botFB",
-        method="farmbot",
         rotation=-31.9,
         offset_x=0,
         offset_y=0,
         origin_location="top_right",
-        image_id=None,
         coordinate_scale=0.242,
         reference_width=2592,
         reference_height=1944,
@@ -177,10 +220,35 @@ async def test_save_calibration_farmbot_values_branch():
 
 
 @pytest.mark.asyncio
-async def test_save_calibration_farmbot_requires_scale():
-    with pytest.raises(web.HTTPException) as exc:
-        await web.save_calibration(entry_id="botFB", method="farmbot")
-    assert exc.value.status_code == 400
+async def test_save_calibration_persists_to_data_store():
+    """Saved FarmBot inputs are written verbatim to the durable /data store."""
+    await web.save_calibration(
+        entry_id="botStore",
+        rotation=12.0,
+        offset_x=3,
+        offset_y=-4,
+        origin_location="bottom_left",
+        coordinate_scale=0.3,
+        reference_width=2592,
+        reference_height=1944,
+    )
+    stored = web.calibration_store.get("botStore")
+    assert stored is not None
+    assert stored.coordinate_scale == 0.3
+    assert stored.rotation_degrees == 12.0
+    assert stored.offset_x_mm == 3
+    assert str(stored.origin_location) == "bottom_left"
+
+
+@pytest.mark.asyncio
+async def test_save_calibration_rejects_nonpositive_scale():
+    with pytest.raises((web.HTTPException, ValueError)):
+        await web.save_calibration(
+            entry_id="botFB",
+            coordinate_scale=0,
+            reference_width=2592,
+            reference_height=1944,
+        )
 
 
 @pytest.mark.asyncio
@@ -188,13 +256,10 @@ async def test_save_calibration_rejects_unknown_origin():
     with pytest.raises(web.HTTPException) as exc:
         await web.save_calibration(
             entry_id="botFB",
-            method="points",
             origin_location="middle",
-            ax=1,
-            ay=1,
-            bx=20,
-            by=1,
-            distance_mm=5,
+            coordinate_scale=0.242,
+            reference_width=2592,
+            reference_height=1944,
         )
     assert exc.value.status_code == 400
 

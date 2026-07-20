@@ -17,8 +17,9 @@ try:
 except ImportError:  # pragma: no cover - Windows development hosts
     resource = None
 
-from . import CONTRACT_VERSION
+from . import CONTRACT_VERSION, __version__
 from .calibration import resolve_calibration
+from .curves import fit_monotonic_curve
 from .database import Database
 from .home_assistant import HomeAssistantClient, HomeAssistantError, StaleRadiusError
 from .models import (
@@ -60,21 +61,32 @@ class JobManager:
         entry_id: str | None = None,
         mode: OperatingMode | None = None,
         plant_ids: list[int] | None = None,
+        image_ids: list[int] | None = None,
         trigger: str = "manual",
+        queue_if_busy: bool = False,
     ) -> dict:
         if self.lock.locked():
-            self.current["queue_length"] = 1
-            LOGGER.info("Analysis request rejected: another analysis is already running")
-            return {"accepted": False, "reason": "analysis already running"}
+            self.current["queue_length"] = self.current.get("queue_length", 0) + 1
+            if not queue_if_busy:
+                LOGGER.info("Analysis request rejected: another analysis is already running")
+                return {"accepted": False, "reason": "analysis already running"}
+            LOGGER.info("Analysis request queued behind the running analysis")
         entry_id = entry_id or self.settings.selected_config_entry_id
         mode = mode or self.settings.mode
         if not entry_id:
             return {"accepted": False, "reason": "select a FarmBot before analysis"}
         async with self.lock:
-            return await self._run_locked(entry_id, mode, plant_ids or [], trigger)
+            return await self._run_locked(
+                entry_id, mode, plant_ids or [], image_ids or [], trigger
+            )
 
     async def _run_locked(
-        self, entry_id: str, mode: OperatingMode, plant_ids: list[int], trigger: str
+        self,
+        entry_id: str,
+        mode: OperatingMode,
+        plant_ids: list[int],
+        image_ids: list[int],
+        trigger: str,
     ) -> dict:
         job_id = uuid4()
         start_wall = datetime.now(UTC)
@@ -107,6 +119,22 @@ class JobManager:
                 self.settings.safety_margin_mm, self.settings.calibration_uncertainty_mm
             )
             wanted = [p for p in inventory.plants if not plant_ids or p.id in plant_ids]
+            wanted_image_ids = set(image_ids)
+            images = [
+                image
+                for image in sorted(inventory.images, key=lambda item: item.created_at)
+                if image.processed and (not wanted_image_ids or image.id in wanted_image_ids)
+            ]
+            if wanted_image_ids and not images:
+                return await self._finish(
+                    entry_id,
+                    job_id,
+                    "warning",
+                    start_wall,
+                    start_cpu,
+                    [],
+                    "requested image is not yet available",
+                )
             all_measurements = []
             self.current["resolution"] = resolution.as_dict()
             self.current["images_processed"] = 0
@@ -115,17 +143,13 @@ class JobManager:
             self.current["calibration_source"] = None
             artifacts = self.settings.data_dir / "artifacts"
             artifacts.mkdir(parents=True, exist_ok=True)
-            for image_number, image_info in enumerate(
-                sorted(inventory.images, key=lambda item: item.created_at)
-            ):
-                if not image_info.processed:
-                    continue
+            for image_number, image_info in enumerate(images):
                 available, resource_reason = self.resources_available()
                 if not available:
                     LOGGER.warning("Analysis paused: %s", resource_reason)
                     break
                 self.current["progress"] = (
-                    f"Processing image {image_number + 1}/{len(inventory.images)}"
+                    f"Processing image {image_number + 1}/{len(images)}"
                 )
                 # Request the configured resolution; images are fetched one at a time.
                 response = await self.client.image(
@@ -179,6 +203,10 @@ class JobManager:
                     )
                     if result.overlay_jpeg:
                         overlay_path.write_bytes(result.overlay_jpeg)
+                    if result.mask:
+                        (artifacts / f"{job_id}-{response.image_id}-mask.png").write_bytes(
+                            result.mask
+                        )
                     del image_bytes, result
                     continue
 
@@ -323,6 +351,7 @@ class JobManager:
                     automatically_applied=sum(m.decision == Decision.APPLIED for m in measurements),
                     uncertain=sum(m.decision == Decision.UNCERTAIN for m in measurements),
                     message=message,
+                    app_version=__version__,
                 )
             )
         except HomeAssistantError as exc:
@@ -352,6 +381,14 @@ class JobManager:
         else:
             peak = psutil.Process().memory_info().rss / 1024 / 1024
         skip_reasons = self.current.get("skip_reasons", {})
+        crop_slugs = sorted({measurement.crop_slug for measurement in measurements})
+        spread_curves = {
+            slug: fit_monotonic_curve(
+                self.db.measurements_for_crop(slug),
+                safety_margin_mm=self.settings.safety_margin_mm,
+            )
+            for slug in crop_slugs
+        }
         result = {
             "id": str(job_id),
             "status": status,
@@ -377,6 +414,7 @@ class JobManager:
             "processed_dimensions": self.current.get("processed_dimensions"),
             "resize_scales": self.current.get("resize_scales"),
             "contract_version": CONTRACT_VERSION,
+            "spread_curves": spread_curves,
         }
         self.last = result
         self.current = {"status": "idle", "queue_length": 0, "progress": message}

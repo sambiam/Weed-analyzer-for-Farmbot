@@ -1,5 +1,5 @@
 name: FarmBot Vision
-version: "0.3.0"
+version: "0.5.0"
 slug: farmbot_vision
 description: Lightweight canopy analysis and safe FarmBot plant-radius recommendations
 url: https://github.com/sambiam/Weed-analyzer-for-Farmbot
@@ -41,7 +41,7 @@ options:
   diagnostic_retention_days: 14
   failed_analysis_retention_days: 60
   successful_mask_retention_days: 7
-  heartbeat_minutes: 15
+  heartbeat_minutes: 5
   image_lookback_hours: 72
 schema:
   selected_config_entry_id: str
@@ -60,5 +60,5 @@ schema:
   diagnostic_retention_days: int(0,365)
   failed_analysis_retention_days: int(1,365)
   successful_mask_retention_days: int(0,90)
-  heartbeat_minutes: int(5,60)
+  heartbeat_minutes: int(1,60)
   image_lookback_hours: int(1,720)

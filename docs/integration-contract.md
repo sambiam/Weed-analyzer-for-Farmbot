@@ -31,6 +31,7 @@ Response fields:
   This is a compatibility shim in `InventoryImage._normalize`, not the target contract —
   new integration work should still emit the nested/complete shape above.
 - `curves[]`: `id`, `name`, `type` (must be `spread`), and day-string to diameter mapping `data`
+- `weeds[]` (optional): FarmBot `Weed` map points as `id`, nullable `name`, `x`, `y`, `z`, `radius`. Omit the key entirely (or send `[]`) when the integration does not expose weeds; the app treats a missing list as empty. Used by the calibration composite overlay to distinguish weeds from known plants.
 - `camera_calibration`: `available`, nullable positive `pixels_per_mm_x/y`, nullable `rotation_degrees`, nullable `offset_x_mm/y`, and (v2) `reference_width`, `reference_height`, `basis` (`reference_image` or `native_frame`)
 
 When `available` is true both pixel scales are required. This is the **reference** (normalized) calibration: `pixels_per_mm_*` are stated relative to `reference_width` x `reference_height`. The app scales them to the processed resolution — a native scale is never applied directly to a resized frame. Image metadata coordinates are defined as the ground coordinate at image centre.
@@ -97,6 +98,10 @@ rejects unknown event fields. A malformed event is logged with sanitized field
 and error-type details and skipped without reconnecting the active subscription,
 so a later valid event is still processed. The integration should not emit
 overlapping requests repeatedly.
+
+Automatic new-photo requests may instead omit `mode` and include a positive
+integer `image_id`. In that form the app uses its configured operating mode and
+processes only the named image. Manual requests retain the payload above.
 
 ## Exact companion-integration work still required
 

@@ -178,3 +178,58 @@ def test_resource_gate_blocks_low_memory(tmp_path, monkeypatch):
     available, reason = manager.resources_available()
     assert available is False
     assert "free memory" in reason
+
+
+@pytest.mark.asyncio
+async def test_new_photo_job_processes_only_the_target_image(tmp_path, monkeypatch):
+    import numpy as np
+    from conftest import vision_image_dict
+
+    from farmbot_vision.jobs import JobManager
+    from farmbot_vision.models import Inventory, VisionImage
+
+    class Client:
+        def __init__(self):
+            self.image_ids = []
+            self.statuses = []
+
+        async def inventory(self, _request):
+            return Inventory.model_validate(
+                {
+                    "device_id": "42",
+                    "generated_at": "2026-07-20T00:00:00+00:00",
+                    "plants": [],
+                    "images": [
+                        {
+                            "id": image_id,
+                            "created_at": f"2026-07-20T00:00:0{image_id}+00:00",
+                            "processed": True,
+                            "meta": {"x": 0, "y": 0, "z": 0},
+                        }
+                        for image_id in (1, 2)
+                    ],
+                    "curves": [],
+                    "camera_calibration": {"available": False},
+                }
+            )
+
+        async def image(self, request, _max_bytes):
+            self.image_ids.append(request.image_id)
+            return VisionImage.model_validate(
+                vision_image_dict(np.zeros((240, 320, 3), np.uint8), image_id=request.image_id)
+            )
+
+        async def report_status(self, status):
+            self.statuses.append(status)
+
+    client = Client()
+    manager = JobManager(Settings(data_dir=tmp_path), Database(tmp_path / "db.sqlite"), client)
+    monkeypatch.setattr(manager, "resources_available", lambda: (True, "resources available"))
+    result = await manager.run(
+        entry_id="entry-1", image_ids=[2], trigger="new_image", queue_if_busy=True
+    )
+    assert result["accepted"] is True
+    assert result["images_processed"] == 1
+    assert client.image_ids == [2]
+    assert len(list((tmp_path / "artifacts").glob("*-mask.png"))) == 1
+    assert client.statuses[-1].app_version == "0.5.0"

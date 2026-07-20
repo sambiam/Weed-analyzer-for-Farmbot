@@ -7,6 +7,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from html import escape
 from pathlib import Path
+from uuid import UUID
 
 import cv2
 from fastapi import BackgroundTasks, FastAPI, Form, HTTPException, Request
@@ -26,6 +27,7 @@ from . import (
     __version__,
 )
 from .calibration import from_farmbot_calibration
+from .calibration_store import CalibrationStore, FarmbotCalibrationInput
 from .curves import fit_monotonic_curve
 from .database import Database
 from .home_assistant import HomeAssistantClient, HomeAssistantError
@@ -39,14 +41,54 @@ from .models import (
     VisionImageRequest,
 )
 from .settings import Settings
-from .vision import manual_scale
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 LOGGER = logging.getLogger(__name__)
 settings = Settings.load()
 database = Database(settings.data_dir / "farmbot_vision.db")
+calibration_store = CalibrationStore(settings.data_dir / "farmbot_calibration.json")
 client = HomeAssistantClient()
 jobs = JobManager(settings, database, client)
+
+
+def _calibration_from_input(entry_id: str, values: FarmbotCalibrationInput) -> Calibration:
+    """Build a processed-resolution calibration from stored FarmBot inputs."""
+    resolution = settings.resolution
+    return from_farmbot_calibration(
+        coordinate_scale_mm_per_px=values.coordinate_scale,
+        reference_width=values.reference_width,
+        reference_height=values.reference_height,
+        processed_width=resolution.width,
+        processed_height=resolution.height,
+        rotation_degrees=values.rotation_degrees,
+        offset_x_mm=values.offset_x_mm,
+        offset_y_mm=values.offset_y_mm,
+        origin_location=values.origin_location,
+        uncertainty_mm=settings.calibration_uncertainty_mm,
+        analysis_resolution=resolution.value,
+    )
+
+
+def seed_calibration_from_store() -> None:
+    """Restore the active DB calibration from the durable /data store on boot.
+
+    The store is the master record of the FarmBot calibration the user entered;
+    the SQLite active calibration is the runtime source the analysis pipeline
+    reads. If a bot has a stored calibration but no active DB calibration (fresh
+    container, wiped DB), re-derive and persist it so a restart never loses
+    calibration and never requires re-entry.
+    """
+    entry_id = settings.selected_config_entry_id
+    if not entry_id:
+        return
+    stored = calibration_store.get(entry_id)
+    if stored is None or database.active_calibration(entry_id) is not None:
+        return
+    try:
+        database.save_calibration(entry_id, _calibration_from_input(entry_id, stored))
+        LOGGER.info("Restored calibration for %s from the /data store", entry_id)
+    except ValueError as exc:
+        LOGGER.warning("Could not restore stored calibration for %s: %s", entry_id, exc)
 
 
 def _normalize_leading_slashes(value: str) -> str:
@@ -76,161 +118,257 @@ class NormalizeIngressPathMiddleware:
         await self.app(scope, receive, send)
 
 
-# Lightweight vanilla-JS point selection and plant-centre overlay for the
-# calibration page. No frontend build toolchain is used (Part 5).
+# FarmBot-style composite calibration view. One photo-row (images sharing an X
+# coordinate) is stitched in garden-coordinate space using the FarmBot camera
+# calibration, with plant and weed centres overlaid so alignment across the
+# whole row can be verified at once. Vanilla JS on a canvas -- no frontend build
+# toolchain (Part 5). The rotation direction here MUST match
+# vision.ROTATION_SIGN and vision.garden_to_pixel.
 _CALIBRATION_JS = r"""
 (function(){
+  const ROT_SIGN=1;            // matches vision.ROTATION_SIGN
+  const MAX_CANVAS=2400;       // cap composite dimensions to bound memory
   const canvas=document.getElementById('canvas');
   const ctx=canvas.getContext('2d');
-  const sel=document.getElementById('image');
+  const rowSel=document.getElementById('row');
   const status=document.getElementById('status');
   const ppmEl=document.getElementById('ppm');
-  let img=null, plants=[], meta={x:0,y:0}, A=null, B=null;
-  const W=canvas.width, H=canvas.height;
+  let scene={images:[],plants:[],weeds:[]}, rows=[], current=null, pending=false;
+
   function entry(){return document.getElementById('entry_id').value.trim();}
   function num(id){return parseFloat(document.getElementById(id).value)||0;}
-  function method(){return document.getElementById('method').value;}
+  function checked(id){return document.getElementById(id).checked;}
   function origin(){return document.getElementById('origin').value;}
   function originSigns(o){
     return [(o==='top_right'||o==='bottom_right')?-1:1,
             (o==='bottom_left'||o==='bottom_right')?-1:1];
   }
-  // Toggle which method-specific inputs are shown.
-  function syncMethod(){
-    const fb=method()==='farmbot';
-    document.getElementById('group_points').style.display=fb?'none':'';
-    document.getElementById('group_farmbot').style.display=fb?'':'none';
-    updatePpm();
+  // FarmBot calibration inputs, or null when incomplete.
+  function params(){
+    const scale=num('fb_scale'), refw=num('fb_refw'), refh=num('fb_refh');
+    if(!(scale>0&&refw>0&&refh>0)) return null;
+    const s=originSigns(origin());
+    return {scale:scale,refw:refw,refh:refh,sx:s[0],sy:s[1],
+            rot:num('rotation')*Math.PI/180*ROT_SIGN,ox:num('offx'),oy:num('offy')};
   }
-  function redraw(){
-    ctx.clearRect(0,0,W,H);
-    if(img) ctx.drawImage(img,0,0,W,H);
-    if(method()==='farmbot') return;
-    if(A){ctx.fillStyle='#2ecc40';ctx.beginPath();ctx.arc(A[0],A[1],5,0,7);ctx.fill();}
-    if(B){ctx.fillStyle='#0074d9';ctx.beginPath();ctx.arc(B[0],B[1],5,0,7);ctx.fill();}
-    if(A&&B){ctx.strokeStyle='#fff';ctx.beginPath();ctx.moveTo(A[0],A[1]);ctx.lineTo(B[0],B[1]);ctx.stroke();}
+  // Pixels-per-mm of one processed image (its own natural size) under p.
+  function imagePpm(p,iw,ih){return [(1/p.scale)*iw/p.refw,(1/p.scale)*ih/p.refh];}
+  // Map a source pixel (u,v) of an image taken at (cx,cy) to a garden coord.
+  // Inverse of vision.garden_to_pixel.
+  function pixelToCoord(p,cx,cy,iw,ih,u,v){
+    const ppm=imagePpm(p,iw,ih);
+    const rx=u-iw/2, ry=v-ih/2;
+    const c=Math.cos(p.rot), s=Math.sin(p.rot);
+    const vx=c*rx - s*ry, vy=s*rx + c*ry;
+    return [cx + vx/(p.sx*ppm[0]), cy + vy/(p.sy*ppm[1])];
   }
-  // Returns [ppmX, ppmY] at the processed (canvas) resolution, or null.
-  function currentPpm(){
-    if(method()==='farmbot'){
-      const s=num('fb_scale'), rw=num('fb_refw'), rh=num('fb_refh');
-      if(s>0&&rw>0&&rh>0){const p=1/s; return [p*W/rw, p*H/rh];}
-      return null;
+  // Group images into rows by shared X (within tolerance, mm).
+  function buildRows(images,tol){
+    const imgs=images.filter(im=>isFinite(im.x)&&isFinite(im.y)).slice()
+                     .sort((a,b)=>a.x-b.x);
+    const out=[]; let cur=null;
+    imgs.forEach(im=>{
+      if(!cur||Math.abs(im.x-cur.x)>tol){cur={x:im.x,sum:im.x,images:[im]};out.push(cur);}
+      else{cur.images.push(im);cur.sum+=im.x;cur.x=cur.sum/cur.images.length;}
+    });
+    out.forEach(r=>r.images.sort((a,b)=>a.y-b.y));
+    return out;
+  }
+  function populateRows(){
+    rows=buildRows(scene.images,num('rowtol')||50);
+    rowSel.innerHTML='';
+    rows.forEach((r,i)=>{
+      const o=document.createElement('option');
+      o.value=i;
+      o.textContent='X≈'+Math.round(r.x)+' mm ('+r.images.length+' photos)';
+      rowSel.appendChild(o);
+    });
+  }
+  function selectRow(){
+    const p=params();
+    ppmEl.textContent=p?('Pixels per mm (at analysis res): scale '+p.scale+' mm/px'):
+                        'Enter the FarmBot pixel coordinate scale, and measured-at width/height';
+    const row=rows[+rowSel.value];
+    if(!row){current=null;clearCanvas('Load a bot, then pick a photo row');return;}
+    current={images:[]};
+    status.textContent='Loading '+row.images.length+' photos…';
+    row.images.forEach(im=>{
+      const image=new Image();
+      const rec={info:im,img:image,loaded:false};
+      current.images.push(rec);
+      image.onload=function(){rec.loaded=true;render();};
+      image.onerror=function(){status.textContent='Could not load image #'+im.id;};
+      image.src='api/vision/image/'+im.id+'.jpg?entry_id='+encodeURIComponent(entry());
+    });
+  }
+  function clearCanvas(msg){
+    canvas.width=640;canvas.height=200;
+    ctx.setTransform(1,0,0,1,0,0);
+    ctx.fillStyle='#111';ctx.fillRect(0,0,canvas.width,canvas.height);
+    ctx.fillStyle='#888';ctx.font='14px sans-serif';ctx.fillText(msg||'',12,28);
+  }
+  function scheduleRender(){
+    if(pending) return; pending=true;
+    requestAnimationFrame(function(){pending=false;render();});
+  }
+  function render(){
+    const p=params();
+    document.getElementById('save').disabled=!(p&&checked('confirm'));
+    if(!current){return;}
+    const ready=current.images.filter(r=>r.loaded&&r.img.naturalWidth>0);
+    if(!p){clearCanvas('Enter FarmBot calibration values to build the composite');return;}
+    if(!ready.length){return;}
+    // Garden-space bounding box from every image's four corners.
+    let gxmin=Infinity,gxmax=-Infinity,gymin=Infinity,gymax=-Infinity,ppmSum=0;
+    ready.forEach(r=>{
+      const iw=r.img.naturalWidth, ih=r.img.naturalHeight;
+      const pp=imagePpm(p,iw,ih); ppmSum+=(pp[0]+pp[1])/2;
+      [[0,0],[iw,0],[0,ih],[iw,ih]].forEach(c=>{
+        const g=pixelToCoord(p,r.info.x,r.info.y,iw,ih,c[0],c[1]);
+        gxmin=Math.min(gxmin,g[0]);gxmax=Math.max(gxmax,g[0]);
+        gymin=Math.min(gymin,g[1]);gymax=Math.max(gymax,g[1]);
+      });
+    });
+    let P=ppmSum/ready.length;
+    const rangeX=Math.max(1,gxmax-gxmin), rangeY=Math.max(1,gymax-gymin);
+    P=Math.min(P,MAX_CANVAS/rangeX,MAX_CANVAS/rangeY);
+    canvas.width=Math.max(1,Math.round(rangeX*P));
+    canvas.height=Math.max(1,Math.round(rangeY*P));
+    const toCanvas=function(gx,gy){return [(gx-gxmin)*P,(gy-gymin)*P];};
+    ctx.setTransform(1,0,0,1,0,0);
+    ctx.fillStyle='#111';ctx.fillRect(0,0,canvas.width,canvas.height);
+    // Paint each image via the affine that maps its source pixels into the
+    // composite (three mapped points fully determine the affine).
+    ctx.imageSmoothingEnabled=true;
+    ready.forEach(r=>{
+      const iw=r.img.naturalWidth, ih=r.img.naturalHeight;
+      const p0=toCanvas.apply(null,pixelToCoord(p,r.info.x,r.info.y,iw,ih,0,0));
+      const pu=toCanvas.apply(null,pixelToCoord(p,r.info.x,r.info.y,iw,ih,iw,0));
+      const pv=toCanvas.apply(null,pixelToCoord(p,r.info.x,r.info.y,iw,ih,0,ih));
+      ctx.setTransform((pu[0]-p0[0])/iw,(pu[1]-p0[1])/iw,
+                       (pv[0]-p0[0])/ih,(pv[1]-p0[1])/ih,p0[0],p0[1]);
+      ctx.drawImage(r.img,0,0);
+    });
+    ctx.setTransform(1,0,0,1,0,0);
+    if(checked('showoverlay')) drawOverlay(p,toCanvas,P);
+    status.textContent='Row composite: '+ready.length+' photos, '
+      +scene.plants.length+' plants, '+scene.weeds.length+' weeds. '
+      +'Confirm centres sit on their plants across the row.';
+  }
+  function marker(p,toCanvas,P,pt,colour,label){
+    // Offset shifts a point's projected position exactly as garden_to_pixel does.
+    const c=toCanvas(pt.x+p.ox,pt.y+p.oy);
+    if(c[0]<-40||c[1]<-40||c[0]>canvas.width+40||c[1]>canvas.height+40) return;
+    ctx.strokeStyle=colour;ctx.fillStyle=colour;ctx.lineWidth=2;
+    ctx.beginPath();ctx.arc(c[0],c[1],Math.max(4,(pt.radius||0)*P),0,7);ctx.stroke();
+    ctx.beginPath();ctx.arc(c[0],c[1],2.5,0,7);ctx.fill();
+    if(label&&checked('showlabels')){
+      ctx.font='12px sans-serif';
+      ctx.fillText(label,c[0]+5,c[1]-5);
     }
-    const d=num('distance');
-    if(A&&B&&d>0){const px=Math.hypot(B[0]-A[0],B[1]-A[1]); const p=px/d; return [p,p];}
-    return null;
   }
-  function updatePpm(){
-    const ppm=currentPpm();
-    if(ppm){
-      ppmEl.textContent='Pixels per millimetre: '+ppm[0].toFixed(4)+' × '+ppm[1].toFixed(4);
-      document.getElementById('save').disabled=!document.getElementById('confirm').checked;
-    }else{
-      ppmEl.textContent='Pixels per millimetre: —';
-      document.getElementById('save').disabled=true;
-    }
-    return ppm;
+  function drawOverlay(p,toCanvas,P){
+    scene.plants.forEach(pl=>marker(p,toCanvas,P,pl,'#2ecc40',
+      (pl.name||('#'+pl.id))+(pl.slug?(' ('+pl.slug+')'):'')));
+    scene.weeds.forEach(w=>marker(p,toCanvas,P,w,'#ff4136',w.name||'Weed'));
   }
-  function gardenToPixel(px,py,ppmX,ppmY,rot,offx,offy,o){
-    let dx=px-meta.x+offx, dy=py-meta.y+offy;
-    let t=rot*Math.PI/180;
-    let rx=dx*Math.cos(t)-dy*Math.sin(t), ry=dx*Math.sin(t)+dy*Math.cos(t);
-    const s=originSigns(o);
-    return [W/2+s[0]*rx*ppmX, H/2+s[1]*ry*ppmY];
-  }
-  canvas.addEventListener('click',function(e){
-    if(method()==='farmbot') return;
-    const rect=canvas.getBoundingClientRect();
-    const x=(e.clientX-rect.left)*(W/rect.width);
-    const y=(e.clientY-rect.top)*(H/rect.height);
-    if(!A||B){A=[x,y];B=null;}else{B=[x,y];}
-    redraw();updatePpm();
-  });
-  ['method','origin','distance','fb_scale','fb_refw','fb_refh'].forEach(function(id){
-    const el=document.getElementById(id);
-    el.addEventListener(id==='method'?'change':'input',id==='method'?syncMethod:updatePpm);
-  });
-  document.getElementById('confirm').addEventListener('change',updatePpm);
+
   document.getElementById('load').addEventListener('click',async function(){
-    status.textContent='Loading…';
+    status.textContent='Loading inventory…';
     try{
       const r=await fetch('api/vision/images?entry_id='+encodeURIComponent(entry()));
       if(!r.ok) throw new Error('HTTP '+r.status);
-      const data=await r.json();
-      plants=data.plants||[];
-      sel.innerHTML='';
-      (data.images||[]).forEach(function(im){
-        const o=document.createElement('option');
-        o.value=im.id;o.dataset.x=im.x;o.dataset.y=im.y;
-        o.textContent='#'+im.id+' '+im.created_at;
-        sel.appendChild(o);
-      });
-      status.textContent=(data.images||[]).length+' images, '+plants.length+' plants';
-      if(sel.options.length) sel.dispatchEvent(new Event('change'));
-    }catch(err){status.textContent='Could not load images: '+err.message;}
+      scene=await r.json();
+      scene.images=scene.images||[];scene.plants=scene.plants||[];scene.weeds=scene.weeds||[];
+      populateRows();
+      status.textContent=scene.images.length+' images, '+rows.length+' rows, '
+        +scene.plants.length+' plants, '+scene.weeds.length+' weeds';
+      if(rows.length) selectRow(); else clearCanvas('No images with coordinates found');
+    }catch(err){status.textContent='Could not load inventory: '+err.message;}
   });
-  sel.addEventListener('change',function(){
-    const o=sel.options[sel.selectedIndex];
-    if(!o) return;
-    meta={x:parseFloat(o.dataset.x)||0,y:parseFloat(o.dataset.y)||0};
-    A=null;B=null;
-    img=new Image();
-    img.onload=redraw;
-    img.onerror=function(){status.textContent='Could not load image bytes';};
-    img.src='api/vision/image/'+o.value+'.jpg?entry_id='+encodeURIComponent(entry());
+  rowSel.addEventListener('change',selectRow);
+  document.getElementById('rowtol').addEventListener('input',function(){
+    populateRows();selectRow();
   });
-  document.getElementById('overlay').addEventListener('click',function(){
-    const ppm=updatePpm();
-    if(!ppm){status.textContent='Enter calibration values first';return;}
-    redraw();
-    ctx.strokeStyle='#ff4136';ctx.fillStyle='#ff4136';ctx.font='12px sans-serif';
-    const meanPpm=(ppm[0]+ppm[1])/2;
-    plants.forEach(function(p){
-      const c=gardenToPixel(p.x,p.y,ppm[0],ppm[1],num('rotation'),num('offx'),num('offy'),origin());
-      ctx.beginPath();ctx.arc(c[0],c[1],Math.max(4,(p.radius||0)*meanPpm),0,7);ctx.stroke();
-      ctx.fillText(p.id,c[0]+4,c[1]-4);
-    });
-    status.textContent='Overlaid '+plants.length+' plant centres — confirm alignment.';
+  ['fb_scale','fb_refw','fb_refh','rotation','origin','offx','offy'].forEach(function(id){
+    document.getElementById(id).addEventListener('input',scheduleRender);
+    document.getElementById(id).addEventListener('change',scheduleRender);
+  });
+  ['showoverlay','showlabels','confirm'].forEach(function(id){
+    document.getElementById(id).addEventListener('change',scheduleRender);
   });
   document.getElementById('save').addEventListener('click',function(){
-    const ppm=updatePpm();
-    if(!ppm){status.textContent='Enter calibration values first';return;}
-    const o=sel.options[sel.selectedIndex];
+    const p=params();
+    if(!p){status.textContent='Enter the FarmBot calibration values first';return;}
     const f=document.createElement('form');f.method='post';f.action='calibration';
-    const fields={entry_id:entry(),method:method(),rotation:num('rotation'),
-      offset_x:num('offx'),offset_y:num('offy'),origin_location:origin(),
-      image_id:o?o.value:''};
-    if(method()==='farmbot'){
-      fields.coordinate_scale=num('fb_scale');
-      fields.reference_width=num('fb_refw');
-      fields.reference_height=num('fb_refh');
-    }else{
-      if(!A||!B){status.textContent='Set both points and a separation';return;}
-      fields.ax=A[0];fields.ay=A[1];fields.bx=B[0];fields.by=B[1];
-      fields.distance_mm=num('distance');
-    }
+    const fields={entry_id:entry(),coordinate_scale:num('fb_scale'),
+      reference_width:num('fb_refw'),reference_height:num('fb_refh'),
+      rotation:num('rotation'),origin_location:origin(),
+      offset_x:num('offx'),offset_y:num('offy')};
     for(const k in fields){const i=document.createElement('input');i.type='hidden';
       i.name=k;i.value=fields[k];f.appendChild(i);}
     document.body.appendChild(f);f.submit();
   });
-  syncMethod();
+  clearCanvas('Load a bot, then pick a photo row');
 })();
 """
 
 
 async def event_listener() -> None:
     async for event in client.vision_events():
-        asyncio.create_task(
-            jobs.run(event.config_entry_id, OperatingMode(event.mode), event.plant_ids, "event")
+        # Await each automatic request so photos cannot be silently discarded
+        # merely because the previous image is still being analysed.
+        await jobs.run(
+            entry_id=event.config_entry_id,
+            mode=OperatingMode(event.mode) if event.mode is not None else settings.mode,
+            plant_ids=event.plant_ids,
+            image_ids=[event.image_id] if event.image_id is not None else None,
+            trigger="new_image" if event.image_id is not None else "event",
+            queue_if_busy=True,
         )
 
 
 async def heartbeat() -> None:
     while True:
-        await asyncio.sleep(settings.heartbeat_minutes * 60)
-        if settings.selected_config_entry_id and not jobs.lock.locked():
-            await jobs._status(settings.selected_config_entry_id, None, "idle", "ready")
+        if settings.selected_config_entry_id:
+            if jobs.lock.locked():
+                try:
+                    job_id = UUID(str(jobs.current.get("id")))
+                except (TypeError, ValueError):
+                    job_id = None
+                await jobs._status(
+                    settings.selected_config_entry_id,
+                    job_id,
+                    "running",
+                    str(jobs.current.get("progress") or "analysing")[:240],
+                )
+            else:
+                await jobs._status(settings.selected_config_entry_id, None, "idle", "ready")
+        # Older installations may retain the former 15-minute option. Cap the
+        # effective interval so they also stay inside the integration's
+        # ten-minute availability window after upgrading.
+        await asyncio.sleep(min(settings.heartbeat_minutes, 5) * 60)
+
+
+async def resolve_config_entry() -> None:
+    """Select the only loaded FarmBot automatically when no ID was configured."""
+    if settings.selected_config_entry_id:
+        return
+    try:
+        bots = (await client.list_bots()).bots
+    except HomeAssistantError as exc:
+        LOGGER.warning("Could not discover FarmBot config entries at startup: %s", exc)
+        return
+    if len(bots) == 1:
+        settings.selected_config_entry_id = bots[0].config_entry_id
+        LOGGER.info(
+            "Automatically selected the only loaded FarmBot config entry: %s",
+            settings.selected_config_entry_id,
+        )
+    elif len(bots) > 1:
+        LOGGER.warning(
+            "Multiple FarmBots are loaded; select one in the add-on options to enable heartbeats"
+        )
 
 
 async def scheduler() -> None:
@@ -268,6 +406,7 @@ async def retention_cleanup() -> None:
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    await resolve_config_entry()
     LOGGER.info(
         "FarmBot Vision %s starting: selected_config_entry_id=%s mode=%s analysis_resolution=%s",
         __version__,
@@ -280,6 +419,7 @@ async def lifespan(_: FastAPI):
             "No FarmBot config entry ID configured; scheduled/heartbeat status reports and "
             "the calibration page will not work until one is set in the add-on options"
         )
+    seed_calibration_from_store()
     tasks = [
         asyncio.create_task(event_listener(), name="event_listener"),
         asyncio.create_task(heartbeat(), name="heartbeat"),
@@ -491,9 +631,23 @@ def _calibration_warnings(calibration: Calibration | None) -> list[str]:
     return warnings
 
 
+def _origin_options(selected: str) -> str:
+    labels = {
+        "top_left": "Top left",
+        "top_right": "Top right",
+        "bottom_left": "Bottom left",
+        "bottom_right": "Bottom right",
+    }
+    return "".join(
+        f'<option value={value}{" selected" if value == selected else ""}>{escape(label)}</option>'
+        for value, label in labels.items()
+    )
+
+
 @app.get("/settings", response_class=HTMLResponse)
 async def calibration_page(request: Request) -> HTMLResponse:
-    calibration = database.active_calibration(settings.selected_config_entry_id)
+    entry_id = settings.selected_config_entry_id
+    calibration = database.active_calibration(entry_id)
     resolution = settings.resolution
     warnings = _calibration_warnings(calibration)
     warning_html = "".join(f"<p class=warn>⚠ {escape(w)}</p>" for w in warnings)
@@ -507,53 +661,54 @@ async def calibration_page(request: Request) -> HTMLResponse:
             f"origin={calibration.origin_location}, "
             f"offsets=({calibration.offset_x_mm},{calibration.offset_y_mm}) mm"
         )
-    body = f"""<section class=card><h2>Manual calibration</h2>
-<p>Calibrate against a recent FarmBot image at the configured analysis
-resolution ({escape(resolution.label)}). Either measure two features a known distance
-apart, or copy the values from FarmBot's own camera calibration. In both cases overlay the
-known plant centres and confirm several align before saving. No external tools are needed.</p>
+    # Prefill the form with the durable stored inputs so a restart shows the last
+    # saved calibration ready to edit (persistence is /data-backed, not options).
+    stored = calibration_store.get(entry_id) if entry_id else None
+    v_scale = "" if stored is None else stored.coordinate_scale
+    v_refw = 2592 if stored is None else stored.reference_width
+    v_refh = 1944 if stored is None else stored.reference_height
+    v_rot = 0 if stored is None else stored.rotation_degrees
+    v_ox = 0 if stored is None else stored.offset_x_mm
+    v_oy = 0 if stored is None else stored.offset_y_mm
+    v_origin = "top_left" if stored is None else str(stored.origin_location)
+    body = f"""<section class=card><h2>FarmBot calibration</h2>
+<p>Copy the values from FarmBot's own camera calibration (Photos → Camera
+calibration), then verify alignment against a whole photo row. The app rescales
+FarmBot's mm/pixel scale (measured at its native frame) to the configured
+analysis resolution ({escape(resolution.label)}). Values are saved to the app's
+persistent storage and restored automatically after a restart — no external
+tools needed.</p>
 {warning_html}
-<p class=muted>Current: {escape(current)}</p>
+<p class=muted>Current active calibration: {escape(current)}</p>
 <div class=grid>
 <div>
-<label>FarmBot config entry ID<br><input id=entry_id value="{escape(settings.selected_config_entry_id)}"></label>
-<p><button type=button id=load>Load recent images</button></p>
-<label>Image<br><select id=image></select></label>
-<label>Method<br><select id=method>
-<option value=points>Measure two points</option>
-<option value=farmbot>FarmBot calibration values</option>
-</select></label>
-<div id=group_points>
-<p class=muted>Click point A (green), then point B (blue) on the image.</p>
-<label>Known separation A→B (mm)<br><input id=distance type=number min=0.1 step=any></label>
-</div>
-<div id=group_farmbot>
-<p class=muted>In FarmBot open Photos → Camera calibration and copy each value below. The
-app rescales the mm/pixel scale at the measured resolution to its own analysis resolution.</p>
-<label>Pixel coordinate scale (mm/pixel)<br><input id=fb_scale type=number min=0 step=any></label>
-<label>Measured at width (px)<br><input id=fb_refw type=number min=1 step=1 value=2592></label>
-<label>Measured at height (px)<br><input id=fb_refh type=number min=1 step=1 value=1944></label>
-</div>
-<p id=ppm class=muted>Pixels per millimetre: —</p>
-<label>Camera rotation (degrees)<br><input id=rotation type=number step=any value=0></label>
-<label>Origin location in image<br><select id=origin>
-<option value=top_left>Top left</option>
-<option value=top_right>Top right</option>
-<option value=bottom_left>Bottom left</option>
-<option value=bottom_right>Bottom right</option>
-</select></label>
-<label>Offset X (mm)<br><input id=offx type=number step=any value=0></label>
-<label>Offset Y (mm)<br><input id=offy type=number step=any value=0></label>
+<label>FarmBot config entry ID<br><input id=entry_id value="{escape(entry_id)}"></label>
+<p><button type=button id=load>Load bot inventory</button></p>
+<label>Photo row (same X)<br><select id=row></select></label>
+<label>Row X tolerance (mm)<br><input id=rowtol type=number min=1 step=any value=50></label>
+<hr>
+<p class=muted>In FarmBot open Photos → Camera calibration and copy each value below.</p>
+<label>Pixel coordinate scale (mm/pixel)<br><input id=fb_scale type=number min=0 step=any value="{v_scale}"></label>
+<label>Measured at width (px)<br><input id=fb_refw type=number min=1 step=1 value="{v_refw}"></label>
+<label>Measured at height (px)<br><input id=fb_refh type=number min=1 step=1 value="{v_refh}"></label>
+<p id=ppm class=muted>Enter the FarmBot pixel coordinate scale, and measured-at width/height</p>
+<label>Camera rotation (degrees)<br><input id=rotation type=number step=any value="{v_rot}"></label>
+<label>Origin location in image<br><select id=origin>{_origin_options(v_origin)}</select></label>
+<label>Offset X (mm)<br><input id=offx type=number step=any value="{v_ox}"></label>
+<label>Offset Y (mm)<br><input id=offy type=number step=any value="{v_oy}"></label>
 <p class=muted>Leave offsets at 0 unless the overlay is shifted. FarmBot's camera offset is
 already folded into the image-centre coordinate, so entering it again would double-count.</p>
-<p><button type=button id=overlay>Overlay plant centres</button></p>
-<label><input type=checkbox id=confirm> Plant centres align in this image</label>
+<label><input type=checkbox id=showoverlay checked> Overlay plant &amp; weed centres</label><br>
+<label><input type=checkbox id=showlabels checked> Show labels (name / weed)</label>
+<p><label><input type=checkbox id=confirm> Centres align across the row</label></p>
 <p><button type=button id=save disabled>Save calibration</button></p>
 <p id=status class=muted></p>
 </div>
 <div>
-<canvas id=canvas width={resolution.width} height={resolution.height}
- style="width:100%;border:1px solid #ccc;cursor:crosshair;background:#111"></canvas>
+<canvas id=canvas width=640 height=200
+ style="width:100%;border:1px solid #ccc;background:#111"></canvas>
+<p class=muted>Green = known plants (name · crop). Red = FarmBot weeds. Adjust the
+values above and the composite updates live.</p>
 </div>
 </div>
 </section>
@@ -583,10 +738,21 @@ async def vision_images(entry_id: str) -> JSONResponse:
         if i.processed
     ]
     plants = [
-        {"id": p.id, "name": p.name, "x": p.x, "y": p.y, "radius": p.radius}
+        {
+            "id": p.id,
+            "name": p.name,
+            "slug": p.openfarm_slug,
+            "x": p.x,
+            "y": p.y,
+            "radius": p.radius,
+        }
         for p in inventory.plants
     ]
-    return JSONResponse({"images": images, "plants": plants})
+    weeds = [
+        {"id": w.id, "name": w.name, "x": w.x, "y": w.y, "radius": w.radius}
+        for w in inventory.weeds
+    ]
+    return JSONResponse({"images": images, "plants": plants, "weeds": weeds})
 
 
 @app.get("/api/vision/image/{image_id}.jpg")
@@ -616,80 +782,40 @@ async def vision_image(entry_id: str, image_id: int) -> Response:
 @app.post("/calibration")
 async def save_calibration(
     entry_id: str = Form(...),
-    method: str = Form("points"),
+    coordinate_scale: float = Form(...),
+    reference_width: int = Form(...),
+    reference_height: int = Form(...),
     rotation: float = Form(0),
     offset_x: float = Form(0),
     offset_y: float = Form(0),
     origin_location: str = Form("top_left"),
-    image_id: int | None = Form(None),
-    # Two-point method.
-    ax: float | None = Form(None),
-    ay: float | None = Form(None),
-    bx: float | None = Form(None),
-    by: float | None = Form(None),
-    distance_mm: float | None = Form(None),
-    # FarmBot calibration-values method.
-    coordinate_scale: float | None = Form(None),
-    reference_width: int | None = Form(None),
-    reference_height: int | None = Form(None),
 ) -> RedirectResponse:
-    resolution = settings.resolution
+    """Persist the FarmBot camera calibration for a bot.
+
+    The entered values are written to the durable /data store (the master record
+    that survives restarts) and the derived processed-resolution calibration is
+    made the active one in the database (the runtime source the analysis
+    pipeline reads).
+    """
     try:
         origin = OriginLocation(origin_location)
     except ValueError as exc:
         raise HTTPException(400, "invalid origin location") from exc
-
-    if method == "farmbot":
-        if coordinate_scale is None or reference_width is None or reference_height is None:
-            raise HTTPException(
-                400, "FarmBot calibration requires a scale and the resolution it was measured at"
-            )
-        try:
-            calibration = from_farmbot_calibration(
-                coordinate_scale_mm_per_px=coordinate_scale,
-                reference_width=reference_width,
-                reference_height=reference_height,
-                processed_width=resolution.width,
-                processed_height=resolution.height,
-                rotation_degrees=rotation,
-                offset_x_mm=offset_x,
-                offset_y_mm=offset_y,
-                origin_location=origin,
-                uncertainty_mm=settings.calibration_uncertainty_mm,
-                analysis_resolution=resolution.value,
-                image_id=image_id,
-            )
-        except ValueError as exc:
-            raise HTTPException(400, str(exc)) from exc
-        database.save_calibration(entry_id, calibration)
-        return RedirectResponse("settings", status_code=303)
-
-    # Default: interactive two-point method.
-    if None in (ax, ay, bx, by, distance_mm):
-        raise HTTPException(400, "two-point calibration requires both points and a separation")
-    scale = manual_scale((ax, ay), (bx, by), distance_mm)
-    database.save_calibration(
-        entry_id,
-        Calibration(
-            source="manual",
-            pixels_per_mm_x=scale,
-            pixels_per_mm_y=scale,
+    try:
+        values = FarmbotCalibrationInput(
+            coordinate_scale=coordinate_scale,
+            reference_width=reference_width,
+            reference_height=reference_height,
             rotation_degrees=rotation,
+            origin_location=origin,
             offset_x_mm=offset_x,
             offset_y_mm=offset_y,
-            origin_location=origin,
-            uncertainty_mm=settings.calibration_uncertainty_mm,
-            analysis_resolution=resolution.value,
-            image_id=image_id,
-            processed_width=resolution.width,
-            processed_height=resolution.height,
-            point_a_x=ax,
-            point_a_y=ay,
-            point_b_x=bx,
-            point_b_y=by,
-            separation_mm=distance_mm,
-        ),
-    )
+        )
+        calibration = _calibration_from_input(entry_id, values)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    calibration_store.save(entry_id, values)
+    database.save_calibration(entry_id, calibration)
     return RedirectResponse("settings", status_code=303)
 
 

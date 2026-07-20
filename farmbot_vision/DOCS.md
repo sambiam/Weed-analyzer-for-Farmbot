@@ -11,7 +11,7 @@ leading slashes at the ASGI boundary. Dashboard and calibration URLs are
 relative to the current `X-Ingress-Path`, so they remain inside temporary
 Ingress sessions. The app never logs the complete `X-Ingress-Path` value.
 
-The accepted `farmbot_vision_request` data is:
+Manual `farmbot_vision_request` data is:
 
 ```json
 {"config_entry_id":"string","device_id":"string","plant_ids":[],"mode":"recommend"}
@@ -22,9 +22,14 @@ empty list means all eligible plants. Unknown fields remain rejected. A single
 malformed JSON or invalid event is skipped in place; it does not reconnect the
 WebSocket, and subsequent valid events continue to be processed.
 
+For each newly processed FarmBot photo, integration 1.4.0 or newer emits a
+targeted request containing `image_id` and omitting `mode`. The app then uses
+its configured mode and analyses only that image. Requests wait behind a
+running job rather than being dropped.
+
 ## Before enabling it
 
-FarmBot Vision requires Home Assistant Core 2026.7 or newer and a companion FarmBot integration that provides the actions in `docs/integration-contract.md`. Start in **Observe** mode. Do not use early experimental output as the sole input to destructive weeding.
+FarmBot Vision requires Home Assistant Core 2026.7 or newer and companion FarmBot integration 1.4.0 or newer. Start in **Observe** mode. Do not use early experimental output as the sole input to destructive weeding.
 
 ## Modes
 
@@ -51,35 +56,45 @@ preference order: (1) `processed_calibration` returned with the image;
 dimensions; (3) a compatible manual calibration; (4) none. A native-resolution
 scale is never applied directly to a resized frame.
 
-If no integration calibration is available, open **Calibration**, pick a recent
-FarmBot image (shown at the configured resolution) and use either method:
+If no integration calibration is available, open **Calibration** and copy
+FarmBot's own camera calibration (Photos → Camera calibration):
 
-- **Measure two points:** click point A and point B on two features a known
-  distance apart and enter that separation.
-- **FarmBot calibration values:** copy FarmBot's own camera calibration
-  (**Pixel coordinate scale** in mm/pixel, the resolution it was measured at,
-  **Camera rotation**, and **Origin location in image**). FarmBot's scale is
-  stated for its native frame, so it is inverted to pixels-per-millimetre and
-  rescaled to the analysis resolution exactly as reference calibration is — a
-  native scale is never applied directly to a resized frame, so the numbers can
-  be copied verbatim.
+- **Pixel coordinate scale** (mm/pixel) and the **resolution it was measured
+  at** (its native frame, e.g. 2592 × 1944). FarmBot's scale is stated for that
+  native frame, so it is inverted to pixels-per-millimetre and rescaled to the
+  analysis resolution exactly as reference calibration is — a native scale is
+  never applied directly to a resized frame, so the numbers can be copied
+  verbatim.
+- **Camera rotation** and **Origin location in image**, plus any residual
+  offset correction.
 
-Both methods then set rotation, origin location and any offset correction,
-overlay the known plant centres, and require confirmation that several align
-before saving. **Origin location** encodes the garden↔pixel axis reflection
-(`top_left` is the identity and default), letting a rotated or mirrored camera
-mount map correctly — something rotation alone cannot express. FarmBot's camera
-offset is already folded into the image-centre coordinate, so the offset fields
-default to 0 and should only be used to correct a residual shift seen in the
-overlay. No external tools are needed. Manual calibration records the config
-entry, image, processed resolution, pixel points, separation and version; when
-the resolution changes it is only reused if the scaling relationship is fully
-known (and then a transformed calibration is recorded), otherwise recalibration
-is required. Automatic writes and approvals are refused without valid
-calibration.
+**Verify against a whole photo row.** Click *Load bot inventory*, then pick a
+**photo row** — the images FarmBot captured at the same X coordinate. The app
+stitches that row into a single composite in coordinate space (each photo
+rotated and placed exactly as FarmBot's own map does), and overlays every known
+plant centre (green, labelled with the plant name and crop) and every FarmBot
+weed point (red). The composite updates live as you edit the values, so you can
+confirm the circles sit on their plants and weeds across the whole row before
+saving. Only one row is loaded at a time to keep memory bounded. Use the *Row X
+tolerance* to control how close two X coordinates must be to count as one row.
+
+**Origin location** encodes the garden↔pixel axis reflection (`top_left` is the
+identity and default), letting a rotated or mirrored camera mount map correctly
+— something rotation alone cannot express. FarmBot's camera offset is already
+folded into the image-centre coordinate, so the offset fields default to 0 and
+should only be used to correct a residual shift seen in the overlay.
+
+**Persistence.** Saved calibration values are written to the app's persistent
+`/data` volume and restored automatically after a restart — you never re-enter
+them — and remain editable in the app at any time. The derived
+processed-resolution calibration becomes the active one used by analysis.
+Automatic writes and approvals are refused without valid calibration.
 
 The transformation assumes image metadata `x,y` is the image's ground centre.
-Rotation is applied in the image plane; offsets are in millimetres. Every
+`garden_to_pixel` inverts FarmBot's own pixel↔coordinate model: the metric
+offset from the image centre is scaled and reflected by the origin, then rotated
+in pixel space about the image centre (mirroring FarmBot physically rotating
+each photo to align it to the garden axes). Offsets are in millimetres. Every
 observation retains the exact transform, resolution, resize scales, calibration
 source and version used.
 
@@ -96,7 +111,7 @@ The classical pipeline combines HSV and Excess Green, morphology, components, kn
 
 ## Scheduling and resources
 
-Manual and integration-event runs are always available. Daily scheduling is disabled by default and does not run until a FarmBot and calibration exist. Only one job and one image run at a time. OpenCV and common numerical thread pools are limited to one thread. Jobs pause when CPU or free-memory gates fail.
+Automatic new-photo, manual, and integration-event runs are available. Daily scheduling is disabled by default and does not run until a FarmBot and calibration exist. Only one job and one image run at a time. OpenCV and common numerical thread pools are limited to one thread. Jobs pause when CPU or free-memory gates fail.
 
 The design targets under 200 MB idle and under 600 MB peak RSS on a Pi 4 at the
 default 960 × 720. Image arrays are released after each image, masks are stored
