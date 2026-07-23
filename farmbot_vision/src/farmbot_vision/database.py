@@ -494,7 +494,9 @@ class Database:
         ).fetchone()
         return None if row is None else dict(row)
 
-    def update_curve_proposal(self, proposal_id: int, status: str, data: dict | None = None) -> None:
+    def update_curve_proposal(
+        self, proposal_id: int, status: str, data: dict | None = None
+    ) -> None:
         with self.connection:
             if data is None:
                 self.connection.execute(

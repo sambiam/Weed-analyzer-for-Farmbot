@@ -44,7 +44,10 @@ def decide(
             )
         if mode == OperatingMode.OBSERVE:
             return measurement.model_copy(
-                update={"decision": Decision.OBSERVED, "reason": "observe mode does not remove plants"}
+                update={
+                    "decision": Decision.OBSERVED,
+                    "reason": "observe mode does not remove plants",
+                }
             )
         automatic = mode == OperatingMode.AUTO_RADIUS and settings.removal_auto_apply
         return measurement.model_copy(

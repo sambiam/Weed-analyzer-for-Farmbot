@@ -640,7 +640,7 @@ async def dashboard(request: Request) -> HTMLResponse:
             f'<button class=review-action data-url="recommendations/{r["measurement_id"]}/approve">Approve</button></form>'
             f'<form method=post action="recommendations/{r["measurement_id"]}/reject">'
             f'<button class=review-action data-url="recommendations/{r["measurement_id"]}/reject">Reject</button></form>'
-            '<small class=action-message></small>'
+            "<small class=action-message></small>"
         )
 
     measurement_rows = "".join(
@@ -668,7 +668,7 @@ async def dashboard(request: Request) -> HTMLResponse:
         f'data-url="removals/{r["measurement_id"]}/approve">Approve removal</button></form>'
         f'<form method=post action="removals/{r["measurement_id"]}/keep"><button class=review-action '
         f'data-url="removals/{r["measurement_id"]}/keep">Keep plant</button></form>'
-        '<small class=action-message></small></td></tr>'
+        "<small class=action-message></small></td></tr>"
         for r in rows
         if r["decision"] == "removal_recommended"
     )
@@ -698,13 +698,13 @@ async def dashboard(request: Request) -> HTMLResponse:
             f"day {escape(str(proposal['conflict_day']))} = {escape(str(proposal['conflict_old_diameter']))}</td>"
             f"<td>{diagnostic}</td><td>"
             f'<form id="curve-apply-{proposal["id"]}" method=post action="curve-proposals/{proposal["id"]}/apply">'
-            '<input type=hidden name=confirm_override value=true>'
+            "<input type=hidden name=confirm_override value=true>"
             f'<button class=curve-action data-action=apply data-url="curve-proposals/{proposal["id"]}/apply">Use value</button></form>'
             f'<form method=post action="curve-proposals/{proposal["id"]}/discard-new"><button class=curve-action '
             f'data-action=discard-new data-url="curve-proposals/{proposal["id"]}/discard-new">Discard new</button></form>'
             f'<form method=post action="curve-proposals/{proposal["id"]}/discard-old"><button class=curve-action '
             f'data-action=discard-old data-url="curve-proposals/{proposal["id"]}/discard-old">Discard old</button></form>'
-            '<small class=action-message></small></td></tr>'
+            "<small class=action-message></small></td></tr>"
         )
     flagged_curve_rows = "".join(proposal_rows)
     decision_rows = "".join(
@@ -1032,13 +1032,19 @@ async def recommendation(request: Request, measurement_id: str, action: str) -> 
     if row is None:
         raise HTTPException(404)
     if database.has_terminal_decision(measurement_id):
-        return _action_response(request, "conflict", "This recommendation was already reviewed", error_status=409)
+        return _action_response(
+            request, "conflict", "This recommendation was already reviewed", error_status=409
+        )
     if row["decision"] != "recommended":
-        return _action_response(request, "conflict", "Only recommended radius changes can be reviewed", error_status=409)
+        return _action_response(
+            request, "conflict", "Only recommended radius changes can be reviewed", error_status=409
+        )
     if action == "approve":
         # Approval is impossible without a valid calibration (Part 6, Part 10).
         if not row.get("calibrated", 1):
-            return _action_response(request, "conflict", "Calibration is required", error_status=409)
+            return _action_response(
+                request, "conflict", "Calibration is required", error_status=409
+            )
         if row["recommended_protection_radius_mm"] <= row["current_radius_mm"]:
             return _action_response(request, "conflict", "Shrinking is disabled", error_status=409)
         entry_id = row.get("config_entry_id") or settings.selected_config_entry_id
@@ -1062,7 +1068,12 @@ async def recommendation(request: Request, measurement_id: str, action: str) -> 
                     image_lookback_hours=settings.image_lookback_hours,
                 )
             )
-            return _action_response(request, "conflict", "The plant radius changed; inventory refreshed", error_status=409)
+            return _action_response(
+                request,
+                "conflict",
+                "The plant radius changed; inventory refreshed",
+                error_status=409,
+            )
         status = str(result.get("status", "error"))
         message = str(result.get("message") or status)
         if status != "applied":
@@ -1095,9 +1106,7 @@ async def recommendation(request: Request, measurement_id: str, action: str) -> 
                 curve_result = await jobs._update_curve_after_radius(
                     entry_id, inventory, approved_measurement, human_approved=True
                 )
-                curve_message = str(
-                    curve_result.get("message") or curve_result.get("status", "")
-                )
+                curve_message = str(curve_result.get("message") or curve_result.get("status", ""))
             except HomeAssistantError as exc:
                 LOGGER.warning("Radius applied but curve inventory/update failed: %s", exc)
                 curve_message = "deferred because inventory was unavailable"
@@ -1118,9 +1127,13 @@ async def removal(request: Request, measurement_id: str, action: str) -> Respons
     if row is None:
         raise HTTPException(404)
     if database.has_terminal_decision(measurement_id):
-        return _action_response(request, "conflict", "This removal was already reviewed", error_status=409)
+        return _action_response(
+            request, "conflict", "This removal was already reviewed", error_status=409
+        )
     if row["decision"] != "removal_recommended":
-        return _action_response(request, "conflict", "Removal is not currently recommended", error_status=409)
+        return _action_response(
+            request, "conflict", "Removal is not currently recommended", error_status=409
+        )
     entry_id = row.get("config_entry_id") or settings.selected_config_entry_id
     if not database.is_latest_plant_measurement(entry_id, row["plant_id"], measurement_id):
         return _action_response(
@@ -1145,7 +1158,9 @@ async def removal(request: Request, measurement_id: str, action: str) -> Respons
             )
         )
     except StaleRadiusError:
-        return _action_response(request, "conflict", "The plant changed; removal was not applied", error_status=409)
+        return _action_response(
+            request, "conflict", "The plant changed; removal was not applied", error_status=409
+        )
     status = str(result.get("status", "error"))
     message = str(result.get("message") or status)
     if status != "applied":
@@ -1169,7 +1184,9 @@ async def curve_proposal_action(
     if proposal is None:
         raise HTTPException(404)
     if proposal["status"] != "flagged":
-        return _action_response(request, "conflict", "This proposal was already reviewed", error_status=409)
+        return _action_response(
+            request, "conflict", "This proposal was already reviewed", error_status=409
+        )
     if action == "discard-new":
         database.update_curve_proposal(proposal_id, "rejected")
         return _action_response(request, "rejected", "New curve value discarded")
@@ -1202,8 +1219,10 @@ async def curve_proposal_action(
         )
     )
     plant = next((item for item in inventory.plants if item.id == proposal["plant_id"]), None)
-    assigned = None if plant is None else next(
-        (item for item in inventory.curves if item.id == plant.spread_curve_id), None
+    assigned = (
+        None
+        if plant is None
+        else next((item for item in inventory.curves if item.id == plant.spread_curve_id), None)
     )
     if plant is None or assigned is None or assigned.data != previous:
         return _action_response(
@@ -1212,7 +1231,9 @@ async def curve_proposal_action(
             "The plant's assigned curve changed after this proposal was created",
             error_status=409,
         )
-    curve_data = {control_day: float(round(diameter)) for control_day, diameter in edit.data.items()}
+    curve_data = {
+        control_day: float(round(diameter)) for control_day, diameter in edit.data.items()
+    }
     result = await client.upsert_curve(
         UpsertCurveRequest(
             config_entry_id=entry_id,

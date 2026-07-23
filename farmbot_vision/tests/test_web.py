@@ -139,7 +139,9 @@ async def test_approval_json_reports_rejection_without_recording_a_false_success
     }
     assert calls[0].human_approved is True
     decisions = [
-        row for row in web.database.recent_decisions() if row["measurement_id"] == str(measurement.measurement_id)
+        row
+        for row in web.database.recent_decisions()
+        if row["measurement_id"] == str(measurement.measurement_id)
     ]
     assert decisions == []
 
@@ -162,7 +164,8 @@ async def test_approval_json_records_applied_and_html_post_still_redirects(monke
     assert status == 200
     assert json.loads(body)["status"] == "applied"
     decisions = [
-        row for row in web.database.recent_decisions()
+        row
+        for row in web.database.recent_decisions()
         if row["measurement_id"] == str(json_measurement.measurement_id)
     ]
     assert [row["action"] for row in decisions] == ["applied"]

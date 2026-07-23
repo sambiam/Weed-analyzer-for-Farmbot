@@ -280,7 +280,9 @@ async def test_new_photo_job_processes_only_the_target_image(tmp_path, monkeypat
 
 
 @pytest.mark.asyncio
-async def test_calibrated_job_persists_overlay_vegetation_and_ownership_artifacts(tmp_path, monkeypatch):
+async def test_calibrated_job_persists_overlay_vegetation_and_ownership_artifacts(
+    tmp_path, monkeypatch
+):
     import numpy as np
     from conftest import vision_image_dict
 

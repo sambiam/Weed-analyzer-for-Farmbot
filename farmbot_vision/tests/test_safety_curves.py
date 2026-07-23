@@ -65,19 +65,21 @@ def test_absence_requires_enabled_detection_prior_canopy_and_streak():
     )
     confirmed = absent.model_copy(update={"absent_observations": 2})
     assert (
-        decide(confirmed, OperatingMode.RECOMMEND, enabled, previously_observed_canopy=False).decision
+        decide(
+            confirmed, OperatingMode.RECOMMEND, enabled, previously_observed_canopy=False
+        ).decision
         == Decision.OBSERVED
     )
     assert (
-        decide(confirmed, OperatingMode.RECOMMEND, enabled, previously_observed_canopy=True).decision
+        decide(
+            confirmed, OperatingMode.RECOMMEND, enabled, previously_observed_canopy=True
+        ).decision
         == Decision.REMOVAL_RECOMMENDED
     )
 
 
 def test_confirmed_absence_auto_archives_only_when_enabled():
-    absent = measurement().model_copy(
-        update={"vegetation_absent": True, "absent_observations": 2}
-    )
+    absent = measurement().model_copy(update={"vegetation_absent": True, "absent_observations": 2})
     manual = Settings(removal_detection_enabled=True, removal_min_consecutive_absent=2)
     automatic = Settings(
         removal_detection_enabled=True,
@@ -90,7 +92,9 @@ def test_confirmed_absence_auto_archives_only_when_enabled():
         == Decision.REMOVAL_RECOMMENDED
     )
     assert (
-        decide(absent, OperatingMode.AUTO_RADIUS, automatic, previously_observed_canopy=True).decision
+        decide(
+            absent, OperatingMode.AUTO_RADIUS, automatic, previously_observed_canopy=True
+        ).decision
         == Decision.REMOVED
     )
 

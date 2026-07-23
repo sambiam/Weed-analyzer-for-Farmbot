@@ -65,9 +65,7 @@ class JobManager:
         plant = next((item for item in inventory.plants if item.id == measurement.plant_id), None)
         if plant is None or plant.spread_curve_id is None or measurement.plant_age_days is None:
             return {"status": "skipped", "message": "plant has no editable spread curve or age"}
-        curve = next(
-            (item for item in inventory.curves if item.id == plant.spread_curve_id), None
-        )
+        curve = next((item for item in inventory.curves if item.id == plant.spread_curve_id), None)
         if curve is None:
             return {"status": "skipped", "message": "assigned spread curve was not found"}
         edit = propose_curve_point(
@@ -80,9 +78,7 @@ class JobManager:
         users = [item for item in inventory.plants if item.spread_curve_id == curve.id]
         may_patch = curve.name.startswith("[FarmBot Vision]") and len(users) == 1
         target_curve_id = curve.id if may_patch else None
-        target_name = (
-            curve.name if may_patch else f"[FarmBot Vision] {plant.name} spread"
-        )
+        target_name = curve.name if may_patch else f"[FarmBot Vision] {plant.name} spread"
         if edit.verdict == "flagged":
             proposal_id = self.db.create_curve_proposal(
                 config_entry_id=entry_id,
@@ -423,7 +419,9 @@ class JobManager:
                                 )
                                 self.db.record_decision(
                                     str(item.measurement_id),
-                                    "removed" if removal_status == "applied" else "removal_rejected",
+                                    "removed"
+                                    if removal_status == "applied"
+                                    else "removal_rejected",
                                     removal_result,
                                 )
                             except StaleRadiusError:
@@ -469,7 +467,9 @@ class JobManager:
                             )
                             updated = item.model_copy(
                                 update={
-                                    "decision": Decision.APPLIED if radius_applied else fallback_decision,
+                                    "decision": Decision.APPLIED
+                                    if radius_applied
+                                    else fallback_decision,
                                     "applied": radius_applied,
                                 }
                             )

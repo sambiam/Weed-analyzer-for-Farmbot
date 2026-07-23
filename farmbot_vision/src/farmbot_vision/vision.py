@@ -355,7 +355,9 @@ class ClassicalVisionEngine(ImageAnalysisEngine):
         # pixels remain an unmistakable red warning.
         _tint_pixels(overlay, mask > 0, (40, 220, 40), 0.35)
         for index in valid_indices:
-            _tint_pixels(overlay, ownership == index + 1, _PLANT_COLORS[index % len(_PLANT_COLORS)], 0.5)
+            _tint_pixels(
+                overlay, ownership == index + 1, _PLANT_COLORS[index % len(_PLANT_COLORS)], 0.5
+            )
         _tint_pixels(overlay, ambiguous, (0, 0, 255), 0.75)
 
         measurements: list[Measurement] = []
