@@ -15,6 +15,7 @@ from pydantic import BaseModel, ValidationError
 
 from .models import (
     ApplyRadiusRequest,
+    ApplyRemovalRequest,
     BotList,
     Inventory,
     InventoryRequest,
@@ -252,6 +253,9 @@ class HomeAssistantClient:
 
     async def apply_radius(self, request: ApplyRadiusRequest) -> dict[str, Any]:
         return await self._service("apply_vision_radius", request)  # type: ignore[return-value]
+
+    async def apply_removal(self, request: ApplyRemovalRequest) -> dict[str, Any]:
+        return await self._service("apply_vision_removal", request)  # type: ignore[return-value]
 
     async def upsert_curve(self, request: UpsertCurveRequest) -> dict[str, Any]:
         return await self._service("upsert_vision_spread_curve", request)  # type: ignore[return-value]

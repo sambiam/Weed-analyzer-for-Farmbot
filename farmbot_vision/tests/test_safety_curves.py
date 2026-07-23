@@ -46,6 +46,55 @@ def test_auto_radius_requires_confidence():
     assert result.decision == Decision.UNCERTAIN
 
 
+def test_absence_requires_enabled_detection_prior_canopy_and_streak():
+    absent = measurement()
+    absent = absent.model_copy(
+        update={
+            "vegetation_absent": True,
+            "absent_observations": 1,
+            "recommended_protection_radius_mm": 0,
+            "maximum_accepted_canopy_radius_mm": 0,
+        }
+    )
+    enabled = Settings(removal_detection_enabled=True, removal_min_consecutive_absent=2)
+
+    assert decide(absent, OperatingMode.RECOMMEND, Settings()).decision == Decision.OBSERVED
+    assert (
+        decide(absent, OperatingMode.RECOMMEND, enabled, previously_observed_canopy=True).decision
+        == Decision.OBSERVED
+    )
+    confirmed = absent.model_copy(update={"absent_observations": 2})
+    assert (
+        decide(confirmed, OperatingMode.RECOMMEND, enabled, previously_observed_canopy=False).decision
+        == Decision.OBSERVED
+    )
+    assert (
+        decide(confirmed, OperatingMode.RECOMMEND, enabled, previously_observed_canopy=True).decision
+        == Decision.REMOVAL_RECOMMENDED
+    )
+
+
+def test_confirmed_absence_auto_archives_only_when_enabled():
+    absent = measurement().model_copy(
+        update={"vegetation_absent": True, "absent_observations": 2}
+    )
+    manual = Settings(removal_detection_enabled=True, removal_min_consecutive_absent=2)
+    automatic = Settings(
+        removal_detection_enabled=True,
+        removal_min_consecutive_absent=2,
+        removal_auto_apply=True,
+    )
+
+    assert (
+        decide(absent, OperatingMode.AUTO_RADIUS, manual, previously_observed_canopy=True).decision
+        == Decision.REMOVAL_RECOMMENDED
+    )
+    assert (
+        decide(absent, OperatingMode.AUTO_RADIUS, automatic, previously_observed_canopy=True).decision
+        == Decision.REMOVED
+    )
+
+
 def test_monotonic_curve_fitting():
     curve = fit_monotonic_curve([(1, 20), (4, 18), (7, 30), (10, 28)])
     values = list(curve.values())

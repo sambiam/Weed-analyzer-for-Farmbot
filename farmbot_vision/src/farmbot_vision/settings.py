@@ -23,8 +23,12 @@ class Settings(BaseModel):
     calibration_uncertainty_mm: float = Field(default=10, ge=0)
     minimum_auto_confidence: float = Field(default=0.90, ge=0, le=1)
     maximum_daily_radius_growth_mm: float = Field(default=50, gt=0)
+    maximum_plant_radius_mm: float = Field(default=500, gt=0)
     maximum_single_update_percent: float = Field(default=40, gt=0)
     minimum_observations_for_curve: int = Field(default=5, ge=2)
+    removal_detection_enabled: bool = False
+    removal_auto_apply: bool = False
+    removal_min_consecutive_absent: int = Field(default=2, ge=1)
     maximum_system_load_percent: int = Field(default=80, ge=20, le=100)
     minimum_free_memory_mb: int = Field(default=512, ge=128)
     diagnostic_retention_days: int = Field(default=14, ge=0)

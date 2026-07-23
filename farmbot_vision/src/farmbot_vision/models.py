@@ -302,6 +302,17 @@ class ApplyRadiusRequest(StrictModel):
     recommended_radius_mm: float = Field(ge=0)
     confidence: float = Field(ge=0, le=1)
     apply: bool = False
+    human_approved: bool = False
+
+
+class ApplyRemovalRequest(StrictModel):
+    config_entry_id: str
+    plant_id: int
+    measurement_id: UUID
+    expected_current_radius_mm: float = Field(ge=0)
+    confidence: float = Field(ge=0, le=1)
+    apply: bool = False
+    human_approved: bool = False
 
 
 class UpsertCurveRequest(StrictModel):
@@ -312,6 +323,7 @@ class UpsertCurveRequest(StrictModel):
     data: dict[str, float]
     assign_to_plant_ids: list[int]
     apply: bool = False
+    human_approved: bool = False
 
     @model_validator(mode="after")
     def vision_owned_name(self) -> UpsertCurveRequest:
@@ -364,6 +376,8 @@ class Decision(StrEnum):
     RETAIN = "retain"
     UNCERTAIN = "uncertain"
     SKIPPED = "skipped"
+    REMOVED = "removed"
+    REMOVAL_RECOMMENDED = "removal_recommended"
 
 
 class OriginLocation(StrEnum):
@@ -454,6 +468,7 @@ class PlantSeed(StrictModel):
 
 class Measurement(StrictModel):
     measurement_id: UUID
+    config_entry_id: str | None = None
     plant_id: int
     crop_slug: str
     image_id: int
@@ -473,6 +488,11 @@ class Measurement(StrictModel):
     plant_age_days: int | None = None
     mask_path: str | None = None
     overlay_path: str | None = None
+    artifact_paths: list[str] = Field(default_factory=list)
+    vegetation_absent: bool = False
+    absent_observations: int = Field(default=0, ge=0)
+    safety_margin_mm: float = Field(default=0, ge=0)
+    calibration_uncertainty_mm: float = Field(default=0, ge=0)
     # Resolution / calibration provenance (contract v2).
     analysis_resolution: str | None = None
     processed_width: int | None = None
@@ -485,5 +505,6 @@ class Measurement(StrictModel):
 class AnalysisResult(StrictModel):
     measurements: list[Measurement]
     mask: bytes | None = None
+    ownership_mask: bytes | None = None
     overlay_jpeg: bytes | None = None
     skipped: dict[int, str] = Field(default_factory=dict)

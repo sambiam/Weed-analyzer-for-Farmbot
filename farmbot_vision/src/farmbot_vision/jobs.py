@@ -19,15 +19,18 @@ except ImportError:  # pragma: no cover - Windows development hosts
 
 from . import CONTRACT_VERSION, __version__
 from .calibration import resolve_calibration
+from .curve_edit import propose_curve_point, radius_mm_to_diameter_mm
 from .curves import fit_monotonic_curve
 from .database import Database
 from .home_assistant import HomeAssistantClient, HomeAssistantError, StaleRadiusError
 from .models import (
     ApplyRadiusRequest,
+    ApplyRemovalRequest,
     Decision,
     InventoryRequest,
     OperatingMode,
     PlantSeed,
+    UpsertCurveRequest,
     VisionImageRequest,
     VisionStatus,
 )
@@ -55,6 +58,79 @@ class JobManager:
         if cpu > self.settings.maximum_system_load_percent:
             return False, f"system CPU load above {self.settings.maximum_system_load_percent}%"
         return True, "resources available"
+
+    async def _update_curve_after_radius(
+        self, entry_id: str, inventory, measurement, *, human_approved: bool
+    ) -> dict:
+        plant = next((item for item in inventory.plants if item.id == measurement.plant_id), None)
+        if plant is None or plant.spread_curve_id is None or measurement.plant_age_days is None:
+            return {"status": "skipped", "message": "plant has no editable spread curve or age"}
+        curve = next(
+            (item for item in inventory.curves if item.id == plant.spread_curve_id), None
+        )
+        if curve is None:
+            return {"status": "skipped", "message": "assigned spread curve was not found"}
+        edit = propose_curve_point(
+            curve.data,
+            measurement.plant_age_days,
+            radius_mm_to_diameter_mm(measurement.recommended_protection_radius_mm),
+            max_daily_growth_mm=self.settings.maximum_daily_radius_growth_mm,
+            maximum_plant_radius_mm=self.settings.maximum_plant_radius_mm,
+        )
+        users = [item for item in inventory.plants if item.spread_curve_id == curve.id]
+        may_patch = curve.name.startswith("[FarmBot Vision]") and len(users) == 1
+        target_curve_id = curve.id if may_patch else None
+        target_name = (
+            curve.name if may_patch else f"[FarmBot Vision] {plant.name} spread"
+        )
+        if edit.verdict == "flagged":
+            proposal_id = self.db.create_curve_proposal(
+                config_entry_id=entry_id,
+                plant_id=plant.id,
+                measurement_id=str(measurement.measurement_id),
+                crop_slug=measurement.crop_slug,
+                plant_age_days=measurement.plant_age_days,
+                curve_id=target_curve_id,
+                curve_name=target_name,
+                previous_data=curve.data,
+                data=edit.data,
+                reason=edit.reason or "curve edit needs review",
+                conflict_day=edit.conflict_day,
+                conflict_old_diameter=edit.conflict_old_diameter,
+                overlay_path=measurement.overlay_path,
+                warning="; ".join(edit.warnings) or None,
+            )
+            result = {
+                "status": "flagged",
+                "message": edit.reason or "curve edit needs review",
+                "proposal_id": proposal_id,
+            }
+            self.db.record_decision(str(measurement.measurement_id), "curve_flagged", result)
+            return result
+        # The companion contract uses integer millimetres. Round deliberately
+        # instead of relying on its schema coercion to truncate float values.
+        curve_data = {day: float(round(value)) for day, value in edit.data.items()}
+        try:
+            result = await self.client.upsert_curve(
+                UpsertCurveRequest(
+                    config_entry_id=entry_id,
+                    crop_slug=measurement.crop_slug,
+                    curve_id=target_curve_id,
+                    name=target_name,
+                    data=curve_data,
+                    assign_to_plant_ids=[plant.id],
+                    apply=True,
+                    human_approved=human_approved,
+                )
+            )
+        except HomeAssistantError as exc:
+            result = {"status": "rejected", "message": str(exc)}
+        self.db.record_decision(
+            str(measurement.measurement_id),
+            "curve_applied" if result.get("status") == "applied" else "curve_rejected",
+            result,
+        )
+        return result
 
     async def run(
         self,
@@ -243,13 +319,44 @@ class JobManager:
                     timeout=60,
                 )
                 del image_bytes, previous_masks
-                decided = [decide(item, mode, self.settings) for item in result.measurements]
+                decided = []
+                for item in result.measurements:
+                    if item.vegetation_absent and not self.settings.removal_detection_enabled:
+                        result.skipped[item.plant_id] = "removal detection is disabled"
+                        continue
+                    if item.vegetation_absent:
+                        item = item.model_copy(
+                            update={
+                                "config_entry_id": entry_id,
+                                "absent_observations": self.db.absent_streak(
+                                    entry_id,
+                                    item.plant_id,
+                                    current_image_id=item.image_id,
+                                    current_image_timestamp=item.image_timestamp,
+                                ),
+                            }
+                        )
+                    else:
+                        item = item.model_copy(update={"config_entry_id": entry_id})
+                    decided.append(
+                        decide(
+                            item,
+                            mode,
+                            self.settings,
+                            previously_observed_canopy=self.db.has_present_measurement(
+                                entry_id, item.plant_id
+                            ),
+                        )
+                    )
                 if result.overlay_jpeg:
                     overlay_path.write_bytes(result.overlay_jpeg)
-                ownership = None
+                vegetation_path = artifacts / f"{job_id}-{response.image_id}-mask.png"
                 if result.mask:
+                    vegetation_path.write_bytes(result.mask)
+                ownership = None
+                if result.ownership_mask:
                     ownership = cv2.imdecode(
-                        np.frombuffer(result.mask, dtype=np.uint8), cv2.IMREAD_UNCHANGED
+                        np.frombuffer(result.ownership_mask, dtype=np.uint8), cv2.IMREAD_UNCHANGED
                     )
                 labelled = {seed.plant_id: index + 1 for index, seed in enumerate(seeds)}
                 persisted = []
@@ -262,28 +369,87 @@ class JobManager:
                             str(mask_path),
                             (ownership == labelled[item.plant_id]).astype(np.uint8) * 255,
                         )
+                    artifact_paths = [str(overlay_path)] if result.overlay_jpeg else []
+                    if result.mask:
+                        artifact_paths.append(str(vegetation_path))
+                    if ownership is not None:
+                        artifact_paths.append(str(mask_path))
                     persisted.append(
                         item.model_copy(
                             update={
                                 "overlay_path": str(overlay_path),
                                 "mask_path": str(mask_path) if ownership is not None else None,
+                                "artifact_paths": artifact_paths,
                             }
                         )
                     )
                 decided = persisted
                 self.db.save_measurements(decided)
-                all_measurements.extend(decided)
                 skip_reasons = self.current.setdefault("skip_reasons", {})
                 for plant_id, reason in result.skipped.items():
                     skip_reasons[str(plant_id)] = reason
                 del result
                 if mode == OperatingMode.AUTO_RADIUS:
-                    for item in decided:
+                    for item_index, item in enumerate(decided):
+                        if item.decision == Decision.REMOVED:
+                            try:
+                                removal_result = await self.client.apply_removal(
+                                    ApplyRemovalRequest(
+                                        config_entry_id=entry_id,
+                                        plant_id=item.plant_id,
+                                        measurement_id=item.measurement_id,
+                                        expected_current_radius_mm=item.current_radius_mm,
+                                        confidence=item.confidence,
+                                        apply=True,
+                                    )
+                                )
+                                removal_status = str(removal_result.get("status", "error"))
+                                removal_applied = removal_status == "applied"
+                                updated = item.model_copy(
+                                    update={
+                                        "decision": (
+                                            Decision.REMOVED
+                                            if removal_applied
+                                            else Decision.REMOVAL_RECOMMENDED
+                                        ),
+                                        "applied": removal_applied,
+                                    }
+                                )
+                                decided[item_index] = updated
+                                self.db.update_measurement_outcome(
+                                    str(item.measurement_id),
+                                    decision=updated.decision.value,
+                                    applied=updated.applied,
+                                )
+                                self.db.record_decision(
+                                    str(item.measurement_id),
+                                    "removed" if removal_status == "applied" else "removal_rejected",
+                                    removal_result,
+                                )
+                            except StaleRadiusError:
+                                decided[item_index] = item.model_copy(
+                                    update={"decision": Decision.REMOVAL_RECOMMENDED}
+                                )
+                                self.db.update_measurement_outcome(
+                                    str(item.measurement_id),
+                                    decision=Decision.REMOVAL_RECOMMENDED.value,
+                                    applied=False,
+                                )
+                                self.db.record_decision(
+                                    str(item.measurement_id), "removal_conflict", {}
+                                )
+                                await self.client.inventory(
+                                    InventoryRequest(
+                                        config_entry_id=entry_id,
+                                        image_lookback_hours=self.settings.image_lookback_hours,
+                                    )
+                                )
+                            continue
                         # Never write without a valid calibration (Part 6).
                         if item.decision != Decision.APPLIED or not item.calibrated:
                             continue
                         try:
-                            await self.client.apply_radius(
+                            apply_result = await self.client.apply_radius(
                                 ApplyRadiusRequest(
                                     config_entry_id=entry_id,
                                     plant_id=item.plant_id,
@@ -294,8 +460,50 @@ class JobManager:
                                     apply=True,
                                 )
                             )
-                            self.db.record_decision(str(item.measurement_id), "applied", {})
+                            apply_status = str(apply_result.get("status", "error"))
+                            radius_applied = apply_status == "applied"
+                            fallback_decision = (
+                                Decision.UNCERTAIN
+                                if apply_status == "conflict"
+                                else Decision.RECOMMENDED
+                            )
+                            updated = item.model_copy(
+                                update={
+                                    "decision": Decision.APPLIED if radius_applied else fallback_decision,
+                                    "applied": radius_applied,
+                                }
+                            )
+                            decided[item_index] = updated
+                            self.db.update_measurement_outcome(
+                                str(item.measurement_id),
+                                decision=updated.decision.value,
+                                applied=updated.applied,
+                            )
+                            self.db.record_decision(
+                                str(item.measurement_id),
+                                "applied" if apply_status == "applied" else "apply_rejected",
+                                apply_result,
+                            )
+                            if radius_applied:
+                                await self._update_curve_after_radius(
+                                    entry_id, inventory, updated, human_approved=False
+                                )
+                            elif apply_status == "conflict":
+                                await self.client.inventory(
+                                    InventoryRequest(
+                                        config_entry_id=entry_id,
+                                        image_lookback_hours=self.settings.image_lookback_hours,
+                                    )
+                                )
                         except StaleRadiusError:
+                            decided[item_index] = item.model_copy(
+                                update={"decision": Decision.UNCERTAIN}
+                            )
+                            self.db.update_measurement_outcome(
+                                str(item.measurement_id),
+                                decision=Decision.UNCERTAIN.value,
+                                applied=False,
+                            )
                             self.db.record_decision(str(item.measurement_id), "stale_radius", {})
                             await self.client.inventory(
                                 InventoryRequest(
@@ -303,6 +511,7 @@ class JobManager:
                                     image_lookback_hours=self.settings.image_lookback_hours,
                                 )
                             )
+                all_measurements.extend(decided)
             return await self._finish(
                 entry_id, job_id, "idle", start_wall, start_cpu, all_measurements, "completed"
             )

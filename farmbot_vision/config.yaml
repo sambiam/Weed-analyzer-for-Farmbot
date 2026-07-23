@@ -34,8 +34,12 @@ options:
   calibration_uncertainty_mm: 10.0
   minimum_auto_confidence: 0.90
   maximum_daily_radius_growth_mm: 50.0
+  maximum_plant_radius_mm: 500.0
   maximum_single_update_percent: 40.0
   minimum_observations_for_curve: 5
+  removal_detection_enabled: false
+  removal_auto_apply: false
+  removal_min_consecutive_absent: 2
   maximum_system_load_percent: 80
   minimum_free_memory_mb: 512
   diagnostic_retention_days: 14
@@ -53,8 +57,12 @@ schema:
   calibration_uncertainty_mm: float(0,100)
   minimum_auto_confidence: float(0.5,1)
   maximum_daily_radius_growth_mm: float(1,500)
+  maximum_plant_radius_mm: float(1,2000)
   maximum_single_update_percent: float(1,200)
   minimum_observations_for_curve: int(2,100)
+  removal_detection_enabled: bool
+  removal_auto_apply: bool
+  removal_min_consecutive_absent: int(1,20)
   maximum_system_load_percent: int(20,100)
   minimum_free_memory_mb: int(128,4096)
   diagnostic_retention_days: int(0,365)

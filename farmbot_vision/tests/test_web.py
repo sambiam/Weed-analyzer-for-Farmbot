@@ -1,13 +1,36 @@
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime
 from pathlib import Path
+from uuid import uuid4
 
 import pytest
 import yaml
 
 import farmbot_vision.web as web
-from farmbot_vision.models import BotList, VisionRequestEvent
+from farmbot_vision.models import BotList, Decision, Measurement, VisionRequestEvent
+
+
+def _review_measurement(**updates) -> Measurement:
+    values = {
+        "measurement_id": uuid4(),
+        "config_entry_id": "review-bot",
+        "plant_id": 812,
+        "crop_slug": "lettuce",
+        "image_id": 19,
+        "image_timestamp": datetime.now(UTC),
+        "current_radius_mm": 40,
+        "typical_canopy_radius_mm": 45,
+        "maximum_accepted_canopy_radius_mm": 50,
+        "recommended_protection_radius_mm": 70,
+        "confidence": 0.42,
+        "decision": Decision.RECOMMENDED,
+        "reason": "safe radius increase",
+        "algorithm_version": "test",
+    }
+    values.update(updates)
+    return Measurement(**values)
 
 
 async def asgi_request(
@@ -90,6 +113,100 @@ async def test_post_duplicate_path_works(monkeypatch: pytest.MonkeyPatch):
     status, headers, _ = await asgi_request("//analyse", method="POST")
     assert status == 303
     assert headers[b"location"] == b"./"
+
+
+@pytest.mark.asyncio
+async def test_approval_json_reports_rejection_without_recording_a_false_success(monkeypatch):
+    measurement = _review_measurement()
+    web.database.save_measurements([measurement])
+    calls = []
+
+    async def rejected(request):
+        calls.append(request)
+        return {"status": "rejected", "message": "FarmBot declined this change"}
+
+    monkeypatch.setattr(web.client, "apply_radius", rejected)
+    status, _, body = await asgi_request(
+        f"/recommendations/{measurement.measurement_id}/approve",
+        method="POST",
+        headers=[(b"accept", b"application/json")],
+    )
+
+    assert status == 200
+    assert json.loads(body) == {
+        "status": "rejected",
+        "message": "FarmBot declined this change",
+    }
+    assert calls[0].human_approved is True
+    decisions = [
+        row for row in web.database.recent_decisions() if row["measurement_id"] == str(measurement.measurement_id)
+    ]
+    assert decisions == []
+
+
+@pytest.mark.asyncio
+async def test_approval_json_records_applied_and_html_post_still_redirects(monkeypatch):
+    json_measurement = _review_measurement()
+    html_measurement = _review_measurement()
+    web.database.save_measurements([json_measurement, html_measurement])
+
+    async def applied(_request):
+        return {"status": "applied", "message": "radius updated"}
+
+    monkeypatch.setattr(web.client, "apply_radius", applied)
+    status, _, body = await asgi_request(
+        f"/recommendations/{json_measurement.measurement_id}/approve",
+        method="POST",
+        headers=[(b"accept", b"application/json")],
+    )
+    assert status == 200
+    assert json.loads(body)["status"] == "applied"
+    decisions = [
+        row for row in web.database.recent_decisions()
+        if row["measurement_id"] == str(json_measurement.measurement_id)
+    ]
+    assert [row["action"] for row in decisions] == ["applied"]
+
+    status, headers, _ = await asgi_request(
+        f"/recommendations/{html_measurement.measurement_id}/approve", method="POST"
+    )
+    assert status == 303
+    assert b"location" in headers
+
+
+@pytest.mark.asyncio
+async def test_dashboard_modal_uses_artifact_manifest_and_pending_rows(tmp_path, monkeypatch):
+    artifact_dir = tmp_path / "artifacts"
+    artifact_dir.mkdir()
+    overlay = artifact_dir / "review-overlay.jpg"
+    mask = artifact_dir / "review-mask.png"
+    overlay.write_bytes(b"overlay")
+    mask.write_bytes(b"mask")
+    measurement = _review_measurement(
+        overlay_path=str(overlay),
+        mask_path=str(mask),
+        artifact_paths=[str(overlay), str(mask)],
+    )
+    web.database.save_measurements([measurement])
+    monkeypatch.setattr(web.settings, "data_dir", tmp_path)
+
+    status, _, body = await asgi_request("/")
+    html = body.decode()
+    assert status == 200
+    assert "id=overlay-modal" in html
+    assert "data-artifacts=" in html
+    assert "artifact/review-overlay.jpg" in html
+    assert "artifact/review-mask.png" in html
+
+    # The modal still relies on the deliberately restricted artifact route.
+    status, _, served = await asgi_request("/artifact/review-overlay.jpg")
+    assert status == 200
+    assert served == b"overlay"
+
+    web.database.record_decision(str(measurement.measurement_id), "applied", {})
+    assert str(measurement.measurement_id) not in {
+        row["measurement_id"] for row in web.database.pending_measurements()
+    }
 
 
 @pytest.mark.asyncio

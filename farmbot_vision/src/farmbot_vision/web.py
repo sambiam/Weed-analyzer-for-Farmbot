@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 import logging
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
@@ -28,16 +29,20 @@ from . import (
 )
 from .calibration import from_farmbot_calibration
 from .calibration_store import CalibrationStore, FarmbotCalibrationInput
+from .curve_edit import propose_curve_point
 from .curves import fit_monotonic_curve
 from .database import Database
-from .home_assistant import HomeAssistantClient, HomeAssistantError
+from .home_assistant import HomeAssistantClient, HomeAssistantError, StaleRadiusError
 from .jobs import JobManager
 from .models import (
     ApplyRadiusRequest,
+    ApplyRemovalRequest,
     Calibration,
     InventoryRequest,
+    Measurement,
     OperatingMode,
     OriginLocation,
+    UpsertCurveRequest,
     VisionImageRequest,
 )
 from .settings import Settings
@@ -313,6 +318,82 @@ _CALIBRATION_JS = r"""
 })();
 """
 
+_DASHBOARD_JS = r"""
+(function(){
+  const modal=document.getElementById('overlay-modal');
+  const modalImg=document.getElementById('overlay-modal-img');
+  const modalDetails=document.getElementById('overlay-modal-details');
+  const closeButton=document.getElementById('overlay-modal-close');
+  const counter=document.getElementById('overlay-modal-counter');
+  let artifacts=[], index=0, returnFocus=null;
+  function showArtifact(){
+    if(!artifacts.length) return;
+    modalImg.src=artifacts[index];
+    counter.textContent=(index+1)+' / '+artifacts.length;
+  }
+  function closeModal(){
+    modal.hidden=true; modalImg.removeAttribute('src');
+    if(returnFocus) returnFocus.focus();
+  }
+  document.addEventListener('click',async function(event){
+    const viewer=event.target.closest('[data-artifacts]');
+    if(viewer){
+      try{artifacts=JSON.parse(viewer.dataset.artifacts||'[]');}catch(_){artifacts=[];}
+      if(!artifacts.length) return;
+      index=0; returnFocus=viewer;
+      let details={}; try{details=JSON.parse(viewer.dataset.details||'{}');}catch(_){}
+      modalDetails.textContent=details.formula||'';
+      modal.hidden=false; showArtifact(); closeButton.focus(); return;
+    }
+    const action=event.target.closest('.review-action');
+    if(action){
+      event.preventDefault();
+      const row=action.closest('.review-item');
+      const message=row&&row.querySelector('.action-message');
+      action.disabled=true;
+      try{
+        const response=await fetch(action.dataset.url,{method:'POST',headers:{Accept:'application/json'}});
+        const result=await response.json();
+        const explicitReject=/\/(reject|keep)$/.test(action.dataset.url);
+        if(response.ok&&(result.status==='applied'||(result.status==='rejected'&&explicitReject))) row.remove();
+        else if(message) message.textContent=result.message||('HTTP '+response.status);
+      }catch(error){if(message) message.textContent='Request failed: '+error.message;}
+      finally{action.disabled=false;}
+      return;
+    }
+    const curveAction=event.target.closest('.curve-action');
+    if(curveAction){
+      event.preventDefault();
+      const row=curveAction.closest('.review-item');
+      const message=row.querySelector('.action-message');
+      const data=new FormData();
+      if(curveAction.dataset.action==='apply'){
+        const input=row.querySelector('.curve-value'); data.append('value',input.value);
+        if(!window.confirm('Apply this curve value? Flagged values override the automatic gate.')) return;
+        data.append('confirm_override','true');
+      }
+      curveAction.disabled=true;
+      try{
+        const response=await fetch(curveAction.dataset.url,{method:'POST',headers:{Accept:'application/json'},body:data});
+        const result=await response.json();
+        if(response.ok&&(result.status==='applied'||result.status==='rejected')) row.remove();
+        else message.textContent=result.message||('HTTP '+response.status);
+      }catch(error){message.textContent='Request failed: '+error.message;}
+      finally{curveAction.disabled=false;}
+    }
+  });
+  closeButton.addEventListener('click',closeModal);
+  modal.addEventListener('click',function(event){if(event.target===modal) closeModal();});
+  document.getElementById('overlay-modal-prev').addEventListener('click',function(){
+    index=(index-1+artifacts.length)%artifacts.length;showArtifact();
+  });
+  document.getElementById('overlay-modal-next').addEventListener('click',function(){
+    index=(index+1)%artifacts.length;showArtifact();
+  });
+  document.addEventListener('keydown',function(event){if(event.key==='Escape'&&!modal.hidden)closeModal();});
+})();
+"""
+
 
 async def event_listener() -> None:
     async for event in client.vision_events():
@@ -471,6 +552,11 @@ body{{font:15px system-ui;margin:0;background:#f3f7f4;color:var(--dark)}}header{
 main{{max-width:1100px;margin:auto;padding:1.2rem}}nav a{{color:white;margin-right:1rem}}.grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:1rem}}
 .card{{background:white;border-radius:10px;padding:1rem;box-shadow:0 1px 4px #0002;overflow:auto}}table{{width:100%;border-collapse:collapse}}td,th{{padding:.5rem;text-align:left;border-bottom:1px solid #ddd}}
 button{{background:var(--green);border:0;border-radius:6px;padding:.65rem 1rem;cursor:pointer}}.warn{{color:#9b4b00}}.muted{{color:var(--muted)}}input,select{{padding:.5rem;max-width:100%}}img{{max-width:100%}}
+.action-message{{display:block;color:#a40000;max-width:24rem}}.overlay-modal[hidden]{{display:none}}
+.overlay-modal{{position:fixed;inset:0;z-index:1000;background:#000b;display:flex;align-items:center;justify-content:center;padding:1rem}}
+.overlay-modal figure{{position:relative;background:white;border-radius:10px;margin:0;padding:1rem;max-width:min(95vw,1000px);max-height:95vh;overflow:auto}}
+.overlay-modal img{{display:block;max-height:70vh;margin:auto}}.modal-close{{position:absolute;right:.5rem;top:.5rem;font-size:1.5rem}}
+.modal-controls{{display:flex;gap:.5rem;align-items:center;justify-content:center;margin-top:.6rem}}.legend{{font-size:.9rem;color:var(--muted)}}
 </style></head><body><header><h1>🌱 FarmBot Vision</h1><nav><a href="./">Dashboard</a><a href="settings">Calibration</a><a href="api/health">Health JSON</a></nav></header>
 <main>{body}</main></body></html>""")
 
@@ -508,7 +594,7 @@ async def health() -> JSONResponse:
 
 @app.get("/", response_class=HTMLResponse)
 async def dashboard(request: Request) -> HTMLResponse:
-    rows = database.recent_measurements()
+    rows = database.pending_measurements()
     crop_slugs = sorted({row["crop_slug"] for row in rows})
     curves = {
         slug: fit_monotonic_curve(
@@ -517,33 +603,110 @@ async def dashboard(request: Request) -> HTMLResponse:
         for slug in crop_slugs
     }
 
+    def _artifact_button(r: dict) -> str:
+        paths = r.get("artifact_paths") or []
+        if not paths and r.get("overlay_path"):
+            paths = [r["overlay_path"]]
+        urls = [f"artifact/{Path(path).name}" for path in paths if path]
+        if not urls:
+            return "<span class=muted>None</span>"
+        uncertainty = float(r.get("calibration_uncertainty_mm") or 0)
+        details = {
+            "formula": (
+                f"Current {r['current_radius_mm']:.1f} mm; typical "
+                f"{r['typical_canopy_radius_mm']:.1f} mm; maximum "
+                f"{r['maximum_accepted_canopy_radius_mm']:.1f} mm. Recommended = maximum + "
+                f"safety {float(r.get('safety_margin_mm') or 0):.1f} + calibration "
+                f"uncertainty {uncertainty:.1f} = {r['recommended_protection_radius_mm']:.1f} mm. "
+                "Legend: green = vegetation; palette = plant ownership; red = ambiguous; "
+                "cyan/plant colour/white = typical/maximum/protected geometry."
+            )
+        }
+        artifacts_json = escape(json.dumps(urls, separators=(",", ":")), quote=True)
+        details_json = escape(json.dumps(details, separators=(",", ":")), quote=True)
+        return (
+            f'<button type=button data-artifacts="{artifacts_json}" '
+            f'data-details="{details_json}">View</button>'
+        )
+
     def _review_controls(r: dict) -> str:
         # Approval is impossible without a valid calibration (Part 6, Part 10).
         if not r.get("calibrated", 1):
             return "<span class=warn>Calibration required</span>"
+        if r["decision"] != "recommended":
+            return "<span class=muted>Not reviewable</span>"
         return (
             f'<form method=post action="recommendations/{r["measurement_id"]}/approve">'
-            "<button>Approve</button></form>"
+            f'<button class=review-action data-url="recommendations/{r["measurement_id"]}/approve">Approve</button></form>'
             f'<form method=post action="recommendations/{r["measurement_id"]}/reject">'
-            "<button>Reject</button></form>"
+            f'<button class=review-action data-url="recommendations/{r["measurement_id"]}/reject">Reject</button></form>'
+            '<small class=action-message></small>'
         )
 
     measurement_rows = "".join(
-        f"<tr><td>{r['plant_id']}</td><td>{escape(r['crop_slug'])}</td>"
+        f'<tr class=review-item id="measurement-{r["measurement_id"]}"><td>{r["plant_id"]}</td><td>{escape(r["crop_slug"])}</td>'
         f"<td>{escape(str(r.get('processed_width') or '—'))}x{escape(str(r.get('processed_height') or '—'))}</td>"
         f"<td>{r['current_radius_mm']:.1f}</td>"
         f"<td>{r['maximum_accepted_canopy_radius_mm']:.1f}</td><td>{r['recommended_protection_radius_mm']:.1f}</td>"
         f"<td>{r['confidence']:.2f}</td><td>{escape(str(r.get('calibration_source') or '—'))}</td>"
         f"<td>{escape(r['decision'])}</td><td>{escape(r['reason'])}</td>"
-        f'<td><a href="artifact/{escape(Path(r["overlay_path"]).name) if r["overlay_path"] else ""}">overlay</a></td>'
+        f"<td>{_artifact_button(r)}</td>"
         f"<td>{_review_controls(r)}</td></tr>"
         for r in rows
+        if not r.get("vegetation_absent")
     )
     last = jobs.last
     curve_rows = "".join(
         f"<tr><td>{escape(slug)}</td><td>{escape(str(curve))}</td><td>diameter mm</td></tr>"
         for slug, curve in curves.items()
     )
+    removal_rows = "".join(
+        f'<tr class=review-item id="measurement-{r["measurement_id"]}"><td>{r["plant_id"]}</td>'
+        f"<td>{r['absent_observations']}</td><td>{r['confidence']:.2f}</td>"
+        f"<td>{escape(r['reason'])}</td><td>{_artifact_button(r)}</td><td>"
+        f'<form method=post action="removals/{r["measurement_id"]}/approve"><button class=review-action '
+        f'data-url="removals/{r["measurement_id"]}/approve">Approve removal</button></form>'
+        f'<form method=post action="removals/{r["measurement_id"]}/keep"><button class=review-action '
+        f'data-url="removals/{r["measurement_id"]}/keep">Keep plant</button></form>'
+        '<small class=action-message></small></td></tr>'
+        for r in rows
+        if r["decision"] == "removal_recommended"
+    )
+    proposal_rows = []
+    for proposal in database.curve_proposals():
+        previous = json.loads(proposal["previous_data_json"] or "{}")
+        proposed = json.loads(proposal["data_json"] or "{}")
+        day = int(proposal["plant_age_days"])
+        value = float(proposed.get(str(day), 0))
+        diagnostic = _artifact_button(
+            {
+                "artifact_paths": [proposal["overlay_path"]] if proposal["overlay_path"] else [],
+                "current_radius_mm": value / 2,
+                "typical_canopy_radius_mm": value / 2,
+                "maximum_accepted_canopy_radius_mm": value / 2,
+                "recommended_protection_radius_mm": value / 2,
+                "safety_margin_mm": 0,
+                "calibration_uncertainty_mm": 0,
+            }
+        )
+        proposal_rows.append(
+            f'<tr class=review-item id="curve-proposal-{proposal["id"]}"><td>{proposal["plant_id"]}</td>'
+            f"<td>{escape(str(previous))}</td><td>day {day}: "
+            f'<input class=curve-value form="curve-apply-{proposal["id"]}" name=value '
+            f'type=number min=0 step=any value="{value:g}"> mm diameter</td>'
+            f"<td>{escape(proposal['reason'] or '')}; old conflict "
+            f"day {escape(str(proposal['conflict_day']))} = {escape(str(proposal['conflict_old_diameter']))}</td>"
+            f"<td>{diagnostic}</td><td>"
+            f'<form id="curve-apply-{proposal["id"]}" method=post action="curve-proposals/{proposal["id"]}/apply">'
+            '<input type=hidden name=confirm_override value=true>'
+            f'<button class=curve-action data-action=apply data-url="curve-proposals/{proposal["id"]}/apply">Use value</button></form>'
+            f'<form method=post action="curve-proposals/{proposal["id"]}/discard-new"><button class=curve-action '
+            f'data-action=discard-new data-url="curve-proposals/{proposal["id"]}/discard-new">Discard new</button></form>'
+            f'<form method=post action="curve-proposals/{proposal["id"]}/discard-old"><button class=curve-action '
+            f'data-action=discard-old data-url="curve-proposals/{proposal["id"]}/discard-old">Discard old</button></form>'
+            '<small class=action-message></small></td></tr>'
+        )
+    flagged_curve_rows = "".join(proposal_rows)
     decision_rows = "".join(
         f"<tr><td>{escape(row['created_at'])}</td><td>{escape(row['measurement_id'])}</td>"
         f"<td>{escape(row['action'])}</td></tr>"
@@ -592,9 +755,17 @@ async def dashboard(request: Request) -> HTMLResponse:
 <p><b>Calibration warnings</b></p><ul>{warning_html}</ul>
 <p><b>Skip reasons</b></p><ul>{skip_html}</ul></section>
 <section class=card><h2>Measurements</h2><table><thead><tr><th>Plant</th><th>Crop</th><th>Resolution</th><th>Current</th><th>Max leaf</th><th>Recommended</th><th>Confidence</th><th>Calibration</th><th>Decision</th><th>Reason</th><th>Diagnostic</th><th>Review</th></tr></thead><tbody>{measurement_rows or "<tr><td colspan=12>No measurements yet</td></tr>"}</tbody></table></section>
+<section class=card><h2>Removed / missing plants</h2><table><thead><tr><th>Plant</th><th>Absent looks</th><th>Confidence</th><th>Reason</th><th>Diagnostic</th><th>Review</th></tr></thead><tbody>{removal_rows or "<tr><td colspan=6>No confirmed missing plants</td></tr>"}</tbody></table></section>
+<section class=card><h2>Growth-curve updates</h2><p class=muted>Flagged per-plant diameter points require review.</p><table><tbody>{flagged_curve_rows or "<tr><td>No flagged curve updates</td></tr>"}</tbody></table></section>
 <section class=card><h2>Crop protection spread proposals</h2><p class=muted>Monotonic and limited to 10 points. FarmBot values are diameters; assignment requires approval.</p><table><tbody>{curve_rows or "<tr><td>No curve is ready</td></tr>"}</tbody></table></section>
 <section class=card><h2>Approval and rollback history</h2><table><tbody>{decision_rows or "<tr><td>No decisions yet</td></tr>"}</tbody></table></section>
-<section class=card><h2>Safety warning</h2><p class=warn>Early experimental vision results must not be the sole basis for destructive automatic weeding.</p></section>"""
+<section class=card><h2>Safety warning</h2><p class=warn>Early experimental vision results must not be the sole basis for destructive automatic weeding.</p></section>
+<div id=overlay-modal class=overlay-modal hidden role=dialog aria-modal=true aria-label="Analysis diagnostic"><figure>
+<button id=overlay-modal-close class=modal-close type=button aria-label=Close>&times;</button>
+<img id=overlay-modal-img alt="Plant analysis diagnostic"><figcaption id=overlay-modal-details></figcaption>
+<p class=legend>Vegetation mask and per-plant ownership are shown as separate gallery images.</p>
+<div class=modal-controls><button id=overlay-modal-prev type=button>Previous</button><span id=overlay-modal-counter></span><button id=overlay-modal-next type=button>Next</button></div>
+</figure></div><script>{_DASHBOARD_JS}</script>"""
     return layout(request, body)
 
 
@@ -828,36 +999,236 @@ async def artifact(name: str) -> FileResponse:
     return FileResponse(path)
 
 
-@app.post("/recommendations/{measurement_id}/{action}")
-async def recommendation(request: Request, measurement_id: str, action: str) -> RedirectResponse:
-    if action not in {"approve", "reject"}:
-        raise HTTPException(400)
-    row = database.connection.execute(
-        "SELECT * FROM measurements WHERE measurement_id=?", (measurement_id,)
-    ).fetchone()
-    if row is None:
-        raise HTTPException(404)
-    if action == "approve":
-        # Approval is impossible without a valid calibration (Part 6, Part 10).
-        if "calibrated" in row.keys() and not row["calibrated"]:
-            raise HTTPException(409, "calibration required for millimetre measurements")
-        if row["recommended_protection_radius_mm"] <= row["current_radius_mm"]:
-            raise HTTPException(409, "shrinking is disabled")
-        await client.apply_radius(
-            ApplyRadiusRequest(
-                config_entry_id=settings.selected_config_entry_id,
-                plant_id=row["plant_id"],
-                measurement_id=measurement_id,
-                expected_current_radius_mm=row["current_radius_mm"],
-                recommended_radius_mm=row["recommended_protection_radius_mm"],
-                confidence=row["confidence"],
-                apply=True,
-            )
+def _measurement_from_row(row: dict) -> Measurement:
+    payload = {name: row[name] for name in Measurement.model_fields if name in row}
+    try:
+        payload["artifact_paths"] = json.loads(row.get("artifact_paths_json") or "[]")
+    except (TypeError, json.JSONDecodeError):
+        payload["artifact_paths"] = []
+    return Measurement.model_validate(payload)
+
+
+def _action_response(
+    request: Request, status: str, message: str, *, error_status: int | None = None
+) -> Response:
+    if "application/json" in request.headers.get("accept", ""):
+        return JSONResponse(
+            {"status": status, "message": message},
+            status_code=error_status or 200,
         )
-    database.record_decision(measurement_id, action, {})
-    # The ingress prefix is dynamic; returning it explicitly prevents a
-    # relative redirect from climbing above the Home Assistant session path.
+    if error_status is not None:
+        raise HTTPException(error_status, message)
     destination = ingress_base(request)
     if destination == "./":
         destination = "../../../"
     return RedirectResponse(destination, status_code=303)
+
+
+@app.post("/recommendations/{measurement_id}/{action}")
+async def recommendation(request: Request, measurement_id: str, action: str) -> Response:
+    if action not in {"approve", "reject"}:
+        raise HTTPException(400)
+    row = database.measurement(measurement_id)
+    if row is None:
+        raise HTTPException(404)
+    if database.has_terminal_decision(measurement_id):
+        return _action_response(request, "conflict", "This recommendation was already reviewed", error_status=409)
+    if row["decision"] != "recommended":
+        return _action_response(request, "conflict", "Only recommended radius changes can be reviewed", error_status=409)
+    if action == "approve":
+        # Approval is impossible without a valid calibration (Part 6, Part 10).
+        if not row.get("calibrated", 1):
+            return _action_response(request, "conflict", "Calibration is required", error_status=409)
+        if row["recommended_protection_radius_mm"] <= row["current_radius_mm"]:
+            return _action_response(request, "conflict", "Shrinking is disabled", error_status=409)
+        entry_id = row.get("config_entry_id") or settings.selected_config_entry_id
+        try:
+            result = await client.apply_radius(
+                ApplyRadiusRequest(
+                    config_entry_id=entry_id,
+                    plant_id=row["plant_id"],
+                    measurement_id=measurement_id,
+                    expected_current_radius_mm=row["current_radius_mm"],
+                    recommended_radius_mm=row["recommended_protection_radius_mm"],
+                    confidence=row["confidence"],
+                    apply=True,
+                    human_approved=True,
+                )
+            )
+        except StaleRadiusError:
+            await client.inventory(
+                InventoryRequest(
+                    config_entry_id=entry_id,
+                    image_lookback_hours=settings.image_lookback_hours,
+                )
+            )
+            return _action_response(request, "conflict", "The plant radius changed; inventory refreshed", error_status=409)
+        status = str(result.get("status", "error"))
+        message = str(result.get("message") or status)
+        if status != "applied":
+            if status == "conflict":
+                await client.inventory(
+                    InventoryRequest(
+                        config_entry_id=entry_id,
+                        image_lookback_hours=settings.image_lookback_hours,
+                    )
+                )
+            return _action_response(
+                request,
+                status,
+                message,
+                error_status=409 if status == "conflict" else None,
+            )
+        database.update_measurement_outcome(measurement_id, decision="applied", applied=True)
+        database.record_decision(measurement_id, "applied", result)
+        approved_measurement = _measurement_from_row(row)
+        if approved_measurement.plant_age_days is None:
+            curve_message = "skipped because plant age is unavailable"
+        else:
+            try:
+                inventory = await client.inventory(
+                    InventoryRequest(
+                        config_entry_id=entry_id,
+                        image_lookback_hours=settings.image_lookback_hours,
+                    )
+                )
+                curve_result = await jobs._update_curve_after_radius(
+                    entry_id, inventory, approved_measurement, human_approved=True
+                )
+                curve_message = str(
+                    curve_result.get("message") or curve_result.get("status", "")
+                )
+            except HomeAssistantError as exc:
+                LOGGER.warning("Radius applied but curve inventory/update failed: %s", exc)
+                curve_message = "deferred because inventory was unavailable"
+        return _action_response(
+            request,
+            "applied",
+            f"Radius applied. Curve update: {curve_message}",
+        )
+    database.record_decision(measurement_id, "reject", {})
+    return _action_response(request, "rejected", "Recommendation rejected")
+
+
+@app.post("/removals/{measurement_id}/{action}")
+async def removal(request: Request, measurement_id: str, action: str) -> Response:
+    if action not in {"approve", "keep"}:
+        raise HTTPException(400)
+    row = database.measurement(measurement_id)
+    if row is None:
+        raise HTTPException(404)
+    if database.has_terminal_decision(measurement_id):
+        return _action_response(request, "conflict", "This removal was already reviewed", error_status=409)
+    if row["decision"] != "removal_recommended":
+        return _action_response(request, "conflict", "Removal is not currently recommended", error_status=409)
+    entry_id = row.get("config_entry_id") or settings.selected_config_entry_id
+    if not database.is_latest_plant_measurement(entry_id, row["plant_id"], measurement_id):
+        return _action_response(
+            request,
+            "conflict",
+            "A newer canopy observation exists; removal was not applied",
+            error_status=409,
+        )
+    if action == "keep":
+        database.record_decision(measurement_id, "keep", {})
+        return _action_response(request, "rejected", "Plant kept")
+    try:
+        result = await client.apply_removal(
+            ApplyRemovalRequest(
+                config_entry_id=entry_id,
+                plant_id=row["plant_id"],
+                measurement_id=measurement_id,
+                expected_current_radius_mm=row["current_radius_mm"],
+                confidence=row["confidence"],
+                apply=True,
+                human_approved=True,
+            )
+        )
+    except StaleRadiusError:
+        return _action_response(request, "conflict", "The plant changed; removal was not applied", error_status=409)
+    status = str(result.get("status", "error"))
+    message = str(result.get("message") or status)
+    if status != "applied":
+        return _action_response(request, status, message, error_status=409)
+    database.update_measurement_outcome(measurement_id, decision="removed", applied=True)
+    database.record_decision(measurement_id, "removed", result)
+    return _action_response(request, "applied", message)
+
+
+@app.post("/curve-proposals/{proposal_id}/{action}")
+async def curve_proposal_action(
+    request: Request,
+    proposal_id: int,
+    action: str,
+    value: float | None = Form(None),
+    confirm_override: bool = Form(False),
+) -> Response:
+    if action not in {"apply", "discard-new", "discard-old"}:
+        raise HTTPException(400)
+    proposal = database.curve_proposal(proposal_id)
+    if proposal is None:
+        raise HTTPException(404)
+    if proposal["status"] != "flagged":
+        return _action_response(request, "conflict", "This proposal was already reviewed", error_status=409)
+    if action == "discard-new":
+        database.update_curve_proposal(proposal_id, "rejected")
+        return _action_response(request, "rejected", "New curve value discarded")
+    previous = json.loads(proposal["previous_data_json"] or "{}")
+    proposed = json.loads(proposal["data_json"] or "{}")
+    day = int(proposal["plant_age_days"])
+    new_value = float(value if value is not None else proposed[str(day)])
+    base = dict(previous)
+    if action == "discard-old" and proposal["conflict_day"] is not None:
+        base.pop(str(proposal["conflict_day"]), None)
+    edit = propose_curve_point(
+        base,
+        day,
+        new_value,
+        max_daily_growth_mm=settings.maximum_daily_radius_growth_mm,
+        maximum_plant_radius_mm=settings.maximum_plant_radius_mm,
+    )
+    if edit.verdict == "flagged" and not confirm_override:
+        return _action_response(
+            request,
+            "conflict",
+            f"Edited value is still flagged: {edit.reason}; confirm the override to apply",
+            error_status=409,
+        )
+    entry_id = proposal["config_entry_id"] or settings.selected_config_entry_id
+    inventory = await client.inventory(
+        InventoryRequest(
+            config_entry_id=entry_id,
+            image_lookback_hours=settings.image_lookback_hours,
+        )
+    )
+    plant = next((item for item in inventory.plants if item.id == proposal["plant_id"]), None)
+    assigned = None if plant is None else next(
+        (item for item in inventory.curves if item.id == plant.spread_curve_id), None
+    )
+    if plant is None or assigned is None or assigned.data != previous:
+        return _action_response(
+            request,
+            "conflict",
+            "The plant's assigned curve changed after this proposal was created",
+            error_status=409,
+        )
+    curve_data = {control_day: float(round(diameter)) for control_day, diameter in edit.data.items()}
+    result = await client.upsert_curve(
+        UpsertCurveRequest(
+            config_entry_id=entry_id,
+            crop_slug=proposal["crop_slug"],
+            curve_id=proposal["farmbot_curve_id"],
+            name=proposal["curve_name"],
+            data=curve_data,
+            assign_to_plant_ids=[proposal["plant_id"]],
+            apply=True,
+            human_approved=True,
+        )
+    )
+    status = str(result.get("status", "error"))
+    message = str(result.get("message") or status)
+    if status != "applied":
+        return _action_response(request, status, message, error_status=409)
+    database.update_curve_proposal(proposal_id, "applied", curve_data)
+    database.record_decision(proposal["measurement_id"], "curve_applied", result)
+    return _action_response(request, "applied", message)

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 from datetime import UTC, datetime
+from pathlib import Path
 from uuid import uuid4
 
 import pytest
@@ -147,6 +149,48 @@ def test_measurement_provenance_round_trips(tmp_path):
     assert row["processed_width"] == 960
 
 
+def test_removal_artifacts_migrate_persist_and_count_distinct_images(tmp_path):
+    database = Database(tmp_path / "db.sqlite")
+    timestamp = datetime(2026, 7, 23, tzinfo=UTC)
+    present = _measurement(
+        config_entry_id="bot-1",
+        image_id=1,
+        image_timestamp=timestamp,
+        artifact_paths=["/data/artifacts/one-overlay.jpg", "/data/artifacts/one-mask.png"],
+    )
+    first_absent = _measurement(
+        config_entry_id="bot-1",
+        image_id=2,
+        image_timestamp=timestamp.replace(hour=1),
+        vegetation_absent=True,
+        absent_observations=1,
+        typical_canopy_radius_mm=0,
+        maximum_accepted_canopy_radius_mm=0,
+        recommended_protection_radius_mm=0,
+    )
+    same_image_again = _measurement(
+        config_entry_id="bot-1",
+        image_id=2,
+        image_timestamp=timestamp.replace(hour=2),
+        vegetation_absent=True,
+        absent_observations=1,
+        typical_canopy_radius_mm=0,
+        maximum_accepted_canopy_radius_mm=0,
+        recommended_protection_radius_mm=0,
+    )
+    database.save_measurements([present, first_absent, same_image_again])
+
+    columns = {row[1] for row in database.connection.execute("PRAGMA table_info(measurements)")}
+    assert {"artifact_paths_json", "vegetation_absent", "absent_observations"} <= columns
+    saved = database.measurement(str(present.measurement_id))
+    assert saved is not None
+    assert json.loads(saved["artifact_paths_json"]) == present.artifact_paths
+    assert database.has_present_measurement("bot-1", 1) is True
+    # Re-analysing one photo can replace/refine its result, but it is not an
+    # independent observation that can advance the removal confirmation gate.
+    assert database.absent_streak("bot-1", 1) == 1
+
+
 @pytest.mark.asyncio
 async def test_second_run_is_rejected_while_locked(tmp_path):
     # Sequential processing: a second run is refused while one holds the lock.
@@ -233,3 +277,82 @@ async def test_new_photo_job_processes_only_the_target_image(tmp_path, monkeypat
     assert client.image_ids == [2]
     assert len(list((tmp_path / "artifacts").glob("*-mask.png"))) == 1
     assert client.statuses[-1].app_version == "0.5.0"
+
+
+@pytest.mark.asyncio
+async def test_calibrated_job_persists_overlay_vegetation_and_ownership_artifacts(tmp_path, monkeypatch):
+    import numpy as np
+    from conftest import vision_image_dict
+
+    from farmbot_vision.jobs import JobManager
+    from farmbot_vision.models import Inventory, VisionImage
+
+    image = np.zeros((240, 320, 3), np.uint8)
+    import cv2
+
+    cv2.circle(image, (160, 120), 24, (20, 210, 30), -1)
+
+    class Client:
+        async def inventory(self, _request):
+            return Inventory.model_validate(
+                {
+                    "device_id": "42",
+                    "generated_at": "2026-07-20T00:00:00+00:00",
+                    "plants": [
+                        {
+                            "id": 21,
+                            "name": "Lettuce",
+                            "openfarm_slug": "lettuce",
+                            "x": 0,
+                            "y": 0,
+                            "radius": 20,
+                            "plant_stage": "planted",
+                            "planted_at": "2026-07-01T00:00:00+00:00",
+                        }
+                    ],
+                    "images": [
+                        {
+                            "id": 9,
+                            "created_at": "2026-07-20T00:00:00+00:00",
+                            "processed": True,
+                            "meta": {"x": 0, "y": 0, "z": 0},
+                        }
+                    ],
+                    "curves": [],
+                    "camera_calibration": {"available": False},
+                }
+            )
+
+        async def image(self, _request, _max_bytes):
+            return VisionImage.model_validate(
+                vision_image_dict(
+                    image,
+                    image_id=9,
+                    processed_calibration={
+                        "available": True,
+                        "pixels_per_mm_x": 1,
+                        "pixels_per_mm_y": 1,
+                        "basis": "processed_image",
+                        "width": 320,
+                        "height": 240,
+                    },
+                )
+            )
+
+        async def report_status(self, _status):
+            pass
+
+    database = Database(tmp_path / "db.sqlite")
+    manager = JobManager(Settings(data_dir=tmp_path), database, Client())
+    monkeypatch.setattr(manager, "resources_available", lambda: (True, "resources available"))
+    result = await manager.run(entry_id="bot-1", image_ids=[9])
+
+    assert result["accepted"] is True
+    row = database.recent_measurements()[0]
+    artifact_paths = [Path(path) for path in row["artifact_paths"]]
+    assert len(artifact_paths) == 3
+    assert {path.suffix for path in artifact_paths} == {".jpg", ".png"}
+    assert any(path.name.endswith("-overlay.jpg") for path in artifact_paths)
+    assert any(path.name.endswith("-mask.png") for path in artifact_paths)
+    assert any("-plant-21-mask.png" in path.name for path in artifact_paths)
+    assert all(path.is_file() for path in artifact_paths)

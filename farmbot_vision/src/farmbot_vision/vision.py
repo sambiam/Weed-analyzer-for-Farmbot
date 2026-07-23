@@ -160,6 +160,65 @@ def _valid_component(stats: np.ndarray, label: int, params: ScaleParams) -> bool
     )
 
 
+_PLANT_COLORS: tuple[tuple[int, int, int], ...] = (
+    (255, 180, 40),
+    (180, 80, 255),
+    (40, 210, 255),
+    (255, 120, 120),
+    (180, 255, 80),
+    (255, 80, 200),
+)
+
+
+def _tint_pixels(
+    image: np.ndarray, selected: np.ndarray, color: tuple[int, int, int], alpha: float
+) -> None:
+    """Alpha-blend one flat colour without allocating another full frame."""
+    if not np.any(selected):
+        return
+    pixels = image[selected].astype(np.float32)
+    image[selected] = np.clip(pixels * (1 - alpha) + np.asarray(color) * alpha, 0, 255)
+
+
+def _dashed_circle(
+    image: np.ndarray,
+    center: tuple[int, int],
+    radius: int,
+    color: tuple[int, int, int],
+    thickness: int = 2,
+) -> None:
+    for start in range(0, 360, 24):
+        cv2.ellipse(image, center, (radius, radius), 0, start, start + 12, color, thickness)
+
+
+def _draw_legend(image: np.ndarray) -> None:
+    entries = (
+        ("vegetation", (40, 220, 40)),
+        ("plant-owned pixels", _PLANT_COLORS[0]),
+        ("ambiguous", (0, 0, 255)),
+        ("typical / maximum / protected", (255, 255, 0)),
+    )
+    width = min(image.shape[1] - 8, 250)
+    if width < 100:
+        return
+    height = 18 + len(entries) * 18
+    panel = image[4 : 4 + height, 4 : 4 + width]
+    panel[:] = (panel.astype(np.float32) * 0.35).astype(np.uint8)
+    for index, (label, color) in enumerate(entries):
+        y = 18 + index * 18
+        cv2.rectangle(image, (12, y - 8), (24, y + 3), color, -1)
+        cv2.putText(
+            image,
+            label,
+            (30, y + 2),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.38,
+            (255, 255, 255),
+            1,
+            cv2.LINE_AA,
+        )
+
+
 class ClassicalVisionEngine(ImageAnalysisEngine):
     def __init__(self, safety_margin_mm: float = 20, calibration_uncertainty_mm: float = 10):
         self.safety_margin_mm = safety_margin_mm
@@ -176,7 +235,7 @@ class ClassicalVisionEngine(ImageAnalysisEngine):
         params = ScaleParams.build(image.shape[1], image.shape[0], None)
         mask = vegetation_mask(image, params)
         overlay = image.copy()
-        overlay[mask > 0] = (40, 220, 40)
+        _tint_pixels(overlay, mask > 0, (40, 220, 40), 0.4)
         cv2.putText(
             overlay,
             "Calibration required for millimetre measurements",
@@ -187,6 +246,7 @@ class ClassicalVisionEngine(ImageAnalysisEngine):
             1,
             cv2.LINE_AA,
         )
+        _draw_legend(overlay)
         ok_mask, encoded_mask = cv2.imencode(".png", mask)
         ok_overlay, encoded_overlay = cv2.imencode(".jpg", overlay, [cv2.IMWRITE_JPEG_QUALITY, 82])
         del image, mask, overlay
@@ -290,13 +350,91 @@ class ClassicalVisionEngine(ImageAnalysisEngine):
                 ):
                     uncertain_seeds.add(index)
 
+        # Explain segmentation before adding geometry: all vegetation is green,
+        # each plant's owned pixels have a stable palette colour, and ambiguous
+        # pixels remain an unmistakable red warning.
+        _tint_pixels(overlay, mask > 0, (40, 220, 40), 0.35)
+        for index in valid_indices:
+            _tint_pixels(overlay, ownership == index + 1, _PLANT_COLORS[index % len(_PLANT_COLORS)], 0.5)
+        _tint_pixels(overlay, ambiguous, (0, 0, 255), 0.75)
+
         measurements: list[Measurement] = []
         for index in valid_indices:
             seed = seeds[index]
             owned = ownership == index + 1
             ys, xs = np.where(owned)
+            age = None
+            if seed.planted_at:
+                age = max(0, (image_timestamp.date() - seed.planted_at.date()).days)
+            transform_json = json.dumps(
+                {
+                    "pixels_per_mm_x": calibration.pixels_per_mm_x,
+                    "pixels_per_mm_y": calibration.pixels_per_mm_y,
+                    "rotation_degrees": calibration.rotation_degrees,
+                    "offset_x_mm": calibration.offset_x_mm,
+                    "offset_y_mm": calibration.offset_y_mm,
+                    "calibration_source": calibration.source,
+                    "calibration_version": calibration.calibration_version,
+                    "analysis_resolution": calibration.analysis_resolution,
+                    "processed_width": calibration.processed_width,
+                    "processed_height": calibration.processed_height,
+                    "source_width": calibration.source_width,
+                    "source_height": calibration.source_height,
+                    "oriented_width": calibration.oriented_width,
+                    "oriented_height": calibration.oriented_height,
+                    "resize_scale_x": calibration.resize_scale_x,
+                    "resize_scale_y": calibration.resize_scale_y,
+                    "contract_version": CONTRACT_VERSION,
+                    "algorithm_version": ALGORITHM_VERSION,
+                },
+                separators=(",", ":"),
+            )
             if len(xs) < params.min_area:
-                skipped[seed.plant_id] = "no vegetation connected to known plant centre"
+                measurements.append(
+                    Measurement(
+                        measurement_id=uuid4(),
+                        plant_id=seed.plant_id,
+                        crop_slug=seed.crop_slug,
+                        image_id=image_id,
+                        image_timestamp=image_timestamp,
+                        current_radius_mm=seed.current_radius_mm,
+                        typical_canopy_radius_mm=0,
+                        maximum_accepted_canopy_radius_mm=0,
+                        recommended_protection_radius_mm=0,
+                        confidence=0.85,
+                        decision=Decision.OBSERVED,
+                        reason="no vegetation connected to known in-frame plant centre",
+                        vegetation_absent=True,
+                        calibration_version_id=calibration.version_id,
+                        transform_json=transform_json,
+                        algorithm_version=ALGORITHM_VERSION,
+                        plant_age_days=age,
+                        safety_margin_mm=self.safety_margin_mm,
+                        calibration_uncertainty_mm=max(
+                            self.calibration_uncertainty_mm, calibration.uncertainty_mm
+                        ),
+                        analysis_resolution=calibration.analysis_resolution,
+                        processed_width=width,
+                        processed_height=height,
+                        calibration_source=calibration.source,
+                        calibrated=True,
+                        contract_version=CONTRACT_VERSION,
+                    )
+                )
+                center = (round(seed.center_px[0]), round(seed.center_px[1]))
+                absent_radius = max(10, round(seed.current_radius_mm * params.mean_ppm))
+                _dashed_circle(overlay, center, absent_radius, (255, 0, 255))
+                cv2.drawMarker(overlay, center, (255, 0, 255), cv2.MARKER_TILTED_CROSS, 14, 2)
+                cv2.putText(
+                    overlay,
+                    f"{seed.plant_id}: absent?",
+                    (center[0] + 5, center[1] - 7),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.42,
+                    (255, 0, 255),
+                    1,
+                    cv2.LINE_AA,
+                )
                 continue
             dx_mm = (xs - seed.center_px[0]) / calibration.pixels_per_mm_x
             dy_mm = (ys - seed.center_px[1]) / calibration.pixels_per_mm_y
@@ -335,9 +473,6 @@ class ClassicalVisionEngine(ImageAnalysisEngine):
                 if plant_ambiguous
                 else "maximum accepted leaf extent plus safety and calibration margins"
             )
-            age = None
-            if seed.planted_at:
-                age = max(0, (image_timestamp.date() - seed.planted_at.date()).days)
             measurements.append(
                 Measurement(
                     measurement_id=uuid4(),
@@ -354,31 +489,13 @@ class ClassicalVisionEngine(ImageAnalysisEngine):
                     reason=reason,
                     ambiguous=plant_ambiguous,
                     calibration_version_id=calibration.version_id,
-                    transform_json=json.dumps(
-                        {
-                            "pixels_per_mm_x": calibration.pixels_per_mm_x,
-                            "pixels_per_mm_y": calibration.pixels_per_mm_y,
-                            "rotation_degrees": calibration.rotation_degrees,
-                            "offset_x_mm": calibration.offset_x_mm,
-                            "offset_y_mm": calibration.offset_y_mm,
-                            "calibration_source": calibration.source,
-                            "calibration_version": calibration.calibration_version,
-                            "analysis_resolution": calibration.analysis_resolution,
-                            "processed_width": calibration.processed_width,
-                            "processed_height": calibration.processed_height,
-                            "source_width": calibration.source_width,
-                            "source_height": calibration.source_height,
-                            "oriented_width": calibration.oriented_width,
-                            "oriented_height": calibration.oriented_height,
-                            "resize_scale_x": calibration.resize_scale_x,
-                            "resize_scale_y": calibration.resize_scale_y,
-                            "contract_version": CONTRACT_VERSION,
-                            "algorithm_version": ALGORITHM_VERSION,
-                        },
-                        separators=(",", ":"),
-                    ),
+                    transform_json=transform_json,
                     algorithm_version=ALGORITHM_VERSION,
                     plant_age_days=age,
+                    safety_margin_mm=self.safety_margin_mm,
+                    calibration_uncertainty_mm=max(
+                        self.calibration_uncertainty_mm, calibration.uncertainty_mm
+                    ),
                     analysis_resolution=calibration.analysis_resolution,
                     processed_width=width,
                     processed_height=height,
@@ -387,14 +504,24 @@ class ClassicalVisionEngine(ImageAnalysisEngine):
                     contract_version=CONTRACT_VERSION,
                 )
             )
-            color = (0, 165, 255) if plant_ambiguous else (40, 220, 40)
+            color = (0, 165, 255) if plant_ambiguous else _PLANT_COLORS[index % len(_PLANT_COLORS)]
+            center = (round(seed.center_px[0]), round(seed.center_px[1]))
+            cv2.circle(overlay, center, max(1, round(typical * params.mean_ppm)), (255, 255, 0), 1)
             cv2.circle(
                 overlay,
-                (round(seed.center_px[0]), round(seed.center_px[1])),
-                round(maximum * calibration.pixels_per_mm_x),
+                center,
+                max(1, round(maximum * params.mean_ppm)),
                 color,
                 2,
             )
+            cv2.circle(
+                overlay,
+                center,
+                max(1, round(recommendation * params.mean_ppm)),
+                (255, 255, 255),
+                1,
+            )
+            cv2.circle(overlay, center, 3, color, -1)
             cv2.putText(
                 overlay,
                 f"{seed.plant_id}: {recommendation:.0f}mm {confidence:.2f}",
@@ -405,14 +532,16 @@ class ClassicalVisionEngine(ImageAnalysisEngine):
                 1,
                 cv2.LINE_AA,
             )
-        overlay[ambiguous] = (0, 0, 255)
-        ok_mask, encoded_mask = cv2.imencode(".png", ownership.astype(np.uint16))
+        _draw_legend(overlay)
+        ok_mask, encoded_mask = cv2.imencode(".png", mask)
+        ok_ownership, encoded_ownership = cv2.imencode(".png", ownership.astype(np.uint16))
         ok_overlay, encoded_overlay = cv2.imencode(".jpg", overlay, [cv2.IMWRITE_JPEG_QUALITY, 82])
         # Release the large working arrays before returning (Part 7).
         del image, mask, overlay, labels, ownership, ambiguous
         return AnalysisResult(
             measurements=measurements,
             mask=encoded_mask.tobytes() if ok_mask else None,
+            ownership_mask=encoded_ownership.tobytes() if ok_ownership else None,
             overlay_jpeg=encoded_overlay.tobytes() if ok_overlay else None,
             skipped=skipped,
         )

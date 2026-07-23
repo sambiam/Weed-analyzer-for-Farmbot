@@ -88,6 +88,58 @@ def test_green_irrigation_line_and_noise_are_rejected(seed, calibration):
     assert result.measurements[0].maximum_accepted_canopy_radius_mm < 35
 
 
+def test_empty_in_frame_centre_is_an_absence_measurement(seed, calibration):
+    result = analyse([], seed, calibration)
+
+    assert result.skipped == {}
+    assert len(result.measurements) == 1
+    measurement = result.measurements[0]
+    assert measurement.vegetation_absent is True
+    assert measurement.typical_canopy_radius_mm == 0
+    assert measurement.maximum_accepted_canopy_radius_mm == 0
+    assert measurement.recommended_protection_radius_mm == 0
+
+
+def test_empty_out_of_frame_centre_is_skipped_not_absent(calibration):
+    edge_seed = PlantSeed(
+        plant_id=7,
+        crop_slug="lettuce",
+        center_px=(1, 120),
+        current_radius_mm=60,
+    )
+    result = analyse([], edge_seed, calibration)
+
+    assert result.measurements == []
+    assert "outside image" in result.skipped[edge_seed.plant_id]
+
+
+def test_overlay_and_binary_masks_explain_vegetation_ownership(calibration):
+    seeds = [
+        PlantSeed(plant_id=1, crop_slug="lettuce", center_px=(100, 120), current_radius_mm=30),
+        PlantSeed(plant_id=2, crop_slug="lettuce", center_px=(220, 120), current_radius_mm=30),
+    ]
+    result = analyse(
+        [("circle", ((100, 120), 20)), ("circle", ((220, 120), 20))],
+        seeds[0],
+        calibration,
+        seeds=seeds,
+    )
+
+    assert result.mask is not None
+    assert result.ownership_mask is not None
+    assert result.overlay_jpeg is not None
+    vegetation = cv2.imdecode(np.frombuffer(result.mask, np.uint8), cv2.IMREAD_GRAYSCALE)
+    ownership = cv2.imdecode(np.frombuffer(result.ownership_mask, np.uint8), cv2.IMREAD_UNCHANGED)
+    overlay = cv2.imdecode(np.frombuffer(result.overlay_jpeg, np.uint8), cv2.IMREAD_COLOR)
+    assert vegetation is not None and ownership is not None and overlay is not None
+    assert vegetation[120, 100] > 0 and vegetation[120, 220] > 0
+    assert ownership[120, 100] == 1
+    assert ownership[120, 220] == 2
+    # The two plants receive distinct ownership tints in the composite, rather
+    # than the overlay being only geometry drawn on the original green pixels.
+    assert np.linalg.norm(overlay[120, 100].astype(int) - overlay[120, 220].astype(int)) > 25
+
+
 def test_camera_translation_registration():
     previous = np.zeros((120, 160), np.uint8)
     cv2.circle(previous, (70, 60), 15, 255, -1)

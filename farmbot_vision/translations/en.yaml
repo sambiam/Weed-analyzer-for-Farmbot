@@ -24,10 +24,20 @@ configuration:
     name: Minimum automatic confidence
   maximum_daily_radius_growth_mm:
     name: Maximum daily growth (mm)
+  maximum_plant_radius_mm:
+    name: Maximum plant radius (mm)
   maximum_single_update_percent:
     name: Maximum single increase (percent)
   minimum_observations_for_curve:
     name: Minimum curve observations
+  removal_detection_enabled:
+    name: Detect missing plants
+    description: Record in-frame plants with no visible canopy as removal candidates.
+  removal_auto_apply:
+    name: Automatically archive confirmed missing plants
+    description: Requires automatic mode and the companion integration's automatic-removal option.
+  removal_min_consecutive_absent:
+    name: Consecutive absent observations required
   maximum_system_load_percent:
     name: Maximum system load (percent)
   minimum_free_memory_mb:
