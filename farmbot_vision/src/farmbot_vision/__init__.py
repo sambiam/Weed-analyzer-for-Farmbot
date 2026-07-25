@@ -1,6 +1,6 @@
 """FarmBot Vision application."""
 
-__version__ = "1.1.6"
+__version__ = "1.1.7"
 ALGORITHM_VERSION = "classical-0.4.0"
 
 # Version of the typed companion-integration contract this app speaks. v2 adds
