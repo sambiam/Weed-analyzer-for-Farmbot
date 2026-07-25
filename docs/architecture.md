@@ -18,6 +18,15 @@ job lock. Images are fetched and released sequentially. CPU-heavy OpenCV work
 runs outside the event loop, with a 60-second timeout and resource checks
 between images.
 
+Boundaries and exclusion zones (`zones.py`) are a pure geometry/policy layer over
+garden coordinates, persisted as an atomic JSON document in `/data` like the
+weed settings and the FarmBot calibration inputs. `evaluate()` returns an
+allow/deny verdict plus the reason and zone name for one aspect (weeds, plant
+centres, protection radius); the job manager reads the zones once per job and the
+web layer re-reads them per review action, so no analysis state depends on them.
+Because an empty configuration allows everything, the layer is inert until an
+operator defines a zone.
+
 The `ImageAnalysisEngine` abstraction isolates the classical implementation so a small ONNX or TFLite engine can be added later without changing jobs or persistence. No inference runtime ships.
 
 Analysis resolution is configurable (640×480 / 960×720 default / 1280×960) via the `Resolution` model; the job manager requests exactly that size and images are validated and calibrated against the exact processed pixels. Calibration is resolved per image in preference order — processed calibration, reference calibration scaled to the resolution, compatible manual calibration, none — so a native-resolution scale is never applied to a resized frame. Morphology kernels and area thresholds are derived from the effective pixels-per-millimetre (or, uncalibrated, from image dimensions relative to the 640×480 baseline) so physical results stay comparable across presets. The engine interfaces are shaped to allow a future "hybrid plant crop analysis" strategy (a resized full-frame context image plus a higher-resolution per-plant crop) without committing to a native-resolution pipeline now.

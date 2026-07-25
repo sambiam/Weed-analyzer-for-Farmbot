@@ -101,10 +101,32 @@ def test_existing_data_survives_migration(tmp_path):
     assert calibration is not None
     # New columns exist and default sensibly on the migrated row.
     row = database.connection.execute(
-        "SELECT calibrated, analysis_resolution FROM measurements WHERE measurement_id='m1'"
+        "SELECT calibrated,analysis_resolution,recorded_center_x,recorded_center_y "
+        "FROM measurements WHERE measurement_id='m1'"
     ).fetchone()
     assert row["calibrated"] == 1
     assert row["analysis_resolution"] is None
+    assert row["recorded_center_x"] is None
+    assert row["recorded_center_y"] is None
+
+
+def test_measurement_preserves_recorded_and_recommended_centers(tmp_path):
+    database = Database(tmp_path / "db.sqlite")
+    measurement = _measurement(
+        vegetation_absent=True,
+        center_misaligned=True,
+        recorded_center_x=125.5,
+        recorded_center_y=480.25,
+        recommended_center_px=(140.0, 500.0),
+    )
+
+    database.save_measurements([measurement])
+    row = database.measurement(str(measurement.measurement_id))
+
+    assert row["recorded_center_x"] == 125.5
+    assert row["recorded_center_y"] == 480.25
+    assert row["recommended_center_x"] == 140.0
+    assert row["recommended_center_y"] == 500.0
 
 
 def test_derived_calibration_does_not_clobber_manual(tmp_path):

@@ -313,6 +313,7 @@ class ClassicalVisionEngine(ImageAnalysisEngine):
         labels_count, labels, stats, _ = cv2.connectedComponentsWithStats(mask, 8)
         centers = np.array([seed.center_px for seed in seeds], dtype=np.float32)
         overlay = image.copy()
+        weed_review = image.copy() if weed_settings and weed_settings.enabled else None
         ownership = np.zeros_like(labels, dtype=np.int16)
         ambiguous = np.zeros_like(mask, dtype=bool)
         uncertain_seeds: set[int] = set()
@@ -759,17 +760,31 @@ class ClassicalVisionEngine(ImageAnalysisEngine):
                     18,
                     2,
                 )
+                cv2.drawMarker(
+                    weed_review,
+                    (round(wx), round(wy)),
+                    (0, 0, 255),
+                    cv2.MARKER_CROSS,
+                    18,
+                    2,
+                )
         _draw_legend(overlay)
         ok_mask, encoded_mask = cv2.imencode(".png", mask)
         ok_ownership, encoded_ownership = cv2.imencode(".png", ownership.astype(np.uint16))
         ok_overlay, encoded_overlay = cv2.imencode(".jpg", overlay, [cv2.IMWRITE_JPEG_QUALITY, 82])
+        ok_weed_review, encoded_weed_review = (
+            cv2.imencode(".jpg", weed_review, [cv2.IMWRITE_JPEG_QUALITY, 82])
+            if weed_review is not None and weed_detections
+            else (False, None)
+        )
         # Release the large working arrays before returning (Part 7).
-        del image, mask, overlay, labels, ownership, ambiguous
+        del image, mask, overlay, weed_review, labels, ownership, ambiguous
         return AnalysisResult(
             measurements=measurements,
             mask=encoded_mask.tobytes() if ok_mask else None,
             ownership_mask=encoded_ownership.tobytes() if ok_ownership else None,
             overlay_jpeg=encoded_overlay.tobytes() if ok_overlay else None,
+            weed_review_jpeg=encoded_weed_review.tobytes() if ok_weed_review else None,
             skipped=skipped,
             weeds=weed_detections,
         )

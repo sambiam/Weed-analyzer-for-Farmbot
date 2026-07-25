@@ -51,6 +51,15 @@ from .models import (
 from .settings import Settings
 from .vision import garden_to_pixel
 from .weed_settings import WeedSettings, WeedSettingsStore
+from .zones import (
+    Zone,
+    ZoneAspect,
+    ZoneKind,
+    ZoneShape,
+    ZoneStore,
+    ZoneVerdict,
+    evaluate,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 LOGGER = logging.getLogger(__name__)
@@ -59,7 +68,8 @@ database = Database(settings.data_dir / "farmbot_vision.db")
 calibration_store = CalibrationStore(settings.data_dir / "farmbot_calibration.json")
 client = HomeAssistantClient()
 weed_settings_store = WeedSettingsStore(settings.data_dir / "weed_settings.json")
-jobs = JobManager(settings, database, client, weed_settings_store)
+zone_store = ZoneStore(settings.data_dir / "zones.json")
+jobs = JobManager(settings, database, client, weed_settings_store, zone_store)
 
 
 def _calibration_from_input(entry_id: str, values: FarmbotCalibrationInput) -> Calibration:
@@ -368,14 +378,24 @@ _DASHBOARD_JS = r"""
   const weedAccept=document.getElementById('weed-modal-accept');
   const weedReject=document.getElementById('weed-modal-reject');
   const weedAcceptAll=document.getElementById('weed-modal-accept-all');
+  const weedWithoutOverlay=document.getElementById('weed-modal-without-overlay');
+  const weedWithOverlay=document.getElementById('weed-modal-with-overlay');
   let weedData=null, weedReturnFocus=null;
+  function showWeedView(withOverlay){
+    if(!weedData) return;
+    const useOverlay=withOverlay||!weedData.reviewArtifact;
+    weedImg.src=useOverlay?weedData.overlayArtifact:weedData.reviewArtifact;
+    weedWithoutOverlay.disabled=!weedData.reviewArtifact;
+    weedWithoutOverlay.setAttribute('aria-pressed',String(!useOverlay));
+    weedWithOverlay.setAttribute('aria-pressed',String(useOverlay));
+  }
   function closeWeedModal(){
     weedModal.hidden=true; weedImg.removeAttribute('src'); weedData=null;
     if(weedReturnFocus) weedReturnFocus.focus();
   }
   function openWeedModal(data,trigger){
     weedData=data; weedReturnFocus=trigger; weedMessage.textContent='';
-    weedImg.src=data.artifact;
+    showWeedView(false);
     if(data.x!=null&&data.y!=null&&data.width&&data.height){
       weedMarker.style.left=(data.x/data.width*100)+'%';
       weedMarker.style.top=(data.y/data.height*100)+'%';
@@ -422,6 +442,8 @@ _DASHBOARD_JS = r"""
       else weedMessage.textContent=failures+' weed(s) could not be accepted';
     }finally{weedAcceptAll.disabled=false;}
   });
+  weedWithoutOverlay.addEventListener('click',function(){showWeedView(false);});
+  weedWithOverlay.addEventListener('click',function(){showWeedView(true);});
   document.getElementById('weed-modal-close').addEventListener('click',closeWeedModal);
   weedModal.addEventListener('click',function(event){if(event.target===weedModal) closeWeedModal();});
   document.addEventListener('click',async function(event){
@@ -508,6 +530,130 @@ _DASHBOARD_JS = r"""
       queueMessage.textContent=ids.length+' images added';}
     else queueMessage.textContent=data.detail||'Could not add images';
   });
+})();
+"""
+
+# Boundaries and exclusion zones. The add form only shows the geometry fields of
+# the selected shape, permissions start at the sensible polarity for the chosen
+# kind, and a top-down garden map draws every zone (optionally with the bot's
+# plants and weeds) so a zone can be checked before it starts gating writes.
+_ZONES_JS = r"""
+(function(){
+  const shape=document.getElementById('shape');
+  const kind=document.getElementById('kind');
+  const canvas=document.getElementById('zone-map');
+  const ctx=canvas.getContext('2d');
+  const status=document.getElementById('zone-map-status');
+  let zones=[]; try{zones=JSON.parse(canvas.dataset.zones||'[]');}catch(_){zones=[];}
+  let items={plants:[],weeds:[]};
+
+  function showShapeFields(){
+    ['rectangle','circle','polygon'].forEach(function(name){
+      const box=document.getElementById('fields-'+name);
+      const active=(shape.value===name);
+      box.hidden=!active;
+      box.querySelectorAll('input,textarea').forEach(function(field){field.disabled=!active;});
+    });
+  }
+  // Boundaries usually permit everything inside; exclusion zones usually
+  // forbid everything. Both stay editable afterwards.
+  function applyKindDefaults(){
+    const allow=(kind.value==='boundary');
+    ['allow_weeds','allow_plant_centers','allow_plant_radius'].forEach(function(name){
+      document.getElementById('new_'+name).checked=allow;
+    });
+  }
+  function zonePoints(zone){
+    if(zone.shape==='rectangle')
+      return [[zone.min_x,zone.min_y],[zone.max_x,zone.min_y],
+              [zone.max_x,zone.max_y],[zone.min_x,zone.max_y]];
+    if(zone.shape==='circle')
+      return [[zone.center_x-zone.radius_mm,zone.center_y-zone.radius_mm],
+              [zone.center_x+zone.radius_mm,zone.center_y+zone.radius_mm]];
+    return zone.points||[];
+  }
+  function bounds(){
+    let xs=[],ys=[];
+    zones.forEach(function(zone){zonePoints(zone).forEach(function(p){xs.push(p[0]);ys.push(p[1]);});});
+    items.plants.concat(items.weeds).forEach(function(p){xs.push(p.x);ys.push(p.y);});
+    if(!xs.length) return null;
+    let minX=Math.min.apply(null,xs), maxX=Math.max.apply(null,xs);
+    let minY=Math.min.apply(null,ys), maxY=Math.max.apply(null,ys);
+    const padX=Math.max(50,(maxX-minX)*0.08), padY=Math.max(50,(maxY-minY)*0.08);
+    return {minX:minX-padX,maxX:maxX+padX,minY:minY-padY,maxY:maxY+padY};
+  }
+  function drawZone(zone,project,scale){
+    const boundary=(zone.kind==='boundary');
+    ctx.save();
+    ctx.setLineDash(zone.enabled?[]:[6,4]);
+    ctx.lineWidth=2;
+    ctx.strokeStyle=boundary?'#2ecc40':'#ff4136';
+    ctx.fillStyle=boundary?'rgba(46,204,64,.12)':'rgba(255,65,54,.16)';
+    ctx.beginPath();
+    if(zone.shape==='circle'){
+      const c=project(zone.center_x,zone.center_y);
+      ctx.arc(c[0],c[1],Math.max(2,zone.radius_mm*scale),0,Math.PI*2);
+    } else {
+      const pts=zonePoints(zone);
+      pts.forEach(function(p,i){
+        const c=project(p[0],p[1]);
+        if(i===0) ctx.moveTo(c[0],c[1]); else ctx.lineTo(c[0],c[1]);
+      });
+      ctx.closePath();
+    }
+    ctx.fill();ctx.stroke();
+    const label=zonePoints(zone)[0]||[zone.center_x,zone.center_y];
+    const anchor=project(zone.shape==='circle'?zone.center_x:label[0],
+                         zone.shape==='circle'?zone.center_y:label[1]);
+    ctx.setLineDash([]);
+    ctx.fillStyle='#17221b';ctx.font='12px system-ui';
+    ctx.fillText(zone.name+(zone.enabled?'':' (off)'),anchor[0]+6,anchor[1]-6);
+    ctx.restore();
+  }
+  function render(){
+    const box=bounds();
+    ctx.setTransform(1,0,0,1,0,0);
+    ctx.clearRect(0,0,canvas.width,canvas.height);
+    ctx.fillStyle='#fbfdfb';ctx.fillRect(0,0,canvas.width,canvas.height);
+    if(!box){
+      ctx.fillStyle='#74817a';ctx.font='14px system-ui';
+      ctx.fillText('Add a zone to see the garden map',14,26);
+      return;
+    }
+    const scale=Math.min(canvas.width/(box.maxX-box.minX),canvas.height/(box.maxY-box.minY));
+    const project=function(x,y){return [(x-box.minX)*scale,(y-box.minY)*scale];};
+    zones.forEach(function(zone){drawZone(zone,project,scale);});
+    items.plants.forEach(function(plant){
+      const c=project(plant.x,plant.y);
+      ctx.strokeStyle='#1a7f4b';ctx.lineWidth=1.5;
+      ctx.beginPath();ctx.arc(c[0],c[1],Math.max(3,(plant.radius||0)*scale),0,Math.PI*2);ctx.stroke();
+      ctx.fillStyle='#1a7f4b';ctx.beginPath();ctx.arc(c[0],c[1],2.5,0,Math.PI*2);ctx.fill();
+    });
+    items.weeds.forEach(function(weed){
+      const c=project(weed.x,weed.y);
+      ctx.fillStyle='#b3002d';ctx.beginPath();ctx.arc(c[0],c[1],3,0,Math.PI*2);ctx.fill();
+    });
+    ctx.fillStyle='#74817a';ctx.font='12px system-ui';
+    ctx.fillText('X '+Math.round(box.minX)+'…'+Math.round(box.maxX)+' mm, Y '
+      +Math.round(box.minY)+'…'+Math.round(box.maxY)+' mm (Y increases downwards)',10,
+      canvas.height-10);
+  }
+  document.getElementById('zone-load-items').addEventListener('click',async function(){
+    const entry=canvas.dataset.entry||'';
+    if(!entry){status.textContent='Select a FarmBot in the app options first';return;}
+    status.textContent='Loading plants and weeds…';
+    try{
+      const response=await fetch('api/vision/images?entry_id='+encodeURIComponent(entry));
+      if(!response.ok) throw new Error('HTTP '+response.status);
+      const data=await response.json();
+      items={plants:data.plants||[],weeds:data.weeds||[]};
+      status.textContent=items.plants.length+' plants and '+items.weeds.length+' FarmBot weeds shown';
+      render();
+    }catch(err){status.textContent='Could not load garden items: '+err.message;}
+  });
+  shape.addEventListener('change',showShapeFields);
+  kind.addEventListener('change',applyKindDefaults);
+  showShapeFields();applyKindDefaults();render();
 })();
 """
 
@@ -678,15 +824,15 @@ button{{background:var(--green);border:0;border-radius:6px;padding:.65rem 1rem;c
 .queue-dialog{{width:min(95vw,900px)}}.button-row{{display:flex;gap:.5rem;flex-wrap:wrap;align-items:center}}
 .weed-dialog{{width:min(95vw,900px)}}.weed-image-wrap{{position:relative;display:inline-block;margin:auto}}
 .weed-marker{{position:absolute;width:26px;height:26px;margin-left:-13px;margin-top:-13px;pointer-events:none}}
-.weed-marker::before,.weed-marker::after{{content:'';position:absolute;background:#ffe600;box-shadow:0 0 0 1px #000}}
+.weed-marker::before,.weed-marker::after{{content:'';position:absolute;background:#168cff;box-shadow:0 0 0 1px #001b3d}}
 .weed-marker::before{{left:50%;top:0;width:4px;height:100%;margin-left:-2px}}
 .weed-marker::after{{top:50%;left:0;height:4px;width:100%;margin-top:-2px}}
-</style></head><body><header><h1>🌱 FarmBot Vision</h1><nav><a href="./">Dashboard</a><a href="settings">Calibration</a><a href="api/health">Health JSON</a></nav></header>
-<main>{body}</main></body></html>""".replace(
-            '<a href="./">Dashboard</a><a href="settings">Calibration</a>',
-            '<a href="./">Analysis</a><a href="settings">Calibration</a>'
-            '<a href="weed-settings">Weed settings</a>',
-        )
+.weed-view-toggle button[aria-pressed=true]{{background:#1672c4;color:white;box-shadow:inset 0 0 0 2px #0b4779}}
+td.actions{{min-width:9rem}}.actions-group{{display:flex;flex-direction:column;align-items:stretch;gap:.4rem}}
+.actions-group form{{margin:0}}.actions-group button{{width:100%;padding:.45rem .8rem;font-size:.9rem}}
+.actions-group button[data-artifacts]{{background:#e4ede7;color:var(--dark)}}
+</style></head><body><header><h1>🌱 FarmBot Vision</h1><nav><a href="./">Analysis</a><a href="settings">Calibration</a><a href="weed-settings">Weed settings</a><a href="zones">Boundaries &amp; zones</a><a href="api/health">Health JSON</a></nav></header>
+<main>{body}</main></body></html>"""
     )
 
 
@@ -767,11 +913,12 @@ async def dashboard(request: Request) -> HTMLResponse:
                 f'<button class=review-action data-url="recommendations/{r["measurement_id"]}/reject">'
                 "Reject</button></form><small class=action-message></small>"
             )
-        approve_label = (
-            "Apply radius"
-            if r["recommended_protection_radius_mm"] > r["current_radius_mm"]
-            else "Approve observation"
-        )
+        if r["recommended_protection_radius_mm"] > r["current_radius_mm"]:
+            approve_label = "Apply radius"
+        elif r["recommended_protection_radius_mm"] < r["current_radius_mm"]:
+            approve_label = "Apply smaller radius"
+        else:
+            approve_label = "Approve observation"
         return (
             f'<form method=post action="recommendations/{r["measurement_id"]}/approve">'
             f'<button class=review-action data-url="recommendations/{r["measurement_id"]}/approve">'
@@ -789,14 +936,12 @@ async def dashboard(request: Request) -> HTMLResponse:
         )
 
     measurement_rows = "".join(
-        f'<tr class=review-item id="measurement-{r["measurement_id"]}"><td>{r["plant_id"]}</td><td>{escape(r["crop_slug"])}</td>'
-        f"<td>{escape(str(r.get('processed_width') or '—'))}x{escape(str(r.get('processed_height') or '—'))}</td>"
+        f'<tr class=review-item id="measurement-{r["measurement_id"]}"><td>{escape(r["crop_slug"])}</td>'
         f"<td>{r['current_radius_mm']:.1f}</td>"
         f"<td>{r['maximum_accepted_canopy_radius_mm']:.1f}</td><td>{r['recommended_protection_radius_mm']:.1f}</td>"
-        f"<td>{r['confidence']:.2f}</td><td>{escape(str(r.get('calibration_source') or '—'))}</td>"
+        f"<td>{r['confidence']:.2f}</td>"
         f"<td>{escape(r['decision'])}</td><td>{escape(r['reason'])}</td>"
-        f"<td>{_artifact_button(r)}</td>"
-        f"<td>{_review_controls(r)}</td></tr>"
+        f'<td class=actions><div class=actions-group>{_artifact_button(r)}{_review_controls(r)}</div></td></tr>'
         for r in rows
         if not r.get("vegetation_absent")
     )
@@ -805,8 +950,25 @@ async def dashboard(request: Request) -> HTMLResponse:
         f"<tr><td>{escape(slug)}</td><td>{escape(str(curve))}</td><td>diameter mm</td></tr>"
         for slug, curve in curves.items()
     )
+
+    def _format_center(
+        x: object,
+        y: object,
+        *,
+        fallback: str = "Unavailable for older result",
+    ) -> str:
+        if x is None or y is None:
+            return f"<span class=muted>{escape(fallback)}</span>"
+        try:
+            return f"X {float(x):.1f}, Y {float(y):.1f}"
+        except (TypeError, ValueError):
+            return f"<span class=muted>{escape(fallback)}</span>"
+
     removal_rows = "".join(
-        f'<tr class=review-item id="measurement-{r["measurement_id"]}"><td>{r["plant_id"]}</td>'
+        f'<tr class=review-item id="measurement-{r["measurement_id"]}">'
+        f"<td>{escape(r['crop_slug'])}</td>"
+        f"<td>{_format_center(r.get('recorded_center_x'), r.get('recorded_center_y'))}</td>"
+        f"<td>{_format_center(r.get('recommended_center_x'), r.get('recommended_center_y'), fallback='No move suggested')}</td>"
         f"<td>{r['absent_observations']}</td><td>{r['confidence']:.2f}</td>"
         f"<td>{escape(r['reason'])}</td><td>{_artifact_button(r)}</td><td>"
         f'<form method=post action="removals/{r["measurement_id"]}/approve"><button class=review-action '
@@ -873,7 +1035,10 @@ async def dashboard(request: Request) -> HTMLResponse:
             return "<span class=muted>None</span>"
         siblings = [str(other["detection_id"]) for other in weeds_by_image.get(w["image_id"], [])]
         marker = {
-            "artifact": f"artifact/{Path(w['overlay_path']).name}",
+            "overlayArtifact": f"artifact/{Path(w['overlay_path']).name}",
+            "reviewArtifact": (
+                f"artifact/{Path(w['review_path']).name}" if w.get("review_path") else None
+            ),
             "x": w.get("center_px_x"),
             "y": w.get("center_px_y"),
             "width": w.get("processed_width"),
@@ -941,11 +1106,12 @@ It affects automatic changes only; every result remains manually reviewable.</p>
 <div><b>Dimensions</b><p class=muted>source {escape(_dims(last.get("source_dimensions")))} · oriented {escape(_dims(last.get("oriented_dimensions")))} · processed {escape(_dims(last.get("processed_dimensions")))}</p></div>
 <div><b>Calibration</b><p class=muted>source {escape(str(last.get("calibration_source") or "—"))}</p></div>
 <div><b>Contract</b><p class=muted>{escape(str(last.get("contract_version") or CONTRACT_VERSION))} · min integration {MINIMUM_INTEGRATION_VERSION}</p></div>
+<div><b>Zones</b><p class=muted>{last.get("zone_blocked_weeds", 0)} weeds · {last.get("zone_blocked_radius", 0)} radius increases blocked</p></div>
 </div>
 <p><b>Calibration warnings</b></p><ul>{warning_html}</ul>
 <p><b>Skip reasons</b></p><ul>{skip_html}</ul></section>
-<section class=card><h2>Measurements</h2><table><thead><tr><th>Plant</th><th>Crop</th><th>Resolution</th><th>Current</th><th>Max leaf</th><th>Recommended</th><th>Confidence</th><th>Calibration</th><th>Decision</th><th>Reason</th><th>Diagnostic</th><th>Review</th></tr></thead><tbody>{measurement_rows or "<tr><td colspan=12>No measurements yet</td></tr>"}</tbody></table></section>
-<section class=card><h2>Removed / missing plants</h2><table><thead><tr><th>Plant</th><th>Absent looks</th><th>Confidence</th><th>Reason</th><th>Diagnostic</th><th>Review</th></tr></thead><tbody>{removal_rows or "<tr><td colspan=6>No confirmed missing plants</td></tr>"}</tbody></table></section>
+<section class=card><h2>Measurements</h2><table><thead><tr><th>Crop</th><th>Current</th><th>Max leaf</th><th>Recommended</th><th>Confidence</th><th>Decision</th><th>Reason</th><th>Actions</th></tr></thead><tbody>{measurement_rows or "<tr><td colspan=8>No measurements yet</td></tr>"}</tbody></table></section>
+<section class=card><h2>Removed / missing plants</h2><table><thead><tr><th>Crop</th><th>Recorded center (X, Y mm)</th><th>Move center to (X, Y mm)</th><th>Absent looks</th><th>Confidence</th><th>Reason</th><th>Diagnostic</th><th>Review</th></tr></thead><tbody>{removal_rows or "<tr><td colspan=8>No confirmed missing plants</td></tr>"}</tbody></table></section>
 <section class=card><h2>Detected weeds</h2><p class=muted>Unowned vegetation outside known plant protection areas.</p>
 <table><thead><tr><th>Image</th><th>Coordinates</th><th>Area mm²</th><th>Confidence</th><th>View</th><th>Review</th></tr></thead>
 <tbody>{weed_rows or "<tr><td colspan=6>No weed recommendations</td></tr>"}</tbody></table></section>
@@ -961,9 +1127,13 @@ It affects automatic changes only; every result remains manually reviewable.</p>
 </figure></div>
 <div id=weed-modal class=overlay-modal hidden role=dialog aria-modal=true aria-label="Weed review">
 <figure class=weed-dialog><button id=weed-modal-close class=modal-close type=button aria-label=Close>&times;</button>
+<div class="modal-controls weed-view-toggle" role=group aria-label="Weed image view">
+<button id=weed-modal-without-overlay type=button aria-pressed=true>Without overlay</button>
+<button id=weed-modal-with-overlay type=button aria-pressed=false>With overlay</button>
+</div>
 <div class=weed-image-wrap><img id=weed-modal-img alt="Weed detection"><div id=weed-modal-marker class=weed-marker hidden></div></div>
 <figcaption id=weed-modal-details></figcaption>
-<p class=legend>Yellow cross = the weed being reviewed; red crosses = other detected weeds in this image.</p>
+<p class=legend>Blue cross = the weed being reviewed; red crosses = other detected weeds in this image.</p>
 <div class=modal-controls>
 <button id=weed-modal-accept type=button>Accept weed</button>
 <button id=weed-modal-reject type=button>Reject weed</button>
@@ -1111,6 +1281,17 @@ async def approve_weed(detection_id: UUID) -> JSONResponse:
     detection = database.weed_detection(str(detection_id))
     if detection is None or detection["status"] != "recommended":
         raise HTTPException(404, "Weed recommendation not found")
+    verdict = zone_verdict(ZoneAspect.WEEDS, detection["x"], detection["y"])
+    if not verdict.allowed:
+        # The recommendation stays pending so the zones can be corrected instead
+        # of losing the detection.
+        return JSONResponse(
+            {
+                "status": "conflict",
+                "message": f"Weeds are not allowed at this position: {verdict.reason}",
+            },
+            status_code=409,
+        )
     result = await client.create_weed(
         CreateWeedRequest(
             config_entry_id=detection["config_entry_id"],
@@ -1136,6 +1317,232 @@ async def reject_weed(detection_id: UUID) -> JSONResponse:
         raise HTTPException(404, "Weed recommendation not found")
     database.update_weed_detection(str(detection_id), "rejected")
     return JSONResponse({"status": "rejected", "message": "Weed recommendation rejected"})
+
+
+def zone_verdict(aspect: ZoneAspect, x: float, y: float, radius_mm: float = 0.0) -> ZoneVerdict:
+    """Evaluate a placement against the persisted zones (empty config allows)."""
+    return evaluate(zone_store.zones(), aspect, x, y, radius_mm)
+
+
+def _parse_polygon_points(raw: str) -> list[tuple[float, float]]:
+    points: list[tuple[float, float]] = []
+    for line in raw.replace(";", "\n").splitlines():
+        entry = line.strip()
+        if not entry:
+            continue
+        parts = [part for part in entry.replace("\t", ",").split(",") if part.strip()]
+        if len(parts) != 2:
+            raise HTTPException(422, f"Could not read the polygon point '{entry}'; use 'x, y'")
+        try:
+            points.append((float(parts[0]), float(parts[1])))
+        except ValueError as exc:
+            raise HTTPException(422, f"Polygon point '{entry}' is not numeric") from exc
+    return points
+
+
+def _zone_json(zones: list[Zone]) -> str:
+    payload = [
+        {
+            "zone_id": zone.zone_id,
+            "name": zone.name,
+            "kind": zone.kind.value,
+            "shape": zone.shape.value,
+            "enabled": zone.enabled,
+            "min_x": zone.min_x,
+            "min_y": zone.min_y,
+            "max_x": zone.max_x,
+            "max_y": zone.max_y,
+            "center_x": zone.center_x,
+            "center_y": zone.center_y,
+            "radius_mm": zone.radius_mm,
+            "points": [list(point) for point in zone.points],
+        }
+        for zone in zones
+    ]
+    return escape(json.dumps(payload, separators=(",", ":")), quote=True)
+
+
+@app.get("/zones", response_class=HTMLResponse)
+async def zones_page(request: Request) -> HTMLResponse:
+    zones = zone_store.zones()
+
+    def flag(zone: Zone, field: str, label: str) -> str:
+        state = " checked" if getattr(zone, field) else ""
+        return (
+            f'<label><input type=checkbox form="zone-form-{zone.zone_id}" name={field} '
+            f"value=true{state}> {escape(label)}</label>"
+        )
+
+    zone_forms = "".join(
+        f'<form id="zone-form-{zone.zone_id}" method=post action="zones/{zone.zone_id}/update"></form>'
+        f'<form id="zone-delete-{zone.zone_id}" method=post action="zones/{zone.zone_id}/delete"></form>'
+        for zone in zones
+    )
+    zone_rows = "".join(
+        f"<tr><td>{escape(zone.name)}</td>"
+        f"<td>{'Boundary' if zone.kind is ZoneKind.BOUNDARY else 'Exclusion zone'}</td>"
+        f"<td>{escape(zone.describe_geometry())}</td>"
+        f"<td>{flag(zone, 'allow_weeds', 'Weeds allowed')}</td>"
+        f"<td>{flag(zone, 'allow_plant_centers', 'Centres allowed')}</td>"
+        f"<td>{flag(zone, 'allow_plant_radius', 'Radius allowed')}</td>"
+        f"<td>{flag(zone, 'enabled', 'Active')}</td>"
+        f'<td><div class=button-row><button form="zone-form-{zone.zone_id}">Save</button>'
+        f'<button form="zone-delete-{zone.zone_id}">Delete</button></div></td></tr>'
+        for zone in zones
+    )
+    body = f"""<section class=card><h2>Boundaries and exclusion zones</h2>
+<p>Zones are areas of the garden in FarmBot coordinates (millimetres). A
+<b>boundary</b> encloses where things are allowed; an <b>exclusion zone</b> marks
+an area to keep clear. For each zone you choose independently whether weeds may
+be placed there, whether a plant centre may be moved there, and whether a plant's
+protection radius may extend into it.</p>
+<p class=muted>Overlaps resolve in a fixed order: an exclusion zone that allows an
+aspect is an explicit exception and wins; otherwise any zone that forbids the
+aspect and is touched by the position denies it; otherwise, if at least one
+boundary allows that aspect, the position must fall inside one of them. With no
+zones configured nothing is restricted. Weeds and plant centres are tested as
+points; a protection radius must fit entirely inside an allowing boundary and
+must not overlap a forbidding zone.</p>
+<p class=warn>Zones gate both automatic writes and manual approvals: a blocked
+weed is never created, a blocked centre move and a blocked radius increase are
+refused with the zone's name.</p></section>
+<section class=card><h2>Add a zone</h2>
+<form method=post action="zones">
+<div class=grid>
+<div>
+<label>Name<br><input name=name maxlength=60 required placeholder="Bed 1"></label><br>
+<label>Type<br><select id=kind name=kind>
+<option value=boundary selected>Boundary — things may go inside</option>
+<option value=exclusion>Exclusion zone — keep this area clear</option></select></label><br>
+<label>Shape<br><select id=shape name=shape>
+<option value=rectangle selected>Rectangle</option>
+<option value=circle>Circle</option>
+<option value=polygon>Polygon</option></select></label>
+</div>
+<div>
+<div id=fields-rectangle>
+<label>Corner 1 X (mm)<br><input type=number step=any name=min_x value=0></label><br>
+<label>Corner 1 Y (mm)<br><input type=number step=any name=min_y value=0></label><br>
+<label>Corner 2 X (mm)<br><input type=number step=any name=max_x value=1000></label><br>
+<label>Corner 2 Y (mm)<br><input type=number step=any name=max_y value=1000></label>
+</div>
+<div id=fields-circle hidden>
+<label>Centre X (mm)<br><input type=number step=any name=center_x value=0></label><br>
+<label>Centre Y (mm)<br><input type=number step=any name=center_y value=0></label><br>
+<label>Radius (mm)<br><input type=number step=any min=1 name=radius_mm value=500></label>
+</div>
+<div id=fields-polygon hidden>
+<label>Points, one "X, Y" pair per line (at least three)<br>
+<textarea name=points rows=6 cols=24 placeholder="0, 0&#10;1200, 0&#10;1200, 800"></textarea></label>
+</div>
+</div>
+<div>
+<p><b>Inside this zone</b></p>
+<label><input type=checkbox id=new_allow_weeds name=allow_weeds value=true checked>
+Weeds may be placed</label><br>
+<label><input type=checkbox id=new_allow_plant_centers name=allow_plant_centers value=true checked>
+Plant centres may be moved here</label><br>
+<label><input type=checkbox id=new_allow_plant_radius name=allow_plant_radius value=true checked>
+A plant radius may extend into it</label>
+<p class=muted>Clearing a box on a boundary carves a hole in it; ticking one on an
+exclusion zone makes that aspect an allowed exception inside it.</p>
+<p><button>Add zone</button></p>
+</div>
+</div>
+</form></section>
+<section class=card><h2>Configured zones</h2>{zone_forms}
+<table><thead><tr><th>Name</th><th>Type</th><th>Area</th><th>Weeds</th><th>Plant centres</th>
+<th>Plant radius</th><th>Active</th><th>Actions</th></tr></thead>
+<tbody>{zone_rows or "<tr><td colspan=8>No zones yet; nothing is restricted</td></tr>"}</tbody></table>
+<p class=muted>Changing a tick box takes effect after Save.</p></section>
+<section class=card><h2>Garden map</h2>
+<canvas id=zone-map width=900 height=600 data-zones="{_zone_json(zones)}"
+ data-entry="{escape(settings.selected_config_entry_id or "", quote=True)}"
+ style="width:100%;border:1px solid #ccc"></canvas>
+<div class=button-row><button id=zone-load-items type=button>Show plants &amp; FarmBot weeds</button></div>
+<p id=zone-map-status class=muted></p>
+<p class=legend>Green outline = boundary, red outline = exclusion zone, dashed = inactive.
+Green circles = plants with their protection radius, red dots = FarmBot weeds.</p>
+</section>
+<script>{_ZONES_JS}</script>"""
+    return layout(request, body, "Boundaries and zones")
+
+
+@app.get("/api/zones")
+async def zones_api() -> JSONResponse:
+    return JSONResponse(zone_store.load().model_dump(mode="json"))
+
+
+@app.post("/zones")
+async def create_zone(
+    name: str = Form(...),
+    kind: str = Form("boundary"),
+    shape: str = Form("rectangle"),
+    allow_weeds: bool = Form(False),
+    allow_plant_centers: bool = Form(False),
+    allow_plant_radius: bool = Form(False),
+    min_x: float = Form(0),
+    min_y: float = Form(0),
+    max_x: float = Form(0),
+    max_y: float = Form(0),
+    center_x: float = Form(0),
+    center_y: float = Form(0),
+    radius_mm: float = Form(0),
+    points: str = Form(""),
+) -> RedirectResponse:
+    try:
+        zone_kind, zone_shape = ZoneKind(kind), ZoneShape(shape)
+    except ValueError as exc:
+        raise HTTPException(400, "Unknown zone type or shape") from exc
+    try:
+        zone = Zone(
+            name=name.strip(),
+            kind=zone_kind,
+            shape=zone_shape,
+            allow_weeds=allow_weeds,
+            allow_plant_centers=allow_plant_centers,
+            allow_plant_radius=allow_plant_radius,
+            min_x=min_x,
+            min_y=min_y,
+            max_x=max_x,
+            max_y=max_y,
+            center_x=center_x,
+            center_y=center_y,
+            radius_mm=radius_mm,
+            points=_parse_polygon_points(points) if zone_shape is ZoneShape.POLYGON else [],
+        )
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    zone_store.add(zone)
+    LOGGER.info("Added %s zone '%s' (%s)", zone.kind.value, zone.name, zone.describe_geometry())
+    return RedirectResponse("zones", status_code=303)
+
+
+@app.post("/zones/{zone_id}/update")
+async def update_zone(
+    zone_id: str,
+    allow_weeds: bool = Form(False),
+    allow_plant_centers: bool = Form(False),
+    allow_plant_radius: bool = Form(False),
+    enabled: bool = Form(False),
+) -> RedirectResponse:
+    updated = zone_store.update(
+        zone_id,
+        allow_weeds=allow_weeds,
+        allow_plant_centers=allow_plant_centers,
+        allow_plant_radius=allow_plant_radius,
+        enabled=enabled,
+    )
+    if updated is None:
+        raise HTTPException(404, "Zone not found")
+    return RedirectResponse("../../zones", status_code=303)
+
+
+@app.post("/zones/{zone_id}/delete")
+async def delete_zone(zone_id: str) -> RedirectResponse:
+    if not zone_store.delete(zone_id):
+        raise HTTPException(404, "Zone not found")
+    return RedirectResponse("../../zones", status_code=303)
 
 
 def _calibration_warnings(calibration: Calibration | None) -> list[str]:
@@ -1371,6 +1778,36 @@ def _measurement_from_row(row: dict) -> Measurement:
     return Measurement.model_validate(payload)
 
 
+def _center_move_blocked(row: dict) -> str | None:
+    """Refusal message when zones forbid a plant centre at the suggested point."""
+    verdict = zone_verdict(
+        ZoneAspect.CENTERS, row["recommended_center_x"], row["recommended_center_y"]
+    )
+    if verdict.allowed:
+        return None
+    return f"A plant centre cannot be moved there: {verdict.reason}"
+
+
+def _radius_growth_blocked(row: dict) -> str | None:
+    """Refusal message when zones forbid the recommended protection radius.
+
+    Measurements recorded before the plant position was stored cannot be
+    checked; those keep their previous behaviour rather than being blocked.
+    """
+    center_x, center_y = row.get("recorded_center_x"), row.get("recorded_center_y")
+    if center_x is None or center_y is None:
+        return None
+    verdict = zone_verdict(
+        ZoneAspect.RADIUS,
+        float(center_x),
+        float(center_y),
+        float(row["recommended_protection_radius_mm"]),
+    )
+    if verdict.allowed:
+        return None
+    return f"The recommended radius is not allowed to extend there: {verdict.reason}"
+
+
 def _action_response(
     request: Request, status: str, message: str, *, error_status: int | None = None
 ) -> Response:
@@ -1403,6 +1840,9 @@ async def recommendation(request: Request, measurement_id: str, action: str) -> 
             return _action_response(
                 request, "conflict", "No centre correction is available", error_status=409
             )
+        blocked = _center_move_blocked(row)
+        if blocked is not None:
+            return _action_response(request, "conflict", blocked, error_status=409)
         entry_id = row.get("config_entry_id") or settings.selected_config_entry_id
         inventory = await client.inventory(
             InventoryRequest(
@@ -1448,7 +1888,7 @@ async def recommendation(request: Request, measurement_id: str, action: str) -> 
             return _action_response(
                 request, "conflict", "Calibration is required", error_status=409
             )
-        if row["recommended_protection_radius_mm"] <= row["current_radius_mm"]:
+        if row["recommended_protection_radius_mm"] == row["current_radius_mm"]:
             database.record_decision(
                 measurement_id,
                 "approved_no_change",
@@ -1458,8 +1898,11 @@ async def recommendation(request: Request, measurement_id: str, action: str) -> 
                 },
             )
             return _action_response(
-                request, "applied", "Observation approved; no radius increase was needed"
+                request, "applied", "Observation approved; no radius change was needed"
             )
+        blocked = _radius_growth_blocked(row)
+        if blocked is not None:
+            return _action_response(request, "conflict", blocked, error_status=409)
         entry_id = row.get("config_entry_id") or settings.selected_config_entry_id
         try:
             result = await client.apply_radius(
@@ -1559,6 +2002,9 @@ async def removal(request: Request, measurement_id: str, action: str) -> Respons
             return _action_response(
                 request, "conflict", "No centre correction is available", error_status=409
             )
+        blocked = _center_move_blocked(row)
+        if blocked is not None:
+            return _action_response(request, "conflict", blocked, error_status=409)
         inventory = await client.inventory(
             InventoryRequest(
                 config_entry_id=entry_id,

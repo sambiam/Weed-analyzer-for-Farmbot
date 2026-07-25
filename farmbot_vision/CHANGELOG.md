@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+- Added a **Boundaries & zones** tab. Boundaries enclose where things may be
+  placed and exclusion zones mark areas to keep clear; each zone separately
+  permits or forbids weed placement, plant-centre moves, and protection-radius
+  growth. Rectangles, circles, and polygons are supported, zones can be
+  disabled without deleting them, and a garden map draws them alongside the
+  bot's plants and weeds. Zones persist in `/data/zones.json` and gate both
+  automatic writes and manual approvals; with no zones configured nothing is
+  restricted.
+
 ## 1.1.5 - 2026-07-25
 
 - Re-cut the release: the `V1.1.4` GitHub release/tag was created against a
@@ -154,5 +165,5 @@ contract (contract **farmbot-vision-v2**).
 - Initial Home Assistant app for aarch64 and amd64.
 - Added strict companion-integration contracts over the Supervisor Core REST/WebSocket proxy.
 - Added sequential classical canopy analysis, maximum-leaf protection, overlap uncertainty, and temporal evidence hooks.
-- Added no-shrink radius safety, optimistic-concurrency handling, manual calibration, monotonic curve learning, SQLite migrations, retention, scheduling, and ingress UI.
+- Added conservative radius-change safety: small decreases can be automatic while larger decreases remain lower-confidence review items, alongside optimistic-concurrency handling, manual calibration, monotonic curve learning, SQLite migrations, retention, scheduling, and ingress UI.
 - Added synthetic safety tests and BuildKit multi-architecture CI/release workflows.

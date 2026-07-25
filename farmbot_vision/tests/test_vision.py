@@ -129,6 +129,7 @@ def test_unowned_component_becomes_weed_only_when_enabled(seed, calibration):
     )
     assert len(result.weeds) == 1
     assert result.weeds[0].center_px[0] > 270
+    assert result.weed_review_jpeg is not None
 
 
 def test_known_neighbouring_plant_is_not_a_weed_but_small_bottom_weed_is(calibration):

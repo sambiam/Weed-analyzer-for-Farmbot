@@ -36,6 +36,7 @@ options:
   maximum_daily_radius_growth_mm: 50.0
   maximum_plant_radius_mm: 500.0
   maximum_single_update_percent: 40.0
+  maximum_automatic_radius_reduction_percent: 10.0
   minimum_observations_for_curve: 5
   removal_detection_enabled: false
   removal_auto_apply: false
@@ -59,6 +60,7 @@ schema:
   maximum_daily_radius_growth_mm: float(1,500)
   maximum_plant_radius_mm: float(1,2000)
   maximum_single_update_percent: float(1,200)
+  maximum_automatic_radius_reduction_percent: float(0,100)
   minimum_observations_for_curve: int(2,100)
   removal_detection_enabled: bool
   removal_auto_apply: bool

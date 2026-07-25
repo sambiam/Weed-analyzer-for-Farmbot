@@ -40,6 +40,7 @@ from .safety import decide
 from .settings import Settings
 from .vision import ClassicalVisionEngine, garden_to_pixel, pixel_to_garden
 from .weed_settings import WeedSettingsStore
+from .zones import Zone, ZoneAspect, ZoneStore, evaluate
 
 LOGGER = logging.getLogger(__name__)
 
@@ -51,6 +52,7 @@ class JobManager:
         database: Database,
         client: HomeAssistantClient,
         weed_settings_store: WeedSettingsStore | None = None,
+        zone_store: ZoneStore | None = None,
     ):
         self.settings = settings
         self.db = database
@@ -60,6 +62,7 @@ class JobManager:
         self.last: dict = {}
         self.queued_image_ids: list[int] = []
         self.weed_settings_store = weed_settings_store
+        self.zone_store = zone_store
 
     def add_to_queue(self, image_ids: list[int]) -> int:
         for image_id in image_ids:
@@ -228,6 +231,9 @@ class JobManager:
             weed_settings = (
                 self.weed_settings_store.load() if self.weed_settings_store is not None else None
             )
+            # Boundaries and exclusion zones are read once per job so a mid-job
+            # edit cannot make one image obey different rules than the next.
+            zones: list[Zone] = self.zone_store.zones() if self.zone_store is not None else []
             wanted = [p for p in inventory.plants if not plant_ids or p.id in plant_ids]
             wanted_image_ids = set(image_ids)
             images = [
@@ -251,6 +257,8 @@ class JobManager:
             self.current["uncalibrated_images"] = 0
             self.current["calibration_warnings"] = []
             self.current["calibration_source"] = None
+            self.current["zone_blocked_weeds"] = 0
+            self.current["zone_blocked_radius"] = 0
             artifacts = self.settings.data_dir / "artifacts"
             artifacts.mkdir(parents=True, exist_ok=True)
             for image_number, image_info in enumerate(images):
@@ -300,6 +308,7 @@ class JobManager:
                 self.current["images_processed"] += 1
 
                 overlay_path = artifacts / f"{job_id}-{response.image_id}-overlay.jpg"
+                weed_review_path = artifacts / f"{job_id}-{response.image_id}-weed-review.jpg"
 
                 if resolved.calibration is None:
                     # No valid metric calibration: pixel-only diagnostics, no
@@ -357,7 +366,15 @@ class JobManager:
                 )
                 del image_bytes, previous_masks
                 decided = []
+                plants_by_id = {plant.id: plant for plant in wanted}
                 for item in result.measurements:
+                    plant = plants_by_id[item.plant_id]
+                    item = item.model_copy(
+                        update={
+                            "recorded_center_x": plant.x,
+                            "recorded_center_y": plant.y,
+                        }
+                    )
                     suggested_center = item.recommended_center_px
                     if suggested_center is not None:
                         suggested_center = pixel_to_garden(
@@ -396,6 +413,8 @@ class JobManager:
                     )
                 if result.overlay_jpeg:
                     overlay_path.write_bytes(result.overlay_jpeg)
+                if result.weed_review_jpeg:
+                    weed_review_path.write_bytes(result.weed_review_jpeg)
                 for weed in result.weeds:
                     weed_x, weed_y = pixel_to_garden(
                         weed.center_px[0],
@@ -412,6 +431,19 @@ class JobManager:
                         <= max(duplicate_distance, existing.radius)
                         for existing in inventory.weeds
                     ) or self.db.has_weed_detection_near(weed_x, weed_y, duplicate_distance):
+                        continue
+                    # Zones decide where a weed may exist at all: a position the
+                    # user has ruled out is not stored, so it is never created
+                    # automatically and never offered for review either.
+                    zone_check = evaluate(zones, ZoneAspect.WEEDS, weed_x, weed_y)
+                    if not zone_check.allowed:
+                        self.current["zone_blocked_weeds"] += 1
+                        LOGGER.info(
+                            "Weed at (%.1f, %.1f) discarded: %s",
+                            weed_x,
+                            weed_y,
+                            zone_check.reason,
+                        )
                         continue
                     weed_status = "recommended"
                     if (
@@ -450,6 +482,9 @@ class JobManager:
                         radius_mm=weed.radius_mm,
                         confidence=weed.confidence,
                         overlay_path=str(overlay_path) if result.overlay_jpeg else None,
+                        review_path=(
+                            str(weed_review_path) if result.weed_review_jpeg else None
+                        ),
                         status=weed_status,
                         center_px_x=weed.center_px[0],
                         center_px_y=weed.center_px[1],
@@ -555,6 +590,45 @@ class JobManager:
                             continue
                         # Never write without a valid calibration (Part 6).
                         if item.decision != Decision.APPLIED or not item.calibrated:
+                            continue
+                        # A protection radius may only grow into areas the zones
+                        # permit. Blocked growth stays a recommendation so the
+                        # zone can be adjusted or the result rejected by hand.
+                        radius_zone_check = (
+                            evaluate(
+                                zones,
+                                ZoneAspect.RADIUS,
+                                item.recorded_center_x,
+                                item.recorded_center_y,
+                                item.recommended_protection_radius_mm,
+                            )
+                            if item.recorded_center_x is not None
+                            and item.recorded_center_y is not None
+                            else None
+                        )
+                        if radius_zone_check is not None and not radius_zone_check.allowed:
+                            self.current["zone_blocked_radius"] += 1
+                            decided[item_index] = item.model_copy(
+                                update={
+                                    "decision": Decision.RECOMMENDED,
+                                    "applied": False,
+                                    "reason": (
+                                        f"{item.reason}; radius growth blocked: "
+                                        f"{radius_zone_check.reason}"
+                                    ),
+                                }
+                            )
+                            self.db.update_measurement_outcome(
+                                str(item.measurement_id),
+                                decision=Decision.RECOMMENDED.value,
+                                applied=False,
+                                reason=decided[item_index].reason,
+                            )
+                            self.db.record_decision(
+                                str(item.measurement_id),
+                                "zone_blocked",
+                                {"aspect": "radius", "reason": radius_zone_check.reason},
+                            )
                             continue
                         try:
                             apply_result = await self.client.apply_radius(
@@ -722,6 +796,8 @@ class JobManager:
             "analysis_resolution": self.settings.resolution.as_dict(),
             "images_processed": self.current.get("images_processed", 0),
             "uncalibrated_images": self.current.get("uncalibrated_images", 0),
+            "zone_blocked_weeds": self.current.get("zone_blocked_weeds", 0),
+            "zone_blocked_radius": self.current.get("zone_blocked_radius", 0),
             "calibration_source": self.current.get("calibration_source"),
             "calibration_warnings": self.current.get("calibration_warnings", []),
             "source_dimensions": self.current.get("source_dimensions"),

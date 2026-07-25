@@ -209,6 +209,35 @@ async def test_uncertain_measurement_is_manually_reviewable_and_applicable(monke
 
 
 @pytest.mark.asyncio
+async def test_manual_approval_can_apply_a_radius_reduction(monkeypatch):
+    measurement = _review_measurement(
+        current_radius_mm=100,
+        recommended_protection_radius_mm=90,
+        confidence=0.5,
+        decision=Decision.UNCERTAIN,
+        reason="large radius reduction requires human review",
+    )
+    web.database.save_measurements([measurement])
+    calls = []
+
+    async def applied(request):
+        calls.append(request)
+        return {"status": "applied", "message": "radius updated"}
+
+    monkeypatch.setattr(web.client, "apply_radius", applied)
+    status, _, body = await asgi_request(
+        f"/recommendations/{measurement.measurement_id}/approve",
+        method="POST",
+        headers=[(b"accept", b"application/json")],
+    )
+
+    assert status == 200
+    assert json.loads(body)["status"] == "applied"
+    assert calls[0].recommended_radius_mm == 90
+    assert calls[0].human_approved is True
+
+
+@pytest.mark.asyncio
 async def test_dashboard_modal_uses_artifact_manifest_and_pending_rows(tmp_path, monkeypatch):
     artifact_dir = tmp_path / "artifacts"
     artifact_dir.mkdir()
@@ -241,6 +270,31 @@ async def test_dashboard_modal_uses_artifact_manifest_and_pending_rows(tmp_path,
     assert str(measurement.measurement_id) not in {
         row["measurement_id"] for row in web.database.pending_measurements()
     }
+
+
+@pytest.mark.asyncio
+async def test_missing_plant_table_shows_crop_and_center_coordinates():
+    measurement = _review_measurement(
+        vegetation_absent=True,
+        center_misaligned=True,
+        recorded_center_x=123.4,
+        recorded_center_y=567.8,
+        recommended_center_px=(130.5, 575.25),
+        absent_observations=2,
+    )
+    web.database.save_measurements([measurement])
+
+    status, _, body = await asgi_request("/")
+    html = body.decode()
+
+    assert status == 200
+    assert "<th>Crop</th>" in html
+    assert "Recorded center (X, Y mm)" in html
+    assert "Move center to (X, Y mm)" in html
+    assert "<td>lettuce</td>" in html
+    assert "<td>X 123.4, Y 567.8</td>" in html
+    assert "<td>X 130.5, Y 575.2</td>" in html
+    assert "<th>Plant</th><th>Absent looks</th>" not in html
 
 
 @pytest.mark.asyncio

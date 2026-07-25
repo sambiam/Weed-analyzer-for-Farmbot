@@ -132,6 +132,18 @@ MIGRATIONS = [
     ALTER TABLE weed_detections ADD COLUMN processed_width INTEGER;
     ALTER TABLE weed_detections ADD COLUMN processed_height INTEGER;
     """,
+    # Migration 7: retain the plant's recorded garden position alongside any
+    # suggested centre so removal review remains understandable even if the
+    # FarmBot point is later changed or archived.
+    """
+    ALTER TABLE measurements ADD COLUMN recorded_center_x REAL;
+    ALTER TABLE measurements ADD COLUMN recorded_center_y REAL;
+    """,
+    # Migration 8: a photo-only weed review artifact keeps weed markers visible
+    # while allowing the segmentation/ownership overlay to be hidden.
+    """
+    ALTER TABLE weed_detections ADD COLUMN review_path TEXT;
+    """,
 ]
 
 
@@ -336,6 +348,8 @@ class Database:
                     m.safety_margin_mm,
                     m.calibration_uncertainty_mm,
                     int(m.center_misaligned),
+                    m.recorded_center_x,
+                    m.recorded_center_y,
                     m.recommended_center_px[0] if m.recommended_center_px else None,
                     m.recommended_center_px[1] if m.recommended_center_px else None,
                 )
@@ -369,8 +383,9 @@ class Database:
                 mask_path,overlay_path,analysis_resolution,processed_width,processed_height,
                 calibration_source,calibrated,contract_version,artifact_paths_json,
                 vegetation_absent,absent_observations,safety_margin_mm,calibration_uncertainty_mm,
-                center_misaligned,recommended_center_x,recommended_center_y)
-                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                center_misaligned,recorded_center_x,recorded_center_y,
+                recommended_center_x,recommended_center_y)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 values,
             )
 
@@ -388,6 +403,7 @@ class Database:
         radius_mm: float,
         confidence: float,
         overlay_path: str | None,
+        review_path: str | None = None,
         status: str = "recommended",
         center_px_x: float | None = None,
         center_px_y: float | None = None,
@@ -398,9 +414,9 @@ class Database:
             self.connection.execute(
                 """INSERT OR REPLACE INTO weed_detections(
                 detection_id,config_entry_id,image_id,image_timestamp,x,y,z,area_mm2,
-                radius_mm,confidence,overlay_path,status,center_px_x,center_px_y,
+                radius_mm,confidence,overlay_path,review_path,status,center_px_x,center_px_y,
                 processed_width,processed_height)
-                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     detection_id,
                     config_entry_id,
@@ -413,6 +429,7 @@ class Database:
                     radius_mm,
                     confidence,
                     overlay_path,
+                    review_path,
                     status,
                     center_px_x,
                     center_px_y,
@@ -645,13 +662,19 @@ class Database:
             )
 
     def update_measurement_outcome(
-        self, measurement_id: str, *, decision: str, applied: bool
+        self, measurement_id: str, *, decision: str, applied: bool, reason: str | None = None
     ) -> None:
         with self.connection:
-            self.connection.execute(
-                "UPDATE measurements SET decision=?,applied=? WHERE measurement_id=?",
-                (decision, int(applied), measurement_id),
-            )
+            if reason is None:
+                self.connection.execute(
+                    "UPDATE measurements SET decision=?,applied=? WHERE measurement_id=?",
+                    (decision, int(applied), measurement_id),
+                )
+            else:
+                self.connection.execute(
+                    "UPDATE measurements SET decision=?,applied=?,reason=? WHERE measurement_id=?",
+                    (decision, int(applied), reason, measurement_id),
+                )
 
     def start_job(
         self, job_id: str, entry_id: str, trigger: str, mode: str, started_at: str

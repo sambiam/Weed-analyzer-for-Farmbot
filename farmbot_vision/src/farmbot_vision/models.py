@@ -520,6 +520,8 @@ class Measurement(StrictModel):
     artifact_paths: list[str] = Field(default_factory=list)
     vegetation_absent: bool = False
     center_misaligned: bool = False
+    recorded_center_x: float | None = None
+    recorded_center_y: float | None = None
     recommended_center_px: tuple[float, float] | None = None
     absent_observations: int = Field(default=0, ge=0)
     safety_margin_mm: float = Field(default=0, ge=0)
@@ -538,6 +540,7 @@ class AnalysisResult(StrictModel):
     mask: bytes | None = None
     ownership_mask: bytes | None = None
     overlay_jpeg: bytes | None = None
+    weed_review_jpeg: bytes | None = None
     skipped: dict[int, str] = Field(default_factory=dict)
     weeds: list[WeedDetection] = Field(default_factory=list)
 

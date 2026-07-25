@@ -34,11 +34,33 @@ def test_missing_calibration_prevents_job(tmp_path):
     assert Database(tmp_path / "db.sqlite").active_calibration("bot") is None
 
 
-def test_shrink_is_always_retained():
+def test_small_shrink_can_apply_automatically():
     result = decide(
-        measurement(current=100, recommendation=80), OperatingMode.AUTO_RADIUS, Settings()
+        measurement(current=100, recommendation=95), OperatingMode.AUTO_RADIUS, Settings()
     )
-    assert result.decision == Decision.RETAIN
+    assert result.decision == Decision.APPLIED
+
+
+def test_large_shrink_is_reviewable_but_not_automatically_applied():
+    result = decide(
+        measurement(current=100, recommendation=50), OperatingMode.RECOMMEND, Settings()
+    )
+    assert result.decision == Decision.RECOMMENDED
+    assert result.confidence < Settings().minimum_auto_confidence
+    automatic = decide(
+        measurement(current=100, recommendation=50), OperatingMode.AUTO_RADIUS, Settings()
+    )
+    assert automatic.decision == Decision.UNCERTAIN
+    assert automatic.confidence < Settings().minimum_auto_confidence
+
+
+def test_shrink_limit_is_configurable():
+    result = decide(
+        measurement(current=100, recommendation=85),
+        OperatingMode.AUTO_RADIUS,
+        Settings(maximum_automatic_radius_reduction_percent=20),
+    )
+    assert result.decision == Decision.APPLIED
 
 
 def test_auto_radius_requires_confidence():

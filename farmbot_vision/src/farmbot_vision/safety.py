@@ -82,9 +82,55 @@ def decide(
                 "reason": "overlapping canopy ownership is ambiguous",
             }
         )
-    if proposed <= current:
+    if proposed == current:
         return measurement.model_copy(
-            update={"decision": Decision.RETAIN, "reason": "automatic shrinking is disabled"}
+            update={"decision": Decision.RETAIN, "reason": "observed radius matches current radius"}
+        )
+    if proposed < current:
+        reduction_percent = 100 * (current - proposed) / max(current, 1)
+        automatic_limit = settings.maximum_automatic_radius_reduction_percent
+        # A large decrease remains reviewable, but make its uncertainty
+        # visible in the stored result as well as in the automatic decision.
+        if reduction_percent > automatic_limit:
+            confidence_cap = min(
+                1 - reduction_percent / 100,
+                settings.minimum_auto_confidence - 0.01,
+            )
+            measurement = measurement.model_copy(
+                update={"confidence": max(0.05, min(measurement.confidence, confidence_cap))}
+            )
+        if mode == OperatingMode.OBSERVE:
+            return measurement.model_copy(
+                update={
+                    "decision": Decision.OBSERVED,
+                    "reason": "observe mode records a possible radius reduction without writing",
+                }
+            )
+        if mode == OperatingMode.AUTO_RADIUS:
+            if reduction_percent > automatic_limit:
+                return measurement.model_copy(
+                    update={
+                        "decision": Decision.UNCERTAIN,
+                        "reason": "radius reduction exceeds the conservative automatic reduction limit",
+                    }
+                )
+            if measurement.confidence < settings.minimum_auto_confidence:
+                return measurement.model_copy(
+                    update={
+                        "decision": Decision.UNCERTAIN,
+                        "reason": "confidence is below automatic threshold",
+                    }
+                )
+        return measurement.model_copy(
+            update={
+                "decision": (
+                    Decision.APPLIED
+                    if mode == OperatingMode.AUTO_RADIUS
+                    else Decision.RECOMMENDED
+                ),
+                "reason": "safe small radius reduction" if reduction_percent <= automatic_limit
+                else "large radius reduction requires human review",
+            }
         )
     if mode == OperatingMode.OBSERVE:
         return measurement.model_copy(

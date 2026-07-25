@@ -4,7 +4,7 @@ configuration:
     description: Select this in the Ingress interface after the companion integration is available.
   mode:
     name: Operating mode
-    description: Observe only, recommend changes, or automatically apply safe radius increases.
+    description: Observe only, recommend changes, or automatically apply safe radius increases and small decreases.
   analysis_resolution:
     name: Analysis resolution
     description: >-
@@ -31,6 +31,9 @@ configuration:
     name: Maximum plant radius (mm)
   maximum_single_update_percent:
     name: Maximum single increase (percent)
+  maximum_automatic_radius_reduction_percent:
+    name: Maximum automatic radius reduction (percent)
+    description: Small decreases may be applied automatically; larger decreases remain for review with reduced confidence.
   minimum_observations_for_curve:
     name: Minimum curve observations
   removal_detection_enabled:

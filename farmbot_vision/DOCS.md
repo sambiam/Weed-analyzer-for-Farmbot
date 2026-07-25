@@ -38,7 +38,7 @@ FarmBot Vision requires Home Assistant Core 2026.7 or newer and companion FarmBo
 
 - **Observe** stores measurements and diagnostic overlays without writes.
 - **Recommend** proposes individual increases and exposes approve/reject controls. Nothing is written until approved.
-- **Auto radius** writes only high-confidence increases that pass all configured limits. It never shrinks a radius.
+- **Auto radius** writes only high-confidence increases that pass all configured limits, plus small high-confidence decreases within `maximum_automatic_radius_reduction_percent` (10% by default). Larger decreases remain reviewable with reduced confidence and are never automatic.
 - **Auto curve** is a future advanced mode and is intentionally unavailable in 0.1.0. Curve proposals never modify or replace a user-created curve.
 
 ## Analysis resolution
@@ -111,6 +111,43 @@ absence of upscaling, and payload/dimension limits. Base64 image data is never
 logged or persisted.
 
 The classical pipeline combines HSV and Excess Green, morphology, components, known-centre seeds, nearest-centre ownership, historical-mask evidence, maximum accepted distance, and confidence. Ambiguous overlap prevents writes. The protection radius is the largest accepted leaf distance plus safety and calibration margins; a separate 90th-percentile value is retained only as the typical canopy measurement.
+
+## Boundaries and exclusion zones
+
+The **Boundaries & zones** tab defines where the app may place things, in FarmBot
+garden millimetres. A **boundary** encloses the area where placement is allowed;
+an **exclusion zone** marks an area to keep clear. Zones can be rectangles,
+circles, or polygons, and each one can be switched off without deleting it.
+
+Every zone states independently whether, inside it:
+
+- **weeds** may be created,
+- a **plant centre** may be moved there,
+- a plant's **protection radius** may extend into it.
+
+Overlaps resolve in a fixed order: an exclusion zone that *allows* an aspect is
+an explicit exception and wins; otherwise any zone that *forbids* the aspect and
+is touched by the position denies it; otherwise, if at least one boundary allows
+that aspect, the position must fall inside one of them. With no zones configured
+nothing is restricted, so existing installations behave exactly as before.
+Clearing a tick box on a boundary carves a hole in it for that aspect only.
+
+Weeds and plant centres are tested as points. A protection radius is tested as a
+disc: it must fit entirely inside an allowing boundary and must not overlap a
+forbidding zone at all.
+
+Zones gate automatic writes and manual approvals alike. A weed detected in a
+forbidden position is discarded rather than stored, so it is never created and
+never appears for review; the last-job card counts how many were dropped. A
+blocked automatic radius increase stays a recommendation whose reason names the
+zone, and manual approval of a blocked radius or centre move is refused with the
+same explanation. Measurements recorded before the app stored plant positions
+cannot be radius-checked and keep their previous behaviour.
+
+Zones are stored in `/data/zones.json` and survive restarts and upgrades. The
+tab's garden map draws every zone and can overlay the bot's plants (with their
+protection radii) and existing FarmBot weeds so a zone can be checked before it
+starts gating writes.
 
 ## Scheduling and resources
 

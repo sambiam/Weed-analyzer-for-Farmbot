@@ -25,6 +25,9 @@ class Settings(BaseModel):
     maximum_daily_radius_growth_mm: float = Field(default=50, gt=0)
     maximum_plant_radius_mm: float = Field(default=500, gt=0)
     maximum_single_update_percent: float = Field(default=40, gt=0)
+    # A decrease is useful for trimmed or previously overestimated plants,
+    # but is intentionally much more conservative than growth.
+    maximum_automatic_radius_reduction_percent: float = Field(default=10, ge=0, le=100)
     minimum_observations_for_curve: int = Field(default=5, ge=2)
     removal_detection_enabled: bool = False
     removal_auto_apply: bool = False

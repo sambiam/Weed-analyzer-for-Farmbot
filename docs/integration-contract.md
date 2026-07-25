@@ -62,7 +62,7 @@ Input:
 {"config_entry_id":"string","plant_id":123,"measurement_id":"UUID","expected_current_radius_mm":120.0,"recommended_radius_mm":185.0,"confidence":0.94,"apply":false}
 ```
 
-The integration must validate bounds, authorization, and optimistic concurrency. A stale current radius must return HTTP-equivalent conflict semantics (409 or 412 through the service response path) or a structured failure that can be mapped to that condition. `apply:false` validates without mutation. It may return a response.
+The integration must validate bounds, authorization, and optimistic concurrency. A stale current radius must return HTTP-equivalent conflict semantics (409 or 412 through the service response path) or a structured failure that can be mapped to that condition. `apply:false` validates without mutation. It may return a response. Automatic writes may include only small radius decreases (10% by default in the companion integration); larger decreases are for explicit human approval.
 
 ## `farmbot.upsert_vision_spread_curve`
 
