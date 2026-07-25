@@ -40,6 +40,10 @@ class InventoryRequest(StrictModel):
     image_lookback_hours: int = Field(default=72, ge=1, le=720)
 
 
+class QueueImagesRequest(StrictModel):
+    image_ids: list[Annotated[int, Field(gt=0, strict=True)]]
+
+
 class Plant(StrictModel):
     id: int
     name: str
@@ -315,6 +319,31 @@ class ApplyRemovalRequest(StrictModel):
     human_approved: bool = False
 
 
+class ApplyPlantCenterRequest(StrictModel):
+    config_entry_id: str
+    plant_id: int
+    measurement_id: UUID
+    expected_x: float
+    expected_y: float
+    recommended_x: float
+    recommended_y: float
+    apply: bool = False
+    human_approved: bool = False
+
+
+class CreateWeedRequest(StrictModel):
+    config_entry_id: str
+    detection_id: UUID
+    x: float
+    y: float
+    z: float = 0
+    radius: float = Field(default=15, gt=0)
+    name: str = "Vision detected weed"
+    confidence: float = Field(ge=0, le=1)
+    apply: bool = False
+    human_approved: bool = False
+
+
 class UpsertCurveRequest(StrictModel):
     config_entry_id: str
     crop_slug: str
@@ -490,6 +519,8 @@ class Measurement(StrictModel):
     overlay_path: str | None = None
     artifact_paths: list[str] = Field(default_factory=list)
     vegetation_absent: bool = False
+    center_misaligned: bool = False
+    recommended_center_px: tuple[float, float] | None = None
     absent_observations: int = Field(default=0, ge=0)
     safety_margin_mm: float = Field(default=0, ge=0)
     calibration_uncertainty_mm: float = Field(default=0, ge=0)
@@ -508,3 +539,14 @@ class AnalysisResult(StrictModel):
     ownership_mask: bytes | None = None
     overlay_jpeg: bytes | None = None
     skipped: dict[int, str] = Field(default_factory=dict)
+    weeds: list[WeedDetection] = Field(default_factory=list)
+
+
+class WeedDetection(StrictModel):
+    detection_id: UUID
+    image_id: int
+    image_timestamp: datetime
+    center_px: tuple[float, float]
+    area_mm2: float
+    radius_mm: float
+    confidence: float = Field(ge=0, le=1)

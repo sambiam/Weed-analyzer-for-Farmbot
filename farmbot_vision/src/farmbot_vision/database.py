@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import sqlite3
 from collections.abc import Iterable
 from datetime import UTC, datetime
@@ -107,6 +108,21 @@ MIGRATIONS = [
     ALTER TABLE curve_proposals ADD COLUMN conflict_old_diameter REAL;
     ALTER TABLE curve_proposals ADD COLUMN overlay_path TEXT;
     ALTER TABLE curve_proposals ADD COLUMN warning TEXT;
+    """,
+    # Migration 5: centre-alignment alternatives and reviewable weed detections.
+    """
+    ALTER TABLE measurements ADD COLUMN center_misaligned INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE measurements ADD COLUMN recommended_center_x REAL;
+    ALTER TABLE measurements ADD COLUMN recommended_center_y REAL;
+    CREATE TABLE IF NOT EXISTS weed_detections(
+      detection_id TEXT PRIMARY KEY, config_entry_id TEXT NOT NULL, image_id INTEGER NOT NULL,
+      image_timestamp TEXT NOT NULL, x REAL NOT NULL, y REAL NOT NULL, z REAL NOT NULL DEFAULT 0,
+      area_mm2 REAL NOT NULL, radius_mm REAL NOT NULL, confidence REAL NOT NULL,
+      overlay_path TEXT, status TEXT NOT NULL DEFAULT 'recommended',
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE INDEX IF NOT EXISTS idx_weed_detections_pending
+      ON weed_detections(status,image_timestamp DESC);
     """,
 ]
 
@@ -274,6 +290,7 @@ class Database:
         )
 
     def save_measurements(self, measurements: Iterable[Measurement]) -> None:
+        measurements = list(measurements)
         values = []
         for m in measurements:
             values.append(
@@ -310,9 +327,32 @@ class Database:
                     m.absent_observations,
                     m.safety_margin_mm,
                     m.calibration_uncertainty_mm,
+                    int(m.center_misaligned),
+                    m.recommended_center_px[0] if m.recommended_center_px else None,
+                    m.recommended_center_px[1] if m.recommended_center_px else None,
                 )
             )
         with self.connection:
+            # Re-analysis replaces the reviewable result for this plant/image
+            # while retaining the prior measurement and audit trail.
+            for measurement in measurements:
+                prior_rows = self.connection.execute(
+                    "SELECT m.measurement_id FROM measurements m WHERE m.config_entry_id=? "
+                    "AND m.plant_id=? AND m.image_id=? AND m.measurement_id<>? AND NOT EXISTS "
+                    "(SELECT 1 FROM decisions d WHERE d.measurement_id=m.measurement_id "
+                    "AND d.action='superseded')",
+                    (
+                        measurement.config_entry_id,
+                        measurement.plant_id,
+                        measurement.image_id,
+                        str(measurement.measurement_id),
+                    ),
+                ).fetchall()
+                self.connection.executemany(
+                    "INSERT INTO decisions(measurement_id,action,details_json) VALUES(?,"
+                    "'superseded','{}')",
+                    [(row[0],) for row in prior_rows],
+                )
             self.connection.executemany(
                 """INSERT OR REPLACE INTO measurements(measurement_id,config_entry_id,plant_id,crop_slug,plant_age_days,
                 image_id,image_timestamp,current_radius_mm,typical_canopy_radius_mm,
@@ -320,10 +360,80 @@ class Database:
                 calibration_version_id,transform_json,algorithm_version,decision,reason,ambiguous,applied,
                 mask_path,overlay_path,analysis_resolution,processed_width,processed_height,
                 calibration_source,calibrated,contract_version,artifact_paths_json,
-                vegetation_absent,absent_observations,safety_margin_mm,calibration_uncertainty_mm)
-                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                vegetation_absent,absent_observations,safety_margin_mm,calibration_uncertainty_mm,
+                center_misaligned,recommended_center_x,recommended_center_y)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 values,
             )
+
+    def save_weed_detection(
+        self,
+        *,
+        detection_id: str,
+        config_entry_id: str,
+        image_id: int,
+        image_timestamp: datetime,
+        x: float,
+        y: float,
+        z: float,
+        area_mm2: float,
+        radius_mm: float,
+        confidence: float,
+        overlay_path: str | None,
+        status: str = "recommended",
+    ) -> None:
+        with self.connection:
+            self.connection.execute(
+                """INSERT OR REPLACE INTO weed_detections(
+                detection_id,config_entry_id,image_id,image_timestamp,x,y,z,area_mm2,
+                radius_mm,confidence,overlay_path,status)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    detection_id,
+                    config_entry_id,
+                    image_id,
+                    image_timestamp.isoformat(),
+                    x,
+                    y,
+                    z,
+                    area_mm2,
+                    radius_mm,
+                    confidence,
+                    overlay_path,
+                    status,
+                ),
+            )
+
+    def pending_weed_detections(self, limit: int = 100) -> list[dict]:
+        return [
+            dict(row)
+            for row in self.connection.execute(
+                "SELECT * FROM weed_detections WHERE status='recommended' "
+                "ORDER BY image_timestamp DESC LIMIT ?",
+                (limit,),
+            )
+        ]
+
+    def weed_detection(self, detection_id: str) -> dict | None:
+        row = self.connection.execute(
+            "SELECT * FROM weed_detections WHERE detection_id=?", (detection_id,)
+        ).fetchone()
+        return None if row is None else dict(row)
+
+    def update_weed_detection(self, detection_id: str, status: str) -> None:
+        with self.connection:
+            self.connection.execute(
+                "UPDATE weed_detections SET status=? WHERE detection_id=?",
+                (status, detection_id),
+            )
+
+    def has_weed_detection_near(self, x: float, y: float, tolerance_mm: float) -> bool:
+        for row in self.connection.execute(
+            "SELECT x,y FROM weed_detections WHERE status IN ('recommended','created')"
+        ):
+            if math.hypot(float(row[0]) - x, float(row[1]) - y) <= tolerance_mm:
+                return True
+        return False
 
     def latest_mask_path(self, plant_id: int) -> str | None:
         row = self.connection.execute(
@@ -398,7 +508,7 @@ class Database:
             """SELECT m.* FROM measurements m
             WHERE NOT EXISTS (
               SELECT 1 FROM decisions d WHERE d.measurement_id=m.measurement_id
-              AND d.action IN ('applied','reject','removed','keep')
+              AND d.action IN ('applied','reject','removed','keep','superseded')
             )
             ORDER BY m.image_timestamp DESC LIMIT ?""",
             (limit,),
@@ -415,7 +525,7 @@ class Database:
         return (
             self.connection.execute(
                 "SELECT 1 FROM decisions WHERE measurement_id=? "
-                "AND action IN ('applied','reject','removed','keep') LIMIT 1",
+                "AND action IN ('applied','reject','removed','keep','superseded') LIMIT 1",
                 (measurement_id,),
             ).fetchone()
             is not None

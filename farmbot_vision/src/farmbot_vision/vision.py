@@ -11,8 +11,17 @@ import cv2
 import numpy as np
 
 from . import ALGORITHM_VERSION, CONTRACT_VERSION
-from .models import AnalysisResult, Calibration, Decision, Measurement, OriginLocation, PlantSeed
+from .models import (
+    AnalysisResult,
+    Calibration,
+    Decision,
+    Measurement,
+    OriginLocation,
+    PlantSeed,
+    WeedDetection,
+)
 from .resolution import MAX_PROCESSED_HEIGHT, MAX_PROCESSED_WIDTH
+from .weed_settings import WeedSettings
 
 cv2.setNumThreads(1)
 
@@ -143,8 +152,19 @@ def vegetation_mask(image: np.ndarray, params: ScaleParams) -> np.ndarray:
     saturation = hsv[:, :, 1]
     value = hsv[:, :, 2]
     hsv_green = cv2.inRange(hsv, (25, 35, 25), (100, 255, 255)) > 0
-    exg_threshold = max(18, int(np.percentile(excess_green, 70)))
-    mask = hsv_green & (excess_green > exg_threshold) & (saturation > 35) & (value > 25)
+    # A global 70th percentile discarded pale or shadowed leaves whenever a
+    # large, very green plant dominated the frame. Otsu adapts to each image,
+    # while the bounded threshold still rejects brown mulch and grey hardware.
+    positive = np.clip(excess_green, 0, 255).astype(np.uint8)
+    otsu, _ = cv2.threshold(positive, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    exg_threshold = max(10, min(32, int(otsu)))
+    broad_green = (g > r * 0.92) & (g > b * 0.92) & (excess_green > exg_threshold)
+    mask = (
+        (hsv_green | broad_green)
+        & (excess_green > exg_threshold)
+        & (saturation > 22)
+        & (value > 20)
+    )
     binary = mask.astype(np.uint8) * 255
     open_k = np.ones((params.open_kernel, params.open_kernel), np.uint8)
     close_k = np.ones((params.close_kernel, params.close_kernel), np.uint8)
@@ -265,6 +285,7 @@ class ClassicalVisionEngine(ImageAnalysisEngine):
         seeds: list[PlantSeed],
         calibration: Calibration,
         previous_masks: dict[int, np.ndarray] | None = None,
+        weed_settings: WeedSettings | None = None,
     ) -> AnalysisResult:
         image = decode_jpeg(image_bytes)
         params = ScaleParams.build(image.shape[1], image.shape[0], calibration)
@@ -296,7 +317,7 @@ class ClassicalVisionEngine(ImageAnalysisEngine):
         ambiguous = np.zeros_like(mask, dtype=bool)
         uncertain_seeds: set[int] = set()
         skipped: dict[int, str] = {}
-        ambiguity_gap = max(8.0, params.mean_ppm * 8)
+        ambiguity_gap = max(5.0, params.mean_ppm * 5)
 
         valid_indices: list[int] = []
         for index, seed in enumerate(seeds):
@@ -391,7 +412,38 @@ class ClassicalVisionEngine(ImageAnalysisEngine):
                 },
                 separators=(",", ":"),
             )
-            if len(xs) < params.min_area:
+            cx, cy = seed.center_px
+            core_radius_px = max(
+                6.0,
+                min(35.0, max(12.0, seed.current_radius_mm * 0.28)) * params.mean_ppm,
+            )
+            yy, xx = np.ogrid[:height, :width]
+            core = (xx - cx) ** 2 + (yy - cy) ** 2 <= core_radius_px**2
+            core_vegetation = int(np.count_nonzero((mask > 0) & core))
+            core_area = max(1, int(np.count_nonzero(core)))
+            core_coverage = core_vegetation / core_area
+            # A plant must have evidence at its recorded centre. Vegetation
+            # merely touching the outer radius is not proof the plant remains.
+            center_present = core_coverage >= 0.035 or (
+                mask[
+                    min(height - 1, max(0, round(cy))),
+                    min(width - 1, max(0, round(cx))),
+                ]
+                > 0
+                and core_vegetation >= params.min_area
+            )
+            if len(xs) < params.min_area or not center_present:
+                nearby = (mask > 0) & (
+                    (xx - cx) ** 2 + (yy - cy) ** 2
+                    <= max(core_radius_px * 3, seed.current_radius_mm * params.mean_ppm) ** 2
+                )
+                nearby_y, nearby_x = np.where(nearby)
+                suggested = (
+                    (float(np.median(nearby_x)), float(np.median(nearby_y)))
+                    if len(nearby_x) >= params.min_area
+                    else None
+                )
+                absence_confidence = min(0.98, 0.72 + (0.25 * (1 - core_coverage / 0.035)))
                 measurements.append(
                     Measurement(
                         measurement_id=uuid4(),
@@ -403,10 +455,17 @@ class ClassicalVisionEngine(ImageAnalysisEngine):
                         typical_canopy_radius_mm=0,
                         maximum_accepted_canopy_radius_mm=0,
                         recommended_protection_radius_mm=0,
-                        confidence=0.85,
+                        confidence=absence_confidence,
                         decision=Decision.OBSERVED,
-                        reason="no vegetation connected to known in-frame plant centre",
+                        reason=(
+                            "recorded plant centre is empty; vegetation remains nearby, so "
+                            "removal is primary and moving the centre is secondary"
+                            if suggested
+                            else "no vegetation at the known in-frame plant centre"
+                        ),
                         vegetation_absent=True,
+                        center_misaligned=suggested is not None,
+                        recommended_center_px=suggested,
                         calibration_version_id=calibration.version_id,
                         transform_json=transform_json,
                         algorithm_version=ALGORITHM_VERSION,
@@ -443,7 +502,12 @@ class ClassicalVisionEngine(ImageAnalysisEngine):
             distances_mm = np.sqrt(dx_mm**2 + dy_mm**2)
             typical = float(np.percentile(distances_mm, 90))
             maximum = float(distances_mm.max())
-            plant_ambiguous = bool(np.any(ambiguous & owned)) or index in uncertain_seeds
+            ambiguous_pixels = int(np.count_nonzero(ambiguous & owned))
+            ambiguous_fraction = ambiguous_pixels / max(1, len(xs))
+            # Overlap is expected in a mature bed. Only make the result
+            # unreviewable when ambiguity dominates the evidence; preserve the
+            # unambiguous core and nearest-seed pixels for growth measurement.
+            plant_ambiguous = ambiguous_fraction > 0.45 or index in uncertain_seeds
             component_coverage = min(1.0, len(xs) / (500.0 * params.mean_ppm**2))
             border_distance = min(
                 seed.center_px[0],
@@ -461,7 +525,8 @@ class ClassicalVisionEngine(ImageAnalysisEngine):
                     0.55
                     + 0.25 * component_coverage
                     + 0.2 * edge_score
-                    - (0.4 if plant_ambiguous else 0),
+                    - min(0.28, ambiguous_fraction * 0.35)
+                    - (0.18 if index in uncertain_seeds else 0),
                 ),
             )
             recommendation = (
@@ -534,6 +599,56 @@ class ClassicalVisionEngine(ImageAnalysisEngine):
                 1,
                 cv2.LINE_AA,
             )
+        weed_detections: list[WeedDetection] = []
+        if weed_settings and weed_settings.enabled:
+            claimed = ownership > 0
+            exclusion = np.zeros_like(mask)
+            for seed in seeds:
+                exclusion_radius = (
+                    seed.current_radius_mm + weed_settings.plant_exclusion_margin_mm
+                ) * params.mean_ppm
+                cv2.circle(
+                    exclusion,
+                    (round(seed.center_px[0]), round(seed.center_px[1])),
+                    max(1, round(exclusion_radius)),
+                    255,
+                    -1,
+                )
+            candidate_mask = ((mask > 0) & ~claimed & (exclusion == 0)).astype(np.uint8) * 255
+            count, candidate_labels, candidate_stats, candidate_centroids = (
+                cv2.connectedComponentsWithStats(candidate_mask, 8)
+            )
+            area_scale = calibration.pixels_per_mm_x * calibration.pixels_per_mm_y
+            for label in range(1, count):
+                area_mm2 = float(candidate_stats[label, cv2.CC_STAT_AREA] / area_scale)
+                if not (
+                    weed_settings.minimum_area_mm2 <= area_mm2 <= weed_settings.maximum_area_mm2
+                ):
+                    continue
+                wx, wy = candidate_centroids[label]
+                compactness = min(1.0, area_mm2 / max(weed_settings.minimum_area_mm2 * 2, 1))
+                confidence = min(0.98, 0.62 + compactness * 0.28)
+                if confidence < weed_settings.minimum_confidence:
+                    continue
+                weed_detections.append(
+                    WeedDetection(
+                        detection_id=uuid4(),
+                        image_id=image_id,
+                        image_timestamp=image_timestamp,
+                        center_px=(float(wx), float(wy)),
+                        area_mm2=area_mm2,
+                        radius_mm=max(weed_settings.weed_radius_mm, math.sqrt(area_mm2 / math.pi)),
+                        confidence=confidence,
+                    )
+                )
+                cv2.drawMarker(
+                    overlay,
+                    (round(wx), round(wy)),
+                    (0, 0, 255),
+                    cv2.MARKER_CROSS,
+                    18,
+                    2,
+                )
         _draw_legend(overlay)
         ok_mask, encoded_mask = cv2.imencode(".png", mask)
         ok_ownership, encoded_ownership = cv2.imencode(".png", ownership.astype(np.uint16))
@@ -546,6 +661,7 @@ class ClassicalVisionEngine(ImageAnalysisEngine):
             ownership_mask=encoded_ownership.tobytes() if ok_ownership else None,
             overlay_jpeg=encoded_overlay.tobytes() if ok_overlay else None,
             skipped=skipped,
+            weeds=weed_detections,
         )
 
 
@@ -593,6 +709,30 @@ def garden_to_pixel(
     rx = cos_t * vx + sin_t * vy
     ry = -sin_t * vx + cos_t * vy
     return (width / 2 + rx, height / 2 + ry)
+
+
+def pixel_to_garden(
+    pixel_x: float,
+    pixel_y: float,
+    image_x: float,
+    image_y: float,
+    width: int,
+    height: int,
+    calibration: Calibration,
+) -> tuple[float, float]:
+    """Inverse of :func:`garden_to_pixel`, used for weed and centre proposals."""
+    rx, ry = pixel_x - width / 2, pixel_y - height / 2
+    theta = math.radians(ROTATION_SIGN * calibration.rotation_degrees)
+    cos_t, sin_t = math.cos(theta), math.sin(theta)
+    vx = cos_t * rx - sin_t * ry
+    vy = sin_t * rx + cos_t * ry
+    origin = OriginLocation(calibration.origin_location)
+    dx = vx / (origin.sign_x * calibration.pixels_per_mm_x)
+    dy = vy / (origin.sign_y * calibration.pixels_per_mm_y)
+    return (
+        image_x + dx - calibration.offset_x_mm,
+        image_y + dy - calibration.offset_y_mm,
+    )
 
 
 def manual_scale(

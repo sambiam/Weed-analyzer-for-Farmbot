@@ -149,6 +149,23 @@ def test_measurement_provenance_round_trips(tmp_path):
     assert row["processed_width"] == 960
 
 
+def test_reanalysis_supersedes_the_old_review_row_without_deleting_history(tmp_path):
+    database = Database(tmp_path / "db.sqlite")
+    first = _measurement(config_entry_id="bot", decision=Decision.RECOMMENDED)
+    second = _measurement(
+        config_entry_id="bot",
+        plant_id=first.plant_id,
+        image_id=first.image_id,
+        decision=Decision.RECOMMENDED,
+    )
+    database.save_measurements([first])
+    database.save_measurements([second])
+    pending_ids = {row["measurement_id"] for row in database.pending_measurements()}
+    assert str(first.measurement_id) not in pending_ids
+    assert str(second.measurement_id) in pending_ids
+    assert database.measurement(str(first.measurement_id)) is not None
+
+
 def test_removal_artifacts_migrate_persist_and_count_distinct_images(tmp_path):
     database = Database(tmp_path / "db.sqlite")
     timestamp = datetime(2026, 7, 23, tzinfo=UTC)

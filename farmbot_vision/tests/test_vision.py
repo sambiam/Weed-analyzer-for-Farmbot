@@ -46,7 +46,7 @@ def test_weed_close_to_crop_is_conservative(seed, calibration):
     assert result.measurements[0].decision == Decision.UNCERTAIN
 
 
-def test_overlapping_crops_are_uncertain(calibration):
+def test_overlapping_crops_keep_reviewable_nearest_seed_ownership(calibration):
     seeds = [
         PlantSeed(plant_id=1, crop_slug="lettuce", center_px=(135, 120), current_radius_mm=50),
         PlantSeed(plant_id=2, crop_slug="lettuce", center_px=(185, 120), current_radius_mm=50),
@@ -58,7 +58,8 @@ def test_overlapping_crops_are_uncertain(calibration):
         seeds=seeds,
     )
     assert len(result.measurements) == 2
-    assert all(item.ambiguous for item in result.measurements)
+    assert all(not item.ambiguous for item in result.measurements)
+    assert all(item.confidence >= 0.6 for item in result.measurements)
 
 
 def test_disconnected_leaf_accepted_from_previous_mask(seed, calibration):
@@ -98,6 +99,36 @@ def test_empty_in_frame_centre_is_an_absence_measurement(seed, calibration):
     assert measurement.typical_canopy_radius_mm == 0
     assert measurement.maximum_accepted_canopy_radius_mm == 0
     assert measurement.recommended_protection_radius_mm == 0
+
+
+def test_empty_center_with_outer_vegetation_recommends_removal_and_center_move(seed, calibration):
+    result = analyse([("circle", ((220, 120), 16))], seed, calibration)
+    measurement = result.measurements[0]
+    assert measurement.vegetation_absent is True
+    assert measurement.center_misaligned is True
+    assert measurement.recommended_center_px is not None
+
+
+def test_unowned_component_becomes_weed_only_when_enabled(seed, calibration):
+    from farmbot_vision.weed_settings import WeedSettings
+
+    engine = ClassicalVisionEngine()
+    result = engine.analyse(
+        jpeg([("circle", ((160, 120), 25)), ("circle", ((285, 40), 10))]),
+        9,
+        NOW,
+        [seed],
+        calibration,
+        {},
+        WeedSettings(
+            enabled=True,
+            plant_exclusion_margin_mm=10,
+            minimum_area_mm2=25,
+            minimum_confidence=0.7,
+        ),
+    )
+    assert len(result.weeds) == 1
+    assert result.weeds[0].center_px[0] > 270
 
 
 def test_empty_out_of_frame_centre_is_skipped_not_absent(calibration):

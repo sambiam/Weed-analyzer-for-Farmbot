@@ -35,17 +35,22 @@ from .database import Database
 from .home_assistant import HomeAssistantClient, HomeAssistantError, StaleRadiusError
 from .jobs import JobManager
 from .models import (
+    ApplyPlantCenterRequest,
     ApplyRadiusRequest,
     ApplyRemovalRequest,
     Calibration,
+    CreateWeedRequest,
     InventoryRequest,
     Measurement,
     OperatingMode,
     OriginLocation,
+    QueueImagesRequest,
     UpsertCurveRequest,
     VisionImageRequest,
 )
 from .settings import Settings
+from .vision import garden_to_pixel
+from .weed_settings import WeedSettings, WeedSettingsStore
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 LOGGER = logging.getLogger(__name__)
@@ -53,7 +58,8 @@ settings = Settings.load()
 database = Database(settings.data_dir / "farmbot_vision.db")
 calibration_store = CalibrationStore(settings.data_dir / "farmbot_calibration.json")
 client = HomeAssistantClient()
-jobs = JobManager(settings, database, client)
+weed_settings_store = WeedSettingsStore(settings.data_dir / "weed_settings.json")
+jobs = JobManager(settings, database, client, weed_settings_store)
 
 
 def _calibration_from_input(entry_id: str, values: FarmbotCalibrationInput) -> Calibration:
@@ -326,6 +332,25 @@ _DASHBOARD_JS = r"""
   const closeButton=document.getElementById('overlay-modal-close');
   const counter=document.getElementById('overlay-modal-counter');
   let artifacts=[], index=0, returnFocus=null;
+  const queueModal=document.getElementById('queue-modal');
+  const queueRows=document.getElementById('queue-image-rows');
+  const queueMessage=document.getElementById('queue-message');
+  async function loadQueueImages(){
+    const hours=document.getElementById('queue-hours').value;
+    queueMessage.textContent='Loading images…';
+    try{
+      const response=await fetch('api/analysis/images?hours='+encodeURIComponent(hours));
+      const data=await response.json();
+      if(!response.ok) throw new Error(data.detail||('HTTP '+response.status));
+      queueRows.innerHTML=(data.images||[]).map(function(image){
+        const plants=(image.plants||[]).map(p=>p.name+' (#'+p.id+')').join(', ')||'None';
+        return '<tr><td><input class=queue-checkbox type=checkbox value="'+image.id+'"></td>'
+          +'<td>'+image.x.toFixed(1)+', '+image.y.toFixed(1)+', '+image.z.toFixed(1)+'</td>'
+          +'<td>'+plants+'</td><td>'+new Date(image.created_at).toLocaleString()+'</td></tr>';
+      }).join('')||'<tr><td colspan=4>No images in this timeframe</td></tr>';
+      queueMessage.textContent=data.images.length+' images found';
+    }catch(error){queueMessage.textContent='Could not load images: '+error.message;}
+  }
   function showArtifact(){
     if(!artifacts.length) return;
     modalImg.src=artifacts[index];
@@ -391,6 +416,24 @@ _DASHBOARD_JS = r"""
     index=(index+1)%artifacts.length;showArtifact();
   });
   document.addEventListener('keydown',function(event){if(event.key==='Escape'&&!modal.hidden)closeModal();});
+  document.getElementById('queue-open').addEventListener('click',function(){
+    queueModal.hidden=false;loadQueueImages();
+  });
+  document.getElementById('queue-close').addEventListener('click',function(){queueModal.hidden=true;});
+  document.getElementById('queue-refresh').addEventListener('click',loadQueueImages);
+  document.getElementById('queue-select-all').addEventListener('change',function(){
+    document.querySelectorAll('.queue-checkbox').forEach(box=>box.checked=this.checked);
+  });
+  document.getElementById('queue-add').addEventListener('click',async function(){
+    const ids=[...document.querySelectorAll('.queue-checkbox:checked')].map(box=>+box.value);
+    if(!ids.length){queueMessage.textContent='Select at least one image';return;}
+    const response=await fetch('analysis/queue',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({image_ids:ids})});
+    const data=await response.json();
+    if(response.ok){document.getElementById('queue-count').textContent=data.queue_length;
+      queueMessage.textContent=ids.length+' images added';}
+    else queueMessage.textContent=data.detail||'Could not add images';
+  });
 })();
 """
 
@@ -544,7 +587,8 @@ def ingress_base(request: Request) -> str:
 
 def layout(request: Request, body: str, title: str = "FarmBot Vision") -> HTMLResponse:
     base = escape(ingress_base(request), quote=True)
-    return HTMLResponse(f"""<!doctype html><html lang=en><head><meta charset=utf-8>
+    return HTMLResponse(
+        f"""<!doctype html><html lang=en><head><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1"><base href="{base}">
 <title>{escape(title)}</title><style>
 :root{{--green:#52b788;--dark:#17221b;--muted:#74817a}}*{{box-sizing:border-box}}
@@ -557,8 +601,14 @@ button{{background:var(--green);border:0;border-radius:6px;padding:.65rem 1rem;c
 .overlay-modal figure{{position:relative;background:white;border-radius:10px;margin:0;padding:1rem;max-width:min(95vw,1000px);max-height:95vh;overflow:auto}}
 .overlay-modal img{{display:block;max-height:70vh;margin:auto}}.modal-close{{position:absolute;right:.5rem;top:.5rem;font-size:1.5rem}}
 .modal-controls{{display:flex;gap:.5rem;align-items:center;justify-content:center;margin-top:.6rem}}.legend{{font-size:.9rem;color:var(--muted)}}
+.queue-dialog{{width:min(95vw,900px)}}.button-row{{display:flex;gap:.5rem;flex-wrap:wrap;align-items:center}}
 </style></head><body><header><h1>🌱 FarmBot Vision</h1><nav><a href="./">Dashboard</a><a href="settings">Calibration</a><a href="api/health">Health JSON</a></nav></header>
-<main>{body}</main></body></html>""")
+<main>{body}</main></body></html>""".replace(
+            '<a href="./">Dashboard</a><a href="settings">Calibration</a>',
+            '<a href="./">Analysis</a><a href="settings">Calibration</a>'
+            '<a href="weed-settings">Weed settings</a>',
+        )
+    )
 
 
 @app.get("/health")
@@ -668,7 +718,13 @@ async def dashboard(request: Request) -> HTMLResponse:
         f'data-url="removals/{r["measurement_id"]}/approve">Approve removal</button></form>'
         f'<form method=post action="removals/{r["measurement_id"]}/keep"><button class=review-action '
         f'data-url="removals/{r["measurement_id"]}/keep">Keep plant</button></form>'
-        "<small class=action-message></small></td></tr>"
+        + (
+            f'<form method=post action="removals/{r["measurement_id"]}/move-center"><button class=review-action '
+            f'data-url="removals/{r["measurement_id"]}/move-center">Move center</button></form>'
+            if r.get("center_misaligned")
+            else ""
+        )
+        + "<small class=action-message></small></td></tr>"
         for r in rows
         if r["decision"] == "removal_recommended"
     )
@@ -712,6 +768,16 @@ async def dashboard(request: Request) -> HTMLResponse:
         f"<td>{escape(row['action'])}</td></tr>"
         for row in database.recent_decisions()
     )
+    weed_rows = "".join(
+        f"<tr class=review-item><td>{w['image_id']}</td>"
+        f"<td>{w['x']:.1f}, {w['y']:.1f}, {w['z']:.1f}</td>"
+        f"<td>{w['area_mm2']:.1f}</td><td>{w['confidence']:.2f}</td><td>"
+        f'<form><button class=review-action data-url="weeds/{w["detection_id"]}/approve">'
+        "Create weed</button></form>"
+        f'<form><button class=review-action data-url="weeds/{w["detection_id"]}/reject">'
+        "Reject</button></form><small class=action-message></small></td></tr>"
+        for w in database.pending_weed_detections()
+    )
     resolution = settings.resolution
 
     def _dims(value: object) -> str:
@@ -740,8 +806,9 @@ async def dashboard(request: Request) -> HTMLResponse:
 <p>Mode: {settings.mode.value}</p></section>
 <section class=card><h2>Analysis resolution</h2><p><b>{escape(resolution.label)}</b></p>
 <p class=muted>{resolution.pixel_count:,} px · restart to change</p></section>
-<section class=card><h2>Queue</h2><p>{jobs.current.get("queue_length", 0)} waiting</p>
-<form method=post action="analyse"><button>Analyse now</button></form></section></div>
+<section class=card><h2>Analysis</h2><p><span id=queue-count>{len(jobs.queued_image_ids)}</span> queued</p>
+<div class=button-row><form method=post action="analyse"><button>Analyse queue</button></form>
+<button id=queue-open type=button>Add to queue</button></div></section></div>
 <section class=card><h2>Last job</h2>
 <p>{escape(last.get("message", "Never run"))}</p>
 <div class=grid>
@@ -756,6 +823,9 @@ async def dashboard(request: Request) -> HTMLResponse:
 <p><b>Skip reasons</b></p><ul>{skip_html}</ul></section>
 <section class=card><h2>Measurements</h2><table><thead><tr><th>Plant</th><th>Crop</th><th>Resolution</th><th>Current</th><th>Max leaf</th><th>Recommended</th><th>Confidence</th><th>Calibration</th><th>Decision</th><th>Reason</th><th>Diagnostic</th><th>Review</th></tr></thead><tbody>{measurement_rows or "<tr><td colspan=12>No measurements yet</td></tr>"}</tbody></table></section>
 <section class=card><h2>Removed / missing plants</h2><table><thead><tr><th>Plant</th><th>Absent looks</th><th>Confidence</th><th>Reason</th><th>Diagnostic</th><th>Review</th></tr></thead><tbody>{removal_rows or "<tr><td colspan=6>No confirmed missing plants</td></tr>"}</tbody></table></section>
+<section class=card><h2>Detected weeds</h2><p class=muted>Unowned vegetation outside known plant protection areas.</p>
+<table><thead><tr><th>Image</th><th>Coordinates</th><th>Area mm²</th><th>Confidence</th><th>Review</th></tr></thead>
+<tbody>{weed_rows or "<tr><td colspan=5>No weed recommendations</td></tr>"}</tbody></table></section>
 <section class=card><h2>Growth-curve updates</h2><p class=muted>Flagged per-plant diameter points require review.</p><table><tbody>{flagged_curve_rows or "<tr><td>No flagged curve updates</td></tr>"}</tbody></table></section>
 <section class=card><h2>Crop protection spread proposals</h2><p class=muted>Monotonic and limited to 10 points. FarmBot values are diameters; assignment requires approval.</p><table><tbody>{curve_rows or "<tr><td>No curve is ready</td></tr>"}</tbody></table></section>
 <section class=card><h2>Approval and rollback history</h2><table><tbody>{decision_rows or "<tr><td>No decisions yet</td></tr>"}</tbody></table></section>
@@ -765,6 +835,17 @@ async def dashboard(request: Request) -> HTMLResponse:
 <img id=overlay-modal-img alt="Plant analysis diagnostic"><figcaption id=overlay-modal-details></figcaption>
 <p class=legend>Vegetation mask and per-plant ownership are shown as separate gallery images.</p>
 <div class=modal-controls><button id=overlay-modal-prev type=button>Previous</button><span id=overlay-modal-counter></span><button id=overlay-modal-next type=button>Next</button></div>
+</figure></div>
+<div id=queue-modal class=overlay-modal hidden role=dialog aria-modal=true aria-label="Add images to analysis queue">
+<figure class=queue-dialog><button id=queue-close class=modal-close type=button aria-label=Close>&times;</button>
+<h2>Add images to analysis queue</h2>
+<div class=button-row><label>Timeframe
+<select id=queue-hours><option value=24>Last 24 hours</option><option value=72 selected>Last 3 days</option>
+<option value=168>Last 7 days</option><option value=336>Last 14 days</option><option value=720>Last 30 days</option></select></label>
+<button id=queue-refresh type=button>Refresh</button><label><input id=queue-select-all type=checkbox> Select all</label></div>
+<p id=queue-message class=muted></p><table><thead><tr><th>Select</th><th>Coordinates (x, y, z)</th>
+<th>Plants present</th><th>Date taken</th></tr></thead><tbody id=queue-image-rows></tbody></table>
+<div class=button-row><button id=queue-add type=button>Add selected images to queue</button></div>
 </figure></div><script>{_DASHBOARD_JS}</script>"""
     return layout(request, body)
 
@@ -773,6 +854,153 @@ async def dashboard(request: Request) -> HTMLResponse:
 async def analyse(background: BackgroundTasks) -> RedirectResponse:
     background.add_task(jobs.run, trigger="manual")
     return RedirectResponse("./", status_code=303)
+
+
+@app.get("/api/analysis/images")
+async def analysis_images(hours: int = 72) -> JSONResponse:
+    if not settings.selected_config_entry_id:
+        raise HTTPException(400, "Select a FarmBot before loading images")
+    hours = max(1, min(720, hours))
+    try:
+        inventory = await client.inventory(
+            InventoryRequest(
+                config_entry_id=settings.selected_config_entry_id,
+                image_lookback_hours=hours,
+            )
+        )
+    except HomeAssistantError as exc:
+        raise HTTPException(502, str(exc)) from exc
+    calibration = database.active_calibration(settings.selected_config_entry_id)
+    width, height = settings.analysis_width, settings.analysis_height
+    items = []
+    for image in sorted(inventory.images, key=lambda item: item.created_at, reverse=True):
+        present = []
+        for plant in inventory.plants:
+            if calibration is not None:
+                px, py = garden_to_pixel(
+                    plant.x,
+                    plant.y,
+                    image.meta.x,
+                    image.meta.y,
+                    width,
+                    height,
+                    calibration,
+                )
+                is_present = (
+                    -plant.radius * calibration.pixels_per_mm_x
+                    <= px
+                    <= width + plant.radius * calibration.pixels_per_mm_x
+                    and -plant.radius * calibration.pixels_per_mm_y
+                    <= py
+                    <= height + plant.radius * calibration.pixels_per_mm_y
+                )
+            else:
+                # Useful conservative fallback before calibration: images still
+                # remain selectable and nearby plants are listed approximately.
+                is_present = (
+                    abs(plant.x - image.meta.x) <= 500 and abs(plant.y - image.meta.y) <= 400
+                )
+            if is_present:
+                present.append({"id": plant.id, "name": plant.name})
+        items.append(
+            {
+                "id": image.id,
+                "created_at": image.created_at.isoformat(),
+                "x": image.meta.x,
+                "y": image.meta.y,
+                "z": image.meta.z,
+                "plants": present,
+            }
+        )
+    return JSONResponse({"images": items, "hours": hours})
+
+
+@app.post("/analysis/queue")
+async def add_analysis_queue(request: QueueImagesRequest) -> JSONResponse:
+    return JSONResponse({"queue_length": jobs.add_to_queue(request.image_ids)})
+
+
+@app.get("/weed-settings", response_class=HTMLResponse)
+async def weed_settings_page(request: Request) -> HTMLResponse:
+    values = weed_settings_store.load()
+
+    def checked(value: bool) -> str:
+        return " checked" if value else ""
+
+    body = f"""<section class=card><h2>Weed settings</h2>
+<p>Detection is off by default. Recommendations require review; automatic creation also
+requires the companion integration's automatic weed-write permission.</p>
+<form method=post action="weed-settings">
+<label><input type=checkbox name=enabled value=true{checked(values.enabled)}> Enable weed detection</label><br>
+<label><input type=checkbox name=automatic_creation value=true{checked(values.automatic_creation)}>
+Automatically create detected weeds in FarmBot</label><br>
+<label>Minimum weed area (mm²) <input type=number name=minimum_area_mm2 min=5 step=1 value="{values.minimum_area_mm2:g}"></label><br>
+<label>Maximum weed area (mm²) <input type=number name=maximum_area_mm2 min=10 step=1 value="{values.maximum_area_mm2:g}"></label><br>
+<label>Extra exclusion around plants (mm) <input type=number name=plant_exclusion_margin_mm min=0 step=1 value="{values.plant_exclusion_margin_mm:g}"></label><br>
+<label>Minimum confidence <input type=number name=minimum_confidence min=0 max=1 step=.01 value="{values.minimum_confidence:g}"></label><br>
+<label>Created weed radius (mm) <input type=number name=weed_radius_mm min=1 step=1 value="{values.weed_radius_mm:g}"></label><br>
+<button>Save weed settings</button></form></section>"""
+    return layout(request, body, "Weed settings")
+
+
+@app.post("/weed-settings")
+async def save_weed_settings(
+    enabled: bool = Form(False),
+    automatic_creation: bool = Form(False),
+    minimum_area_mm2: float = Form(25),
+    maximum_area_mm2: float = Form(2500),
+    plant_exclusion_margin_mm: float = Form(35),
+    minimum_confidence: float = Form(0.75),
+    weed_radius_mm: float = Form(15),
+) -> RedirectResponse:
+    try:
+        values = WeedSettings(
+            enabled=enabled,
+            automatic_creation=automatic_creation,
+            minimum_area_mm2=minimum_area_mm2,
+            maximum_area_mm2=maximum_area_mm2,
+            plant_exclusion_margin_mm=plant_exclusion_margin_mm,
+            minimum_confidence=minimum_confidence,
+            weed_radius_mm=weed_radius_mm,
+        )
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    if values.minimum_area_mm2 > values.maximum_area_mm2:
+        raise HTTPException(422, "Minimum weed area cannot exceed maximum weed area")
+    weed_settings_store.save(values)
+    return RedirectResponse("weed-settings", status_code=303)
+
+
+@app.post("/weeds/{detection_id}/approve")
+async def approve_weed(detection_id: UUID) -> JSONResponse:
+    detection = database.weed_detection(str(detection_id))
+    if detection is None or detection["status"] != "recommended":
+        raise HTTPException(404, "Weed recommendation not found")
+    result = await client.create_weed(
+        CreateWeedRequest(
+            config_entry_id=detection["config_entry_id"],
+            detection_id=detection_id,
+            x=detection["x"],
+            y=detection["y"],
+            z=detection["z"],
+            radius=detection["radius_mm"],
+            confidence=detection["confidence"],
+            apply=True,
+            human_approved=True,
+        )
+    )
+    if result.get("status") == "applied":
+        database.update_weed_detection(str(detection_id), "created")
+    return JSONResponse(result)
+
+
+@app.post("/weeds/{detection_id}/reject")
+async def reject_weed(detection_id: UUID) -> JSONResponse:
+    detection = database.weed_detection(str(detection_id))
+    if detection is None:
+        raise HTTPException(404, "Weed recommendation not found")
+    database.update_weed_detection(str(detection_id), "rejected")
+    return JSONResponse({"status": "rejected", "message": "Weed recommendation rejected"})
 
 
 def _calibration_warnings(calibration: Calibration | None) -> list[str]:
@@ -1121,7 +1349,7 @@ async def recommendation(request: Request, measurement_id: str, action: str) -> 
 
 @app.post("/removals/{measurement_id}/{action}")
 async def removal(request: Request, measurement_id: str, action: str) -> Response:
-    if action not in {"approve", "keep"}:
+    if action not in {"approve", "keep", "move-center"}:
         raise HTTPException(400)
     row = database.measurement(measurement_id)
     if row is None:
@@ -1145,6 +1373,44 @@ async def removal(request: Request, measurement_id: str, action: str) -> Respons
     if action == "keep":
         database.record_decision(measurement_id, "keep", {})
         return _action_response(request, "rejected", "Plant kept")
+    if action == "move-center":
+        if not row.get("center_misaligned") or row.get("recommended_center_x") is None:
+            return _action_response(
+                request, "conflict", "No centre correction is available", error_status=409
+            )
+        inventory = await client.inventory(
+            InventoryRequest(
+                config_entry_id=entry_id,
+                image_lookback_hours=settings.image_lookback_hours,
+            )
+        )
+        plant = next((p for p in inventory.plants if p.id == row["plant_id"]), None)
+        if plant is None:
+            return _action_response(
+                request, "conflict", "Plant is no longer active", error_status=409
+            )
+        result = await client.apply_plant_center(
+            ApplyPlantCenterRequest(
+                config_entry_id=entry_id,
+                plant_id=row["plant_id"],
+                measurement_id=measurement_id,
+                expected_x=plant.x,
+                expected_y=plant.y,
+                recommended_x=row["recommended_center_x"],
+                recommended_y=row["recommended_center_y"],
+                apply=True,
+                human_approved=True,
+            )
+        )
+        status = str(result.get("status", "error"))
+        if status == "applied":
+            database.record_decision(measurement_id, "keep", result)
+        return _action_response(
+            request,
+            status,
+            str(result.get("message") or status),
+            error_status=409 if status != "applied" else None,
+        )
     try:
         result = await client.apply_removal(
             ApplyRemovalRequest(

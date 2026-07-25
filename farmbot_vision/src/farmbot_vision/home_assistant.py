@@ -14,9 +14,11 @@ import websockets
 from pydantic import BaseModel, ValidationError
 
 from .models import (
+    ApplyPlantCenterRequest,
     ApplyRadiusRequest,
     ApplyRemovalRequest,
     BotList,
+    CreateWeedRequest,
     Inventory,
     InventoryRequest,
     UpsertCurveRequest,
@@ -256,6 +258,12 @@ class HomeAssistantClient:
 
     async def apply_removal(self, request: ApplyRemovalRequest) -> dict[str, Any]:
         return await self._service("apply_vision_removal", request)  # type: ignore[return-value]
+
+    async def apply_plant_center(self, request: ApplyPlantCenterRequest) -> dict[str, Any]:
+        return await self._service("apply_vision_plant_center", request)  # type: ignore[return-value]
+
+    async def create_weed(self, request: CreateWeedRequest) -> dict[str, Any]:
+        return await self._service("create_vision_weed", request)  # type: ignore[return-value]
 
     async def upsert_curve(self, request: UpsertCurveRequest) -> dict[str, Any]:
         return await self._service("upsert_vision_spread_curve", request)  # type: ignore[return-value]

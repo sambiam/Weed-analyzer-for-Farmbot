@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import logging
+import math
 import time
 from datetime import UTC, datetime
 from pathlib import Path
@@ -26,6 +27,7 @@ from .home_assistant import HomeAssistantClient, HomeAssistantError, StaleRadius
 from .models import (
     ApplyRadiusRequest,
     ApplyRemovalRequest,
+    CreateWeedRequest,
     Decision,
     InventoryRequest,
     OperatingMode,
@@ -36,19 +38,35 @@ from .models import (
 )
 from .safety import decide
 from .settings import Settings
-from .vision import ClassicalVisionEngine, garden_to_pixel
+from .vision import ClassicalVisionEngine, garden_to_pixel, pixel_to_garden
+from .weed_settings import WeedSettingsStore
 
 LOGGER = logging.getLogger(__name__)
 
 
 class JobManager:
-    def __init__(self, settings: Settings, database: Database, client: HomeAssistantClient):
+    def __init__(
+        self,
+        settings: Settings,
+        database: Database,
+        client: HomeAssistantClient,
+        weed_settings_store: WeedSettingsStore | None = None,
+    ):
         self.settings = settings
         self.db = database
         self.client = client
         self.lock = asyncio.Lock()
         self.current: dict = {"status": "idle", "queue_length": 0, "progress": "Not run"}
         self.last: dict = {}
+        self.queued_image_ids: list[int] = []
+        self.weed_settings_store = weed_settings_store
+
+    def add_to_queue(self, image_ids: list[int]) -> int:
+        for image_id in image_ids:
+            if image_id > 0 and image_id not in self.queued_image_ids:
+                self.queued_image_ids.append(image_id)
+        self.current["queue_length"] = len(self.queued_image_ids)
+        return len(self.queued_image_ids)
 
     def resources_available(self) -> tuple[bool, str]:
         memory_mb = psutil.virtual_memory().available / 1024 / 1024
@@ -147,6 +165,9 @@ class JobManager:
         mode = mode or self.settings.mode
         if not entry_id:
             return {"accepted": False, "reason": "select a FarmBot before analysis"}
+        if trigger == "manual" and not image_ids and self.queued_image_ids:
+            image_ids = list(self.queued_image_ids)
+            self.queued_image_ids.clear()
         async with self.lock:
             return await self._run_locked(entry_id, mode, plant_ids or [], image_ids or [], trigger)
 
@@ -187,6 +208,9 @@ class JobManager:
             manual_calibration = self.db.active_calibration(entry_id)
             engine = ClassicalVisionEngine(
                 self.settings.safety_margin_mm, self.settings.calibration_uncertainty_mm
+            )
+            weed_settings = (
+                self.weed_settings_store.load() if self.weed_settings_store is not None else None
             )
             wanted = [p for p in inventory.plants if not plant_ids or p.id in plant_ids]
             wanted_image_ids = set(image_ids)
@@ -311,6 +335,7 @@ class JobManager:
                         seeds,
                         calibration,
                         previous_masks,
+                        weed_settings,
                     ),
                     timeout=60,
                 )
@@ -321,9 +346,23 @@ class JobManager:
                         result.skipped[item.plant_id] = "removal detection is disabled"
                         continue
                     if item.vegetation_absent:
+                        suggested_center = item.recommended_center_px
+                        if suggested_center is not None:
+                            suggested_center = pixel_to_garden(
+                                suggested_center[0],
+                                suggested_center[1],
+                                response.meta.x,
+                                response.meta.y,
+                                response.width,
+                                response.height,
+                                calibration,
+                            )
                         item = item.model_copy(
                             update={
                                 "config_entry_id": entry_id,
+                                # Persist garden coordinates for the alternative
+                                # "move centre" review action.
+                                "recommended_center_px": suggested_center,
                                 "absent_observations": self.db.absent_streak(
                                     entry_id,
                                     item.plant_id,
@@ -346,6 +385,58 @@ class JobManager:
                     )
                 if result.overlay_jpeg:
                     overlay_path.write_bytes(result.overlay_jpeg)
+                for weed in result.weeds:
+                    weed_x, weed_y = pixel_to_garden(
+                        weed.center_px[0],
+                        weed.center_px[1],
+                        response.meta.x,
+                        response.meta.y,
+                        response.width,
+                        response.height,
+                        calibration,
+                    )
+                    duplicate_distance = max(20.0, weed.radius_mm * 1.5)
+                    if any(
+                        math.hypot(existing.x - weed_x, existing.y - weed_y)
+                        <= max(duplicate_distance, existing.radius)
+                        for existing in inventory.weeds
+                    ) or self.db.has_weed_detection_near(weed_x, weed_y, duplicate_distance):
+                        continue
+                    weed_status = "recommended"
+                    if weed_settings and weed_settings.automatic_creation:
+                        try:
+                            create_result = await self.client.create_weed(
+                                CreateWeedRequest(
+                                    config_entry_id=entry_id,
+                                    detection_id=weed.detection_id,
+                                    x=weed_x,
+                                    y=weed_y,
+                                    z=response.meta.z,
+                                    radius=weed.radius_mm,
+                                    confidence=weed.confidence,
+                                    apply=True,
+                                )
+                            )
+                            if create_result.get("status") == "applied":
+                                weed_status = "created"
+                        except HomeAssistantError as exc:
+                            LOGGER.warning(
+                                "Automatic weed creation failed; keeping recommendation: %s", exc
+                            )
+                    self.db.save_weed_detection(
+                        detection_id=str(weed.detection_id),
+                        config_entry_id=entry_id,
+                        image_id=weed.image_id,
+                        image_timestamp=weed.image_timestamp,
+                        x=weed_x,
+                        y=weed_y,
+                        z=response.meta.z,
+                        area_mm2=weed.area_mm2,
+                        radius_mm=weed.radius_mm,
+                        confidence=weed.confidence,
+                        overlay_path=str(overlay_path) if result.overlay_jpeg else None,
+                        status=weed_status,
+                    )
                 vegetation_path = artifacts / f"{job_id}-{response.image_id}-mask.png"
                 if result.mask:
                     vegetation_path.write_bytes(result.mask)
@@ -622,7 +713,11 @@ class JobManager:
             "spread_curves": spread_curves,
         }
         self.last = result
-        self.current = {"status": "idle", "queue_length": 0, "progress": message}
+        self.current = {
+            "status": "idle",
+            "queue_length": len(self.queued_image_ids),
+            "progress": message,
+        }
         self.db.finish_job(str(job_id), result)
         await self._status(entry_id, job_id, status, message, measurements)
         return {"accepted": True, **result}

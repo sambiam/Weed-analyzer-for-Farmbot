@@ -92,7 +92,7 @@ def test_isolated_weed_stays_separate_at_high_resolution():
     assert result.measurements[0].maximum_accepted_canopy_radius_mm < 60
 
 
-def test_overlapping_plants_remain_uncertain():
+def test_overlapping_plants_remain_measurable():
     ppm = 1.5
     width, height = 960, 720
     image = np.zeros((height, width, 3), np.uint8)
@@ -115,7 +115,8 @@ def test_overlapping_plants_remain_uncertain():
     result = ClassicalVisionEngine().analyse(
         encode_jpeg(image), 1, NOW, seeds, _calibration(ppm), {}
     )
-    assert any(m.ambiguous for m in result.measurements)
+    assert all(not m.ambiguous for m in result.measurements)
+    assert all(m.confidence >= 0.6 for m in result.measurements)
 
 
 def test_temporal_mask_from_another_resolution_is_resized_safely():

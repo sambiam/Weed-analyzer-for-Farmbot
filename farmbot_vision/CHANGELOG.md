@@ -132,3 +132,10 @@ contract (contract **farmbot-vision-v2**).
 - Added sequential classical canopy analysis, maximum-leaf protection, overlap uncertainty, and temporal evidence hooks.
 - Added no-shrink radius safety, optimistic-concurrency handling, manual calibration, monotonic curve learning, SQLite migrations, retention, scheduling, and ingress UI.
 - Added synthetic safety tests and BuildKit multi-architecture CI/release workflows.
+## Unreleased
+
+- Replaced the queue card with an Analysis workflow and a timeframe-based image picker.
+- Added persistent, opt-in weed detection settings with recommendation and automatic-creation modes.
+- Improved pale-leaf segmentation, overlapping-canopy ownership, empty-centre removal detection,
+  and reviewability of large human-approved growth changes.
+- Added removal review alternatives to keep a plant or move its recorded centre.

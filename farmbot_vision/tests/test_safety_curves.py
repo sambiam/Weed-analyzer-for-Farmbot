@@ -46,6 +46,12 @@ def test_auto_radius_requires_confidence():
     assert result.decision == Decision.UNCERTAIN
 
 
+def test_large_growth_is_reviewable_but_not_automatically_applied():
+    large = measurement(current=100, recommendation=190)
+    assert decide(large, OperatingMode.RECOMMEND, Settings()).decision == Decision.RECOMMENDED
+    assert decide(large, OperatingMode.AUTO_RADIUS, Settings()).decision == Decision.UNCERTAIN
+
+
 def test_absence_requires_enabled_detection_prior_canopy_and_streak():
     absent = measurement()
     absent = absent.model_copy(
@@ -97,6 +103,24 @@ def test_confirmed_absence_auto_archives_only_when_enabled():
         ).decision
         == Decision.REMOVED
     )
+
+
+def test_confident_empty_center_can_remove_on_first_observation():
+    absent = measurement(confidence=0.96).model_copy(
+        update={
+            "vegetation_absent": True,
+            "center_misaligned": True,
+            "absent_observations": 1,
+            "recommended_protection_radius_mm": 0,
+        }
+    )
+    settings = Settings(
+        removal_detection_enabled=True,
+        removal_min_consecutive_absent=2,
+        removal_auto_apply=True,
+    )
+    result = decide(absent, OperatingMode.AUTO_RADIUS, settings, previously_observed_canopy=True)
+    assert result.decision == Decision.REMOVED
 
 
 def test_monotonic_curve_fitting():

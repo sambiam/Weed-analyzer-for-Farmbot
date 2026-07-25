@@ -32,7 +32,11 @@ def decide(
                     "reason": "no earlier canopy observation confirms the plant was present",
                 }
             )
-        if measurement.absent_observations < settings.removal_min_consecutive_absent:
+        strong_empty_center = measurement.confidence >= 0.9 and measurement.center_misaligned
+        if (
+            measurement.absent_observations < settings.removal_min_consecutive_absent
+            and not strong_empty_center
+        ):
             return measurement.model_copy(
                 update={
                     "decision": Decision.OBSERVED,
@@ -54,7 +58,11 @@ def decide(
             update={
                 "decision": Decision.REMOVED if automatic else Decision.REMOVAL_RECOMMENDED,
                 "reason": (
-                    "consecutive observations confirm the plant canopy is absent; "
+                    (
+                        "the recorded centre is confidently empty despite nearby vegetation; "
+                        if strong_empty_center
+                        else "consecutive observations confirm the plant canopy is absent; "
+                    )
                     + ("automatic archival enabled" if automatic else "human approval required")
                 ),
             }
@@ -78,14 +86,18 @@ def decide(
             }
         )
     percent = 100 * (proposed - current) / max(current, 1)
-    if percent > settings.maximum_single_update_percent:
+    if mode == OperatingMode.AUTO_RADIUS and percent > settings.maximum_single_update_percent:
         return measurement.model_copy(
             update={
                 "decision": Decision.UNCERTAIN,
                 "reason": "increase exceeds maximum single-update percentage",
             }
         )
-    if proposed - current > settings.maximum_daily_radius_growth_mm * max(days_since_previous, 1):
+    if (
+        mode == OperatingMode.AUTO_RADIUS
+        and proposed - current
+        > settings.maximum_daily_radius_growth_mm * max(days_since_previous, 1)
+    ):
         return measurement.model_copy(
             update={
                 "decision": Decision.UNCERTAIN,
@@ -107,6 +119,12 @@ def decide(
             "decision": Decision.APPLIED
             if mode == OperatingMode.AUTO_RADIUS
             else Decision.RECOMMENDED,
-            "reason": "safe radius increase",
+            "reason": (
+                "large radius increase requires human review"
+                if percent > settings.maximum_single_update_percent
+                or proposed - current
+                > settings.maximum_daily_radius_growth_mm * max(days_since_previous, 1)
+                else "safe radius increase"
+            ),
         }
     )
