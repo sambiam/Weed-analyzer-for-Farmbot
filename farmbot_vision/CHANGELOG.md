@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.1.6 - 2026-07-25
 
 - Added a **Boundaries & zones** tab. Boundaries enclose where things may be
   placed and exclusion zones mark areas to keep clear; each zone separately
