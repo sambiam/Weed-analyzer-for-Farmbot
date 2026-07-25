@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.1.5 - 2026-07-25
+
+- Re-cut the release: the `V1.1.4` GitHub release/tag was created against a
+  commit that predated the 1.1.4 version bump, so its build published the
+  app image tagged `0.5.0`/`V1.1.4` instead of `1.1.4`. Since Home Assistant
+  Supervisor matches the image tag to `config.yaml`'s `version` field exactly,
+  it could not find a `1.1.4` image and kept reporting `0.5.0` as both
+  installed and latest. This release is cut from the current `main`, so its
+  published image is correctly tagged `1.1.5` to match.
+
 ## 1.1.4 - 2026-07-25
 
 - Made all analysis outcomes manually approvable/rejectable; certainty now gates automation only.
