@@ -124,11 +124,10 @@ def decide(
         return measurement.model_copy(
             update={
                 "decision": (
-                    Decision.APPLIED
-                    if mode == OperatingMode.AUTO_RADIUS
-                    else Decision.RECOMMENDED
+                    Decision.APPLIED if mode == OperatingMode.AUTO_RADIUS else Decision.RECOMMENDED
                 ),
-                "reason": "safe small radius reduction" if reduction_percent <= automatic_limit
+                "reason": "safe small radius reduction"
+                if reduction_percent <= automatic_limit
                 else "large radius reduction requires human review",
             }
         )

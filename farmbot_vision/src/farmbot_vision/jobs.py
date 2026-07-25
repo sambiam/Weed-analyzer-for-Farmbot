@@ -482,9 +482,7 @@ class JobManager:
                         radius_mm=weed.radius_mm,
                         confidence=weed.confidence,
                         overlay_path=str(overlay_path) if result.overlay_jpeg else None,
-                        review_path=(
-                            str(weed_review_path) if result.weed_review_jpeg else None
-                        ),
+                        review_path=(str(weed_review_path) if result.weed_review_jpeg else None),
                         status=weed_status,
                         center_px_x=weed.center_px[0],
                         center_px_y=weed.center_px[1],

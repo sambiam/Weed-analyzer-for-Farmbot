@@ -941,7 +941,7 @@ async def dashboard(request: Request) -> HTMLResponse:
         f"<td>{r['maximum_accepted_canopy_radius_mm']:.1f}</td><td>{r['recommended_protection_radius_mm']:.1f}</td>"
         f"<td>{r['confidence']:.2f}</td>"
         f"<td>{escape(r['decision'])}</td><td>{escape(r['reason'])}</td>"
-        f'<td class=actions><div class=actions-group>{_artifact_button(r)}{_review_controls(r)}</div></td></tr>'
+        f"<td class=actions><div class=actions-group>{_artifact_button(r)}{_review_controls(r)}</div></td></tr>"
         for r in rows
         if not r.get("vegetation_absent")
     )
