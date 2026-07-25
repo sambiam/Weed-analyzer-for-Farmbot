@@ -69,17 +69,23 @@ def main() -> None:
     pyproject = tomllib.loads((ROOT / "pyproject.toml").read_text())
     pyproject_version = pyproject.get("project", {}).get("version")
     if pyproject_version != __version__:
-        fail(f"pyproject.toml version {pyproject_version!r} must match farmbot_vision.__version__ {__version__!r}")
+        fail(
+            f"pyproject.toml version {pyproject_version!r} must match farmbot_vision.__version__ {__version__!r}"
+        )
 
     if config.get("version") != __version__:
-        fail(f"config.yaml version {config.get('version')!r} must match farmbot_vision.__version__ {__version__!r}")
+        fail(
+            f"config.yaml version {config.get('version')!r} must match farmbot_vision.__version__ {__version__!r}"
+        )
 
     readme = (ROOT / "farmbot_vision" / "README.md").read_text()
     if not re.search(rf"\b{re.escape(__version__)}\b", readme):
         fail(f"farmbot_vision/README.md must mention current version {__version__!r}")
 
     changelog = (ROOT / "farmbot_vision" / "CHANGELOG.md").read_text()
-    if f"## {__version__} " not in changelog and not changelog.startswith(f"# Changelog\n\n## {__version__}"):
+    if f"## {__version__} " not in changelog and not changelog.startswith(
+        f"# Changelog\n\n## {__version__}"
+    ):
         fail(f"farmbot_vision/CHANGELOG.md must have a heading for {__version__!r}")
 
     print(
