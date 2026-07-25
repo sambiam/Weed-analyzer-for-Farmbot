@@ -131,7 +131,50 @@ def test_unowned_component_becomes_weed_only_when_enabled(seed, calibration):
     assert result.weeds[0].center_px[0] > 270
 
 
-def test_empty_out_of_frame_centre_is_skipped_not_absent(calibration):
+def test_known_neighbouring_plant_is_not_a_weed_but_small_bottom_weed_is(calibration):
+    from farmbot_vision.weed_settings import WeedSettings
+
+    seeds = [
+        PlantSeed(
+            plant_id=1,
+            crop_slug="spinach",
+            center_px=(110, 115),
+            current_radius_mm=70,
+        ),
+        PlantSeed(
+            plant_id=2,
+            crop_slug="marjoram",
+            center_px=(245, 90),
+            current_radius_mm=30,
+        ),
+    ]
+    result = ClassicalVisionEngine().analyse(
+        jpeg(
+            [
+                ("circle", ((110, 115), 48)),
+                ("circle", ((245, 90), 24)),
+                ("circle", ((260, 210), 8)),
+            ]
+        ),
+        9,
+        NOW,
+        seeds,
+        calibration,
+        {},
+        WeedSettings(
+            enabled=True,
+            plant_exclusion_margin_mm=10,
+            minimum_area_mm2=12,
+            minimum_confidence=0.7,
+        ),
+    )
+    assert len(result.weeds) == 1
+    assert result.weeds[0].center_px[1] > 195
+    ownership = cv2.imdecode(np.frombuffer(result.ownership_mask, np.uint8), cv2.IMREAD_UNCHANGED)
+    assert ownership[90, 245] == 2
+
+
+def test_edge_plant_is_low_confidence_reviewable_not_skipped_or_removed(calibration):
     edge_seed = PlantSeed(
         plant_id=7,
         crop_slug="lettuce",
@@ -140,8 +183,11 @@ def test_empty_out_of_frame_centre_is_skipped_not_absent(calibration):
     )
     result = analyse([], edge_seed, calibration)
 
-    assert result.measurements == []
-    assert "outside image" in result.skipped[edge_seed.plant_id]
+    assert result.skipped == {}
+    assert len(result.measurements) == 1
+    assert result.measurements[0].vegetation_absent is False
+    assert result.measurements[0].decision == Decision.UNCERTAIN
+    assert result.measurements[0].confidence <= 0.2
 
 
 def test_overlay_and_binary_masks_explain_vegetation_ownership(calibration):

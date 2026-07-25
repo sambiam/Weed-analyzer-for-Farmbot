@@ -123,6 +123,24 @@ def test_confident_empty_center_can_remove_on_first_observation():
     assert result.decision == Decision.REMOVED
 
 
+def test_automatic_decision_threshold_applies_to_removal_too():
+    absent = measurement(confidence=0.8).model_copy(
+        update={
+            "vegetation_absent": True,
+            "center_misaligned": True,
+            "absent_observations": 2,
+            "recommended_protection_radius_mm": 0,
+        }
+    )
+    settings = Settings(
+        removal_detection_enabled=True,
+        removal_auto_apply=True,
+        minimum_auto_confidence=0.9,
+    )
+    result = decide(absent, OperatingMode.AUTO_RADIUS, settings, previously_observed_canopy=True)
+    assert result.decision == Decision.REMOVAL_RECOMMENDED
+
+
 def test_monotonic_curve_fitting():
     curve = fit_monotonic_curve([(1, 20), (4, 18), (7, 30), (10, 28)])
     values = list(curve.values())

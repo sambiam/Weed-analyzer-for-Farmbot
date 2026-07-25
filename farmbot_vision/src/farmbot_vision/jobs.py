@@ -81,23 +81,39 @@ class JobManager:
         self, entry_id: str, inventory, measurement, *, human_approved: bool
     ) -> dict:
         plant = next((item for item in inventory.plants if item.id == measurement.plant_id), None)
-        if plant is None or plant.spread_curve_id is None or measurement.plant_age_days is None:
-            return {"status": "skipped", "message": "plant has no editable spread curve or age"}
+        if plant is None or measurement.plant_age_days is None:
+            return {"status": "skipped", "message": "plant or plant age is unavailable"}
         curve = next((item for item in inventory.curves if item.id == plant.spread_curve_id), None)
-        if curve is None:
-            return {"status": "skipped", "message": "assigned spread curve was not found"}
+        # Plants without a curve still need one after an approved measurement.
+        # Seed a Vision-owned curve with the current FarmBot diameter and add
+        # the measured-age point below.
+        base_curve_data = (
+            curve.data
+            if curve is not None
+            else {"0": radius_mm_to_diameter_mm(measurement.current_radius_mm)}
+        )
         edit = propose_curve_point(
-            curve.data,
+            base_curve_data,
             measurement.plant_age_days,
             radius_mm_to_diameter_mm(measurement.recommended_protection_radius_mm),
             max_daily_growth_mm=self.settings.maximum_daily_radius_growth_mm,
             maximum_plant_radius_mm=self.settings.maximum_plant_radius_mm,
         )
-        users = [item for item in inventory.plants if item.spread_curve_id == curve.id]
-        may_patch = curve.name.startswith("[FarmBot Vision]") and len(users) == 1
-        target_curve_id = curve.id if may_patch else None
-        target_name = curve.name if may_patch else f"[FarmBot Vision] {plant.name} spread"
-        if edit.verdict == "flagged":
+        users = (
+            [item for item in inventory.plants if item.spread_curve_id == curve.id]
+            if curve is not None
+            else []
+        )
+        may_patch = (
+            curve is not None and curve.name.startswith("[FarmBot Vision]") and len(users) == 1
+        )
+        target_curve_id = curve.id if may_patch and curve is not None else None
+        target_name = (
+            curve.name
+            if may_patch and curve is not None
+            else f"[FarmBot Vision] {plant.name} spread"
+        )
+        if edit.verdict == "flagged" and not human_approved:
             proposal_id = self.db.create_curve_proposal(
                 config_entry_id=entry_id,
                 plant_id=plant.id,
@@ -106,7 +122,7 @@ class JobManager:
                 plant_age_days=measurement.plant_age_days,
                 curve_id=target_curve_id,
                 curve_name=target_name,
-                previous_data=curve.data,
+                previous_data=base_curve_data,
                 data=edit.data,
                 reason=edit.reason or "curve edit needs review",
                 conflict_day=edit.conflict_day,
@@ -342,27 +358,22 @@ class JobManager:
                 del image_bytes, previous_masks
                 decided = []
                 for item in result.measurements:
-                    if item.vegetation_absent and not self.settings.removal_detection_enabled:
-                        result.skipped[item.plant_id] = "removal detection is disabled"
-                        continue
+                    suggested_center = item.recommended_center_px
+                    if suggested_center is not None:
+                        suggested_center = pixel_to_garden(
+                            suggested_center[0],
+                            suggested_center[1],
+                            response.meta.x,
+                            response.meta.y,
+                            response.width,
+                            response.height,
+                            calibration,
+                        )
+                        item = item.model_copy(update={"recommended_center_px": suggested_center})
                     if item.vegetation_absent:
-                        suggested_center = item.recommended_center_px
-                        if suggested_center is not None:
-                            suggested_center = pixel_to_garden(
-                                suggested_center[0],
-                                suggested_center[1],
-                                response.meta.x,
-                                response.meta.y,
-                                response.width,
-                                response.height,
-                                calibration,
-                            )
                         item = item.model_copy(
                             update={
                                 "config_entry_id": entry_id,
-                                # Persist garden coordinates for the alternative
-                                # "move centre" review action.
-                                "recommended_center_px": suggested_center,
                                 "absent_observations": self.db.absent_streak(
                                     entry_id,
                                     item.plant_id,
@@ -403,7 +414,11 @@ class JobManager:
                     ) or self.db.has_weed_detection_near(weed_x, weed_y, duplicate_distance):
                         continue
                     weed_status = "recommended"
-                    if weed_settings and weed_settings.automatic_creation:
+                    if (
+                        weed_settings
+                        and weed_settings.automatic_creation
+                        and weed.confidence >= self.settings.minimum_auto_confidence
+                    ):
                         try:
                             create_result = await self.client.create_weed(
                                 CreateWeedRequest(
@@ -436,6 +451,10 @@ class JobManager:
                         confidence=weed.confidence,
                         overlay_path=str(overlay_path) if result.overlay_jpeg else None,
                         status=weed_status,
+                        center_px_x=weed.center_px[0],
+                        center_px_y=weed.center_px[1],
+                        processed_width=response.width,
+                        processed_height=response.height,
                     )
                 vegetation_path = artifacts / f"{job_id}-{response.image_id}-mask.png"
                 if result.mask:

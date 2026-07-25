@@ -224,6 +224,59 @@ async def test_second_run_is_rejected_while_locked(tmp_path):
         manager.lock.release()
 
 
+@pytest.mark.asyncio
+async def test_approved_radius_creates_curve_when_plant_has_none(tmp_path):
+    from farmbot_vision.jobs import JobManager
+    from farmbot_vision.models import Inventory
+
+    class Client:
+        def __init__(self):
+            self.requests = []
+
+        async def upsert_curve(self, request):
+            self.requests.append(request)
+            return {"status": "applied", "curve_id": 99, "message": "Curve created"}
+
+    inventory = Inventory.model_validate(
+        {
+            "device_id": "42",
+            "generated_at": "2026-07-25T00:00:00+00:00",
+            "plants": [
+                {
+                    "id": 1,
+                    "name": "Thyme",
+                    "openfarm_slug": "thyme",
+                    "x": 0,
+                    "y": 0,
+                    "radius": 100,
+                    "plant_stage": "planted",
+                    "planted_at": "2026-07-01T00:00:00+00:00",
+                }
+            ],
+            "images": [],
+            "curves": [],
+            "camera_calibration": {"available": False},
+        }
+    )
+    client = Client()
+    manager = JobManager(Settings(), Database(tmp_path / "db.sqlite"), client)
+    result = await manager._update_curve_after_radius(
+        "entry",
+        inventory,
+        _measurement(
+            config_entry_id="entry",
+            crop_slug="thyme",
+            current_radius_mm=100,
+            recommended_protection_radius_mm=120,
+            plant_age_days=24,
+        ),
+        human_approved=True,
+    )
+    assert result["status"] == "applied"
+    assert client.requests[0].curve_id is None
+    assert client.requests[0].assign_to_plant_ids == [1]
+
+
 def test_resource_gate_blocks_low_memory(tmp_path, monkeypatch):
     from farmbot_vision import jobs as jobs_module
     from farmbot_vision.jobs import JobManager

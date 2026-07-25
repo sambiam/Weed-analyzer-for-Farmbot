@@ -124,6 +124,14 @@ MIGRATIONS = [
     CREATE INDEX IF NOT EXISTS idx_weed_detections_pending
       ON weed_detections(status,image_timestamp DESC);
     """,
+    # Migration 6: weed detection pixel geometry, so the review UI can
+    # highlight a single weed on its source overlay image.
+    """
+    ALTER TABLE weed_detections ADD COLUMN center_px_x REAL;
+    ALTER TABLE weed_detections ADD COLUMN center_px_y REAL;
+    ALTER TABLE weed_detections ADD COLUMN processed_width INTEGER;
+    ALTER TABLE weed_detections ADD COLUMN processed_height INTEGER;
+    """,
 ]
 
 
@@ -381,13 +389,18 @@ class Database:
         confidence: float,
         overlay_path: str | None,
         status: str = "recommended",
+        center_px_x: float | None = None,
+        center_px_y: float | None = None,
+        processed_width: int | None = None,
+        processed_height: int | None = None,
     ) -> None:
         with self.connection:
             self.connection.execute(
                 """INSERT OR REPLACE INTO weed_detections(
                 detection_id,config_entry_id,image_id,image_timestamp,x,y,z,area_mm2,
-                radius_mm,confidence,overlay_path,status)
-                VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+                radius_mm,confidence,overlay_path,status,center_px_x,center_px_y,
+                processed_width,processed_height)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     detection_id,
                     config_entry_id,
@@ -401,6 +414,10 @@ class Database:
                     confidence,
                     overlay_path,
                     status,
+                    center_px_x,
+                    center_px_y,
+                    processed_width,
+                    processed_height,
                 ),
             )
 
@@ -508,7 +525,8 @@ class Database:
             """SELECT m.* FROM measurements m
             WHERE NOT EXISTS (
               SELECT 1 FROM decisions d WHERE d.measurement_id=m.measurement_id
-              AND d.action IN ('applied','reject','removed','keep','superseded')
+              AND d.action IN
+                ('applied','approved_no_change','reject','removed','keep','superseded')
             )
             ORDER BY m.image_timestamp DESC LIMIT ?""",
             (limit,),
@@ -525,7 +543,8 @@ class Database:
         return (
             self.connection.execute(
                 "SELECT 1 FROM decisions WHERE measurement_id=? "
-                "AND action IN ('applied','reject','removed','keep','superseded') LIMIT 1",
+                "AND action IN "
+                "('applied','approved_no_change','reject','removed','keep','superseded') LIMIT 1",
                 (measurement_id,),
             ).fetchone()
             is not None

@@ -134,6 +134,12 @@ contract (contract **farmbot-vision-v2**).
 - Added synthetic safety tests and BuildKit multi-architecture CI/release workflows.
 ## Unreleased
 
+- Made all analysis outcomes manually approvable/rejectable; certainty now gates automation only.
+- Fixed new spread-curve HTTP 400s, creates curves for plants without one, and verifies radius
+  and curve writes against FarmBot before reporting success.
+- Analyses partially visible plants at reduced confidence instead of skipping their centres.
+- Added known-plant soft ownership before weed classification and centre-move suggestions for
+  offset but otherwise healthy canopies.
 - Replaced the queue card with an Analysis workflow and a timeframe-based image picker.
 - Added persistent, opt-in weed detection settings with recommendation and automatic-creation modes.
 - Improved pale-leaf segmentation, overlapping-canopy ownership, empty-centre removal detection,

@@ -12,7 +12,12 @@ from farmbot_vision.home_assistant import (
     HomeAssistantError,
     StaleRadiusError,
 )
-from farmbot_vision.models import ApplyRadiusRequest, InventoryRequest, VisionRequestEvent
+from farmbot_vision.models import (
+    ApplyRadiusRequest,
+    InventoryRequest,
+    UpsertCurveRequest,
+    VisionRequestEvent,
+)
 
 
 @pytest.mark.asyncio
@@ -151,6 +156,33 @@ async def test_stale_current_radius_conflict():
                 apply=True,
             )
         )
+    await client.close()
+
+
+@pytest.mark.asyncio
+async def test_new_curve_request_omits_null_optional_curve_id():
+    bodies = []
+
+    async def handler(request):
+        bodies.append(json.loads(request.content))
+        return httpx.Response(200, json={"service_response": {"status": "applied"}})
+
+    client = HomeAssistantClient(token="test", base_url="http://test")
+    await client._http.aclose()
+    client._http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    result = await client.upsert_curve(
+        UpsertCurveRequest(
+            config_entry_id="entry",
+            crop_slug="thyme",
+            name="[FarmBot Vision] Thyme spread",
+            data={"0": 100, "20": 220},
+            assign_to_plant_ids=[1],
+            apply=True,
+            human_approved=True,
+        )
+    )
+    assert result["status"] == "applied"
+    assert "curve_id" not in bodies[0]
     await client.close()
 
 

@@ -266,7 +266,14 @@ class HomeAssistantClient:
         return await self._service("create_vision_weed", request)  # type: ignore[return-value]
 
     async def upsert_curve(self, request: UpsertCurveRequest) -> dict[str, Any]:
-        return await self._service("upsert_vision_spread_curve", request)  # type: ignore[return-value]
+        # ``curve_id`` is optional in the Home Assistant service schema. Sending
+        # JSON null still counts as providing it and fails ``Coerce(int)``
+        # before the handler runs, which was the source of the observed HTTP
+        # 400 on every new Vision-owned curve.
+        return await self._service(
+            "upsert_vision_spread_curve",
+            request.model_dump(mode="json", exclude_none=True),
+        )  # type: ignore[return-value]
 
     async def report_status(self, status: VisionStatus) -> None:
         await self._service("report_vision_status", status, return_response=False)

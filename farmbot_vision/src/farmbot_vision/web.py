@@ -360,7 +360,77 @@ _DASHBOARD_JS = r"""
     modal.hidden=true; modalImg.removeAttribute('src');
     if(returnFocus) returnFocus.focus();
   }
+  const weedModal=document.getElementById('weed-modal');
+  const weedImg=document.getElementById('weed-modal-img');
+  const weedMarker=document.getElementById('weed-modal-marker');
+  const weedDetails=document.getElementById('weed-modal-details');
+  const weedMessage=document.getElementById('weed-modal-message');
+  const weedAccept=document.getElementById('weed-modal-accept');
+  const weedReject=document.getElementById('weed-modal-reject');
+  const weedAcceptAll=document.getElementById('weed-modal-accept-all');
+  let weedData=null, weedReturnFocus=null;
+  function closeWeedModal(){
+    weedModal.hidden=true; weedImg.removeAttribute('src'); weedData=null;
+    if(weedReturnFocus) weedReturnFocus.focus();
+  }
+  function openWeedModal(data,trigger){
+    weedData=data; weedReturnFocus=trigger; weedMessage.textContent='';
+    weedImg.src=data.artifact;
+    if(data.x!=null&&data.y!=null&&data.width&&data.height){
+      weedMarker.style.left=(data.x/data.width*100)+'%';
+      weedMarker.style.top=(data.y/data.height*100)+'%';
+      weedMarker.hidden=false;
+    } else weedMarker.hidden=true;
+    const others=Math.max(0,(data.siblings||[]).length-1);
+    weedDetails.textContent='Area '+data.areaMm2.toFixed(1)+' mm² · confidence '+data.confidence.toFixed(2)
+      +(others?(' · '+others+' other weed(s) in this image'):'');
+    weedModal.hidden=false; weedModal.querySelector('.modal-close').focus();
+  }
+  async function postWeedAction(id,action){
+    try{
+      const response=await fetch('weeds/'+id+'/'+action,{method:'POST',headers:{Accept:'application/json'}});
+      const result=await response.json().catch(function(){return {};});
+      const ok=response.ok&&(result.status==='applied'||result.status==='rejected');
+      if(ok){const row=document.getElementById('weed-'+id); if(row) row.remove();}
+      return ok;
+    }catch(_){return false;}
+  }
+  weedAccept.addEventListener('click',async function(){
+    if(!weedData) return;
+    weedAccept.disabled=true;
+    try{
+      const ok=await postWeedAction(weedData.detectionId,'approve');
+      if(ok) closeWeedModal(); else weedMessage.textContent='Could not accept weed';
+    }finally{weedAccept.disabled=false;}
+  });
+  weedReject.addEventListener('click',async function(){
+    if(!weedData) return;
+    weedReject.disabled=true;
+    try{
+      const ok=await postWeedAction(weedData.detectionId,'reject');
+      if(ok) closeWeedModal(); else weedMessage.textContent='Could not reject weed';
+    }finally{weedReject.disabled=false;}
+  });
+  weedAcceptAll.addEventListener('click',async function(){
+    if(!weedData) return;
+    weedAcceptAll.disabled=true;
+    try{
+      const ids=(weedData.siblings&&weedData.siblings.length)?weedData.siblings:[weedData.detectionId];
+      let failures=0;
+      for(const id of ids){ if(!await postWeedAction(id,'approve')) failures++; }
+      if(!failures) closeWeedModal();
+      else weedMessage.textContent=failures+' weed(s) could not be accepted';
+    }finally{weedAcceptAll.disabled=false;}
+  });
+  document.getElementById('weed-modal-close').addEventListener('click',closeWeedModal);
+  weedModal.addEventListener('click',function(event){if(event.target===weedModal) closeWeedModal();});
   document.addEventListener('click',async function(event){
+    const weedViewer=event.target.closest('.weed-view');
+    if(weedViewer){
+      let data=null; try{data=JSON.parse(weedViewer.dataset.weed||'null');}catch(_){data=null;}
+      if(data) openWeedModal(data,weedViewer);
+      return;
+    }
     const viewer=event.target.closest('[data-artifacts]');
     if(viewer){
       try{artifacts=JSON.parse(viewer.dataset.artifacts||'[]');}catch(_){artifacts=[];}
@@ -415,7 +485,11 @@ _DASHBOARD_JS = r"""
   document.getElementById('overlay-modal-next').addEventListener('click',function(){
     index=(index+1)%artifacts.length;showArtifact();
   });
-  document.addEventListener('keydown',function(event){if(event.key==='Escape'&&!modal.hidden)closeModal();});
+  document.addEventListener('keydown',function(event){
+    if(event.key!=='Escape') return;
+    if(!modal.hidden) closeModal();
+    if(!weedModal.hidden) closeWeedModal();
+  });
   document.getElementById('queue-open').addEventListener('click',function(){
     queueModal.hidden=false;loadQueueImages();
   });
@@ -602,6 +676,11 @@ button{{background:var(--green);border:0;border-radius:6px;padding:.65rem 1rem;c
 .overlay-modal img{{display:block;max-height:70vh;margin:auto}}.modal-close{{position:absolute;right:.5rem;top:.5rem;font-size:1.5rem}}
 .modal-controls{{display:flex;gap:.5rem;align-items:center;justify-content:center;margin-top:.6rem}}.legend{{font-size:.9rem;color:var(--muted)}}
 .queue-dialog{{width:min(95vw,900px)}}.button-row{{display:flex;gap:.5rem;flex-wrap:wrap;align-items:center}}
+.weed-dialog{{width:min(95vw,900px)}}.weed-image-wrap{{position:relative;display:inline-block;margin:auto}}
+.weed-marker{{position:absolute;width:26px;height:26px;margin-left:-13px;margin-top:-13px;pointer-events:none}}
+.weed-marker::before,.weed-marker::after{{content:'';position:absolute;background:#ffe600;box-shadow:0 0 0 1px #000}}
+.weed-marker::before{{left:50%;top:0;width:4px;height:100%;margin-left:-2px}}
+.weed-marker::after{{top:50%;left:0;height:4px;width:100%;margin-top:-2px}}
 </style></head><body><header><h1>🌱 FarmBot Vision</h1><nav><a href="./">Dashboard</a><a href="settings">Calibration</a><a href="api/health">Health JSON</a></nav></header>
 <main>{body}</main></body></html>""".replace(
             '<a href="./">Dashboard</a><a href="settings">Calibration</a>',
@@ -682,15 +761,31 @@ async def dashboard(request: Request) -> HTMLResponse:
     def _review_controls(r: dict) -> str:
         # Approval is impossible without a valid calibration (Part 6, Part 10).
         if not r.get("calibrated", 1):
-            return "<span class=warn>Calibration required</span>"
-        if r["decision"] != "recommended":
-            return "<span class=muted>Not reviewable</span>"
+            return (
+                "<span class=warn>Calibration required to apply a radius</span>"
+                f'<form method=post action="recommendations/{r["measurement_id"]}/reject">'
+                f'<button class=review-action data-url="recommendations/{r["measurement_id"]}/reject">'
+                "Reject</button></form><small class=action-message></small>"
+            )
+        approve_label = (
+            "Apply radius"
+            if r["recommended_protection_radius_mm"] > r["current_radius_mm"]
+            else "Approve observation"
+        )
         return (
             f'<form method=post action="recommendations/{r["measurement_id"]}/approve">'
-            f'<button class=review-action data-url="recommendations/{r["measurement_id"]}/approve">Approve</button></form>'
+            f'<button class=review-action data-url="recommendations/{r["measurement_id"]}/approve">'
+            f"{approve_label}</button></form>"
             f'<form method=post action="recommendations/{r["measurement_id"]}/reject">'
             f'<button class=review-action data-url="recommendations/{r["measurement_id"]}/reject">Reject</button></form>'
-            "<small class=action-message></small>"
+            + (
+                f'<form method=post action="recommendations/{r["measurement_id"]}/move-center">'
+                f'<button class=review-action data-url="recommendations/{r["measurement_id"]}/move-center">'
+                "Move center</button></form>"
+                if r.get("center_misaligned")
+                else ""
+            )
+            + "<small class=action-message></small>"
         )
 
     measurement_rows = "".join(
@@ -726,7 +821,7 @@ async def dashboard(request: Request) -> HTMLResponse:
         )
         + "<small class=action-message></small></td></tr>"
         for r in rows
-        if r["decision"] == "removal_recommended"
+        if r.get("vegetation_absent")
     )
     proposal_rows = []
     for proposal in database.curve_proposals():
@@ -768,15 +863,39 @@ async def dashboard(request: Request) -> HTMLResponse:
         f"<td>{escape(row['action'])}</td></tr>"
         for row in database.recent_decisions()
     )
+    pending_weeds = database.pending_weed_detections()
+    weeds_by_image: dict[int, list[dict]] = {}
+    for w in pending_weeds:
+        weeds_by_image.setdefault(w["image_id"], []).append(w)
+
+    def _weed_view_button(w: dict) -> str:
+        if not w.get("overlay_path"):
+            return "<span class=muted>None</span>"
+        siblings = [str(other["detection_id"]) for other in weeds_by_image.get(w["image_id"], [])]
+        marker = {
+            "artifact": f"artifact/{Path(w['overlay_path']).name}",
+            "x": w.get("center_px_x"),
+            "y": w.get("center_px_y"),
+            "width": w.get("processed_width"),
+            "height": w.get("processed_height"),
+            "detectionId": str(w["detection_id"]),
+            "siblings": siblings,
+            "areaMm2": w["area_mm2"],
+            "confidence": w["confidence"],
+        }
+        marker_json = escape(json.dumps(marker, separators=(",", ":")), quote=True)
+        return f'<button type=button class=weed-view data-weed="{marker_json}">View</button>'
+
     weed_rows = "".join(
-        f"<tr class=review-item><td>{w['image_id']}</td>"
+        f'<tr class=review-item id="weed-{w["detection_id"]}"><td>{w["image_id"]}</td>'
         f"<td>{w['x']:.1f}, {w['y']:.1f}, {w['z']:.1f}</td>"
-        f"<td>{w['area_mm2']:.1f}</td><td>{w['confidence']:.2f}</td><td>"
+        f"<td>{w['area_mm2']:.1f}</td><td>{w['confidence']:.2f}</td>"
+        f"<td>{_weed_view_button(w)}</td><td>"
         f'<form><button class=review-action data-url="weeds/{w["detection_id"]}/approve">'
         "Create weed</button></form>"
         f'<form><button class=review-action data-url="weeds/{w["detection_id"]}/reject">'
         "Reject</button></form><small class=action-message></small></td></tr>"
-        for w in database.pending_weed_detections()
+        for w in pending_weeds
     )
     resolution = settings.resolution
 
@@ -806,6 +925,10 @@ async def dashboard(request: Request) -> HTMLResponse:
 <p>Mode: {settings.mode.value}</p></section>
 <section class=card><h2>Analysis resolution</h2><p><b>{escape(resolution.label)}</b></p>
 <p class=muted>{resolution.pixel_count:,} px · restart to change</p></section>
+<section class=card><h2>Automatic decision threshold</h2>
+<p><b>{settings.minimum_auto_confidence:.0%} confidence</b></p>
+<p class=muted>Set <code>minimum_auto_confidence</code> in the add-on configuration.
+It affects automatic changes only; every result remains manually reviewable.</p></section>
 <section class=card><h2>Analysis</h2><p><span id=queue-count>{len(jobs.queued_image_ids)}</span> queued</p>
 <div class=button-row><form method=post action="analyse"><button>Analyse queue</button></form>
 <button id=queue-open type=button>Add to queue</button></div></section></div>
@@ -824,8 +947,8 @@ async def dashboard(request: Request) -> HTMLResponse:
 <section class=card><h2>Measurements</h2><table><thead><tr><th>Plant</th><th>Crop</th><th>Resolution</th><th>Current</th><th>Max leaf</th><th>Recommended</th><th>Confidence</th><th>Calibration</th><th>Decision</th><th>Reason</th><th>Diagnostic</th><th>Review</th></tr></thead><tbody>{measurement_rows or "<tr><td colspan=12>No measurements yet</td></tr>"}</tbody></table></section>
 <section class=card><h2>Removed / missing plants</h2><table><thead><tr><th>Plant</th><th>Absent looks</th><th>Confidence</th><th>Reason</th><th>Diagnostic</th><th>Review</th></tr></thead><tbody>{removal_rows or "<tr><td colspan=6>No confirmed missing plants</td></tr>"}</tbody></table></section>
 <section class=card><h2>Detected weeds</h2><p class=muted>Unowned vegetation outside known plant protection areas.</p>
-<table><thead><tr><th>Image</th><th>Coordinates</th><th>Area mm²</th><th>Confidence</th><th>Review</th></tr></thead>
-<tbody>{weed_rows or "<tr><td colspan=5>No weed recommendations</td></tr>"}</tbody></table></section>
+<table><thead><tr><th>Image</th><th>Coordinates</th><th>Area mm²</th><th>Confidence</th><th>View</th><th>Review</th></tr></thead>
+<tbody>{weed_rows or "<tr><td colspan=6>No weed recommendations</td></tr>"}</tbody></table></section>
 <section class=card><h2>Growth-curve updates</h2><p class=muted>Flagged per-plant diameter points require review.</p><table><tbody>{flagged_curve_rows or "<tr><td>No flagged curve updates</td></tr>"}</tbody></table></section>
 <section class=card><h2>Crop protection spread proposals</h2><p class=muted>Monotonic and limited to 10 points. FarmBot values are diameters; assignment requires approval.</p><table><tbody>{curve_rows or "<tr><td>No curve is ready</td></tr>"}</tbody></table></section>
 <section class=card><h2>Approval and rollback history</h2><table><tbody>{decision_rows or "<tr><td>No decisions yet</td></tr>"}</tbody></table></section>
@@ -835,6 +958,18 @@ async def dashboard(request: Request) -> HTMLResponse:
 <img id=overlay-modal-img alt="Plant analysis diagnostic"><figcaption id=overlay-modal-details></figcaption>
 <p class=legend>Vegetation mask and per-plant ownership are shown as separate gallery images.</p>
 <div class=modal-controls><button id=overlay-modal-prev type=button>Previous</button><span id=overlay-modal-counter></span><button id=overlay-modal-next type=button>Next</button></div>
+</figure></div>
+<div id=weed-modal class=overlay-modal hidden role=dialog aria-modal=true aria-label="Weed review">
+<figure class=weed-dialog><button id=weed-modal-close class=modal-close type=button aria-label=Close>&times;</button>
+<div class=weed-image-wrap><img id=weed-modal-img alt="Weed detection"><div id=weed-modal-marker class=weed-marker hidden></div></div>
+<figcaption id=weed-modal-details></figcaption>
+<p class=legend>Yellow cross = the weed being reviewed; red crosses = other detected weeds in this image.</p>
+<div class=modal-controls>
+<button id=weed-modal-accept type=button>Accept weed</button>
+<button id=weed-modal-reject type=button>Reject weed</button>
+<button id=weed-modal-accept-all type=button>Accept all weeds</button>
+</div>
+<small id=weed-modal-message class=action-message></small>
 </figure></div>
 <div id=queue-modal class=overlay-modal hidden role=dialog aria-modal=true aria-label="Add images to analysis queue">
 <figure class=queue-dialog><button id=queue-close class=modal-close type=button aria-label=Close>&times;</button>
@@ -1254,7 +1389,7 @@ def _action_response(
 
 @app.post("/recommendations/{measurement_id}/{action}")
 async def recommendation(request: Request, measurement_id: str, action: str) -> Response:
-    if action not in {"approve", "reject"}:
+    if action not in {"approve", "reject", "move-center"}:
         raise HTTPException(400)
     row = database.measurement(measurement_id)
     if row is None:
@@ -1263,9 +1398,49 @@ async def recommendation(request: Request, measurement_id: str, action: str) -> 
         return _action_response(
             request, "conflict", "This recommendation was already reviewed", error_status=409
         )
-    if row["decision"] != "recommended":
+    if action == "move-center":
+        if not row.get("center_misaligned") or row.get("recommended_center_x") is None:
+            return _action_response(
+                request, "conflict", "No centre correction is available", error_status=409
+            )
+        entry_id = row.get("config_entry_id") or settings.selected_config_entry_id
+        inventory = await client.inventory(
+            InventoryRequest(
+                config_entry_id=entry_id,
+                image_lookback_hours=settings.image_lookback_hours,
+            )
+        )
+        plant = next((p for p in inventory.plants if p.id == row["plant_id"]), None)
+        if plant is None:
+            return _action_response(
+                request, "conflict", "Plant is no longer active", error_status=409
+            )
+        result = await client.apply_plant_center(
+            ApplyPlantCenterRequest(
+                config_entry_id=entry_id,
+                plant_id=row["plant_id"],
+                measurement_id=measurement_id,
+                expected_x=plant.x,
+                expected_y=plant.y,
+                recommended_x=row["recommended_center_x"],
+                recommended_y=row["recommended_center_y"],
+                apply=True,
+                human_approved=True,
+            )
+        )
+        status = str(result.get("status", "error"))
+        if status == "applied":
+            database.record_decision(measurement_id, "center_moved", result)
+            return _action_response(
+                request,
+                "updated",
+                "Plant centre moved; you can still apply or reject the radius",
+            )
         return _action_response(
-            request, "conflict", "Only recommended radius changes can be reviewed", error_status=409
+            request,
+            status,
+            str(result.get("message") or status),
+            error_status=409 if status == "conflict" else None,
         )
     if action == "approve":
         # Approval is impossible without a valid calibration (Part 6, Part 10).
@@ -1274,7 +1449,17 @@ async def recommendation(request: Request, measurement_id: str, action: str) -> 
                 request, "conflict", "Calibration is required", error_status=409
             )
         if row["recommended_protection_radius_mm"] <= row["current_radius_mm"]:
-            return _action_response(request, "conflict", "Shrinking is disabled", error_status=409)
+            database.record_decision(
+                measurement_id,
+                "approved_no_change",
+                {
+                    "current_radius_mm": row["current_radius_mm"],
+                    "observed_radius_mm": row["recommended_protection_radius_mm"],
+                },
+            )
+            return _action_response(
+                request, "applied", "Observation approved; no radius increase was needed"
+            )
         entry_id = row.get("config_entry_id") or settings.selected_config_entry_id
         try:
             result = await client.apply_radius(
@@ -1357,10 +1542,6 @@ async def removal(request: Request, measurement_id: str, action: str) -> Respons
     if database.has_terminal_decision(measurement_id):
         return _action_response(
             request, "conflict", "This removal was already reviewed", error_status=409
-        )
-    if row["decision"] != "removal_recommended":
-        return _action_response(
-            request, "conflict", "Removal is not currently recommended", error_status=409
         )
     entry_id = row.get("config_entry_id") or settings.selected_config_entry_id
     if not database.is_latest_plant_measurement(entry_id, row["plant_id"], measurement_id):

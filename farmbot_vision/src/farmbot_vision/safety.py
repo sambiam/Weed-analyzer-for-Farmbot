@@ -53,7 +53,11 @@ def decide(
                     "reason": "observe mode does not remove plants",
                 }
             )
-        automatic = mode == OperatingMode.AUTO_RADIUS and settings.removal_auto_apply
+        automatic = (
+            mode == OperatingMode.AUTO_RADIUS
+            and settings.removal_auto_apply
+            and measurement.confidence >= settings.minimum_auto_confidence
+        )
         return measurement.model_copy(
             update={
                 "decision": Decision.REMOVED if automatic else Decision.REMOVAL_RECOMMENDED,
@@ -63,7 +67,11 @@ def decide(
                         if strong_empty_center
                         else "consecutive observations confirm the plant canopy is absent; "
                     )
-                    + ("automatic archival enabled" if automatic else "human approval required")
+                    + (
+                        "automatic archival enabled"
+                        if automatic
+                        else "human approval required or confidence below automatic threshold"
+                    )
                 ),
             }
         )

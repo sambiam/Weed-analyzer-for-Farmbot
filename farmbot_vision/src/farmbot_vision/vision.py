@@ -316,17 +316,35 @@ class ClassicalVisionEngine(ImageAnalysisEngine):
         ownership = np.zeros_like(labels, dtype=np.int16)
         ambiguous = np.zeros_like(mask, dtype=bool)
         uncertain_seeds: set[int] = set()
+        edge_truncated: set[int] = set()
         skipped: dict[int, str] = {}
         ambiguity_gap = max(5.0, params.mean_ppm * 5)
 
         valid_indices: list[int] = []
         for index, seed in enumerate(seeds):
             x, y = seed.center_px
-            border = max(3, min(seed.current_radius_mm * calibration.pixels_per_mm_x * 0.1, 15))
-            if x < border or y < border or x >= width - border or y >= height - border:
-                skipped[seed.plant_id] = "plant centre outside image or too close to border"
+            visible_radius = (
+                max(
+                    30.0,
+                    seed.current_radius_mm + self.safety_margin_mm,
+                )
+                * params.mean_ppm
+            )
+            if (
+                x + visible_radius < 0
+                or y + visible_radius < 0
+                or x - visible_radius >= width
+                or y - visible_radius >= height
+            ):
+                skipped[seed.plant_id] = "plant protection area is outside this image"
+                continue
+            valid_indices.append(index)
+            if x < 0 or y < 0 or x >= width or y >= height:
+                edge_truncated.add(index)
             else:
-                valid_indices.append(index)
+                border = min(x, y, width - x, height - y)
+                if border < visible_radius:
+                    edge_truncated.add(index)
 
         for label in range(1, labels_count):
             if not _valid_component(stats, label, params):
@@ -350,13 +368,11 @@ class ClassicalVisionEngine(ImageAnalysisEngine):
                 candidate = nearest == index
                 seed = seeds[index]
                 cx, cy = seed.center_px
-                seed_radius_px = max(
-                    8,
-                    seed.current_radius_mm
-                    * (calibration.pixels_per_mm_x + calibration.pixels_per_mm_y)
-                    / 2,
+                core_radius_px = max(
+                    6.0,
+                    min(35.0, max(12.0, seed.current_radius_mm * 0.28)) * params.mean_ppm,
                 )
-                component_near_seed = np.any((xs - cx) ** 2 + (ys - cy) ** 2 <= seed_radius_px**2)
+                component_near_seed = np.any((xs - cx) ** 2 + (ys - cy) ** 2 <= core_radius_px**2)
                 prior = previous_masks.get(seed.plant_id)
                 historical_overlap = (
                     prior is not None and prior.shape == mask.shape and np.any(prior[ys, xs] > 0)
@@ -364,12 +380,26 @@ class ClassicalVisionEngine(ImageAnalysisEngine):
                 if component_near_seed or historical_overlap:
                     ownership[ys[candidate], xs[candidate]] = index + 1
                     ambiguous[ys[candidate & is_ambiguous], xs[candidate & is_ambiguous]] = True
-                elif (
-                    np.min(np.sqrt((xs - cx) ** 2 + (ys - cy) ** 2))
-                    < seed_radius_px
-                    + 50 * (calibration.pixels_per_mm_x + calibration.pixels_per_mm_y) / 2
-                ):
-                    uncertain_seeds.add(index)
+                else:
+                    nearest_distance = np.min(np.sqrt((xs - cx) ** 2 + (ys - cy) ** 2))
+                    component_area_mm2 = len(xs) / (
+                        calibration.pixels_per_mm_x * calibration.pixels_per_mm_y
+                    )
+                    soft_radius_px = (
+                        max(seed.current_radius_mm * 1.35, seed.current_radius_mm + 60)
+                        * params.mean_ppm
+                    )
+                    likely_disconnected_canopy = (
+                        nearest_distance < soft_radius_px
+                        and component_area_mm2 >= max(MIN_COMPONENT_AREA_MM2 * 12, 600)
+                    )
+                    if likely_disconnected_canopy:
+                        # Soft ownership keeps a known neighbouring plant
+                        # (for example marjoram beside spinach) out of the weed
+                        # list while retaining uncertainty for automation.
+                        ownership[ys[candidate], xs[candidate]] = index + 1
+                    if nearest_distance < soft_radius_px:
+                        uncertain_seeds.add(index)
 
         # Explain segmentation before adding geometry: all vegetation is green,
         # each plant's owned pixels have a stable palette colour, and ambiguous
@@ -432,7 +462,43 @@ class ClassicalVisionEngine(ImageAnalysisEngine):
                 > 0
                 and core_vegetation >= params.min_area
             )
-            if len(xs) < params.min_area or not center_present:
+            if len(xs) < params.min_area and index in edge_truncated:
+                measurements.append(
+                    Measurement(
+                        measurement_id=uuid4(),
+                        plant_id=seed.plant_id,
+                        crop_slug=seed.crop_slug,
+                        image_id=image_id,
+                        image_timestamp=image_timestamp,
+                        current_radius_mm=seed.current_radius_mm,
+                        typical_canopy_radius_mm=0,
+                        maximum_accepted_canopy_radius_mm=0,
+                        recommended_protection_radius_mm=seed.current_radius_mm,
+                        confidence=0.1,
+                        decision=Decision.UNCERTAIN,
+                        reason=(
+                            "plant is only partly in frame and no connected canopy was found; "
+                            "manual review is available"
+                        ),
+                        ambiguous=True,
+                        calibration_version_id=calibration.version_id,
+                        transform_json=transform_json,
+                        algorithm_version=ALGORITHM_VERSION,
+                        plant_age_days=age,
+                        safety_margin_mm=self.safety_margin_mm,
+                        calibration_uncertainty_mm=max(
+                            self.calibration_uncertainty_mm, calibration.uncertainty_mm
+                        ),
+                        analysis_resolution=calibration.analysis_resolution,
+                        processed_width=width,
+                        processed_height=height,
+                        calibration_source=calibration.source,
+                        calibrated=True,
+                        contract_version=CONTRACT_VERSION,
+                    )
+                )
+                continue
+            if len(xs) < params.min_area or (not center_present and index not in edge_truncated):
                 nearby = (mask > 0) & (
                     (xx - cx) ** 2 + (yy - cy) ** 2
                     <= max(core_radius_px * 3, seed.current_radius_mm * params.mean_ppm) ** 2
@@ -526,7 +592,8 @@ class ClassicalVisionEngine(ImageAnalysisEngine):
                     + 0.25 * component_coverage
                     + 0.2 * edge_score
                     - min(0.28, ambiguous_fraction * 0.35)
-                    - (0.18 if index in uncertain_seeds else 0),
+                    - (0.18 if index in uncertain_seeds else 0)
+                    - (0.22 if index in edge_truncated else 0),
                 ),
             )
             recommendation = (
@@ -534,12 +601,24 @@ class ClassicalVisionEngine(ImageAnalysisEngine):
                 + self.safety_margin_mm
                 + max(self.calibration_uncertainty_mm, calibration.uncertainty_mm)
             )
+            canopy_center = (float(np.median(xs)), float(np.median(ys)))
+            center_offset_mm = math.hypot(
+                (canopy_center[0] - seed.center_px[0]) / calibration.pixels_per_mm_x,
+                (canopy_center[1] - seed.center_px[1]) / calibration.pixels_per_mm_y,
+            )
+            center_misaligned = center_offset_mm > max(
+                20.0, min(60.0, seed.current_radius_mm * 0.3)
+            )
             decision = Decision.UNCERTAIN if plant_ambiguous else Decision.OBSERVED
             reason = (
-                "ownership is ambiguous or a new disconnected region needs history"
+                "partial-frame or soft-owned canopy requires human review"
+                if index in edge_truncated
+                else "ownership is ambiguous or a new disconnected region needs history"
                 if plant_ambiguous
                 else "maximum accepted leaf extent plus safety and calibration margins"
             )
+            if center_misaligned:
+                reason += "; canopy centre is offset and can be moved during review"
             measurements.append(
                 Measurement(
                     measurement_id=uuid4(),
@@ -555,6 +634,8 @@ class ClassicalVisionEngine(ImageAnalysisEngine):
                     decision=decision,
                     reason=reason,
                     ambiguous=plant_ambiguous,
+                    center_misaligned=center_misaligned,
+                    recommended_center_px=canopy_center if center_misaligned else None,
                     calibration_version_id=calibration.version_id,
                     transform_json=transform_json,
                     algorithm_version=ALGORITHM_VERSION,
@@ -605,7 +686,8 @@ class ClassicalVisionEngine(ImageAnalysisEngine):
             exclusion = np.zeros_like(mask)
             for seed in seeds:
                 exclusion_radius = (
-                    seed.current_radius_mm + weed_settings.plant_exclusion_margin_mm
+                    min(60.0, max(20.0, seed.current_radius_mm * 0.3))
+                    + weed_settings.plant_exclusion_margin_mm
                 ) * params.mean_ppm
                 cv2.circle(
                     exclusion,
@@ -619,13 +701,41 @@ class ClassicalVisionEngine(ImageAnalysisEngine):
                 cv2.connectedComponentsWithStats(candidate_mask, 8)
             )
             area_scale = calibration.pixels_per_mm_x * calibration.pixels_per_mm_y
+            owned_seed_indices = [
+                index for index in range(len(seeds)) if np.any(ownership == index + 1)
+            ]
             for label in range(1, count):
                 area_mm2 = float(candidate_stats[label, cv2.CC_STAT_AREA] / area_scale)
+                wx, wy = candidate_centroids[label]
+                supported_seed = None
+                supported_distance = math.inf
+                for seed_index in owned_seed_indices:
+                    seed = seeds[seed_index]
+                    distance_mm = math.hypot(
+                        (wx - seed.center_px[0]) / calibration.pixels_per_mm_x,
+                        (wy - seed.center_px[1]) / calibration.pixels_per_mm_y,
+                    )
+                    support_radius_mm = min(100.0, seed.current_radius_mm + 40.0)
+                    if distance_mm <= support_radius_mm and distance_mm < supported_distance:
+                        supported_seed = seed_index
+                        supported_distance = distance_mm
+                if supported_seed is not None:
+                    # Second-pass soft ownership: unconnected leaves clustered
+                    # around an identified known plant are possible canopy,
+                    # not a FarmBot weed.
+                    component = candidate_labels == label
+                    ownership[component] = supported_seed + 1
+                    _tint_pixels(
+                        overlay,
+                        component,
+                        _PLANT_COLORS[supported_seed % len(_PLANT_COLORS)],
+                        0.35,
+                    )
+                    continue
                 if not (
                     weed_settings.minimum_area_mm2 <= area_mm2 <= weed_settings.maximum_area_mm2
                 ):
                     continue
-                wx, wy = candidate_centroids[label]
                 compactness = min(1.0, area_mm2 / max(weed_settings.minimum_area_mm2 * 2, 1))
                 confidence = min(0.98, 0.62 + compactness * 0.28)
                 if confidence < weed_settings.minimum_confidence:

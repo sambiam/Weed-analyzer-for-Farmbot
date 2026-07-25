@@ -178,6 +178,37 @@ async def test_approval_json_records_applied_and_html_post_still_redirects(monke
 
 
 @pytest.mark.asyncio
+async def test_uncertain_measurement_is_manually_reviewable_and_applicable(monkeypatch):
+    measurement = _review_measurement(
+        decision=Decision.UNCERTAIN,
+        reason="overlap lowers confidence for automation",
+    )
+    web.database.save_measurements([measurement])
+    calls = []
+
+    async def applied(request):
+        calls.append(request)
+        return {"status": "applied", "message": "radius verified"}
+
+    monkeypatch.setattr(web.client, "apply_radius", applied)
+    status, _, dashboard = await asgi_request("/")
+    assert status == 200
+    html = dashboard.decode()
+    assert str(measurement.measurement_id) in html
+    assert "Not reviewable" not in html
+    assert "Apply radius" in html
+
+    status, _, body = await asgi_request(
+        f"/recommendations/{measurement.measurement_id}/approve",
+        method="POST",
+        headers=[(b"accept", b"application/json")],
+    )
+    assert status == 200
+    assert json.loads(body)["status"] == "applied"
+    assert calls[0].human_approved is True
+
+
+@pytest.mark.asyncio
 async def test_dashboard_modal_uses_artifact_manifest_and_pending_rows(tmp_path, monkeypatch):
     artifact_dir = tmp_path / "artifacts"
     artifact_dir.mkdir()

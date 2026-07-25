@@ -21,7 +21,10 @@ configuration:
   calibration_uncertainty_mm:
     name: Calibration uncertainty (mm)
   minimum_auto_confidence:
-    name: Minimum automatic confidence
+    name: Automatic decision confidence threshold
+    description: >-
+      Minimum confidence required for automatic radius, removal, and weed
+      changes. This never prevents a user from approving or rejecting a result.
   maximum_daily_radius_growth_mm:
     name: Maximum daily growth (mm)
   maximum_plant_radius_mm:
