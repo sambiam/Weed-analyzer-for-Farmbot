@@ -3,12 +3,17 @@
 
 Checks that config.yaml, the translations file and the Settings model agree on
 the analysis_resolution option, and that the default is the documented
-960x720. Run in CI so a schema drift fails the build.
+960x720. Also checks that config.yaml, pyproject.toml and the package
+`__version__` agree, so a release that bumps one and forgets the others fails
+the build instead of shipping a version Home Assistant won't recognise as an
+update. Run in CI so drift of either kind fails the build.
 """
 
 from __future__ import annotations
 
+import re
 import sys
+import tomllib
 from pathlib import Path
 
 import yaml
@@ -16,6 +21,7 @@ import yaml
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "farmbot_vision" / "src"))
 
+from farmbot_vision import __version__  # noqa: E402
 from farmbot_vision.resolution import AnalysisResolution  # noqa: E402
 from farmbot_vision.settings import Settings  # noqa: E402
 
@@ -60,10 +66,26 @@ def main() -> None:
     if "analysis_resolution" not in translations.get("configuration", {}):
         fail("translations missing analysis_resolution description")
 
-    if config.get("version") != "0.5.0":
-        fail("config.yaml version must be 0.5.0")
+    pyproject = tomllib.loads((ROOT / "pyproject.toml").read_text())
+    pyproject_version = pyproject.get("project", {}).get("version")
+    if pyproject_version != __version__:
+        fail(f"pyproject.toml version {pyproject_version!r} must match farmbot_vision.__version__ {__version__!r}")
 
-    print("config schema check passed: analysis_resolution consistent, default 960x720")
+    if config.get("version") != __version__:
+        fail(f"config.yaml version {config.get('version')!r} must match farmbot_vision.__version__ {__version__!r}")
+
+    readme = (ROOT / "farmbot_vision" / "README.md").read_text()
+    if not re.search(rf"\b{re.escape(__version__)}\b", readme):
+        fail(f"farmbot_vision/README.md must mention current version {__version__!r}")
+
+    changelog = (ROOT / "farmbot_vision" / "CHANGELOG.md").read_text()
+    if f"## {__version__} " not in changelog and not changelog.startswith(f"# Changelog\n\n## {__version__}"):
+        fail(f"farmbot_vision/CHANGELOG.md must have a heading for {__version__!r}")
+
+    print(
+        f"config schema check passed: analysis_resolution consistent, default 960x720, "
+        f"version {__version__} consistent across config.yaml, pyproject.toml, README and CHANGELOG"
+    )
 
 
 if __name__ == "__main__":

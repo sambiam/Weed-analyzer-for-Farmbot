@@ -1,14 +1,17 @@
 # FarmBot Vision documentation
 
-## Upgrading from 0.2.0
+## Upgrading
 
-Install app version **0.2.1**, then restart the app. Close the old FarmBot
-Vision browser tab and reopen the Web UI so Home Assistant creates a fresh
-Ingress session. The companion integration does not need to be changed.
+Install the new app version from the Home Assistant App store, then restart
+the app. Close the old FarmBot Vision browser tab and reopen the Web UI so
+Home Assistant creates a fresh Ingress session. See
+[`CHANGELOG.md`](CHANGELOG.md) for what changed in each release; the
+companion integration only needs to change when a release raises the minimum
+compatible companion integration version (currently **1.4.0**).
 
-This release removes the explicit root Ingress entry and normalizes duplicate
-leading slashes at the ASGI boundary. Dashboard and calibration URLs are
-relative to the current `X-Ingress-Path`, so they remain inside temporary
+Since 0.2.1 the app removes the explicit root Ingress entry and normalizes
+duplicate leading slashes at the ASGI boundary. Dashboard and calibration URLs
+are relative to the current `X-Ingress-Path`, so they remain inside temporary
 Ingress sessions. The app never logs the complete `X-Ingress-Path` value.
 
 Manual `farmbot_vision_request` data is:

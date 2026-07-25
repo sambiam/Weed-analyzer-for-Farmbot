@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.1.4 - 2026-07-25
+
+- Made all analysis outcomes manually approvable/rejectable; certainty now gates automation only.
+- Fixed new spread-curve HTTP 400s, creates curves for plants without one, and verifies radius
+  and curve writes against FarmBot before reporting success.
+- Analyses partially visible plants at reduced confidence instead of skipping their centres.
+- Added known-plant soft ownership before weed classification and centre-move suggestions for
+  offset but otherwise healthy canopies.
+- Replaced the queue card with an Analysis workflow and a timeframe-based image picker.
+- Added persistent, opt-in weed detection settings with recommendation and automatic-creation modes.
+- Improved pale-leaf segmentation, overlapping-canopy ownership, empty-centre removal detection,
+  and reviewability of large human-approved growth changes.
+- Added removal review alternatives to keep a plant or move its recorded centre.
+
 ## 0.5.0 - 2026-07-20
 
 Calibration is rebuilt around FarmBot's own coordinate model.
@@ -132,16 +146,3 @@ contract (contract **farmbot-vision-v2**).
 - Added sequential classical canopy analysis, maximum-leaf protection, overlap uncertainty, and temporal evidence hooks.
 - Added no-shrink radius safety, optimistic-concurrency handling, manual calibration, monotonic curve learning, SQLite migrations, retention, scheduling, and ingress UI.
 - Added synthetic safety tests and BuildKit multi-architecture CI/release workflows.
-## Unreleased
-
-- Made all analysis outcomes manually approvable/rejectable; certainty now gates automation only.
-- Fixed new spread-curve HTTP 400s, creates curves for plants without one, and verifies radius
-  and curve writes against FarmBot before reporting success.
-- Analyses partially visible plants at reduced confidence instead of skipping their centres.
-- Added known-plant soft ownership before weed classification and centre-move suggestions for
-  offset but otherwise healthy canopies.
-- Replaced the queue card with an Analysis workflow and a timeframe-based image picker.
-- Added persistent, opt-in weed detection settings with recommendation and automatic-creation modes.
-- Improved pale-leaf segmentation, overlapping-canopy ownership, empty-centre removal detection,
-  and reviewability of large human-approved growth changes.
-- Added removal review alternatives to keep a plant or move its recorded centre.

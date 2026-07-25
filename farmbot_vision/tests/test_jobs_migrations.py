@@ -8,6 +8,7 @@ from uuid import uuid4
 
 import pytest
 
+from farmbot_vision import __version__
 from farmbot_vision.database import Database
 from farmbot_vision.models import (
     Calibration,
@@ -346,7 +347,7 @@ async def test_new_photo_job_processes_only_the_target_image(tmp_path, monkeypat
     assert result["images_processed"] == 1
     assert client.image_ids == [2]
     assert len(list((tmp_path / "artifacts").glob("*-mask.png"))) == 1
-    assert client.statuses[-1].app_version == "0.5.0"
+    assert client.statuses[-1].app_version == __version__
 
 
 @pytest.mark.asyncio
