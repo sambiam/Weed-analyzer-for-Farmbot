@@ -253,6 +253,20 @@ class HomeAssistantClient:
             SoilCaptureStatus,
         )  # type: ignore[return-value]
 
+    async def start_grid_repair(
+        self, config_entry_id: str, targets: list[dict[str, float]]
+    ) -> dict[str, Any]:
+        return await self._service(
+            "start_vision_grid_repair",
+            {"config_entry_id": config_entry_id, "targets": targets},
+        )  # type: ignore[return-value]
+
+    async def grid_repair_status(self, config_entry_id: str, repair_id: str) -> dict[str, Any]:
+        return await self._service(
+            "get_vision_grid_repair",
+            {"config_entry_id": config_entry_id, "repair_id": repair_id},
+        )  # type: ignore[return-value]
+
     async def image(self, request: VisionImageRequest, max_payload_bytes: int) -> VisionImage:
         result = await self._service("get_vision_image", request, VisionImage)
         if not isinstance(result, VisionImage):

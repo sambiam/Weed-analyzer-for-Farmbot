@@ -1,9 +1,9 @@
 # Companion FarmBot integration contract
 
 Contract version: **farmbot-vision-v2**. Minimum compatible companion FarmBot
-integration release: **1.8.0** (the release that implements clear-site
-soil-height capture and reviewed stale-point relocation in addition to the
-returned-JPEG contract and known-weed writes). Version 1.8.0 of the companion integration in the sibling
+integration release: **1.9.0** (the release that adds bounded photo-grid
+repair in addition to clear-site soil-height capture, the returned-JPEG
+contract and known-weed writes). Version 1.9.0 of the companion integration in the sibling
 `Farmbot-for-Home-Assistant` repository implements this contract.
 
 All actions are in the `farmbot` domain. Response actions must support Home Assistant service response data. Unknown, invalid, or unauthorised fields must fail rather than be coerced. Timestamps are ISO-8601. The integration remains the only component that talks to FarmBot APIs.
@@ -53,6 +53,19 @@ Response (contract v2):
 - optional `processed_calibration`: `{available, pixels_per_mm_x, pixels_per_mm_y, rotation_degrees, offset_x_mm, offset_y_mm, basis:"processed_image", width, height}` where `width`/`height` equal the returned image
 
 The integration must resize before base64 encoding and must not return signed URLs. The app fetches sequentially and independently validates the checksum, base64, JPEG format, decoded dimensions, resize-scale consistency, aspect ratio, absence of upscaling, and payload/dimension limits. Older v1 responses (no `source_*`/`oriented_*`/`resize_scale_*`) are accepted as a legacy path but yield pixel-only diagnostics with no metric writes.
+
+## Photo-grid repair services
+
+`farmbot.start_vision_grid_repair` accepts `config_entry_id` and one to twelve
+`targets`, each containing finite `x`, `y`, and `z` coordinates. It validates
+connection, emergency-stop, busy state, and all axis bounds before queuing
+acknowledged safe-Z move, settle, and photo commands. It returns a `repair_id`
+immediately and restores the initial position when the command finishes or
+fails.
+
+`farmbot.get_vision_grid_repair` accepts `config_entry_id` and `repair_id`.
+It returns `queued|running|complete|failed`, a sanitized message, and the
+validated target coordinates.
 
 ## Soil-height services
 

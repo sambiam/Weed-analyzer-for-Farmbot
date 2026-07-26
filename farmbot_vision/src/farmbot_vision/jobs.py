@@ -168,9 +168,9 @@ def build_plant_composite(
                 ownership = cv2.max(ownership, warped_mask)
     canvas = np.zeros_like(accumulated, dtype=np.uint8)
     present = weights > 0
-    canvas[present] = np.clip(
-        accumulated[present] / weights[present, np.newaxis], 0, 255
-    ).astype(np.uint8)
+    canvas[present] = np.clip(accumulated[present] / weights[present, np.newaxis], 0, 255).astype(
+        np.uint8
+    )
     overlay_canvas = canvas.copy()
     selected = ownership > 0
     overlay_canvas[selected] = (
@@ -216,9 +216,7 @@ def build_plant_composite(
         )
 
     annotate(canvas)
-    clean_written = bool(
-        cv2.imwrite(str(output_path), canvas, [cv2.IMWRITE_JPEG_QUALITY, 88])
-    )
+    clean_written = bool(cv2.imwrite(str(output_path), canvas, [cv2.IMWRITE_JPEG_QUALITY, 88]))
     if overlay_output_path is None:
         return clean_written
     annotate(overlay_canvas)
@@ -1196,21 +1194,15 @@ class JobManager:
                         fused.angular_coverage >= fusion_settings.minimum_angular_coverage
                         and fused.corroborated_fraction
                         >= fusion_settings.minimum_corroborated_fraction
-                        and disagreement
-                        <= fusion_settings.maximum_automatic_disagreement_mm
+                        and disagreement <= fusion_settings.maximum_automatic_disagreement_mm
                     )
                     safety_margin = max(item.safety_margin_mm for item in plant_measurements)
                     calibration_uncertainty = max(
                         item.calibration_uncertainty_mm for item in plant_measurements
                     )
-                    diagnostic_path = (
-                        artifacts / f"{job_id}-plant-{plant_id}-fusion.jpg"
-                    )
+                    diagnostic_path = artifacts / f"{job_id}-plant-{plant_id}-fusion.jpg"
                     stored_diagnostic = None
-                    if (
-                        fusion_settings.save_diagnostics
-                        and fused.diagnostic_jpeg is not None
-                    ):
+                    if fusion_settings.save_diagnostics and fused.diagnostic_jpeg is not None:
                         diagnostic_path.write_bytes(fused.diagnostic_jpeg)
                         stored_diagnostic = str(diagnostic_path)
                     fused_values = {
@@ -1218,9 +1210,7 @@ class JobManager:
                         "fused_typical_radius_mm": fused.typical_radius_mm,
                         "fused_maximum_radius_mm": fused.maximum_radius_mm,
                         "fused_recommended_radius_mm": (
-                            fused.maximum_radius_mm
-                            + safety_margin
-                            + calibration_uncertainty
+                            fused.maximum_radius_mm + safety_margin + calibration_uncertainty
                         ),
                         "fused_confidence": fused.confidence,
                         "fusion_view_count": fused.view_count,

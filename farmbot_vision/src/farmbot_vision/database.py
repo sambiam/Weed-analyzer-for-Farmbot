@@ -661,9 +661,7 @@ class Database:
         next_count = observations + 1
         next_x = (float(row["x"]) * observations + x) / next_count
         next_y = (float(row["y"]) * observations + y) / next_count
-        next_confidence = (
-            float(row["mean_confidence"]) * observations + confidence
-        ) / next_count
+        next_confidence = (float(row["mean_confidence"]) * observations + confidence) / next_count
         with self.connection:
             self.connection.execute(
                 """UPDATE weed_candidate_tracks SET x=?,y=?,observations=?,last_seen_at=?,
@@ -1084,9 +1082,7 @@ class Database:
                 None,
             )
             if fused is not None:
-                representative["typical_canopy_radius_mm"] = float(
-                    fused["fused_typical_radius_mm"]
-                )
+                representative["typical_canopy_radius_mm"] = float(fused["fused_typical_radius_mm"])
                 representative["maximum_accepted_canopy_radius_mm"] = float(
                     fused["fused_maximum_radius_mm"]
                 )
@@ -1116,11 +1112,7 @@ class Database:
             None,
         )
         representative["composite_overlay_path"] = next(
-            (
-                row["composite_overlay_path"]
-                for row in ordered
-                if row.get("composite_overlay_path")
-            ),
+            (row["composite_overlay_path"] for row in ordered if row.get("composite_overlay_path")),
             None,
         )
         for row in ordered:

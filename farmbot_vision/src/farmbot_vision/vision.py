@@ -864,9 +864,7 @@ class ClassicalVisionEngine(ImageAnalysisEngine):
                     area_mm2,
                     green_hue_min=weed_settings.green_hue_min,
                     green_hue_max=weed_settings.green_hue_max,
-                    strong_green_minimum_saturation=(
-                        weed_settings.strong_green_minimum_saturation
-                    ),
+                    strong_green_minimum_saturation=(weed_settings.strong_green_minimum_saturation),
                     strong_green_minimum_excess_green=(
                         weed_settings.strong_green_minimum_excess_green
                     ),
@@ -909,9 +907,7 @@ class ClassicalVisionEngine(ImageAnalysisEngine):
                     and verifier_confidence is not None
                 ):
                     weight = weed_settings.visual_verifier_weight
-                    confidence = (
-                        heuristic_confidence * (1 - weight) + verifier_confidence * weight
-                    )
+                    confidence = heuristic_confidence * (1 - weight) + verifier_confidence * weight
                     if verifier_confidence < weed_settings.visual_verifier_minimum_confidence:
                         continue
                 if confidence < weed_settings.minimum_confidence:

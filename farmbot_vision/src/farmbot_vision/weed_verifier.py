@@ -57,7 +57,9 @@ def extract_visual_features(
     contour = max(contours, key=cv2.contourArea) if contours else None
     perimeter = float(cv2.arcLength(contour, True)) if contour is not None else 0.0
     hull_area = (
-        float(cv2.contourArea(cv2.convexHull(contour))) if contour is not None and len(contour) >= 3 else 0
+        float(cv2.contourArea(cv2.convexHull(contour)))
+        if contour is not None and len(contour) >= 3
+        else 0
     )
     hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
     pixels = image[component].astype(np.float32)
@@ -83,9 +85,7 @@ def extract_visual_features(
         "aspect_ratio": float(min(12.0, max(width, height) / max(1, min(width, height))) / 12.0),
         "extent": float(min(1.0, area_px / (width * height))),
         "solidity": float(min(1.0, area_px / max(1.0, hull_area))),
-        "circularity": float(
-            min(1.0, (4.0 * math.pi * area_px) / max(1.0, perimeter * perimeter))
-        ),
+        "circularity": float(min(1.0, (4.0 * math.pi * area_px) / max(1.0, perimeter * perimeter))),
         "mean_hue": float(np.mean(hsv_pixels[:, 0]) / 179.0),
         "mean_saturation": float(np.mean(hsv_pixels[:, 1]) / 255.0),
         "mean_value": float(np.mean(hsv_pixels[:, 2]) / 255.0),
@@ -101,11 +101,7 @@ def extract_visual_features(
             )
         ),
         "context_orange_fraction": float(
-            np.mean(
-                (context_hue >= 4)
-                & (context_hue <= 24)
-                & (context_saturation >= 40)
-            )
+            np.mean((context_hue >= 4) & (context_hue <= 24) & (context_saturation >= 40))
         ),
         "context_neutral_fraction": float(np.mean(context_saturation < 35)),
         "context_saturation": float(np.mean(context_saturation) / 255.0),
@@ -203,10 +199,17 @@ class WeedVisualVerifier:
                 f"currently have {len(positives)} and {len(negatives)}"
             )
         ordered = sorted(
-            usable, key=lambda sample: (str(sample.get("created_at", "")), str(sample.get("detection_id", "")))
+            usable,
+            key=lambda sample: (
+                str(sample.get("created_at", "")),
+                str(sample.get("detection_id", "")),
+            ),
         )
         raw_x = np.asarray(
-            [[float(sample["features"].get(name, 0.0)) for name in FEATURE_NAMES] for sample in ordered]
+            [
+                [float(sample["features"].get(name, 0.0)) for name in FEATURE_NAMES]
+                for sample in ordered
+            ]
         )
         y = np.asarray([1.0 if sample["label"] == POSITIVE_LABEL else 0.0 for sample in ordered])
         mean = raw_x.mean(axis=0)
@@ -262,7 +265,9 @@ class WeedVisualVerifier:
             },
         }
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        with NamedTemporaryFile("w", encoding="utf-8", dir=self.path.parent, delete=False) as handle:
+        with NamedTemporaryFile(
+            "w", encoding="utf-8", dir=self.path.parent, delete=False
+        ) as handle:
             json.dump(model, handle, indent=2)
             temp = Path(handle.name)
         os.replace(temp, self.path)

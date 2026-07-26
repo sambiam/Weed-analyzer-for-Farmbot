@@ -132,9 +132,7 @@ def fuse_canopy_masks(
         mask = frame["mask"] > 0
         height, width = mask.shape
         yy, xx = np.indices(mask.shape)
-        border_px = np.minimum.reduce((xx, yy, width - 1 - xx, height - 1 - yy)).astype(
-            np.float32
-        )
+        border_px = np.minimum.reduce((xx, yy, width - 1 - xx, height - 1 - yy)).astype(np.float32)
         edge_margin_px = settings.source_edge_margin_mm * frame["scale"]
         edge_quality = (
             np.ones_like(border_px)
@@ -168,8 +166,7 @@ def fuse_canopy_masks(
         strongest_evidence = np.maximum(strongest_evidence, warped_evidence)
 
     accepted = (support_count >= settings.minimum_supporting_views) | (
-        (support_count >= 1)
-        & (strongest_evidence >= settings.single_view_acceptance_confidence)
+        (support_count >= 1) & (strongest_evidence >= settings.single_view_acceptance_confidence)
     )
     if not np.any(accepted):
         return None
@@ -211,9 +208,7 @@ def fuse_canopy_masks(
     )
     observed_sectors = set(
         np.floor(
-            all_angles[annulus & (visible_count > 0)]
-            / (2 * math.pi)
-            * settings.angular_sectors
+            all_angles[annulus & (visible_count > 0)] / (2 * math.pi) * settings.angular_sectors
         )
         .astype(int)
         .tolist()

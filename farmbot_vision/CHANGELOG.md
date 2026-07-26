@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.9.0 - 2026-07-27
+
+- Added photo-grid repair detection to the Analysis page. The app identifies
+  the latest hour-scale grid, reports missing cells and likely gantry photos,
+  and can retake only those coordinates.
+- Added an app-managed automatic repair time, persisted in the add-on data
+  directory, plus a manual Repair now action.
+- Repair movement is bounded by the FarmBot axis limits, settles before each
+  photo, and restores the bot's starting position.
+
 ## 1.8.0 - 2026-07-26
 
 - Added calibrated multi-image canopy fusion. Plant ownership is segmented in
