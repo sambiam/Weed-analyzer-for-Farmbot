@@ -128,9 +128,7 @@ def _enhance_gray(image: np.ndarray) -> np.ndarray:
 def _green_mask(image: np.ndarray) -> np.ndarray:
     """Reuse the canopy/weed vegetation segmentation, then add a safety margin."""
     height, width = image.shape[:2]
-    mask = vegetation_mask(
-        image, ScaleParams.build(width, height, calibration=None)
-    )
+    mask = vegetation_mask(image, ScaleParams.build(width, height, calibration=None))
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
     return cv2.dilate(mask, kernel, iterations=1) > 0
 
@@ -179,12 +177,8 @@ def _rectify_pair(
     matrix = cv2.getRotationMatrix2D((width / 2, height / 2), angle, 1.0)
     left_rect = cv2.warpAffine(left, matrix, (width, height), flags=cv2.INTER_LINEAR)
     right_rect = cv2.warpAffine(right, matrix, (width, height), flags=cv2.INTER_LINEAR)
-    left_color_rect = cv2.warpAffine(
-        left_color, matrix, (width, height), flags=cv2.INTER_LINEAR
-    )
-    right_color_rect = cv2.warpAffine(
-        right_color, matrix, (width, height), flags=cv2.INTER_LINEAR
-    )
+    left_color_rect = cv2.warpAffine(left_color, matrix, (width, height), flags=cv2.INTER_LINEAR)
+    right_color_rect = cv2.warpAffine(right_color, matrix, (width, height), flags=cv2.INTER_LINEAR)
     return left_rect, right_rect, left_color_rect, right_color_rect
 
 
@@ -203,18 +197,22 @@ def _stereo_maps(left: np.ndarray, right: np.ndarray) -> tuple[np.ndarray, np.nd
         preFilterCap=31,
         mode=cv2.STEREO_SGBM_MODE_SGBM_3WAY,
     )
-    forward = cv2.StereoSGBM_create(
-        minDisparity=0, numDisparities=num, **common
-    ).compute(left, right).astype(np.float32) / 16.0
-    reverse = cv2.StereoSGBM_create(
-        minDisparity=-num, numDisparities=num, **common
-    ).compute(right, left).astype(np.float32) / 16.0
+    forward = (
+        cv2.StereoSGBM_create(minDisparity=0, numDisparities=num, **common)
+        .compute(left, right)
+        .astype(np.float32)
+        / 16.0
+    )
+    reverse = (
+        cv2.StereoSGBM_create(minDisparity=-num, numDisparities=num, **common)
+        .compute(right, left)
+        .astype(np.float32)
+        / 16.0
+    )
     return forward, reverse
 
 
-def _fit_plane(
-    disparity: np.ndarray, valid: np.ndarray
-) -> tuple[np.ndarray, float, float, float]:
+def _fit_plane(disparity: np.ndarray, valid: np.ndarray) -> tuple[np.ndarray, float, float, float]:
     ys, xs = np.nonzero(valid)
     if len(xs) < 500:
         raise SoilHeightError("not enough valid stereo pixels")
@@ -391,9 +389,7 @@ def _pair_artifacts(estimates: list[PairEstimate]) -> dict[str, bytes]:
     if not estimates:
         return {}
     best = max(estimates, key=lambda item: item.valid_coverage * item.plane_support)
-    disparity = cv2.normalize(
-        best.disparity_map, None, 0, 255, cv2.NORM_MINMAX
-    ).astype(np.uint8)
+    disparity = cv2.normalize(best.disparity_map, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
     disparity_color = cv2.applyColorMap(disparity, cv2.COLORMAP_TURBO)
     plane_overlay = disparity_color.copy()
     plane_overlay[best.plane_mask] = (

@@ -52,13 +52,15 @@ def test_composite_stitches_overlapping_frames_and_draws_bold_radii(tmp_path):
     assert composite is not None
     assert composite.shape[1] > 200
     # Planned circle is red; original circle is cyan.
-    assert np.count_nonzero(
-        (composite[:, :, 2] > 180)
-        & (composite[:, :, 1] < 100)
-        & (composite[:, :, 0] < 100)
-    ) > 20
-    assert np.count_nonzero(
-        (composite[:, :, 0] > 150)
-        & (composite[:, :, 1] > 150)
-        & (composite[:, :, 2] < 120)
-    ) > 20
+    assert (
+        np.count_nonzero(
+            (composite[:, :, 2] > 180) & (composite[:, :, 1] < 100) & (composite[:, :, 0] < 100)
+        )
+        > 20
+    )
+    assert (
+        np.count_nonzero(
+            (composite[:, :, 0] > 150) & (composite[:, :, 1] > 150) & (composite[:, :, 2] < 120)
+        )
+        > 20
+    )

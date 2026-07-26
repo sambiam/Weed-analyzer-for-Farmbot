@@ -701,11 +701,13 @@ class Database:
             weights.append(confidence * visible * recency)
 
         present_weight = sum(
-            weight for row, weight in zip(ordered, weights, strict=True)
+            weight
+            for row, weight in zip(ordered, weights, strict=True)
             if not row.get("vegetation_absent")
         )
         absent_weight = sum(
-            weight for row, weight in zip(ordered, weights, strict=True)
+            weight
+            for row, weight in zip(ordered, weights, strict=True)
             if row.get("vegetation_absent")
         )
         use_absent = absent_weight > present_weight
@@ -756,9 +758,7 @@ class Database:
                 if path and path not in paths:
                     paths.append(path)
         representative["artifact_paths"] = paths
-        representative["source_measurement_ids"] = [
-            str(row["measurement_id"]) for row in ordered
-        ]
+        representative["source_measurement_ids"] = [str(row["measurement_id"]) for row in ordered]
         representative["measurement_count"] = len(ordered)
         representative["reason"] = (
             f"Consolidated from {len(ordered)} images using confidence, visible canopy "
@@ -794,9 +794,9 @@ class Database:
             for row in group:
                 by_image.setdefault(int(row["image_id"]), row)
             consolidated.append(self._consolidate_measurement_rows(list(by_image.values())))
-        return sorted(
-            consolidated, key=lambda row: str(row["image_timestamp"]), reverse=True
-        )[:limit]
+        return sorted(consolidated, key=lambda row: str(row["image_timestamp"]), reverse=True)[
+            :limit
+        ]
 
     def has_terminal_decision(self, measurement_id: str) -> bool:
         return (
@@ -1029,9 +1029,7 @@ class Database:
             )
         ]
 
-    def save_soil_calibration(
-        self, calibration: SoilStereoCalibration
-    ) -> SoilStereoCalibration:
+    def save_soil_calibration(self, calibration: SoilStereoCalibration) -> SoilStereoCalibration:
         with self.connection:
             version = int(
                 self.connection.execute(
@@ -1076,9 +1074,7 @@ class Database:
             update={"calibration_id": int(cursor.lastrowid), "version": version}
         )
 
-    def active_soil_calibration(
-        self, config_entry_id: str
-    ) -> SoilStereoCalibration | None:
+    def active_soil_calibration(self, config_entry_id: str) -> SoilStereoCalibration | None:
         row = self.connection.execute(
             """SELECT * FROM soil_calibrations WHERE config_entry_id=? AND active=1
             ORDER BY created_at DESC LIMIT 1""",
@@ -1160,18 +1156,14 @@ class Database:
             ).fetchall()
         return [self._decode_soil_measurement(row) for row in rows]
 
-    def update_soil_measurement_status(
-        self, measurement_id: str, status: str, reason: str
-    ) -> None:
+    def update_soil_measurement_status(self, measurement_id: str, status: str, reason: str) -> None:
         with self.connection:
             self.connection.execute(
                 "UPDATE soil_measurements SET status=?,reason=? WHERE measurement_id=?",
                 (status, reason, measurement_id),
             )
 
-    def record_soil_decision(
-        self, measurement_id: str, action: str, details: dict
-    ) -> None:
+    def record_soil_decision(self, measurement_id: str, action: str, details: dict) -> None:
         with self.connection:
             self.connection.execute(
                 """INSERT INTO soil_decisions(measurement_id,action,details_json)
@@ -1242,9 +1234,7 @@ class Database:
             )
 
     def soil_job(self, job_id: str) -> dict | None:
-        row = self.connection.execute(
-            "SELECT * FROM soil_jobs WHERE id=?", (job_id,)
-        ).fetchone()
+        row = self.connection.execute("SELECT * FROM soil_jobs WHERE id=?", (job_id,)).fetchone()
         if row is None:
             return None
         data = dict(row)

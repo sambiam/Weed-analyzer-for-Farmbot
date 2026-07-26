@@ -1277,10 +1277,9 @@ def _soil_artifacts(paths: list[str]) -> str:
         url = f"artifact/{Path(path).name}"
         label = Path(path).stem.rsplit("-", 1)[-1]
         links.append(
-            f'<a href="{escape(url, quote=True)}" target=_blank rel=noopener>'
-            f"{escape(label)}</a>"
+            f'<a href="{escape(url, quote=True)}" target=_blank rel=noopener>{escape(label)}</a>'
         )
-    return " ".join(links) or '<span class=muted>None</span>'
+    return " ".join(links) or "<span class=muted>None</span>"
 
 
 @app.get("/soil-height", response_class=HTMLResponse)
@@ -1310,24 +1309,18 @@ async def soil_height_page(request: Request) -> HTMLResponse:
             measurement = latest_by_point.get(point.id)
             status = measurement["status"] if measurement else "not measured"
             proposed = (
-                f'{measurement["proposed_z_mm"]:.0f} mm'
+                f"{measurement['proposed_z_mm']:.0f} mm"
                 if measurement and measurement["proposed_z_mm"] is not None
                 else "—"
             )
             uncertainty = (
-                f'±{measurement["uncertainty_mm"]:.1f} mm'
+                f"±{measurement['uncertainty_mm']:.1f} mm"
                 if measurement and measurement["uncertainty_mm"] is not None
                 else "—"
             )
-            confidence = (
-                f'{100 * measurement["confidence"]:.0f}%'
-                if measurement
-                else "—"
-            )
+            confidence = f"{100 * measurement['confidence']:.0f}%" if measurement else "—"
             reason = escape(measurement["reason"] if measurement else "")
-            diagnostics = _soil_artifacts(
-                measurement["artifact_paths"] if measurement else []
-            )
+            diagnostics = _soil_artifacts(measurement["artifact_paths"] if measurement else [])
             if measurement and measurement["status"] == "failed":
                 retry_ids.append(point.id)
             apply_control = ""
@@ -1356,7 +1349,7 @@ async def soil_height_page(request: Request) -> HTMLResponse:
     valid_measurements = [item for item in measurements if item["status"] == "valid"]
     measurement_rows = "".join(
         "<tr>"
-        f'<td><input form=apply-selected type=checkbox name=measurement_ids '
+        f"<td><input form=apply-selected type=checkbox name=measurement_ids "
         f'value="{escape(item["measurement_id"], quote=True)}"></td>'
         f"<td>{escape(item['point_name'])}</td><td>{item['old_z_mm']:.1f} mm</td>"
         f"<td>{item['proposed_z_mm']:.0f} mm</td>"
@@ -1366,7 +1359,7 @@ async def soil_height_page(request: Request) -> HTMLResponse:
     )
     point_count = len(inventory.points) if inventory else 0
     warning = (
-        '<p class=warn>At least three valid soil points are required for FarmBot '
+        "<p class=warn>At least three valid soil points are required for FarmBot "
         "soil-height interpolation.</p>"
         if point_count < 3
         else ""
@@ -1438,12 +1431,12 @@ at the capture Z, then confirm that a 50 mm movement toward the soil is safe.</p
  <form method=post action=soil/measure>{retry_values}
   <input type=hidden name=capture_z value="{default_capture_z:g}">
   <input type=hidden name=baseline_mm value="{default_baseline:g}">
-  <button type=submit name=mode value=retry {'disabled' if not retry_ids else ''}>Retry failed</button>
+  <button type=submit name=mode value=retry {"disabled" if not retry_ids else ""}>Retry failed</button>
  </form>
  <table><thead><tr><th>Select</th><th>ID</th><th>Point</th><th>X, Y</th>
  <th>Current Z</th><th>Proposed Z</th><th>Uncertainty</th><th>Confidence</th>
  <th>Status</th><th>Message</th><th>Diagnostics</th><th>Review</th></tr></thead>
- <tbody>{point_rows or '<tr><td colspan=12>No eligible soil points found.</td></tr>'}</tbody></table>
+ <tbody>{point_rows or "<tr><td colspan=12>No eligible soil points found.</td></tr>"}</tbody></table>
 </section>
 <section class=card>
  <h3>Pending valid results</h3>
@@ -1452,7 +1445,7 @@ at the capture Z, then confirm that a 50 mm movement toward the soil is safe.</p
  </form>
  <table><thead><tr><th>Select</th><th>Point</th><th>Old Z</th><th>Proposed Z</th>
  <th>Confidence</th><th>Quality result</th></tr></thead>
- <tbody>{measurement_rows or '<tr><td colspan=6>No unapplied valid results.</td></tr>'}</tbody></table>
+ <tbody>{measurement_rows or "<tr><td colspan=6>No unapplied valid results.</td></tr>"}</tbody></table>
 </section>
 {live_refresh}"""
     return layout(request, body, "Soil height · FarmBot Vision")
@@ -1598,9 +1591,7 @@ async def reject_soil_measurement(measurement_id: UUID) -> RedirectResponse:
     database.update_soil_measurement_status(
         str(measurement_id), "rejected", "Rejected during human review"
     )
-    database.record_soil_decision(
-        str(measurement_id), "reject", {"status": "rejected"}
-    )
+    database.record_soil_decision(str(measurement_id), "reject", {"status": "rejected"})
     return RedirectResponse("../../../soil-height", status_code=303)
 
 

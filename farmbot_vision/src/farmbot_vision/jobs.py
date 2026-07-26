@@ -269,12 +269,8 @@ class JobManager:
         candidate = latest.model_copy(
             update={
                 "typical_canopy_radius_mm": aggregate["typical_canopy_radius_mm"],
-                "maximum_accepted_canopy_radius_mm": aggregate[
-                    "maximum_accepted_canopy_radius_mm"
-                ],
-                "recommended_protection_radius_mm": aggregate[
-                    "recommended_protection_radius_mm"
-                ],
+                "maximum_accepted_canopy_radius_mm": aggregate["maximum_accepted_canopy_radius_mm"],
+                "recommended_protection_radius_mm": aggregate["recommended_protection_radius_mm"],
                 "confidence": aggregate["confidence"],
                 "visible_fraction": aggregate["visible_fraction"],
                 "vegetation_absent": bool(aggregate["vegetation_absent"]),
@@ -309,9 +305,7 @@ class JobManager:
                 self.db.update_measurement_outcome(
                     str(candidate.measurement_id), decision="removed", applied=True
                 )
-                self.db.record_group_decision(
-                    str(candidate.measurement_id), "removed", result
-                )
+                self.db.record_group_decision(str(candidate.measurement_id), "removed", result)
             return
         if candidate.decision != Decision.APPLIED or not candidate.calibrated:
             return
@@ -345,9 +339,7 @@ class JobManager:
             self.db.update_measurement_outcome(
                 str(candidate.measurement_id), decision="applied", applied=True
             )
-            self.db.record_group_decision(
-                str(candidate.measurement_id), "applied", result
-            )
+            self.db.record_group_decision(str(candidate.measurement_id), "applied", result)
             await self._update_curve_after_radius(
                 entry_id, inventory, candidate, human_approved=False
             )
@@ -660,7 +652,9 @@ class JobManager:
                             weed_id=known_weed.id,
                             x=known_weed.x,
                             y=known_weed.y,
-                            radius_mm=target_radius if status == "radius_adjusted" else known_weed.radius,
+                            radius_mm=target_radius
+                            if status == "radius_adjusted"
+                            else known_weed.radius,
                             confidence=weed.confidence,
                             seen_at=weed.image_timestamp,
                             status=status,
@@ -761,9 +755,7 @@ class JobManager:
                         margin_px = max(
                             8.0,
                             (known_weed.radius + weed_settings.plant_exclusion_margin_mm)
-                            * math.sqrt(
-                                calibration.pixels_per_mm_x * calibration.pixels_per_mm_y
-                            ),
+                            * math.sqrt(calibration.pixels_per_mm_x * calibration.pixels_per_mm_y),
                         )
                         fully_visible = (
                             margin_px <= px < response.width - margin_px
@@ -772,15 +764,14 @@ class JobManager:
                         if not fully_visible or known_weed.id in matched_known_weed_ids:
                             continue
                         prior_track = self.db.weed_track(entry_id, known_weed.id)
-                        absent_observations = int(
-                            (prior_track or {}).get("absent_observations") or 0
-                        ) + 1
+                        absent_observations = (
+                            int((prior_track or {}).get("absent_observations") or 0) + 1
+                        )
                         absence_confidence = min(0.95, 0.58 + 0.12 * absent_observations)
                         track_status = "removal_recommended"
                         if (
                             weed_settings.automatic_removal
-                            and absent_observations
-                            >= weed_settings.removal_min_consecutive_absent
+                            and absent_observations >= weed_settings.removal_min_consecutive_absent
                             and absence_confidence >= weed_settings.removal_confidence
                         ):
                             try:

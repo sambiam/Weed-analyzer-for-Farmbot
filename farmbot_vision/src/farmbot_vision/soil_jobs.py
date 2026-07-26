@@ -115,9 +115,7 @@ class SoilJobManager:
         self.current["message"] = "Stopping after the current soil point"
         job_id = self.current.get("id")
         if job_id:
-            self.db.update_soil_job(
-                job_id, stop_requested=True, message=self.current["message"]
-            )
+            self.db.update_soil_job(job_id, stop_requested=True, message=self.current["message"])
 
     async def close(self) -> None:
         if self.task and not self.task.done():
@@ -125,9 +123,7 @@ class SoilJobManager:
             await asyncio.gather(self.task, return_exceptions=True)
 
     @staticmethod
-    def _nearest_order(
-        points: list[SoilPoint], start_x: float, start_y: float
-    ) -> list[SoilPoint]:
+    def _nearest_order(points: list[SoilPoint], start_x: float, start_y: float) -> list[SoilPoint]:
         remaining, ordered = list(points), []
         x, y = start_x, start_y
         while remaining:
@@ -176,9 +172,7 @@ class SoilJobManager:
         # The integration may legitimately use the full 120 s RPC, 180 s image
         # processing and 60 s best-effort restoration windows.
         for _ in range(190):
-            status = await self.client.soil_capture_status(
-                config_entry_id, str(started.capture_id)
-            )
+            status = await self.client.soil_capture_status(config_entry_id, str(started.capture_id))
             self.current["message"] = status.message
             if status.status == "failed":
                 raise SoilHeightError(status.message)
@@ -313,9 +307,7 @@ class SoilJobManager:
                 if calibration is None:
                     raise SoilHeightError("complete guided soil calibration first")
                 if abs(calibration.baseline_mm - baseline_mm) > 0.01:
-                    raise SoilHeightError(
-                        "capture baseline changed; recalibrate before measuring"
-                    )
+                    raise SoilHeightError("capture baseline changed; recalibrate before measuring")
                 if calibration.z_direction != inventory.motion.z_direction:
                     raise SoilHeightError(
                         "FarmBot Z direction changed; recalibrate before measuring"

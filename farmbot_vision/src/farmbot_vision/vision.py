@@ -405,8 +405,7 @@ class ClassicalVisionEngine(ImageAnalysisEngine):
                     np.max(np.sqrt((xs[candidate] - cx) ** 2 + (ys[candidate] - cy) ** 2))
                 )
                 bounded_historical_leaf = historical_overlap and candidate_farthest <= (
-                    max(seed.current_radius_mm * 1.5, seed.current_radius_mm + 30)
-                    * params.mean_ppm
+                    max(seed.current_radius_mm * 1.5, seed.current_radius_mm + 30) * params.mean_ppm
                 )
                 if component_near_seed or bounded_historical_leaf:
                     ownership[ys[candidate], xs[candidate]] = index + 1

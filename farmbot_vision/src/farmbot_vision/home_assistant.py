@@ -244,13 +244,9 @@ class HomeAssistantClient:
     async def start_soil_capture(
         self, request: SoilCaptureStartRequest
     ) -> SoilCaptureStartResponse:
-        return await self._service(
-            "start_vision_soil_capture", request, SoilCaptureStartResponse
-        )  # type: ignore[return-value]
+        return await self._service("start_vision_soil_capture", request, SoilCaptureStartResponse)  # type: ignore[return-value]
 
-    async def soil_capture_status(
-        self, config_entry_id: str, capture_id: str
-    ) -> SoilCaptureStatus:
+    async def soil_capture_status(self, config_entry_id: str, capture_id: str) -> SoilCaptureStatus:
         return await self._service(
             "get_vision_soil_capture",
             {"config_entry_id": config_entry_id, "capture_id": capture_id},

@@ -45,9 +45,7 @@ def _triplet(
             borderMode=cv2.BORDER_REFLECT,
         )
         if brightness_step:
-            image = cv2.convertScaleAbs(
-                image, alpha=1, beta=brightness_step * view_index
-            )
+            image = cv2.convertScaleAbs(image, alpha=1, beta=brightness_step * view_index)
         frames.append(
             SoilFrame(
                 image_id=image_id + round(z_offset) * 10,
@@ -102,9 +100,7 @@ def test_guided_calibration_and_measurement_recover_soil_z():
 
 
 def test_vertical_misalignment_and_brightness_changes_are_rectified():
-    estimates = estimate_triplet(
-        _triplet(1.4, vertical_shift_px=2.5, brightness_step=-18)
-    )
+    estimates = estimate_triplet(_triplet(1.4, vertical_shift_px=2.5, brightness_step=-18))
     passing = [estimate for estimate in estimates if estimate.passes_geometry]
     assert len(passing) >= 2
     assert np.median([item.normalized_disparity for item in passing]) == pytest.approx(
