@@ -1,5 +1,48 @@
 # Changelog
 
+## 1.8.0 - 2026-07-26
+
+- Added calibrated multi-image canopy fusion. Plant ownership is segmented in
+  each original image, aligned on a plant-centred metric canvas, and measured
+  from the fused mask when partial views cross image boundaries.
+- Added app-managed fusion controls for activation, view and pixel evidence,
+  radial statistics, angular coverage, disagreement tolerance, diagnostics,
+  and automatic-action reliability requirements.
+- Added a locally trained weed visual verifier with in-app hard-negative
+  labelling, manual or automatic retraining, validation metrics, shadow mode,
+  enforcement thresholds, and automation gates.
+- Added configurable colour/shape filtering, complete known-crop protection,
+  temporal weed confirmation, candidate-crop storage, and conservative
+  automatic weed creation, radius maintenance, and disappearance handling.
+- Fusion provenance and diagnostics are persisted with each measurement; an
+  unreliable partial-view fusion stays reviewable and cannot trigger an
+  automatic plant-radius change while its guardrail is enabled.
+
+## 1.7.0 - 2026-07-26
+
+- Plants whose protection area falls entirely outside the analysed image are
+  no longer silently skipped. They now get a low-confidence, uncertain
+  measurement so they still appear for manual review; no automatic change is
+  ever applied to them.
+
+## 1.6.0 - 2026-07-26
+
+- Plant-radius review now opens one stitched composite containing every source
+  image that identified the plant, aligned with the saved calibration's scale,
+  rotation, and coordinate-origin settings.
+- The review composite marks the original radius in cyan, the new radius in
+  red, and the plant centre with a white dot.
+- Reviewers can switch between the original stitched photos and the same
+  composite with the plant ownership mask overlaid. Raw masks and per-frame
+  diagnostic images are no longer included in the plant-radius viewer.
+
+## 1.5.1 - 2026-07-26
+
+- Fixed plant-protection-radius zone checks: a boundary now only requires the
+  plant's centre to stay inside it, matching weeds and plant centres. A
+  protection radius may extend past a boundary's edge; it still must not
+  overlap a forbidding exclusion zone, since those mark real hazards.
+
 ## 1.5.0 - 2026-07-26
 
 - Rejecting a weed recommendation now permanently suppresses that position

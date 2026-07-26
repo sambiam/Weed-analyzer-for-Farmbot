@@ -22,6 +22,7 @@ from .models import (
 )
 from .resolution import MAX_PROCESSED_HEIGHT, MAX_PROCESSED_WIDTH
 from .weed_settings import WeedSettings
+from .weed_verifier import WeedVisualVerifier, encode_candidate_crop, extract_visual_features
 
 cv2.setNumThreads(1)
 
@@ -256,9 +257,15 @@ def _draw_legend(image: np.ndarray) -> None:
 
 
 class ClassicalVisionEngine(ImageAnalysisEngine):
-    def __init__(self, safety_margin_mm: float = 20, calibration_uncertainty_mm: float = 10):
+    def __init__(
+        self,
+        safety_margin_mm: float = 20,
+        calibration_uncertainty_mm: float = 10,
+        weed_verifier: WeedVisualVerifier | None = None,
+    ):
         self.safety_margin_mm = safety_margin_mm
         self.calibration_uncertainty_mm = calibration_uncertainty_mm
+        self.weed_verifier = weed_verifier
 
     def diagnostic_only(self, image_bytes: bytes) -> AnalysisResult:
         """Pixel-space segmentation with no metric measurement (Part 6).
@@ -341,6 +348,7 @@ class ClassicalVisionEngine(ImageAnalysisEngine):
         ambiguous = np.zeros_like(mask, dtype=bool)
         uncertain_seeds: set[int] = set()
         edge_truncated: set[int] = set()
+        out_of_frame: set[int] = set()
         skipped: dict[int, str] = {}
         ambiguity_gap = max(5.0, params.mean_ppm * 5)
 
@@ -360,7 +368,11 @@ class ClassicalVisionEngine(ImageAnalysisEngine):
                 or x - visible_radius >= width
                 or y - visible_radius >= height
             ):
-                skipped[seed.plant_id] = "plant protection area is outside this image"
+                # Fully off-frame: there is no pixel evidence to analyse, so
+                # this plant never joins ownership/connected-components. It
+                # still gets a low-confidence Measurement below so it surfaces
+                # for manual review instead of silently vanishing.
+                out_of_frame.add(index)
                 continue
             valid_indices.append(index)
             if x < 0 or y < 0 or x >= width or y >= height:
@@ -440,7 +452,74 @@ class ClassicalVisionEngine(ImageAnalysisEngine):
             )
         _tint_pixels(overlay, ambiguous, (0, 0, 255), 0.75)
 
+        # Invariant across every plant in this image, so it's built once.
+        transform_json = json.dumps(
+            {
+                "pixels_per_mm_x": calibration.pixels_per_mm_x,
+                "pixels_per_mm_y": calibration.pixels_per_mm_y,
+                "rotation_degrees": calibration.rotation_degrees,
+                "offset_x_mm": calibration.offset_x_mm,
+                "offset_y_mm": calibration.offset_y_mm,
+                "origin_location": calibration.origin_location.value,
+                "calibration_source": calibration.source,
+                "calibration_version": calibration.calibration_version,
+                "analysis_resolution": calibration.analysis_resolution,
+                "processed_width": calibration.processed_width,
+                "processed_height": calibration.processed_height,
+                "source_width": calibration.source_width,
+                "source_height": calibration.source_height,
+                "oriented_width": calibration.oriented_width,
+                "oriented_height": calibration.oriented_height,
+                "resize_scale_x": calibration.resize_scale_x,
+                "resize_scale_y": calibration.resize_scale_y,
+                "contract_version": CONTRACT_VERSION,
+                "algorithm_version": ALGORITHM_VERSION,
+            },
+            separators=(",", ":"),
+        )
+
         measurements: list[Measurement] = []
+        for index in out_of_frame:
+            seed = seeds[index]
+            age = None
+            if seed.planted_at:
+                age = max(0, (image_timestamp.date() - seed.planted_at.date()).days)
+            measurements.append(
+                Measurement(
+                    measurement_id=uuid4(),
+                    plant_id=seed.plant_id,
+                    crop_slug=seed.crop_slug,
+                    image_id=image_id,
+                    image_timestamp=image_timestamp,
+                    current_radius_mm=seed.current_radius_mm,
+                    typical_canopy_radius_mm=0,
+                    maximum_accepted_canopy_radius_mm=0,
+                    recommended_protection_radius_mm=seed.current_radius_mm,
+                    confidence=0.05,
+                    decision=Decision.UNCERTAIN,
+                    reason=(
+                        "plant protection area is entirely outside this image; "
+                        "no automatic change is made and manual review is available"
+                    ),
+                    ambiguous=True,
+                    calibration_version_id=calibration.version_id,
+                    transform_json=transform_json,
+                    algorithm_version=ALGORITHM_VERSION,
+                    plant_age_days=age,
+                    safety_margin_mm=self.safety_margin_mm,
+                    calibration_uncertainty_mm=max(
+                        self.calibration_uncertainty_mm, calibration.uncertainty_mm
+                    ),
+                    analysis_resolution=calibration.analysis_resolution,
+                    processed_width=width,
+                    processed_height=height,
+                    calibration_source=calibration.source,
+                    calibrated=True,
+                    contract_version=CONTRACT_VERSION,
+                    plant_center_px=seed.center_px,
+                    visible_fraction=0.0,
+                )
+            )
         for index in valid_indices:
             seed = seeds[index]
             owned = ownership == index + 1
@@ -448,29 +527,6 @@ class ClassicalVisionEngine(ImageAnalysisEngine):
             age = None
             if seed.planted_at:
                 age = max(0, (image_timestamp.date() - seed.planted_at.date()).days)
-            transform_json = json.dumps(
-                {
-                    "pixels_per_mm_x": calibration.pixels_per_mm_x,
-                    "pixels_per_mm_y": calibration.pixels_per_mm_y,
-                    "rotation_degrees": calibration.rotation_degrees,
-                    "offset_x_mm": calibration.offset_x_mm,
-                    "offset_y_mm": calibration.offset_y_mm,
-                    "calibration_source": calibration.source,
-                    "calibration_version": calibration.calibration_version,
-                    "analysis_resolution": calibration.analysis_resolution,
-                    "processed_width": calibration.processed_width,
-                    "processed_height": calibration.processed_height,
-                    "source_width": calibration.source_width,
-                    "source_height": calibration.source_height,
-                    "oriented_width": calibration.oriented_width,
-                    "oriented_height": calibration.oriented_height,
-                    "resize_scale_x": calibration.resize_scale_x,
-                    "resize_scale_y": calibration.resize_scale_y,
-                    "contract_version": CONTRACT_VERSION,
-                    "algorithm_version": ALGORITHM_VERSION,
-                },
-                separators=(",", ":"),
-            )
             cx, cy = seed.center_px
             core_radius_px = max(
                 6.0,
@@ -732,9 +788,15 @@ class ClassicalVisionEngine(ImageAnalysisEngine):
             claimed = ownership > 0
             exclusion = np.zeros_like(mask)
             for seed in seeds:
+                if weed_settings.crop_protection_enabled:
+                    known_canopy = max(
+                        seed.current_radius_mm * weed_settings.crop_support_radius_multiplier,
+                        seed.current_radius_mm + weed_settings.crop_support_extra_mm,
+                    )
+                else:
+                    known_canopy = min(60.0, max(20.0, seed.current_radius_mm * 0.3))
                 exclusion_radius = (
-                    min(60.0, max(20.0, seed.current_radius_mm * 0.3))
-                    + weed_settings.plant_exclusion_margin_mm
+                    known_canopy + weed_settings.plant_exclusion_margin_mm
                 ) * params.mean_ppm
                 cv2.circle(
                     exclusion,
@@ -743,6 +805,15 @@ class ClassicalVisionEngine(ImageAnalysisEngine):
                     255,
                     -1,
                 )
+            if weed_settings.crop_protection_enabled:
+                prior_margin_px = max(
+                    1, round(weed_settings.plant_exclusion_margin_mm * params.mean_ppm)
+                )
+                for prior in previous_masks.values():
+                    distance_from_prior = cv2.distanceTransform(
+                        (prior == 0).astype(np.uint8), cv2.DIST_L2, 5
+                    )
+                    exclusion[distance_from_prior <= prior_margin_px] = 255
             candidate_mask = ((mask > 0) & ~claimed & (exclusion == 0)).astype(np.uint8) * 255
             count, candidate_labels, candidate_stats, candidate_centroids = (
                 cv2.connectedComponentsWithStats(candidate_mask, 8)
@@ -762,11 +833,14 @@ class ClassicalVisionEngine(ImageAnalysisEngine):
                         (wx - seed.center_px[0]) / calibration.pixels_per_mm_x,
                         (wy - seed.center_px[1]) / calibration.pixels_per_mm_y,
                     )
-                    support_radius_mm = min(100.0, seed.current_radius_mm + 40.0)
+                    support_radius_mm = max(
+                        seed.current_radius_mm * weed_settings.crop_support_radius_multiplier,
+                        seed.current_radius_mm + weed_settings.crop_support_extra_mm,
+                    )
                     if distance_mm <= support_radius_mm and distance_mm < supported_distance:
                         supported_seed = seed_index
                         supported_distance = distance_mm
-                if supported_seed is not None:
+                if supported_seed is not None and weed_settings.crop_protection_enabled:
                     # Second-pass soft ownership: unconnected leaves clustered
                     # around an identified known plant are possible canopy,
                     # not a FarmBot weed.
@@ -783,8 +857,63 @@ class ClassicalVisionEngine(ImageAnalysisEngine):
                     weed_settings.minimum_area_mm2 <= area_mm2 <= weed_settings.maximum_area_mm2
                 ):
                     continue
-                compactness = min(1.0, area_mm2 / max(weed_settings.minimum_area_mm2 * 2, 1))
-                confidence = min(0.98, 0.62 + compactness * 0.28)
+                component = candidate_labels == label
+                features = extract_visual_features(
+                    image,
+                    component,
+                    area_mm2,
+                    green_hue_min=weed_settings.green_hue_min,
+                    green_hue_max=weed_settings.green_hue_max,
+                    strong_green_minimum_saturation=(
+                        weed_settings.strong_green_minimum_saturation
+                    ),
+                    strong_green_minimum_excess_green=(
+                        weed_settings.strong_green_minimum_excess_green
+                    ),
+                )
+                if weed_settings.shape_filter_enabled and (
+                    features["strong_green_fraction"] < weed_settings.minimum_green_purity
+                    or features["solidity"] < weed_settings.minimum_solidity
+                    or features["circularity"] < weed_settings.minimum_circularity
+                    or features["aspect_ratio"] * 12 > weed_settings.maximum_aspect_ratio
+                ):
+                    continue
+                area_score = min(
+                    1.0,
+                    math.sqrt(
+                        max(0.0, area_mm2 - weed_settings.minimum_area_mm2)
+                        / max(1.0, weed_settings.minimum_area_mm2 * 2)
+                    ),
+                )
+                heuristic_confidence = min(
+                    0.98,
+                    0.25
+                    + area_score * 0.25
+                    + features["strong_green_fraction"] * 0.25
+                    + features["solidity"] * 0.15
+                    + features["circularity"] * 0.10,
+                )
+                verifier_confidence = (
+                    self.weed_verifier.predict(features)
+                    if self.weed_verifier is not None
+                    and (
+                        weed_settings.visual_verifier_enabled
+                        or weed_settings.visual_verifier_shadow_mode
+                    )
+                    else None
+                )
+                confidence = heuristic_confidence
+                if (
+                    weed_settings.visual_verifier_enabled
+                    and not weed_settings.visual_verifier_shadow_mode
+                    and verifier_confidence is not None
+                ):
+                    weight = weed_settings.visual_verifier_weight
+                    confidence = (
+                        heuristic_confidence * (1 - weight) + verifier_confidence * weight
+                    )
+                    if verifier_confidence < weed_settings.visual_verifier_minimum_confidence:
+                        continue
                 if confidence < weed_settings.minimum_confidence:
                     continue
                 weed_detections.append(
@@ -796,6 +925,14 @@ class ClassicalVisionEngine(ImageAnalysisEngine):
                         area_mm2=area_mm2,
                         radius_mm=max(weed_settings.weed_radius_mm, math.sqrt(area_mm2 / math.pi)),
                         confidence=confidence,
+                        heuristic_confidence=heuristic_confidence,
+                        verifier_confidence=verifier_confidence,
+                        features=features,
+                        crop_jpeg=(
+                            encode_candidate_crop(image, component)
+                            if weed_settings.candidate_crop_storage_enabled
+                            else None
+                        ),
                     )
                 )
                 # Circle radius follows the detected blob, not the (larger)

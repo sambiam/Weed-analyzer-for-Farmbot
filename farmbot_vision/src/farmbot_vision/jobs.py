@@ -21,6 +21,8 @@ except ImportError:  # pragma: no cover - Windows development hosts
 
 from . import CONTRACT_VERSION, __version__
 from .calibration import resolve_calibration
+from .canopy_fusion import fuse_canopy_masks
+from .canopy_settings import CanopyFusionSettings, CanopyFusionSettingsStore
 from .curve_edit import propose_curve_point, radius_mm_to_diameter_mm
 from .curves import fit_monotonic_curve
 from .database import Database
@@ -43,13 +45,24 @@ from .safety import decide
 from .settings import Settings
 from .vision import ClassicalVisionEngine, garden_to_pixel, pixel_to_garden
 from .weed_settings import WeedSettingsStore
+from .weed_verifier import WeedVisualVerifier
 from .zones import Zone, ZoneAspect, ZoneStore, evaluate
 
 LOGGER = logging.getLogger(__name__)
 
 
-def build_plant_composite(measurements: list, output_path: Path) -> bool:
-    """Stitch every available view around one plant in garden-scale space."""
+def build_plant_composite(
+    measurements: list,
+    output_path: Path,
+    overlay_output_path: Path | None = None,
+) -> bool:
+    """Stitch all views of one plant using their calibrated garden transforms.
+
+    ``output_path`` is the clean photo composite. When ``overlay_output_path``
+    is supplied, a second copy is written with the plant ownership masks
+    tinted over the same stitched pixels. Radius and centre annotations are
+    drawn on both copies.
+    """
     frames = []
     for item in measurements:
         if not item.source_image_path or not item.plant_center_px:
@@ -65,15 +78,47 @@ def build_plant_composite(measurements: list, output_path: Path) -> bool:
         ppm_y = float(transform.get("pixels_per_mm_y") or 0)
         if ppm_x <= 0 or ppm_y <= 0:
             continue
+        rotation = math.radians(float(transform.get("rotation_degrees") or 0))
+        cos_t, sin_t = math.cos(rotation), math.sin(rotation)
+        origin = str(transform.get("origin_location") or "top_left")
+        sign_x = -1 if origin in {"top_right", "bottom_right"} else 1
+        sign_y = -1 if origin in {"bottom_left", "bottom_right"} else 1
         cx, cy = item.plant_center_px
         height, width = image.shape[:2]
+        # Source pixel -> millimetres relative to this plant. This is the
+        # relative form of vision.pixel_to_garden: anchoring each photo at the
+        # same plant cancels camera position and calibration offsets while
+        # retaining rotation, scale and origin reflection.
+        relative_transform = np.float64(
+            [
+                [
+                    sign_x * cos_t / ppm_x,
+                    -sign_x * sin_t / ppm_x,
+                    sign_x * (-cos_t * cx + sin_t * cy) / ppm_x,
+                ],
+                [
+                    sign_y * sin_t / ppm_y,
+                    sign_y * cos_t / ppm_y,
+                    sign_y * (-sin_t * cx - cos_t * cy) / ppm_y,
+                ],
+            ]
+        )
+        corners = cv2.transform(
+            np.float64([[[0, 0], [width, 0], [0, height], [width, height]]]),
+            relative_transform,
+        )[0]
         frames.append(
             {
                 "item": item,
                 "image": image,
-                "ppm_x": ppm_x,
-                "ppm_y": ppm_y,
-                "bounds": (-cx / ppm_x, (width - cx) / ppm_x, -cy / ppm_y, (height - cy) / ppm_y),
+                "transform": relative_transform,
+                "bounds": (
+                    float(corners[:, 0].min()),
+                    float(corners[:, 0].max()),
+                    float(corners[:, 1].min()),
+                    float(corners[:, 1].max()),
+                ),
+                "scale": math.sqrt(ppm_x * ppm_y),
             }
         )
     if not frames:
@@ -82,31 +127,56 @@ def build_plant_composite(measurements: list, output_path: Path) -> bool:
     max_x = max(frame["bounds"][1] for frame in frames)
     min_y = min(frame["bounds"][2] for frame in frames)
     max_y = max(frame["bounds"][3] for frame in frames)
-    ppm = float(np.median([math.sqrt(frame["ppm_x"] * frame["ppm_y"]) for frame in frames]))
+    ppm = float(np.median([frame["scale"] for frame in frames]))
     ppm = min(ppm, 2400 / max(1.0, max(max_x - min_x, max_y - min_y)))
     canvas_width = max(1, round((max_x - min_x) * ppm))
     canvas_height = max(1, round((max_y - min_y) * ppm))
-    canvas = np.zeros((canvas_height, canvas_width, 3), dtype=np.uint8)
+    accumulated = np.zeros((canvas_height, canvas_width, 3), dtype=np.float32)
+    weights = np.zeros((canvas_height, canvas_width), dtype=np.float32)
+    ownership = np.zeros((canvas_height, canvas_width), dtype=np.uint8)
     for frame in sorted(frames, key=lambda frame: frame["item"].image_timestamp):
-        left, right, top, bottom = frame["bounds"]
-        x0, y0 = round((left - min_x) * ppm), round((top - min_y) * ppm)
-        width = max(1, round((right - left) * ppm))
-        height = max(1, round((bottom - top) * ppm))
-        resized = cv2.resize(frame["image"], (width, height), interpolation=cv2.INTER_AREA)
-        x1, y1 = min(canvas_width, x0 + width), min(canvas_height, y0 + height)
-        canvas[y0:y1, x0:x1] = resized[: y1 - y0, : x1 - x0]
-        cv2.rectangle(canvas, (x0, y0), (x1 - 1, y1 - 1), (215, 215, 215), 2)
+        affine = frame["transform"].copy()
+        affine[0] = affine[0] * ppm
+        affine[1] = affine[1] * ppm
+        affine[0, 2] -= min_x * ppm
+        affine[1, 2] -= min_y * ppm
+        size = (canvas_width, canvas_height)
+        warped = cv2.warpAffine(
+            frame["image"], affine, size, flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT
+        )
+        valid = cv2.warpAffine(
+            np.full(frame["image"].shape[:2], 255, dtype=np.uint8),
+            affine,
+            size,
+            flags=cv2.INTER_NEAREST,
+            borderMode=cv2.BORDER_CONSTANT,
+        )
+        selected = valid > 0
+        accumulated[selected] += warped[selected]
+        weights[selected] += 1
         mask_path = frame["item"].mask_path
         if mask_path:
             mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
             if mask is not None:
-                mask = cv2.resize(mask, (width, height), interpolation=cv2.INTER_NEAREST)
-                selected = mask[: y1 - y0, : x1 - x0] > 0
-                region = canvas[y0:y1, x0:x1]
-                region[selected] = (
-                    region[selected].astype(np.float32) * 0.55
-                    + np.asarray((255, 210, 30), dtype=np.float32) * 0.45
-                ).astype(np.uint8)
+                warped_mask = cv2.warpAffine(
+                    mask,
+                    affine,
+                    size,
+                    flags=cv2.INTER_NEAREST,
+                    borderMode=cv2.BORDER_CONSTANT,
+                )
+                ownership = cv2.max(ownership, warped_mask)
+    canvas = np.zeros_like(accumulated, dtype=np.uint8)
+    present = weights > 0
+    canvas[present] = np.clip(
+        accumulated[present] / weights[present, np.newaxis], 0, 255
+    ).astype(np.uint8)
+    overlay_canvas = canvas.copy()
+    selected = ownership > 0
+    overlay_canvas[selected] = (
+        overlay_canvas[selected].astype(np.float32) * 0.58
+        + np.asarray((255, 190, 20), dtype=np.float32) * 0.42
+    ).astype(np.uint8)
     representative = Database._consolidate_measurement_rows(
         [item.model_dump(mode="json") for item in measurements]
     )
@@ -114,21 +184,48 @@ def build_plant_composite(measurements: list, output_path: Path) -> bool:
     current = float(representative["current_radius_mm"])
     planned = float(representative["recommended_protection_radius_mm"])
     thickness = max(4, round(min(canvas_width, canvas_height) / 300))
-    cv2.circle(canvas, center, max(1, round(current * ppm)), (255, 255, 0), thickness)
-    cv2.circle(canvas, center, max(1, round(planned * ppm)), (0, 0, 255), thickness + 1)
-    cv2.drawMarker(canvas, center, (255, 255, 255), cv2.MARKER_CROSS, 22, 3)
-    label = f"original {current:.1f} mm | planned {planned:.1f} mm"
-    cv2.putText(
-        canvas,
-        label,
-        (12, max(28, round(canvas_height * 0.04))),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        max(0.6, min(1.1, canvas_width / 1400)),
-        (255, 255, 255),
-        max(2, thickness // 2),
-        cv2.LINE_AA,
+    label = f"original {current:.1f} mm | new {planned:.1f} mm"
+
+    def annotate(target: np.ndarray) -> None:
+        cv2.circle(target, center, max(1, round(current * ppm)), (255, 255, 0), thickness)
+        cv2.circle(target, center, max(1, round(planned * ppm)), (0, 0, 255), thickness + 1)
+        dot_radius = max(5, thickness + 2)
+        cv2.circle(target, center, dot_radius + 2, (25, 25, 25), -1, cv2.LINE_AA)
+        cv2.circle(target, center, dot_radius, (255, 255, 255), -1, cv2.LINE_AA)
+        text_origin = (12, max(28, round(canvas_height * 0.04)))
+        font_scale = max(0.6, min(1.1, canvas_width / 1400))
+        cv2.putText(
+            target,
+            label,
+            text_origin,
+            cv2.FONT_HERSHEY_SIMPLEX,
+            font_scale,
+            (20, 20, 20),
+            max(4, thickness),
+            cv2.LINE_AA,
+        )
+        cv2.putText(
+            target,
+            label,
+            text_origin,
+            cv2.FONT_HERSHEY_SIMPLEX,
+            font_scale,
+            (255, 255, 255),
+            max(1, thickness // 2),
+            cv2.LINE_AA,
+        )
+
+    annotate(canvas)
+    clean_written = bool(
+        cv2.imwrite(str(output_path), canvas, [cv2.IMWRITE_JPEG_QUALITY, 88])
     )
-    return bool(cv2.imwrite(str(output_path), canvas, [cv2.IMWRITE_JPEG_QUALITY, 88]))
+    if overlay_output_path is None:
+        return clean_written
+    annotate(overlay_canvas)
+    overlay_written = bool(
+        cv2.imwrite(str(overlay_output_path), overlay_canvas, [cv2.IMWRITE_JPEG_QUALITY, 88])
+    )
+    return clean_written and overlay_written
 
 
 class JobManager:
@@ -258,6 +355,7 @@ class JobManager:
         inventory,
         measurements: list,
         zones: list[Zone],
+        fusion_settings: CanopyFusionSettings,
     ) -> None:
         """Apply at most one robust automatic judgement for repeated views."""
         if len(measurements) < 2:
@@ -265,6 +363,18 @@ class JobManager:
         aggregate = Database._consolidate_measurement_rows(
             [item.model_dump(mode="json") for item in measurements]
         )
+        partial_views_require_fusion = (
+            fusion_settings.enabled
+            and fusion_settings.automatic_requires_reliable_fusion
+            and any(
+                item.visible_fraction < fusion_settings.activation_visible_fraction
+                for item in measurements
+            )
+        )
+        if partial_views_require_fusion and not bool(aggregate.get("fusion_reliable")):
+            return
+        if aggregate.get("fused_canopy") and not bool(aggregate.get("fusion_reliable")):
+            return
         latest = max(measurements, key=lambda item: item.image_timestamp)
         candidate = latest.model_copy(
             update={
@@ -405,11 +515,16 @@ class JobManager:
             resolution = self.settings.resolution
             manual_calibration = self.db.active_calibration(entry_id)
             engine = ClassicalVisionEngine(
-                self.settings.safety_margin_mm, self.settings.calibration_uncertainty_mm
+                self.settings.safety_margin_mm,
+                self.settings.calibration_uncertainty_mm,
+                WeedVisualVerifier(self.settings.data_dir / "weed_visual_model.json"),
             )
             weed_settings = (
                 self.weed_settings_store.load() if self.weed_settings_store is not None else None
             )
+            fusion_settings = CanopyFusionSettingsStore(
+                self.settings.data_dir / "canopy_fusion_settings.json"
+            ).load()
             # Boundaries and exclusion zones are read once per job so a mid-job
             # edit cannot make one image obey different rules than the next.
             zones: list[Zone] = self.zone_store.zones() if self.zone_store is not None else []
@@ -525,7 +640,9 @@ class JobManager:
                         current_radius_mm=plant.radius,
                         planted_at=plant.planted_at,
                     )
-                    for plant in wanted
+                    # Every inventory plant participates in ownership, even
+                    # when the caller requested measurements for a subset.
+                    for plant in inventory.plants
                 ]
                 previous_masks = {}
                 for seed in seeds:
@@ -549,6 +666,8 @@ class JobManager:
                 decided = []
                 plants_by_id = {plant.id: plant for plant in wanted}
                 for item in result.measurements:
+                    if item.plant_id not in plants_by_id:
+                        continue
                     plant = plants_by_id[item.plant_id]
                     item = item.model_copy(
                         update={
@@ -602,6 +721,12 @@ class JobManager:
                     weed_review_path.write_bytes(result.weed_review_jpeg)
                 matched_known_weed_ids: set[int] = set()
                 for weed in result.weeds:
+                    crop_path = artifacts / (
+                        f"{job_id}-{response.image_id}-weed-{weed.detection_id}-crop.jpg"
+                    )
+                    if weed.crop_jpeg:
+                        crop_path.write_bytes(weed.crop_jpeg)
+                    stored_crop_path = str(crop_path) if weed.crop_jpeg else None
                     weed_x, weed_y = pixel_to_garden(
                         weed.center_px[0],
                         weed.center_px[1],
@@ -680,9 +805,13 @@ class JobManager:
                             center_px_y=weed.center_px[1],
                             processed_width=response.width,
                             processed_height=response.height,
+                            heuristic_confidence=weed.heuristic_confidence,
+                            verifier_confidence=weed.verifier_confidence,
+                            features=weed.features,
+                            crop_path=stored_crop_path,
                         )
                         continue
-                    if self.db.has_weed_detection_near(
+                    if self.db.has_terminal_weed_detection_near(
                         entry_id, weed_x, weed_y, duplicate_distance
                     ):
                         continue
@@ -699,11 +828,46 @@ class JobManager:
                             zone_check.reason,
                         )
                         continue
-                    weed_status = "recommended"
+                    track = self.db.observe_weed_candidate(
+                        config_entry_id=entry_id,
+                        image_id=weed.image_id,
+                        seen_at=weed.image_timestamp,
+                        x=weed_x,
+                        y=weed_y,
+                        confidence=weed.confidence,
+                        match_distance_mm=weed_settings.temporal_match_distance_mm,
+                        max_gap_hours=weed_settings.temporal_max_gap_hours,
+                    )
+                    observations = int(track["observations"])
+                    recommendation_observations = (
+                        weed_settings.recommendation_min_observations
+                        if weed_settings.temporal_confirmation_enabled
+                        else 1
+                    )
+                    weed_status = (
+                        "recommended"
+                        if observations >= recommendation_observations
+                        else "observing"
+                    )
+                    automatic_observations = (
+                        weed_settings.automatic_min_observations
+                        if weed_settings.temporal_confirmation_enabled
+                        else 1
+                    )
+                    verifier_allows_automatic = (
+                        not weed_settings.visual_verifier_required_for_automatic
+                        or (
+                            weed.verifier_confidence is not None
+                            and weed.verifier_confidence
+                            >= weed_settings.visual_verifier_minimum_confidence
+                        )
+                    )
                     if (
                         weed_settings
                         and weed_settings.automatic_creation
-                        and weed.confidence >= weed_settings.minimum_confidence
+                        and weed.confidence >= weed_settings.automatic_creation_confidence
+                        and observations >= automatic_observations
+                        and verifier_allows_automatic
                     ):
                         try:
                             create_result = await self.client.create_weed(
@@ -724,6 +888,9 @@ class JobManager:
                             LOGGER.warning(
                                 "Automatic weed creation failed; keeping recommendation: %s", exc
                             )
+                    self.db.supersede_pending_weed_detections(
+                        entry_id, weed_x, weed_y, duplicate_distance
+                    )
                     self.db.save_weed_detection(
                         detection_id=str(weed.detection_id),
                         config_entry_id=entry_id,
@@ -742,6 +909,12 @@ class JobManager:
                         center_px_y=weed.center_px[1],
                         processed_width=response.width,
                         processed_height=response.height,
+                        heuristic_confidence=weed.heuristic_confidence,
+                        verifier_confidence=weed.verifier_confidence,
+                        features=weed.features,
+                        crop_path=stored_crop_path,
+                        observation_count=observations,
+                        candidate_track_id=int(track["id"]),
                     )
                 if weed_settings and weed_settings.enabled:
                     for known_weed in inventory.weeds:
@@ -1010,18 +1183,81 @@ class JobManager:
             for measurement in all_measurements:
                 measurements_by_plant.setdefault(measurement.plant_id, []).append(measurement)
             for plant_id, plant_measurements in measurements_by_plant.items():
+                fused = fuse_canopy_masks(plant_measurements, fusion_settings)
+                if fused is not None:
+                    individual = Database._consolidate_measurement_rows(
+                        [item.model_dump(mode="json") for item in plant_measurements]
+                    )
+                    disagreement = abs(
+                        fused.maximum_radius_mm
+                        - float(individual["maximum_accepted_canopy_radius_mm"])
+                    )
+                    reliable = (
+                        fused.angular_coverage >= fusion_settings.minimum_angular_coverage
+                        and fused.corroborated_fraction
+                        >= fusion_settings.minimum_corroborated_fraction
+                        and disagreement
+                        <= fusion_settings.maximum_automatic_disagreement_mm
+                    )
+                    safety_margin = max(item.safety_margin_mm for item in plant_measurements)
+                    calibration_uncertainty = max(
+                        item.calibration_uncertainty_mm for item in plant_measurements
+                    )
+                    diagnostic_path = (
+                        artifacts / f"{job_id}-plant-{plant_id}-fusion.jpg"
+                    )
+                    stored_diagnostic = None
+                    if (
+                        fusion_settings.save_diagnostics
+                        and fused.diagnostic_jpeg is not None
+                    ):
+                        diagnostic_path.write_bytes(fused.diagnostic_jpeg)
+                        stored_diagnostic = str(diagnostic_path)
+                    fused_values = {
+                        "fused_canopy": True,
+                        "fused_typical_radius_mm": fused.typical_radius_mm,
+                        "fused_maximum_radius_mm": fused.maximum_radius_mm,
+                        "fused_recommended_radius_mm": (
+                            fused.maximum_radius_mm
+                            + safety_margin
+                            + calibration_uncertainty
+                        ),
+                        "fused_confidence": fused.confidence,
+                        "fusion_view_count": fused.view_count,
+                        "fusion_angular_coverage": fused.angular_coverage,
+                        "fusion_corroborated_fraction": fused.corroborated_fraction,
+                        "fusion_disagreement_mm": disagreement,
+                        "fusion_reliable": reliable,
+                        "fusion_diagnostic_path": stored_diagnostic,
+                    }
+                    self.db.set_fused_canopy(
+                        [str(item.measurement_id) for item in plant_measurements],
+                        fused_values,
+                    )
+                    plant_measurements = [
+                        item.model_copy(update=fused_values) for item in plant_measurements
+                    ]
                 if mode == OperatingMode.AUTO_RADIUS:
                     await self._apply_consolidated_automatic(
                         entry_id=entry_id,
                         inventory=inventory,
                         measurements=plant_measurements,
                         zones=zones,
+                        fusion_settings=fusion_settings,
                     )
                 composite_path = artifacts / f"{job_id}-plant-{plant_id}-composite.jpg"
-                if build_plant_composite(plant_measurements, composite_path):
+                composite_overlay_path = (
+                    artifacts / f"{job_id}-plant-{plant_id}-composite-overlay.jpg"
+                )
+                if build_plant_composite(
+                    plant_measurements,
+                    composite_path,
+                    composite_overlay_path,
+                ):
                     self.db.set_composite_path(
                         [str(item.measurement_id) for item in plant_measurements],
                         str(composite_path),
+                        str(composite_overlay_path),
                     )
             return await self._finish(
                 entry_id, job_id, "idle", start_wall, start_cpu, all_measurements, "completed"

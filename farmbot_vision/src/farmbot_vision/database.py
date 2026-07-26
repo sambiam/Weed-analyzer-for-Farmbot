@@ -220,6 +220,55 @@ MIGRATIONS = [
     ALTER TABLE soil_measurements ADD COLUMN capture_y REAL;
     ALTER TABLE soil_measurements ADD COLUMN relocation_distance_mm REAL;
     """,
+    # Migration 14: explainable weed features, review-derived training labels,
+    # locally trained verifier history, and multi-image candidate tracks.
+    """
+    ALTER TABLE weed_detections ADD COLUMN heuristic_confidence REAL;
+    ALTER TABLE weed_detections ADD COLUMN verifier_confidence REAL;
+    ALTER TABLE weed_detections ADD COLUMN features_json TEXT NOT NULL DEFAULT '{}';
+    ALTER TABLE weed_detections ADD COLUMN crop_path TEXT;
+    ALTER TABLE weed_detections ADD COLUMN observation_count INTEGER NOT NULL DEFAULT 1;
+    ALTER TABLE weed_detections ADD COLUMN candidate_track_id INTEGER;
+    CREATE TABLE IF NOT EXISTS weed_training_samples(
+      detection_id TEXT PRIMARY KEY, label TEXT NOT NULL, features_json TEXT NOT NULL,
+      crop_path TEXT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE INDEX IF NOT EXISTS idx_weed_training_samples_label
+      ON weed_training_samples(label,created_at);
+    CREATE TABLE IF NOT EXISTS weed_candidate_tracks(
+      id INTEGER PRIMARY KEY AUTOINCREMENT, config_entry_id TEXT NOT NULL,
+      x REAL NOT NULL, y REAL NOT NULL, observations INTEGER NOT NULL DEFAULT 1,
+      first_seen_at TEXT NOT NULL, last_seen_at TEXT NOT NULL, last_image_id INTEGER NOT NULL,
+      mean_confidence REAL NOT NULL, status TEXT NOT NULL DEFAULT 'active'
+    );
+    CREATE INDEX IF NOT EXISTS idx_weed_candidate_tracks_entry
+      ON weed_candidate_tracks(config_entry_id,status,last_seen_at);
+    CREATE TABLE IF NOT EXISTS weed_model_runs(
+      id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TEXT NOT NULL,
+      sample_count INTEGER NOT NULL, positive_count INTEGER NOT NULL,
+      negative_count INTEGER NOT NULL, metrics_json TEXT NOT NULL
+    );
+    """,
+    # Migration 15: a clean plant composite and its optional ownership-mask
+    # variant support a two-state review viewer without exposing raw masks.
+    """
+    ALTER TABLE measurements ADD COLUMN composite_overlay_path TEXT;
+    """,
+    # Migration 16: retain a calibrated multi-image canopy-mask measurement
+    # alongside the original per-image observations.
+    """
+    ALTER TABLE measurements ADD COLUMN fused_canopy INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE measurements ADD COLUMN fused_typical_radius_mm REAL;
+    ALTER TABLE measurements ADD COLUMN fused_maximum_radius_mm REAL;
+    ALTER TABLE measurements ADD COLUMN fused_recommended_radius_mm REAL;
+    ALTER TABLE measurements ADD COLUMN fused_confidence REAL;
+    ALTER TABLE measurements ADD COLUMN fusion_view_count INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE measurements ADD COLUMN fusion_angular_coverage REAL NOT NULL DEFAULT 0;
+    ALTER TABLE measurements ADD COLUMN fusion_corroborated_fraction REAL NOT NULL DEFAULT 0;
+    ALTER TABLE measurements ADD COLUMN fusion_disagreement_mm REAL;
+    ALTER TABLE measurements ADD COLUMN fusion_reliable INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE measurements ADD COLUMN fusion_diagnostic_path TEXT;
+    """,
 ]
 
 
@@ -438,6 +487,18 @@ class Database:
                     m.visible_fraction,
                     m.source_image_path,
                     m.composite_path,
+                    m.composite_overlay_path,
+                    int(m.fused_canopy),
+                    m.fused_typical_radius_mm,
+                    m.fused_maximum_radius_mm,
+                    m.fused_recommended_radius_mm,
+                    m.fused_confidence,
+                    m.fusion_view_count,
+                    m.fusion_angular_coverage,
+                    m.fusion_corroborated_fraction,
+                    m.fusion_disagreement_mm,
+                    int(m.fusion_reliable),
+                    m.fusion_diagnostic_path,
                 )
             )
         with self.connection:
@@ -471,8 +532,12 @@ class Database:
                 vegetation_absent,absent_observations,safety_margin_mm,calibration_uncertainty_mm,
                 center_misaligned,recorded_center_x,recorded_center_y,
                 recommended_center_x,recommended_center_y,plant_center_px_x,plant_center_px_y,
-                visible_fraction,source_image_path,composite_path)
-                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                visible_fraction,source_image_path,composite_path,composite_overlay_path,
+                fused_canopy,fused_typical_radius_mm,fused_maximum_radius_mm,
+                fused_recommended_radius_mm,fused_confidence,fusion_view_count,
+                fusion_angular_coverage,fusion_corroborated_fraction,fusion_disagreement_mm,
+                fusion_reliable,fusion_diagnostic_path)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 values,
             )
 
@@ -496,14 +561,21 @@ class Database:
         center_px_y: float | None = None,
         processed_width: int | None = None,
         processed_height: int | None = None,
+        heuristic_confidence: float | None = None,
+        verifier_confidence: float | None = None,
+        features: dict[str, float] | None = None,
+        crop_path: str | None = None,
+        observation_count: int = 1,
+        candidate_track_id: int | None = None,
     ) -> None:
         with self.connection:
             self.connection.execute(
                 """INSERT OR REPLACE INTO weed_detections(
                 detection_id,config_entry_id,image_id,image_timestamp,x,y,z,area_mm2,
                 radius_mm,confidence,overlay_path,review_path,status,center_px_x,center_px_y,
-                processed_width,processed_height)
-                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                processed_width,processed_height,heuristic_confidence,verifier_confidence,
+                features_json,crop_path,observation_count,candidate_track_id)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     detection_id,
                     config_entry_id,
@@ -522,6 +594,185 @@ class Database:
                     center_px_y,
                     processed_width,
                     processed_height,
+                    heuristic_confidence,
+                    verifier_confidence,
+                    json.dumps(features or {}, separators=(",", ":")),
+                    crop_path,
+                    observation_count,
+                    candidate_track_id,
+                ),
+            )
+
+    def observe_weed_candidate(
+        self,
+        *,
+        config_entry_id: str,
+        image_id: int,
+        seen_at: datetime,
+        x: float,
+        y: float,
+        confidence: float,
+        match_distance_mm: float,
+        max_gap_hours: int,
+    ) -> dict:
+        cutoff = seen_at.timestamp() - max_gap_hours * 3600
+        matches = []
+        for row in self.connection.execute(
+            """SELECT * FROM weed_candidate_tracks
+            WHERE config_entry_id=? AND status='active'""",
+            (config_entry_id,),
+        ):
+            try:
+                last_seen = datetime.fromisoformat(row["last_seen_at"]).timestamp()
+            except (TypeError, ValueError):
+                continue
+            distance = math.hypot(float(row["x"]) - x, float(row["y"]) - y)
+            if last_seen >= cutoff and distance <= match_distance_mm:
+                matches.append((distance, row))
+        if not matches:
+            with self.connection:
+                cursor = self.connection.execute(
+                    """INSERT INTO weed_candidate_tracks(
+                    config_entry_id,x,y,observations,first_seen_at,last_seen_at,last_image_id,
+                    mean_confidence,status) VALUES(?,?,?,?,?,?,?,?,?)""",
+                    (
+                        config_entry_id,
+                        x,
+                        y,
+                        1,
+                        seen_at.isoformat(),
+                        seen_at.isoformat(),
+                        image_id,
+                        confidence,
+                        "active",
+                    ),
+                )
+            return {
+                "id": int(cursor.lastrowid),
+                "observations": 1,
+                "x": x,
+                "y": y,
+                "mean_confidence": confidence,
+            }
+        _, row = min(matches, key=lambda item: item[0])
+        observations = int(row["observations"])
+        if int(row["last_image_id"]) == image_id:
+            return dict(row)
+        next_count = observations + 1
+        next_x = (float(row["x"]) * observations + x) / next_count
+        next_y = (float(row["y"]) * observations + y) / next_count
+        next_confidence = (
+            float(row["mean_confidence"]) * observations + confidence
+        ) / next_count
+        with self.connection:
+            self.connection.execute(
+                """UPDATE weed_candidate_tracks SET x=?,y=?,observations=?,last_seen_at=?,
+                last_image_id=?,mean_confidence=? WHERE id=?""",
+                (
+                    next_x,
+                    next_y,
+                    next_count,
+                    seen_at.isoformat(),
+                    image_id,
+                    next_confidence,
+                    row["id"],
+                ),
+            )
+        return {
+            "id": int(row["id"]),
+            "observations": next_count,
+            "x": next_x,
+            "y": next_y,
+            "mean_confidence": next_confidence,
+        }
+
+    def supersede_pending_weed_detections(
+        self, config_entry_id: str, x: float, y: float, tolerance_mm: float
+    ) -> None:
+        ids = [
+            row["detection_id"]
+            for row in self.connection.execute(
+                """SELECT detection_id,x,y FROM weed_detections
+                WHERE config_entry_id=? AND status IN ('recommended','observing')""",
+                (config_entry_id,),
+            )
+            if math.hypot(float(row["x"]) - x, float(row["y"]) - y) <= tolerance_mm
+        ]
+        with self.connection:
+            self.connection.executemany(
+                "UPDATE weed_detections SET status='superseded' WHERE detection_id=?",
+                ((detection_id,) for detection_id in ids),
+            )
+
+    def has_terminal_weed_detection_near(
+        self, config_entry_id: str, x: float, y: float, tolerance_mm: float
+    ) -> bool:
+        for row in self.connection.execute(
+            """SELECT x,y FROM weed_detections
+            WHERE config_entry_id=? AND status IN ('created','rejected')""",
+            (config_entry_id,),
+        ):
+            if math.hypot(float(row[0]) - x, float(row[1]) - y) <= tolerance_mm:
+                return True
+        return False
+
+    def label_weed_detection(self, detection_id: str, label: str) -> bool:
+        target = self.connection.execute(
+            """SELECT detection_id,features_json,crop_path FROM weed_detections
+            WHERE detection_id=?""",
+            (detection_id,),
+        ).fetchone()
+        if target is None:
+            return False
+        with self.connection:
+            self.connection.execute(
+                """INSERT INTO weed_training_samples(detection_id,label,features_json,crop_path)
+                VALUES(?,?,?,?) ON CONFLICT(detection_id) DO UPDATE SET
+                label=excluded.label,features_json=excluded.features_json,
+                crop_path=excluded.crop_path,created_at=CURRENT_TIMESTAMP""",
+                (detection_id, label, target["features_json"], target["crop_path"]),
+            )
+        return True
+
+    def weed_training_samples(self) -> list[dict]:
+        samples = []
+        for row in self.connection.execute(
+            "SELECT * FROM weed_training_samples ORDER BY created_at,detection_id"
+        ):
+            item = dict(row)
+            try:
+                item["features"] = json.loads(item.pop("features_json"))
+            except (TypeError, json.JSONDecodeError):
+                item["features"] = {}
+            samples.append(item)
+        return samples
+
+    def weed_training_summary(self) -> dict[str, int]:
+        summary = {
+            "weed": 0,
+            "crop": 0,
+            "mulch_soil": 0,
+            "fungus_moss": 0,
+            "hardware_other": 0,
+        }
+        for row in self.connection.execute(
+            "SELECT label,COUNT(*) AS count FROM weed_training_samples GROUP BY label"
+        ):
+            summary[str(row["label"])] = int(row["count"])
+        return summary
+
+    def record_weed_model_run(self, model: dict) -> None:
+        with self.connection:
+            self.connection.execute(
+                """INSERT INTO weed_model_runs(
+                created_at,sample_count,positive_count,negative_count,metrics_json)
+                VALUES(?,?,?,?,?)""",
+                (
+                    model["created_at"],
+                    model["sample_count"],
+                    model["positive_count"],
+                    model["negative_count"],
+                    json.dumps(model["metrics"], separators=(",", ":")),
                 ),
             )
 
@@ -529,7 +780,7 @@ class Database:
         return [
             dict(row)
             for row in self.connection.execute(
-                "SELECT * FROM weed_detections WHERE status='recommended' "
+                "SELECT * FROM weed_detections WHERE status IN ('recommended','observing') "
                 "ORDER BY image_timestamp DESC LIMIT ?",
                 (limit,),
             )
@@ -566,7 +817,7 @@ class Database:
                 row[0]
                 for row in self.connection.execute(
                     """SELECT detection_id,x,y FROM weed_detections
-                    WHERE config_entry_id=? AND status IN ('recommended','rejected')""",
+                    WHERE config_entry_id=? AND status IN ('recommended','observing','rejected')""",
                     (target["config_entry_id"],),
                 )
                 if math.hypot(
@@ -822,20 +1073,72 @@ class Database:
                 representative[field] = cls._weighted_median(
                     [(float(row[field]), weight) for row, weight in selected]
                 )
+            fused = next(
+                (
+                    row
+                    for row in ordered
+                    if row.get("fused_canopy")
+                    and row.get("fused_maximum_radius_mm") is not None
+                    and row.get("fused_recommended_radius_mm") is not None
+                ),
+                None,
+            )
+            if fused is not None:
+                representative["typical_canopy_radius_mm"] = float(
+                    fused["fused_typical_radius_mm"]
+                )
+                representative["maximum_accepted_canopy_radius_mm"] = float(
+                    fused["fused_maximum_radius_mm"]
+                )
+                representative["recommended_protection_radius_mm"] = float(
+                    fused["fused_recommended_radius_mm"]
+                )
+                representative["confidence"] = float(fused["fused_confidence"])
+                for field in (
+                    "fused_canopy",
+                    "fused_typical_radius_mm",
+                    "fused_maximum_radius_mm",
+                    "fused_recommended_radius_mm",
+                    "fused_confidence",
+                    "fusion_view_count",
+                    "fusion_angular_coverage",
+                    "fusion_corroborated_fraction",
+                    "fusion_disagreement_mm",
+                    "fusion_reliable",
+                    "fusion_diagnostic_path",
+                ):
+                    representative[field] = fused.get(field)
+                if not bool(fused.get("fusion_reliable")):
+                    representative["decision"] = "uncertain"
         paths: list[str] = []
+        representative["composite_path"] = next(
+            (row["composite_path"] for row in ordered if row.get("composite_path")),
+            None,
+        )
+        representative["composite_overlay_path"] = next(
+            (
+                row["composite_overlay_path"]
+                for row in ordered
+                if row.get("composite_overlay_path")
+            ),
+            None,
+        )
         for row in ordered:
-            candidates = []
-            if row.get("composite_path"):
-                candidates.append(row["composite_path"])
-            candidates.extend(row.get("artifact_paths") or [])
-            for path in candidates:
+            for path in row.get("artifact_paths") or []:
                 if path and path not in paths:
                     paths.append(path)
         representative["artifact_paths"] = paths
         representative["source_measurement_ids"] = [str(row["measurement_id"]) for row in ordered]
         representative["measurement_count"] = len(ordered)
         representative["reason"] = (
-            f"Consolidated from {len(ordered)} images using confidence, visible canopy "
+            (
+                f"Fused plant ownership masks from {representative['fusion_view_count']} "
+                f"images; angular coverage "
+                f"{float(representative['fusion_angular_coverage']):.0%}, corroborated "
+                f"{float(representative['fusion_corroborated_fraction']):.0%}"
+            )
+            if representative.get("fused_canopy")
+            else f"Consolidated from {len(ordered)} images using confidence, visible canopy "
             "percentage and recency"
         )
         return representative
@@ -966,11 +1269,43 @@ class Database:
                 [(candidate[0], action, payload) for candidate in candidate_rows],
             )
 
-    def set_composite_path(self, measurement_ids: list[str], path: str) -> None:
+    def set_composite_path(
+        self,
+        measurement_ids: list[str],
+        path: str,
+        overlay_path: str | None = None,
+    ) -> None:
         with self.connection:
             self.connection.executemany(
-                "UPDATE measurements SET composite_path=? WHERE measurement_id=?",
-                [(path, measurement_id) for measurement_id in measurement_ids],
+                "UPDATE measurements SET composite_path=?,composite_overlay_path=? "
+                "WHERE measurement_id=?",
+                [(path, overlay_path, measurement_id) for measurement_id in measurement_ids],
+            )
+
+    def set_fused_canopy(self, measurement_ids: list[str], values: dict) -> None:
+        with self.connection:
+            self.connection.executemany(
+                """UPDATE measurements SET fused_canopy=1,fused_typical_radius_mm=?,
+                fused_maximum_radius_mm=?,fused_recommended_radius_mm=?,
+                fused_confidence=?,fusion_view_count=?,fusion_angular_coverage=?,
+                fusion_corroborated_fraction=?,fusion_disagreement_mm=?,
+                fusion_reliable=?,fusion_diagnostic_path=? WHERE measurement_id=?""",
+                [
+                    (
+                        values["fused_typical_radius_mm"],
+                        values["fused_maximum_radius_mm"],
+                        values["fused_recommended_radius_mm"],
+                        values["fused_confidence"],
+                        values["fusion_view_count"],
+                        values["fusion_angular_coverage"],
+                        values["fusion_corroborated_fraction"],
+                        values["fusion_disagreement_mm"],
+                        int(values["fusion_reliable"]),
+                        values.get("fusion_diagnostic_path"),
+                        measurement_id,
+                    )
+                    for measurement_id in measurement_ids
+                ],
             )
 
     def create_curve_proposal(
