@@ -129,6 +129,36 @@ def test_measurement_preserves_recorded_and_recommended_centers(tmp_path):
     assert row["recommended_center_y"] == 500.0
 
 
+def test_fused_canopy_provenance_round_trips_and_overrides_consolidation(tmp_path):
+    database = Database(tmp_path / "db.sqlite")
+    first = _measurement(
+        image_id=1,
+        fused_canopy=True,
+        fused_typical_radius_mm=100,
+        fused_maximum_radius_mm=120,
+        fused_recommended_radius_mm=145,
+        fused_confidence=0.91,
+        fusion_view_count=2,
+        fusion_angular_coverage=0.94,
+        fusion_corroborated_fraction=0.7,
+        fusion_disagreement_mm=8,
+        fusion_reliable=True,
+        fusion_diagnostic_path="/data/artifacts/fusion.jpg",
+    )
+    second = _measurement(image_id=2)
+    database.save_measurements([first, second])
+
+    row = database.measurement(str(first.measurement_id))
+    consolidated = database.pending_measurements()[0]
+
+    assert row["fused_maximum_radius_mm"] == 120
+    assert row["fusion_reliable"] == 1
+    assert consolidated["fused_canopy"] == 1
+    assert consolidated["maximum_accepted_canopy_radius_mm"] == 120
+    assert consolidated["recommended_protection_radius_mm"] == 145
+    assert consolidated["fusion_diagnostic_path"].endswith("fusion.jpg")
+
+
 def test_derived_calibration_does_not_clobber_manual(tmp_path):
     database = Database(tmp_path / "db.sqlite")
     manual = database.save_calibration(
@@ -263,7 +293,12 @@ def test_removal_artifacts_migrate_persist_and_count_distinct_images(tmp_path):
     database.save_measurements([present, first_absent, same_image_again])
 
     columns = {row[1] for row in database.connection.execute("PRAGMA table_info(measurements)")}
-    assert {"artifact_paths_json", "vegetation_absent", "absent_observations"} <= columns
+    assert {
+        "artifact_paths_json",
+        "vegetation_absent",
+        "absent_observations",
+        "composite_overlay_path",
+    } <= columns
     saved = database.measurement(str(present.measurement_id))
     assert saved is not None
     assert json.loads(saved["artifact_paths_json"]) == present.artifact_paths
@@ -308,6 +343,73 @@ def test_rejected_weed_position_suppresses_future_detections_after_restart(tmp_p
     restarted = Database(path)
     assert restarted.has_weed_detection_near("bot-1", 103, 202, 20) is True
     assert restarted.has_weed_detection_near("bot-2", 103, 202, 20) is False
+
+
+def test_weed_candidate_tracking_and_training_labels_survive_restart(tmp_path):
+    path = tmp_path / "db.sqlite"
+    database = Database(path)
+    first = database.observe_weed_candidate(
+        config_entry_id="bot-1",
+        image_id=1,
+        seen_at=datetime(2026, 7, 23, tzinfo=UTC),
+        x=100,
+        y=200,
+        confidence=0.7,
+        match_distance_mm=25,
+        max_gap_hours=72,
+    )
+    repeated_image = database.observe_weed_candidate(
+        config_entry_id="bot-1",
+        image_id=1,
+        seen_at=datetime(2026, 7, 23, tzinfo=UTC),
+        x=103,
+        y=201,
+        confidence=0.8,
+        match_distance_mm=25,
+        max_gap_hours=72,
+    )
+    second = database.observe_weed_candidate(
+        config_entry_id="bot-1",
+        image_id=2,
+        seen_at=datetime(2026, 7, 24, tzinfo=UTC),
+        x=104,
+        y=202,
+        confidence=0.9,
+        match_distance_mm=25,
+        max_gap_hours=72,
+    )
+    assert first["observations"] == repeated_image["observations"] == 1
+    assert second["id"] == first["id"]
+    assert second["observations"] == 2
+
+    detection_id = str(uuid4())
+    database.save_weed_detection(
+        detection_id=detection_id,
+        config_entry_id="bot-1",
+        image_id=2,
+        image_timestamp=datetime(2026, 7, 24, tzinfo=UTC),
+        x=104,
+        y=202,
+        z=0,
+        area_mm2=90,
+        radius_mm=15,
+        confidence=0.85,
+        heuristic_confidence=0.8,
+        verifier_confidence=0.9,
+        features={"strong_green_fraction": 0.8},
+        crop_path="/data/artifacts/candidate.jpg",
+        overlay_path=None,
+        observation_count=2,
+        candidate_track_id=first["id"],
+    )
+    assert database.label_weed_detection(detection_id, "weed") is True
+    database.connection.close()
+
+    restarted = Database(path)
+    sample = restarted.weed_training_samples()[0]
+    assert sample["label"] == "weed"
+    assert sample["features"]["strong_green_fraction"] == 0.8
+    assert restarted.weed_detection(detection_id)["observation_count"] == 2
 
 
 @pytest.mark.asyncio

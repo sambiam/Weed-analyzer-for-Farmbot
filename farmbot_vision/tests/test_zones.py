@@ -100,14 +100,16 @@ def test_exclusion_allowance_overrides_a_surrounding_exclusion():
     assert not weeds_allowed(zones, 100, 100).allowed
 
 
-def test_radius_must_fit_inside_the_boundary_and_avoid_exclusions():
+def test_radius_may_extend_past_the_boundary_but_must_avoid_exclusions():
     zones = [_bed()]
     assert plant_radius_allowed(zones, 500, 500, 200).allowed
-    # A disc reaching past the boundary edge is refused, unlike its centre.
+    # The disc may reach past the boundary edge; only its centre must be inside.
     assert plant_center_allowed(zones, 950, 500).allowed
-    tight = plant_radius_allowed(zones, 950, 500, 100)
-    assert not tight.allowed
-    assert "does not fit inside" in tight.reason
+    assert plant_radius_allowed(zones, 950, 500, 100).allowed
+    # The centre itself still has to fall inside the boundary.
+    outside_center = plant_radius_allowed(zones, 1_050, 500, 100)
+    assert not outside_center.allowed
+    assert "is outside" in outside_center.reason
 
     zones.append(
         Zone(
