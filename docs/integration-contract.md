@@ -1,9 +1,9 @@
 # Companion FarmBot integration contract
 
 Contract version: **farmbot-vision-v2**. Minimum compatible companion FarmBot
-integration release: **1.7.0** (the release that implements acknowledged
-soil-height capture and reviewed soil-point updates in addition to the
-returned-JPEG contract and known-weed writes). Version 1.7.0 of the companion integration in the sibling
+integration release: **1.8.0** (the release that implements clear-site
+soil-height capture and reviewed stale-point relocation in addition to the
+returned-JPEG contract and known-weed writes). Version 1.8.0 of the companion integration in the sibling
 `Farmbot-for-Home-Assistant` repository implements this contract.
 
 All actions are in the `farmbot` domain. Response actions must support Home Assistant service response data. Unknown, invalid, or unauthorised fields must fail rather than be coerced. Timestamps are ISO-8601. The integration remains the only component that talks to FarmBot APIs.
@@ -63,8 +63,10 @@ plus the current position, connected/busy/emergency-stop state, Z direction and
 axis bounds. A matching display name alone is never sufficient.
 
 `farmbot.start_vision_soil_capture` accepts `config_entry_id`, `point_id`,
-`capture_z`, `baseline_mm`, and `z_offsets_mm`. Use `[0]` for a measurement and
-`[0,25,50]` for calibration. It returns a `capture_id` immediately. The
+optional paired `capture_x`/`capture_y`, `capture_z`, `baseline_mm`, and
+`z_offsets_mm`. Use `[0]` for a measurement and `[0,25,50]` for calibration.
+A relocated capture must be less than 200 mm from a point last updated more
+than 14 days ago. It returns a `capture_id` immediately. The
 integration validates the bot and bounds, uses acknowledged safe-Z movement,
 captures `-baseline, 0, +baseline` along Y (or an actual-coordinate one-sided
 triplet at an edge), waits for processed images, claims those image IDs from
@@ -76,10 +78,13 @@ message, and completed frames as `image_id`, `x`, `y`, `z`,
 `lateral_offset_mm`, and `z_offset_mm`.
 
 `farmbot.apply_vision_soil_height` accepts `config_entry_id`, `point_id`,
-`measurement_id`, expected `x/y/z`, `recommended_z_mm`, `confidence`, `apply`,
-and `human_approved`. Writes require both booleans, re-fetch the point, enforce
-a 0.5 mm coordinate tolerance and Z bounds, and patch only `z`. Missing,
-discarded, wrong-type, stale, non-finite, and unrecognized points fail closed.
+`measurement_id`, expected `x/y/z` and `updated_at`, recommended `x/y/z`,
+`confidence`, `apply`, and `human_approved`. Writes require both booleans,
+re-fetch the point, enforce a 0.5 mm coordinate tolerance, unchanged timestamp,
+axis bounds, age over 14 days, and relocation under 200 mm. The existing point
+is relocated and its Z is updated without replacing its metadata. Missing,
+discarded, wrong-type, fresh, changed, non-finite, and unrecognized points fail
+closed.
 
 ## `farmbot.apply_vision_radius`
 
@@ -154,7 +159,7 @@ processes only the named image. Manual requests retain the payload above.
 8. Emit the request event from integration services/UI controls.
 9. Add contract, malformed-response, authentication, reauthentication, stale-write, and permission tests.
 10. Declare the minimum companion version once that integration release exists.
-    **Done: companion 1.7.0 implements the image, known-weed and soil-height
+    **Done: companion 1.8.0 implements the image, known-weed and clear-site soil-height
     contracts.**
 
 ## Contract v2 summary of required integration capabilities
@@ -164,4 +169,4 @@ processes only the named image. Manual requests retain the payload above.
 3. `resize_scale_x/y` equal to processed÷oriented in each axis.
 4. `processed_calibration` (basis `processed_image`) when calibration is known, plus reference dimensions on `camera_calibration`.
 
-The minimum compatible companion integration version is **1.7.0**.
+The minimum compatible companion integration version is **1.8.0**.

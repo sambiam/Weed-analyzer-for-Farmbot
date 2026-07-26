@@ -214,6 +214,12 @@ MIGRATIONS = [
     CREATE UNIQUE INDEX IF NOT EXISTS idx_soil_calibrations_version
       ON soil_calibrations(config_entry_id,version);
     """,
+    """
+    ALTER TABLE soil_measurements ADD COLUMN point_updated_at TEXT;
+    ALTER TABLE soil_measurements ADD COLUMN capture_x REAL;
+    ALTER TABLE soil_measurements ADD COLUMN capture_y REAL;
+    ALTER TABLE soil_measurements ADD COLUMN relocation_distance_mm REAL;
+    """,
 ]
 
 
@@ -593,6 +599,37 @@ class Database:
             if math.hypot(float(row[0]) - x, float(row[1]) - y) <= tolerance_mm:
                 return True
         return False
+
+    def current_vision_weeds(self, config_entry_id: str) -> list[dict]:
+        return [
+            dict(row)
+            for row in self.connection.execute(
+                """SELECT x,y,radius_mm FROM weed_detections
+                WHERE config_entry_id=? AND status IN ('recommended','created')""",
+                (config_entry_id,),
+            )
+        ]
+
+    def current_vision_plants(self, config_entry_id: str) -> list[dict]:
+        """Return the newest positive canopy detection for each plant."""
+        return [
+            dict(row)
+            for row in self.connection.execute(
+                """SELECT m.recorded_center_x AS x,m.recorded_center_y AS y,
+                MAX(m.current_radius_mm,m.maximum_accepted_canopy_radius_mm,
+                    m.recommended_protection_radius_mm) AS radius_mm
+                FROM measurements m
+                WHERE m.config_entry_id=? AND m.vegetation_absent=0
+                  AND m.recorded_center_x IS NOT NULL
+                  AND m.recorded_center_y IS NOT NULL
+                  AND m.image_timestamp=(
+                    SELECT MAX(newest.image_timestamp) FROM measurements newest
+                    WHERE newest.config_entry_id=m.config_entry_id
+                      AND newest.plant_id=m.plant_id
+                  )""",
+                (config_entry_id,),
+            )
+        ]
 
     def latest_mask_path(self, plant_id: int) -> str | None:
         row = self.connection.execute(
@@ -1095,7 +1132,9 @@ class Database:
                 measurement_id,config_entry_id,point_id,point_name,expected_x,expected_y,
                 old_z_mm,proposed_z_mm,confidence,uncertainty_mm,status,reason,capture_id,
                 calibration_id,frame_ids_json,metrics_json,artifact_paths_json,
-                algorithm_version,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                algorithm_version,created_at,point_updated_at,capture_x,capture_y,
+                relocation_distance_mm)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     str(measurement.measurement_id),
                     measurement.config_entry_id,
@@ -1116,6 +1155,14 @@ class Database:
                     json.dumps(measurement.artifact_paths, separators=(",", ":")),
                     measurement.algorithm_version,
                     measurement.created_at.isoformat(),
+                    (
+                        measurement.point_updated_at.isoformat()
+                        if measurement.point_updated_at
+                        else None
+                    ),
+                    measurement.capture_x,
+                    measurement.capture_y,
+                    measurement.relocation_distance_mm,
                 ),
             )
 

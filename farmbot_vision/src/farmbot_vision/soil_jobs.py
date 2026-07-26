@@ -13,9 +13,12 @@ from uuid import UUID, uuid4
 from .database import Database
 from .home_assistant import HomeAssistantClient
 from .models import (
+    InventoryRequest,
     SoilCaptureStartRequest,
     SoilMeasurement,
     SoilPoint,
+    SoilPointInventory,
+    SoilSite,
     VisionImageRequest,
 )
 from .soil_height import (
@@ -24,6 +27,8 @@ from .soil_height import (
     analyse_soil_height,
     fit_calibration,
 )
+from .soil_sites import plan_safe_soil_sites
+from .zones import ZoneStore
 
 LOGGER = logging.getLogger(__name__)
 
@@ -37,11 +42,13 @@ class SoilJobManager:
         client: HomeAssistantClient,
         data_dir: Path,
         shared_lock: asyncio.Lock,
+        zone_store: ZoneStore,
     ):
         self.db = database
         self.client = client
         self.data_dir = data_dir
         self.shared_lock = shared_lock
+        self.zone_store = zone_store
         self.task: asyncio.Task | None = None
         self.stop_requested = False
         self.current: dict = {"status": "idle", "message": "Not run"}
@@ -73,7 +80,6 @@ class SoilJobManager:
         capture_z: float,
         baseline_mm: float,
         reference_distance_mm: float,
-        z_direction: int,
     ) -> str:
         return self._start(
             lambda job_id: self._run_calibration(
@@ -83,7 +89,6 @@ class SoilJobManager:
                 capture_z=capture_z,
                 baseline_mm=baseline_mm,
                 reference_distance_mm=reference_distance_mm,
-                z_direction=z_direction,
             ),
             name="soil-calibration",
         )
@@ -134,6 +139,38 @@ class SoilJobManager:
         return ordered
 
     @staticmethod
+    def _nearest_site_order(
+        sites: list[SoilSite], start_x: float, start_y: float
+    ) -> list[SoilSite]:
+        remaining, ordered = list(sites), []
+        x, y = start_x, start_y
+        while remaining:
+            site = min(
+                remaining,
+                key=lambda item: math.hypot(item.capture_x - x, item.capture_y - y),
+            )
+            remaining.remove(site)
+            ordered.append(site)
+            x, y = site.capture_x, site.capture_y
+        return ordered
+
+    async def safe_sites(
+        self, config_entry_id: str, baseline_mm: float
+    ) -> tuple[SoilPointInventory, list[SoilSite]]:
+        soil, garden = await asyncio.gather(
+            self.client.soil_points(config_entry_id),
+            self.client.inventory(InventoryRequest(config_entry_id=config_entry_id)),
+        )
+        return soil, plan_safe_soil_sites(
+            soil,
+            garden,
+            self.db.current_vision_plants(config_entry_id),
+            self.db.current_vision_weeds(config_entry_id),
+            self.zone_store.zones(),
+            baseline_mm=baseline_mm,
+        )
+
+    @staticmethod
     def _declared_camera_signature(images) -> str:
         signatures = {
             json.dumps(
@@ -154,6 +191,8 @@ class SoilJobManager:
         *,
         config_entry_id: str,
         point_id: int,
+        capture_x: float,
+        capture_y: float,
         capture_z: float,
         baseline_mm: float,
         z_offsets_mm: list[float],
@@ -162,6 +201,8 @@ class SoilJobManager:
             SoilCaptureStartRequest(
                 config_entry_id=config_entry_id,
                 point_id=point_id,
+                capture_x=capture_x,
+                capture_y=capture_y,
                 capture_z=capture_z,
                 baseline_mm=baseline_mm,
                 z_offsets_mm=z_offsets_mm,
@@ -232,15 +273,28 @@ class SoilJobManager:
         capture_z: float,
         baseline_mm: float,
         reference_distance_mm: float,
-        z_direction: int,
     ) -> None:
         self.db.start_soil_job(job_id, config_entry_id, "calibration", [point_id])
         try:
             async with self.shared_lock:
-                self.current.update(status="running", message="Capturing calibration images")
+                inventory, sites = await self.safe_sites(config_entry_id, baseline_mm)
+                site = next((item for item in sites if item.point_id == point_id), None)
+                if site is None:
+                    raise SoilHeightError(
+                        "selected calibration point no longer has a plant- and weed-free site"
+                    )
+                self.current.update(
+                    status="running",
+                    message=(
+                        "Capturing calibration images on clear soil at "
+                        f"({site.capture_x:.0f}, {site.capture_y:.0f})"
+                    ),
+                )
                 capture_id, frames, signature = await self._capture_frames(
                     config_entry_id=config_entry_id,
                     point_id=point_id,
+                    capture_x=site.capture_x,
+                    capture_y=site.capture_y,
                     capture_z=capture_z,
                     baseline_mm=baseline_mm,
                     z_offsets_mm=[0, 25, 50],
@@ -252,7 +306,7 @@ class SoilJobManager:
                     capture_z=capture_z,
                     baseline_mm=baseline_mm,
                     reference_distance_mm=reference_distance_mm,
-                    z_direction=z_direction,
+                    z_direction=inventory.motion.z_direction,
                     frames=frames,
                     declared_camera_signature=signature,
                 )
@@ -295,13 +349,17 @@ class SoilJobManager:
         completed = failed = 0
         try:
             async with self.shared_lock:
-                inventory = await self.client.soil_points(config_entry_id)
-                wanted = [point for point in inventory.points if point.id in set(point_ids)]
+                inventory, sites = await self.safe_sites(config_entry_id, baseline_mm)
+                wanted = [site for site in sites if site.point_id in set(point_ids)]
                 if len(wanted) != len(set(point_ids)):
-                    raise SoilHeightError("one or more selected soil points no longer exist")
+                    raise SoilHeightError(
+                        "one or more selected points are no longer stale or clear"
+                    )
                 position = inventory.motion.position
-                ordered = self._nearest_order(
-                    wanted, float(position.get("x") or 0), float(position.get("y") or 0)
+                ordered = self._nearest_site_order(
+                    wanted,
+                    float(position.get("x") or 0),
+                    float(position.get("y") or 0),
                 )
                 calibration = self.db.active_soil_calibration(config_entry_id)
                 if calibration is None:
@@ -312,17 +370,19 @@ class SoilJobManager:
                     raise SoilHeightError(
                         "FarmBot Z direction changed; recalibrate before measuring"
                     )
-                for point in ordered:
+                for site in ordered:
                     if self.stop_requested:
                         break
                     self.current.update(
                         status="running",
-                        current_point_id=point.id,
-                        message=f"Measuring {point.name} at ({point.x:.0f}, {point.y:.0f})",
+                        current_point_id=site.point_id,
+                        message=(
+                            f"Measuring clear soil at ({site.capture_x:.0f}, {site.capture_y:.0f})"
+                        ),
                     )
                     self.db.update_soil_job(
                         job_id,
-                        current_point_id=point.id,
+                        current_point_id=site.point_id,
                         completed_count=completed,
                         failed_count=failed,
                         message=self.current["message"],
@@ -330,7 +390,9 @@ class SoilJobManager:
                     try:
                         capture_id, frames, signature = await self._capture_frames(
                             config_entry_id=config_entry_id,
-                            point_id=point.id,
+                            point_id=site.point_id,
+                            capture_x=site.capture_x,
+                            capture_y=site.capture_y,
                             capture_z=capture_z,
                             baseline_mm=baseline_mm,
                             z_offsets_mm=[0],
@@ -347,11 +409,15 @@ class SoilJobManager:
                         measurement = SoilMeasurement(
                             measurement_id=analysis.measurement_id,
                             config_entry_id=config_entry_id,
-                            point_id=point.id,
-                            point_name=point.name,
-                            expected_x=point.x,
-                            expected_y=point.y,
-                            old_z_mm=point.z,
+                            point_id=site.point_id,
+                            point_name=site.point_name,
+                            expected_x=site.expected_x,
+                            expected_y=site.expected_y,
+                            old_z_mm=site.expected_z,
+                            point_updated_at=site.point_updated_at,
+                            capture_x=site.capture_x,
+                            capture_y=site.capture_y,
+                            relocation_distance_mm=site.relocation_distance_mm,
                             proposed_z_mm=analysis.proposed_z_mm,
                             confidence=analysis.confidence,
                             uncertainty_mm=analysis.uncertainty_mm,
@@ -373,11 +439,15 @@ class SoilJobManager:
                         measurement = SoilMeasurement(
                             measurement_id=uuid4(),
                             config_entry_id=config_entry_id,
-                            point_id=point.id,
-                            point_name=point.name,
-                            expected_x=point.x,
-                            expected_y=point.y,
-                            old_z_mm=point.z,
+                            point_id=site.point_id,
+                            point_name=site.point_name,
+                            expected_x=site.expected_x,
+                            expected_y=site.expected_y,
+                            old_z_mm=site.expected_z,
+                            point_updated_at=site.point_updated_at,
+                            capture_x=site.capture_x,
+                            capture_y=site.capture_y,
+                            relocation_distance_mm=site.relocation_distance_mm,
                             status="failed",
                             reason=str(err)[:240] or "Soil measurement failed",
                             calibration_id=calibration.calibration_id,

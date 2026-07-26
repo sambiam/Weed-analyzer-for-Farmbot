@@ -73,7 +73,7 @@ client = HomeAssistantClient()
 weed_settings_store = WeedSettingsStore(settings.data_dir / "weed_settings.json")
 zone_store = ZoneStore(settings.data_dir / "zones.json")
 jobs = JobManager(settings, database, client, weed_settings_store, zone_store)
-soil_jobs = SoilJobManager(database, client, settings.data_dir, jobs.lock)
+soil_jobs = SoilJobManager(database, client, settings.data_dir, jobs.lock, zone_store)
 
 
 def _calibration_from_input(entry_id: str, values: FarmbotCalibrationInput) -> Calibration:
@@ -851,9 +851,17 @@ border-radius:50%;border:3px solid #168cff;box-shadow:0 0 0 1px #001b3d}}
 td.actions{{min-width:9rem}}.actions-group{{display:flex;flex-direction:column;align-items:stretch;gap:.4rem}}
 .actions-group form{{margin:0}}.actions-group button{{width:100%;padding:.45rem .8rem;font-size:.9rem}}
 .actions-group button[data-artifacts]{{background:#e4ede7;color:var(--dark)}}
+.hint{{display:inline-flex;align-items:center;justify-content:center;width:1.1em;height:1.1em;
+border-radius:50%;background:var(--muted);color:white;font-size:.72em;font-weight:bold;
+margin-left:.3em;cursor:help;vertical-align:middle;line-height:1}}
 </style></head><body><header><h1>🌱 FarmBot Vision</h1><nav><a href="./">Analysis</a><a href="soil-height">Soil height</a><a href="settings">Calibration</a><a href="weed-settings">Weed settings</a><a href="zones">Boundaries &amp; zones</a><a href="api/health">Health JSON</a></nav></header>
 <main>{body}</main></body></html>"""
     )
+
+
+def hint(text: str) -> str:
+    """A small hover-tooltip badge ("?") explaining a nearby form field."""
+    return f'<span class=hint tabindex=0 title="{escape(text, quote=True)}">?</span>'
 
 
 @app.get("/health")
@@ -1286,14 +1294,16 @@ def _soil_artifacts(paths: list[str]) -> str:
 async def soil_height_page(request: Request) -> HTMLResponse:
     entry_id = settings.selected_config_entry_id
     inventory = None
+    sites = []
     inventory_error = ""
+    calibration = database.active_soil_calibration(entry_id) if entry_id else None
+    planning_baseline = calibration.baseline_mm if calibration else 15
     if entry_id:
         try:
-            inventory = await client.soil_points(entry_id)
+            inventory, sites = await soil_jobs.safe_sites(entry_id, planning_baseline)
         except HomeAssistantError as exc:
             inventory_error = str(exc)
     measurements = database.recent_soil_measurements(entry_id, 200)
-    calibration = database.active_soil_calibration(entry_id) if entry_id else None
     persisted_job = database.latest_soil_job(entry_id)
     current_job = soil_jobs.current if soil_jobs.running else (persisted_job or soil_jobs.current)
 
@@ -1305,8 +1315,8 @@ async def soil_height_page(request: Request) -> HTMLResponse:
     point_options = ""
     retry_ids: list[int] = []
     if inventory:
-        for point in inventory.points:
-            measurement = latest_by_point.get(point.id)
+        for site in sites:
+            measurement = latest_by_point.get(site.point_id)
             status = measurement["status"] if measurement else "not measured"
             proposed = (
                 f"{measurement['proposed_z_mm']:.0f} mm"
@@ -1322,7 +1332,7 @@ async def soil_height_page(request: Request) -> HTMLResponse:
             reason = escape(measurement["reason"] if measurement else "")
             diagnostics = _soil_artifacts(measurement["artifact_paths"] if measurement else [])
             if measurement and measurement["status"] == "failed":
-                retry_ids.append(point.id)
+                retry_ids.append(site.point_id)
             apply_control = ""
             if measurement and measurement["status"] == "valid":
                 measurement_id = escape(measurement["measurement_id"], quote=True)
@@ -1334,34 +1344,50 @@ async def soil_height_page(request: Request) -> HTMLResponse:
                 )
             point_rows += (
                 "<tr>"
-                f'<td><input form=measure-points type=checkbox name=point_ids value="{point.id}"></td>'
-                f"<td>{point.id}</td><td>{escape(point.name)}</td>"
-                f"<td>{point.x:.1f}, {point.y:.1f}</td><td>{point.z:.1f} mm</td>"
+                f'<td><input form=measure-points type=checkbox name=point_ids value="{site.point_id}"></td>'
+                f"<td>{site.point_id}</td><td>{escape(site.point_name)}</td>"
+                f"<td>{site.expected_x:.1f}, {site.expected_y:.1f}</td>"
+                f"<td>{site.capture_x:.1f}, {site.capture_y:.1f}</td>"
+                f"<td>{site.relocation_distance_mm:.1f} mm</td>"
+                f"<td>{site.point_updated_at.date().isoformat()}</td>"
+                f"<td>{site.expected_z:.1f} mm</td>"
                 f"<td>{proposed}</td><td>{uncertainty}</td><td>{confidence}</td>"
                 f"<td>{escape(status)}</td><td>{reason}</td><td>{diagnostics}</td>"
                 f"<td>{apply_control}</td></tr>"
             )
             point_options += (
-                f'<option value="{point.id}">{escape(point.name)} '
-                f"({point.x:.0f}, {point.y:.0f})</option>"
+                f'<option value="{site.point_id}">{escape(site.point_name)}: clear soil '
+                f"({site.capture_x:.0f}, {site.capture_y:.0f})</option>"
             )
 
-    valid_measurements = [item for item in measurements if item["status"] == "valid"]
+    valid_measurements = [
+        item
+        for item in measurements
+        if item["status"] == "valid"
+        and item.get("capture_x") is not None
+        and item.get("capture_y") is not None
+        and item.get("point_updated_at")
+    ]
     measurement_rows = "".join(
         "<tr>"
         f"<td><input form=apply-selected type=checkbox name=measurement_ids "
         f'value="{escape(item["measurement_id"], quote=True)}"></td>'
-        f"<td>{escape(item['point_name'])}</td><td>{item['old_z_mm']:.1f} mm</td>"
+        f"<td>{escape(item['point_name'])}</td>"
+        f"<td>{item['expected_x']:.1f}, {item['expected_y']:.1f}</td>"
+        f"<td>{item['capture_x']:.1f}, {item['capture_y']:.1f}</td>"
+        f"<td>{item['old_z_mm']:.1f} mm</td>"
         f"<td>{item['proposed_z_mm']:.0f} mm</td>"
         f"<td>{100 * item['confidence']:.0f}%</td>"
         f"<td>{escape(item['reason'])}</td></tr>"
         for item in valid_measurements
     )
     point_count = len(inventory.points) if inventory else 0
+    site_count = len(sites)
     warning = (
-        "<p class=warn>At least three valid soil points are required for FarmBot "
-        "soil-height interpolation.</p>"
-        if point_count < 3
+        "<p class=warn>Fewer than three stale soil points currently have a nearby "
+        "clear-soil replacement. FarmBot soil-height interpolation needs at least "
+        "three measured points.</p>"
+        if site_count < 3
         else ""
     )
     motion = inventory.motion if inventory else None
@@ -1381,6 +1407,19 @@ async def soil_height_page(request: Request) -> HTMLResponse:
     )
     default_capture_z = calibration.capture_z if calibration else 0
     default_baseline = calibration.baseline_mm if calibration else 15
+    capture_z_hint = hint(
+        "The FarmBot Z-axis (height) position the gantry moves to before taking soil "
+        "photos. During calibration the bot also steps down 25 mm and 50 mm from this "
+        "height to build the depth curve; during measurement it only captures here. "
+        "Use the same Capture Z every time — changing it invalidates the calibration."
+    )
+    baseline_hint = hint(
+        "How far, in mm, the camera shifts sideways (along Y) between the shots taken "
+        "at each point. This lateral shift is the 'virtual stereo' separation used to "
+        "compute soil depth from the difference between images, similar to the "
+        "distance between two eyes. It must match the value used for calibration — "
+        "changing it requires recalibrating."
+    )
     job_message = escape(str(current_job.get("message", "Not run")))
     job_status = escape(str(current_job.get("status", "idle")))
     retry_values = "".join(
@@ -1391,8 +1430,9 @@ async def soil_height_page(request: Request) -> HTMLResponse:
     )
     body = f"""
 <h2>Supplemental soil-height measurement</h2>
-<p>Captures three virtual-stereo views at each recognized FarmBot soil point. Results
-are reviewed here; the bot point is never updated automatically.</p>
+<p>Finds plant- and weed-free soil within 200 mm of FarmBot soil points that have
+not been updated for more than 14 days. Measurements are captured at those clear
+locations and, after review, replace the assigned stale point.</p>
 {warning}
 <section class=grid>
  <div class=card><h3>Bot</h3><p>{escape(entry_id or "No FarmBot selected")}</p>
@@ -1404,14 +1444,15 @@ are reviewed here; the bot point is never updated automatically.</p>
 </section>
 <section class=card>
  <h3>Guided calibration</h3>
- <p>Choose clear, textured soil. Enter the manually measured camera-to-soil distance
-at the capture Z, then confirm that a 50 mm movement toward the soil is safe.</p>
+ <p>Choose one of the calculated clear-soil sites. Enter the manually measured
+camera-to-soil distance at the capture Z, then confirm that a 50 mm movement
+toward the soil is safe.</p>
  <form method=post action=soil/calibrate>
-  <label>Soil point <select name=point_id required>{point_options}</select></label>
+  <label>Clear soil site <select name=point_id required>{point_options}</select></label>
   <label>Camera-to-soil distance (mm) <input type=number min=1 step=0.1
    name=reference_distance_mm required></label>
-  <label>Capture Z (mm) <input type=number step=0.1 name=capture_z value=0 required></label>
-  <label>Baseline (mm) <input type=number min=5 max=30 step=0.1
+  <label>Capture Z (mm){capture_z_hint} <input type=number step=0.1 name=capture_z value=0 required></label>
+  <label>Baseline (mm){baseline_hint} <input type=number min=5 max=30 step=0.1
    name=baseline_mm value=15 required></label>
   <label><input type=checkbox name=safety_confirm required> I confirm the automated
    50 mm movement toward the soil is safe</label>
@@ -1419,11 +1460,15 @@ at the capture Z, then confirm that a 50 mm movement toward the soil is safe.</p
  </form>
 </section>
 <section class=card>
- <h3>Soil points ({point_count})</h3>
+ <h3>Clear-soil replacements ({site_count} from {point_count} existing points)</h3>
+ <p class=muted>Each candidate has a 75 mm clear-soil margin, expanded for the
+stereo movement, around all current FarmBot plants and weeds, the latest
+detected plant canopies, and pending or created Vision weeds. Fresh points and
+points without a trustworthy update date are not replaced.</p>
  <form id=measure-points method=post action=soil/measure>
-  <label>Capture Z (mm) <input type=number step=0.1 name=capture_z
+  <label>Capture Z (mm){capture_z_hint} <input type=number step=0.1 name=capture_z
    value="{default_capture_z:g}" required></label>
-  <label>Baseline (mm) <input type=number min=5 max=30 step=0.1 name=baseline_mm
+  <label>Baseline (mm){baseline_hint} <input type=number min=5 max=30 step=0.1 name=baseline_mm
    value="{default_baseline:g}" required></label>
   <button type=submit name=mode value=selected>Measure selected</button>
   <button type=submit name=mode value=all>Measure all</button>
@@ -1433,21 +1478,23 @@ at the capture Z, then confirm that a 50 mm movement toward the soil is safe.</p
   <input type=hidden name=baseline_mm value="{default_baseline:g}">
   <button type=submit name=mode value=retry {"disabled" if not retry_ids else ""}>Retry failed</button>
  </form>
- <table><thead><tr><th>Select</th><th>ID</th><th>Point</th><th>X, Y</th>
- <th>Current Z</th><th>Proposed Z</th><th>Uncertainty</th><th>Confidence</th>
+ <table><thead><tr><th>Select</th><th>ID</th><th>Replaces</th><th>Old X, Y</th>
+ <th>Clear X, Y</th><th>Move</th><th>Last updated</th><th>Current Z</th>
+ <th>Proposed Z</th><th>Uncertainty</th><th>Confidence</th>
  <th>Status</th><th>Message</th><th>Diagnostics</th><th>Review</th></tr></thead>
- <tbody>{point_rows or "<tr><td colspan=12>No eligible soil points found.</td></tr>"}</tbody></table>
+ <tbody>{point_rows or "<tr><td colspan=15>No stale point has a safe clear-soil site within 200 mm.</td></tr>"}</tbody></table>
 </section>
 <section class=card>
  <h3>Pending valid results</h3>
  <form id=apply-selected method=post action=soil/apply-selected>
   <button type=submit>Apply selected</button>
  </form>
- <table><thead><tr><th>Select</th><th>Point</th><th>Old Z</th><th>Proposed Z</th>
+ <table><thead><tr><th>Select</th><th>Point</th><th>Old X, Y</th><th>New X, Y</th>
+ <th>Old Z</th><th>Proposed Z</th>
  <th>Confidence</th><th>Quality result</th></tr></thead>
- <tbody>{measurement_rows or "<tr><td colspan=6>No unapplied valid results.</td></tr>"}</tbody></table>
+ <tbody>{measurement_rows or "<tr><td colspan=8>No unapplied valid results.</td></tr>"}</tbody></table>
 </section>
-{live_refresh}"""
+ {live_refresh}"""  # noqa: S608 - HTML template; no SQL is constructed here.
     return layout(request, body, "Soil height · FarmBot Vision")
 
 
@@ -1456,7 +1503,16 @@ async def soil_points_api() -> JSONResponse:
     entry_id = settings.selected_config_entry_id
     if not entry_id:
         raise HTTPException(409, "No FarmBot config entry is selected")
-    return JSONResponse((await client.soil_points(entry_id)).model_dump(mode="json"))
+    calibration = database.active_soil_calibration(entry_id)
+    inventory, sites = await soil_jobs.safe_sites(
+        entry_id, calibration.baseline_mm if calibration else 15
+    )
+    return JSONResponse(
+        {
+            "inventory": inventory.model_dump(mode="json"),
+            "safe_sites": [site.model_dump(mode="json") for site in sites],
+        }
+    )
 
 
 @app.get("/api/soil/job")
@@ -1477,9 +1533,10 @@ async def start_soil_calibration(
         raise HTTPException(409, "No FarmBot config entry is selected")
     if not safety_confirm:
         raise HTTPException(422, "Confirm that the 50 mm calibration movement is safe")
-    inventory = await client.soil_points(entry_id)
-    if point_id not in {point.id for point in inventory.points}:
-        raise HTTPException(404, "Eligible soil point not found")
+    _inventory, sites = await soil_jobs.safe_sites(entry_id, baseline_mm)
+    site = next((item for item in sites if item.point_id == point_id), None)
+    if site is None:
+        raise HTTPException(404, "Clear-soil calibration site not found")
     try:
         soil_jobs.start_calibration(
             config_entry_id=entry_id,
@@ -1487,7 +1544,6 @@ async def start_soil_calibration(
             capture_z=capture_z,
             baseline_mm=baseline_mm,
             reference_distance_mm=reference_distance_mm,
-            z_direction=inventory.motion.z_direction,
         )
     except ValueError as exc:
         raise HTTPException(409, str(exc)) from exc
@@ -1505,8 +1561,8 @@ async def start_soil_measurement(
     if not entry_id:
         raise HTTPException(409, "No FarmBot config entry is selected")
     if mode == "all":
-        inventory = await client.soil_points(entry_id)
-        point_ids = [point.id for point in inventory.points]
+        _inventory, sites = await soil_jobs.safe_sites(entry_id, baseline_mm)
+        point_ids = [site.point_id for site in sites]
     point_ids = point_ids or []
     try:
         soil_jobs.start_measurements(
@@ -1533,6 +1589,9 @@ async def _apply_soil_measurement(measurement_id: str) -> dict:
         measurement is None
         or measurement["status"] != "valid"
         or measurement["proposed_z_mm"] is None
+        or measurement.get("capture_x") is None
+        or measurement.get("capture_y") is None
+        or not measurement.get("point_updated_at")
     ):
         raise HTTPException(404, "Applicable soil result not found")
     apply_request = ApplySoilHeightRequest(
@@ -1542,6 +1601,9 @@ async def _apply_soil_measurement(measurement_id: str) -> dict:
         expected_x=measurement["expected_x"],
         expected_y=measurement["expected_y"],
         expected_z=measurement["old_z_mm"],
+        expected_updated_at=measurement["point_updated_at"],
+        recommended_x=measurement["capture_x"],
+        recommended_y=measurement["capture_y"],
         recommended_z_mm=measurement["proposed_z_mm"],
         confidence=measurement["confidence"],
         apply=True,

@@ -1,5 +1,26 @@
 # Changelog
 
+## 1.4.0 - 2026-07-26
+
+- Replaced direct soil-point capture targets with calculated clear-soil sites
+  that avoid current FarmBot plants and weeds, the latest detected plant
+  canopies, Vision weeds, and excluded garden zones.
+- Only points last updated more than 14 days ago are eligible, and each clear
+  replacement must be less than 200 mm from its assigned point.
+- Guided calibration uses the same plant, weed, canopy, zone, and motion
+  clearance checks and recomputes the selected site immediately before capture.
+- Review now shows old and proposed X/Y coordinates. Approval relocates the
+  existing soil GenericPointer and updates its measured Z; nothing is applied
+  automatically.
+- Requires companion FarmBot integration **1.8.0** for stale-timestamp and
+  relocation validation.
+
+## 1.3.1 - 2026-07-26
+
+- Added hover tooltips to the Soil height guided calibration form explaining
+  what Capture Z and Baseline (mm) mean, since neither was self-explanatory
+  from the label alone.
+
 ## 1.3.0 - 2026-07-26
 
 - Added a **Soil height** tab that inventories recognized FarmBot soil points,

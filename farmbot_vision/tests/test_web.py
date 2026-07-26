@@ -17,6 +17,7 @@ from farmbot_vision.models import (
     SoilMotionState,
     SoilPoint,
     SoilPointInventory,
+    SoilSite,
     VisionRequestEvent,
 )
 
@@ -86,8 +87,14 @@ async def test_soil_height_page_lists_points_and_warns_below_three(monkeypatch):
             device_id="42",
             generated_at=datetime.now(UTC),
             points=[
-                SoilPoint(id=70, name="Clear soil", x=100, y=200, z=-400),
-                SoilPoint(id=71, name="Second soil", x=300, y=200, z=-401),
+                SoilPoint(
+                    id=70,
+                    name="Clear soil",
+                    x=100,
+                    y=200,
+                    z=-400,
+                    updated_at=datetime(2026, 7, 1, tzinfo=UTC),
+                ),
             ],
             motion=SoilMotionState(
                 connected=True,
@@ -100,13 +107,31 @@ async def test_soil_height_page_lists_points_and_warns_below_three(monkeypatch):
         )
 
     monkeypatch.setattr(web.settings, "selected_config_entry_id", "soil-entry")
-    monkeypatch.setattr(web.client, "soil_points", soil_points)
+
+    async def safe_sites(_entry_id, _baseline):
+        inventory = await soil_points(_entry_id)
+        return inventory, [
+            SoilSite(
+                point_id=70,
+                point_name="Clear soil",
+                expected_x=100,
+                expected_y=200,
+                expected_z=-400,
+                point_updated_at=datetime(2026, 7, 1, tzinfo=UTC),
+                capture_x=175,
+                capture_y=200,
+                relocation_distance_mm=75,
+                clearance_mm=20,
+            )
+        ]
+
+    monkeypatch.setattr(web.soil_jobs, "safe_sites", safe_sites)
     status, _, body = await asgi_request("/soil-height")
     assert status == 200
     assert b"Clear soil" in body
     assert b"Measure selected" in body
-    assert b"At least three valid soil points" in body
-    assert b"never updated automatically" in body
+    assert b"Fewer than three stale soil points" in body
+    assert b"replace the assigned stale point" in body
 
 
 @pytest.mark.asyncio
@@ -119,6 +144,10 @@ async def test_soil_apply_is_human_approved_and_audited(monkeypatch):
         expected_x=100,
         expected_y=200,
         old_z_mm=-400,
+        point_updated_at=datetime(2026, 7, 1, tzinfo=UTC),
+        capture_x=125,
+        capture_y=225,
+        relocation_distance_mm=35.36,
         proposed_z_mm=-395,
         confidence=0.9,
         uncertainty_mm=3,

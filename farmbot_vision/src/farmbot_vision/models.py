@@ -230,9 +230,26 @@ class SoilPointInventory(StrictModel):
     motion: SoilMotionState
 
 
+class SoilSite(StrictModel):
+    """A clear-soil capture location assigned to one stale FarmBot point."""
+
+    point_id: int = Field(gt=0)
+    point_name: str
+    expected_x: float
+    expected_y: float
+    expected_z: float
+    point_updated_at: datetime
+    capture_x: float
+    capture_y: float
+    relocation_distance_mm: float = Field(ge=0, lt=200)
+    clearance_mm: float = Field(ge=0)
+
+
 class SoilCaptureStartRequest(StrictModel):
     config_entry_id: str
     point_id: int = Field(gt=0)
+    capture_x: float | None = None
+    capture_y: float | None = None
     capture_z: float = 0
     baseline_mm: float = Field(default=15, ge=5, le=30)
     z_offsets_mm: list[float] = Field(default_factory=lambda: [0.0], min_length=1, max_length=3)
@@ -396,6 +413,9 @@ class ApplySoilHeightRequest(StrictModel):
     expected_x: float
     expected_y: float
     expected_z: float
+    expected_updated_at: datetime
+    recommended_x: float
+    recommended_y: float
     recommended_z_mm: float
     confidence: float = Field(ge=0, le=1)
     apply: bool = False
@@ -432,6 +452,10 @@ class SoilMeasurement(StrictModel):
     expected_x: float
     expected_y: float
     old_z_mm: float
+    point_updated_at: datetime | None = None
+    capture_x: float | None = None
+    capture_y: float | None = None
+    relocation_distance_mm: float | None = Field(default=None, ge=0, lt=200)
     proposed_z_mm: float | None = None
     confidence: float = Field(default=0, ge=0, le=1)
     uncertainty_mm: float | None = Field(default=None, ge=0)

@@ -1,10 +1,21 @@
 from __future__ import annotations
 
+import asyncio
+from datetime import UTC, datetime
 from uuid import uuid4
 
+import pytest
+
 from farmbot_vision.database import Database
-from farmbot_vision.models import SoilMeasurement, SoilPoint, SoilStereoCalibration
+from farmbot_vision.models import (
+    SoilMeasurement,
+    SoilMotionState,
+    SoilPoint,
+    SoilPointInventory,
+    SoilStereoCalibration,
+)
 from farmbot_vision.soil_jobs import SoilJobManager
+from farmbot_vision.zones import ZoneStore
 
 
 def _calibration() -> SoilStereoCalibration:
@@ -73,3 +84,52 @@ def test_soil_points_use_nearest_neighbour_order():
     ]
     ordered = SoilJobManager._nearest_order(points, 0, 0)
     assert [point.id for point in ordered] == [2, 3, 1]
+
+
+@pytest.mark.asyncio
+async def test_calibration_rechecks_clear_site_immediately_before_capture(tmp_path, monkeypatch):
+    database = Database(tmp_path / "vision.db")
+    manager = SoilJobManager(
+        database,
+        object(),
+        tmp_path,
+        asyncio.Lock(),
+        ZoneStore(tmp_path / "zones.json"),
+    )
+    inventory = SoilPointInventory(
+        device_id="42",
+        generated_at=datetime.now(UTC),
+        points=[],
+        motion=SoilMotionState(
+            connected=True,
+            busy=False,
+            locked=False,
+            position={"x": 0, "y": 0, "z": 0},
+            z_direction=-1,
+            axis_bounds={"x": (0, 1000), "y": (0, 1000), "z": (-500, 0)},
+        ),
+    )
+    captured = False
+
+    async def safe_sites(_entry_id, _baseline):
+        return inventory, []
+
+    async def capture_frames(**_kwargs):
+        nonlocal captured
+        captured = True
+        raise AssertionError("unsafe calibration capture was started")
+
+    monkeypatch.setattr(manager, "safe_sites", safe_sites)
+    monkeypatch.setattr(manager, "_capture_frames", capture_frames)
+    await manager._run_calibration(
+        job_id="calibration-job",
+        config_entry_id="bot-soil",
+        point_id=10,
+        capture_z=0,
+        baseline_mm=15,
+        reference_distance_mm=400,
+    )
+
+    assert captured is False
+    assert manager.current["status"] == "failed"
+    assert "plant- and weed-free" in manager.current["message"]
