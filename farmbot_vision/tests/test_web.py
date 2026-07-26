@@ -12,6 +12,7 @@ import farmbot_vision.web as web
 from farmbot_vision.models import (
     BotList,
     Decision,
+    Inventory,
     Measurement,
     SoilMeasurement,
     SoilMotionState,
@@ -394,6 +395,58 @@ async def test_missing_plant_table_shows_crop_and_center_coordinates():
     assert "<td>X 123.4, Y 567.8</td>" in html
     assert "<td>X 130.5, Y 575.2</td>" in html
     assert "<th>Plant</th><th>Absent looks</th>" not in html
+
+
+@pytest.mark.asyncio
+async def test_removal_approval_uses_fresh_inventory_radius(monkeypatch):
+    measurement = _review_measurement(
+        vegetation_absent=True,
+        absent_observations=2,
+        current_radius_mm=40,
+        recommended_protection_radius_mm=0,
+    )
+    web.database.save_measurements([measurement])
+    calls = []
+
+    async def inventory(_request):
+        return Inventory.model_validate(
+            {
+                "device_id": "42",
+                "generated_at": datetime.now(UTC),
+                "plants": [
+                    {
+                        "id": measurement.plant_id,
+                        "name": "Lettuce",
+                        "openfarm_slug": "lettuce",
+                        "x": 100,
+                        "y": 200,
+                        "radius": 55,
+                        "plant_stage": "planted",
+                    }
+                ],
+                "images": [],
+                "curves": [],
+                "camera_calibration": {"available": False},
+            }
+        )
+
+    async def apply_removal(request):
+        calls.append(request)
+        return {"status": "applied", "message": "Plant removed"}
+
+    monkeypatch.setattr(web.client, "inventory", inventory)
+    monkeypatch.setattr(web.client, "apply_removal", apply_removal)
+
+    status, _, body = await asgi_request(
+        f"/removals/{measurement.measurement_id}/approve",
+        method="POST",
+        headers=[(b"accept", b"application/json")],
+    )
+
+    assert status == 200
+    assert json.loads(body)["status"] == "applied"
+    assert calls[0].expected_current_radius_mm == 55
+    assert calls[0].human_approved is True
 
 
 @pytest.mark.asyncio

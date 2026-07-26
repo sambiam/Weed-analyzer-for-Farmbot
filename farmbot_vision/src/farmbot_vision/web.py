@@ -1764,7 +1764,9 @@ async def reject_weed(detection_id: UUID) -> JSONResponse:
     detection = database.weed_detection(str(detection_id))
     if detection is None:
         raise HTTPException(404, "Weed recommendation not found")
-    database.update_weed_detection(str(detection_id), "rejected")
+    database.reject_weed_detection(
+        str(detection_id), max(20.0, float(detection["radius_mm"]) * 1.5)
+    )
     return JSONResponse({"status": "rejected", "message": "Weed recommendation rejected"})
 
 
@@ -2487,13 +2489,26 @@ async def removal(request: Request, measurement_id: str, action: str) -> Respons
             str(result.get("message") or status),
             error_status=409 if status != "applied" else None,
         )
+    # Radius is not part of the removal itself, but the companion service uses
+    # it as an optimistic-concurrency token. Refresh it immediately before the
+    # request so an older vision measurement does not make every otherwise
+    # valid, explicitly approved removal fail as stale.
+    inventory = await client.inventory(
+        InventoryRequest(
+            config_entry_id=entry_id,
+            image_lookback_hours=settings.image_lookback_hours,
+        )
+    )
+    plant = next((p for p in inventory.plants if p.id == row["plant_id"]), None)
+    if plant is None:
+        return _action_response(request, "conflict", "Plant is no longer active", error_status=409)
     try:
         result = await client.apply_removal(
             ApplyRemovalRequest(
                 config_entry_id=entry_id,
                 plant_id=row["plant_id"],
                 measurement_id=measurement_id,
-                expected_current_radius_mm=row["current_radius_mm"],
+                expected_current_radius_mm=plant.radius,
                 confidence=row["confidence"],
                 apply=True,
                 human_approved=True,

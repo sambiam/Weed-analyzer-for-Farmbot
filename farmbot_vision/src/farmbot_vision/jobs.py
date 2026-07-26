@@ -682,7 +682,9 @@ class JobManager:
                             processed_height=response.height,
                         )
                         continue
-                    if self.db.has_weed_detection_near(weed_x, weed_y, duplicate_distance):
+                    if self.db.has_weed_detection_near(
+                        entry_id, weed_x, weed_y, duplicate_distance
+                    ):
                         continue
                     # Zones decide where a weed may exist at all: a position the
                     # user has ruled out is not stored, so it is never created

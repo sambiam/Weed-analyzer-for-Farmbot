@@ -548,6 +548,39 @@ class Database:
                 (status, detection_id),
             )
 
+    def reject_weed_detection(self, detection_id: str, tolerance_mm: float) -> bool:
+        """Permanently suppress a rejected weed position.
+
+        Detection UUIDs change on every analysis. Keep the rejected row as a
+        coordinate-based suppression marker and also clear any already-pending
+        duplicates at the same position.
+        """
+        target = self.connection.execute(
+            "SELECT config_entry_id,x,y FROM weed_detections WHERE detection_id=?",
+            (detection_id,),
+        ).fetchone()
+        if target is None:
+            return False
+        with self.connection:
+            nearby_ids = [
+                row[0]
+                for row in self.connection.execute(
+                    """SELECT detection_id,x,y FROM weed_detections
+                    WHERE config_entry_id=? AND status IN ('recommended','rejected')""",
+                    (target["config_entry_id"],),
+                )
+                if math.hypot(
+                    float(row[1]) - float(target["x"]),
+                    float(row[2]) - float(target["y"]),
+                )
+                <= tolerance_mm
+            ]
+            self.connection.executemany(
+                "UPDATE weed_detections SET status='rejected' WHERE detection_id=?",
+                ((nearby_id,) for nearby_id in nearby_ids),
+            )
+        return True
+
     def upsert_weed_track(
         self,
         *,
@@ -592,9 +625,13 @@ class Database:
         ).fetchone()
         return None if row is None else dict(row)
 
-    def has_weed_detection_near(self, x: float, y: float, tolerance_mm: float) -> bool:
+    def has_weed_detection_near(
+        self, config_entry_id: str, x: float, y: float, tolerance_mm: float
+    ) -> bool:
         for row in self.connection.execute(
-            "SELECT x,y FROM weed_detections WHERE status IN ('recommended','created')"
+            """SELECT x,y FROM weed_detections
+            WHERE config_entry_id=? AND status IN ('recommended','created','rejected')""",
+            (config_entry_id,),
         ):
             if math.hypot(float(row[0]) - x, float(row[1]) - y) <= tolerance_mm:
                 return True

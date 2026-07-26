@@ -273,6 +273,43 @@ def test_removal_artifacts_migrate_persist_and_count_distinct_images(tmp_path):
     assert database.absent_streak("bot-1", 1) == 1
 
 
+def test_rejected_weed_position_suppresses_future_detections_after_restart(tmp_path):
+    path = tmp_path / "db.sqlite"
+    database = Database(path)
+    rejected_id = str(uuid4())
+    duplicate_id = str(uuid4())
+    common = {
+        "config_entry_id": "bot-1",
+        "image_id": 10,
+        "image_timestamp": datetime(2026, 7, 23, tzinfo=UTC),
+        "z": 0,
+        "area_mm2": 100,
+        "radius_mm": 12,
+        "confidence": 0.9,
+        "overlay_path": None,
+    }
+    database.save_weed_detection(
+        detection_id=rejected_id,
+        x=100,
+        y=200,
+        **common,
+    )
+    database.save_weed_detection(
+        detection_id=duplicate_id,
+        x=105,
+        y=203,
+        **common,
+    )
+
+    assert database.reject_weed_detection(rejected_id, 20) is True
+    assert database.pending_weed_detections() == []
+    database.connection.close()
+
+    restarted = Database(path)
+    assert restarted.has_weed_detection_near("bot-1", 103, 202, 20) is True
+    assert restarted.has_weed_detection_near("bot-2", 103, 202, 20) is False
+
+
 @pytest.mark.asyncio
 async def test_second_run_is_rejected_while_locked(tmp_path):
     # Sequential processing: a second run is refused while one holds the lock.
