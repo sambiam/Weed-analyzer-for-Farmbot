@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.5.0 - 2026-07-26
+
+- Rejecting a weed recommendation now permanently suppresses that position
+  instead of just changing its detection status, so a future analysis pass
+  doesn't recreate the same rejected weed. Any other pending detections
+  within the same tolerance are also marked rejected.
+- Weed proximity suppression is now scoped per config entry (bot) and also
+  treats previously rejected positions as occupied.
+- Removal approval now refreshes the plant's current radius from the
+  integration immediately before applying, instead of using the possibly
+  stale radius captured earlier, so an older vision measurement no longer
+  makes an otherwise valid, already-approved removal fail as stale.
+
 ## 1.4.0 - 2026-07-26
 
 - Replaced direct soil-point capture targets with calculated clear-soil sites
