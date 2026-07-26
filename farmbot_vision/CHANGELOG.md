@@ -1,5 +1,33 @@
 # Changelog
 
+## 1.3.0 - 2026-07-26
+
+- Added a **Soil height** tab that inventories recognized FarmBot soil points,
+  orders selected points by nearest neighbour, and supports selected/all runs,
+  retry, stop-after-current, diagnostics, and individual or bulk review.
+- Added required per-bot guided virtual-stereo calibration and a three-view
+  StereoSGBM pipeline with correspondence rectification, vegetation and
+  consistency masks, RANSAC soil-plane fitting, cross-pair validation, and
+  fail-closed quality gates.
+- Added durable soil calibration, measurement, decision and job audit records.
+  In-progress soil jobs are marked interrupted on restart and never resume
+  movement or apply a result automatically.
+- Requires companion FarmBot integration **1.7.0** for acknowledged safe-motion
+  captures and human-approved, optimistic-concurrency-protected point updates.
+
+## 1.2.0 - 2026-07-26
+
+- Consolidated repeated views of each plant into one confidence-, visibility-,
+  and recency-weighted recommendation, using a robust median to prevent one
+  anomalous image from producing a large radius increase.
+- Added plant coordinates, concise review text, and garden-scale composite
+  image stitching with bold original and planned radius circles.
+- Prevented disconnected vegetation and hairline-connected weeds from
+  inflating crop measurements while retaining bounded historical leaf evidence.
+- Added known-weed matching, increasing-only radius tracking, disappearance
+  tracking, and separate automatic radius/removal confidence controls.
+- Replaced the queue timeframe dropdown with explicit from/to date-time inputs.
+
 ## 1.1.6 - 2026-07-25
 
 - Added a **Boundaries & zones** tab. Boundaries enclose where things may be

@@ -205,6 +205,64 @@ class Inventory(StrictModel):
     weeds: list[WeedPoint] = Field(default_factory=list)
 
 
+class SoilPoint(StrictModel):
+    id: int = Field(gt=0)
+    name: str
+    x: float
+    y: float
+    z: float
+    updated_at: datetime | None = None
+
+
+class SoilMotionState(StrictModel):
+    connected: bool
+    busy: bool
+    locked: bool
+    position: dict[Literal["x", "y", "z"], float | None]
+    z_direction: Literal[-1, 1]
+    axis_bounds: dict[Literal["x", "y", "z"], tuple[float, float] | None]
+
+
+class SoilPointInventory(StrictModel):
+    device_id: str
+    generated_at: datetime
+    points: list[SoilPoint]
+    motion: SoilMotionState
+
+
+class SoilCaptureStartRequest(StrictModel):
+    config_entry_id: str
+    point_id: int = Field(gt=0)
+    capture_z: float = 0
+    baseline_mm: float = Field(default=15, ge=5, le=30)
+    z_offsets_mm: list[float] = Field(default_factory=lambda: [0.0], min_length=1, max_length=3)
+
+
+class SoilCaptureStartResponse(StrictModel):
+    status: Literal["queued", "rejected"]
+    capture_id: UUID | None = None
+    message: str = Field(max_length=240)
+
+
+class SoilCaptureFrame(StrictModel):
+    image_id: int = Field(gt=0)
+    x: float
+    y: float
+    z: float
+    lateral_offset_mm: float
+    z_offset_mm: float
+
+
+class SoilCaptureStatus(StrictModel):
+    capture_id: UUID | None = None
+    status: Literal["queued", "running", "waiting_images", "complete", "failed"]
+    message: str = Field(max_length=240)
+    frames: list[SoilCaptureFrame] = Field(default_factory=list)
+    created_at: datetime | None = None
+    started_at: datetime | None = None
+    completed_at: datetime | None = None
+
+
 class VisionImageRequest(StrictModel):
     config_entry_id: str
     image_id: int
@@ -331,6 +389,63 @@ class ApplyPlantCenterRequest(StrictModel):
     human_approved: bool = False
 
 
+class ApplySoilHeightRequest(StrictModel):
+    config_entry_id: str
+    point_id: int = Field(gt=0)
+    measurement_id: UUID
+    expected_x: float
+    expected_y: float
+    expected_z: float
+    recommended_z_mm: float
+    confidence: float = Field(ge=0, le=1)
+    apply: bool = False
+    human_approved: bool = False
+
+
+class SoilStereoCalibration(StrictModel):
+    calibration_id: int | None = None
+    version: int = Field(default=1, ge=1)
+    config_entry_id: str
+    point_id: int = Field(gt=0)
+    capture_z: float
+    baseline_mm: float = Field(ge=5, le=30)
+    reference_distance_mm: float = Field(gt=0)
+    z_direction: Literal[-1, 1]
+    inverse_depth_slope: float = Field(gt=0)
+    inverse_depth_intercept: float
+    residual_mm: float = Field(ge=0)
+    processed_width: int = Field(gt=0)
+    processed_height: int = Field(gt=0)
+    source_width: int = Field(gt=0)
+    source_height: int = Field(gt=0)
+    source_image_ids: list[int]
+    camera_signature: str
+    active: bool = True
+    created_at: datetime = Field(default_factory=lambda: datetime.now().astimezone())
+
+
+class SoilMeasurement(StrictModel):
+    measurement_id: UUID
+    config_entry_id: str
+    point_id: int = Field(gt=0)
+    point_name: str
+    expected_x: float
+    expected_y: float
+    old_z_mm: float
+    proposed_z_mm: float | None = None
+    confidence: float = Field(default=0, ge=0, le=1)
+    uncertainty_mm: float | None = Field(default=None, ge=0)
+    status: Literal["valid", "failed", "applied", "rejected", "conflict"]
+    reason: str
+    capture_id: UUID | None = None
+    calibration_id: int | None = None
+    frame_ids: list[int] = Field(default_factory=list)
+    metrics: dict[str, float | int | str | bool | None] = Field(default_factory=dict)
+    artifact_paths: list[str] = Field(default_factory=list)
+    algorithm_version: str = "soil-stereo-v1"
+    created_at: datetime = Field(default_factory=lambda: datetime.now().astimezone())
+
+
 class CreateWeedRequest(StrictModel):
     config_entry_id: str
     detection_id: UUID
@@ -339,6 +454,24 @@ class CreateWeedRequest(StrictModel):
     z: float = 0
     radius: float = Field(default=15, gt=0)
     name: str = "Vision detected weed"
+    confidence: float = Field(ge=0, le=1)
+    apply: bool = False
+    human_approved: bool = False
+
+
+class UpdateWeedRadiusRequest(StrictModel):
+    config_entry_id: str
+    weed_id: int
+    expected_current_radius_mm: float = Field(ge=0)
+    recommended_radius_mm: float = Field(gt=0)
+    confidence: float = Field(ge=0, le=1)
+    apply: bool = False
+    human_approved: bool = False
+
+
+class RemoveWeedRequest(StrictModel):
+    config_entry_id: str
+    weed_id: int
     confidence: float = Field(ge=0, le=1)
     apply: bool = False
     human_approved: bool = False
@@ -523,9 +656,13 @@ class Measurement(StrictModel):
     recorded_center_x: float | None = None
     recorded_center_y: float | None = None
     recommended_center_px: tuple[float, float] | None = None
+    plant_center_px: tuple[float, float] | None = None
     absent_observations: int = Field(default=0, ge=0)
+    visible_fraction: float = Field(default=1, ge=0, le=1)
     safety_margin_mm: float = Field(default=0, ge=0)
     calibration_uncertainty_mm: float = Field(default=0, ge=0)
+    source_image_path: str | None = None
+    composite_path: str | None = None
     # Resolution / calibration provenance (contract v2).
     analysis_resolution: str | None = None
     processed_width: int | None = None

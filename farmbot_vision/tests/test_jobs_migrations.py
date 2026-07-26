@@ -172,6 +172,48 @@ def test_measurement_provenance_round_trips(tmp_path):
     assert row["processed_width"] == 960
 
 
+def test_pending_views_are_consolidated_with_outlier_resistance(tmp_path):
+    database = Database(tmp_path / "db.sqlite")
+    timestamp = datetime(2026, 7, 26, tzinfo=UTC)
+    measurements = [
+        _measurement(
+            config_entry_id="bot",
+            image_id=101,
+            image_timestamp=timestamp,
+            maximum_accepted_canopy_radius_mm=100,
+            recommended_protection_radius_mm=130,
+            confidence=0.9,
+            visible_fraction=1,
+        ),
+        _measurement(
+            config_entry_id="bot",
+            image_id=102,
+            image_timestamp=timestamp.replace(hour=1),
+            maximum_accepted_canopy_radius_mm=105,
+            recommended_protection_radius_mm=135,
+            confidence=0.85,
+            visible_fraction=0.95,
+        ),
+        _measurement(
+            config_entry_id="bot",
+            image_id=103,
+            image_timestamp=timestamp.replace(hour=2),
+            maximum_accepted_canopy_radius_mm=600,
+            recommended_protection_radius_mm=630,
+            confidence=0.3,
+            visible_fraction=0.2,
+        ),
+    ]
+    database.save_measurements(measurements)
+
+    rows = database.pending_measurements()
+
+    assert len(rows) == 1
+    assert rows[0]["measurement_count"] == 3
+    assert rows[0]["recommended_protection_radius_mm"] in {130, 135}
+    assert rows[0]["recommended_protection_radius_mm"] < 200
+
+
 def test_reanalysis_supersedes_the_old_review_row_without_deleting_history(tmp_path):
     database = Database(tmp_path / "db.sqlite")
     first = _measurement(config_entry_id="bot", decision=Decision.RECOMMENDED)

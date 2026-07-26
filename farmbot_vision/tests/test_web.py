@@ -9,7 +9,16 @@ import pytest
 import yaml
 
 import farmbot_vision.web as web
-from farmbot_vision.models import BotList, Decision, Measurement, VisionRequestEvent
+from farmbot_vision.models import (
+    BotList,
+    Decision,
+    Measurement,
+    SoilMeasurement,
+    SoilMotionState,
+    SoilPoint,
+    SoilPointInventory,
+    VisionRequestEvent,
+)
 
 
 def _review_measurement(**updates) -> Measurement:
@@ -68,6 +77,67 @@ async def asgi_request(
     await web.app(scope, receive, send)
     response = next(message for message in messages if message["type"] == "http.response.start")
     return response["status"], dict(response["headers"]), bytes(body)
+
+
+@pytest.mark.asyncio
+async def test_soil_height_page_lists_points_and_warns_below_three(monkeypatch):
+    async def soil_points(_entry_id):
+        return SoilPointInventory(
+            device_id="42",
+            generated_at=datetime.now(UTC),
+            points=[
+                SoilPoint(id=70, name="Clear soil", x=100, y=200, z=-400),
+                SoilPoint(id=71, name="Second soil", x=300, y=200, z=-401),
+            ],
+            motion=SoilMotionState(
+                connected=True,
+                busy=False,
+                locked=False,
+                position={"x": 0, "y": 0, "z": 0},
+                z_direction=-1,
+                axis_bounds={"x": (0, 1000), "y": (0, 1000), "z": (-500, 0)},
+            ),
+        )
+
+    monkeypatch.setattr(web.settings, "selected_config_entry_id", "soil-entry")
+    monkeypatch.setattr(web.client, "soil_points", soil_points)
+    status, _, body = await asgi_request("/soil-height")
+    assert status == 200
+    assert b"Clear soil" in body
+    assert b"Measure selected" in body
+    assert b"At least three valid soil points" in body
+    assert b"never updated automatically" in body
+
+
+@pytest.mark.asyncio
+async def test_soil_apply_is_human_approved_and_audited(monkeypatch):
+    measurement = SoilMeasurement(
+        measurement_id=uuid4(),
+        config_entry_id="soil-entry",
+        point_id=72,
+        point_name="Soil 72",
+        expected_x=100,
+        expected_y=200,
+        old_z_mm=-400,
+        proposed_z_mm=-395,
+        confidence=0.9,
+        uncertainty_mm=3,
+        status="valid",
+        reason="passed",
+    )
+    web.database.save_soil_measurement(measurement)
+    seen = {}
+
+    async def apply_soil_height(request):
+        seen.update(request.model_dump(mode="json"))
+        return {"status": "applied", "message": "updated"}
+
+    monkeypatch.setattr(web.client, "apply_soil_height", apply_soil_height)
+    result = await web._apply_soil_measurement(str(measurement.measurement_id))
+    assert result["status"] == "applied"
+    assert seen["apply"] is True
+    assert seen["human_approved"] is True
+    assert web.database.soil_measurement(str(measurement.measurement_id))["status"] == "applied"
 
 
 @pytest.mark.asyncio

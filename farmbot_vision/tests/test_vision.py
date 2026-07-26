@@ -46,6 +46,19 @@ def test_weed_close_to_crop_is_conservative(seed, calibration):
     assert result.measurements[0].decision == Decision.UNCERTAIN
 
 
+def test_hairline_connected_weed_does_not_inflate_crop_radius(seed, calibration):
+    result = analyse(
+        [
+            ("circle", ((160, 120), 25)),
+            ("line", ((185, 120), (264, 120), 1)),
+            ("circle", ((275, 120), 11)),
+        ],
+        seed,
+        calibration,
+    )
+    assert result.measurements[0].maximum_accepted_canopy_radius_mm < 40
+
+
 def test_overlapping_crops_keep_reviewable_nearest_seed_ownership(calibration):
     seeds = [
         PlantSeed(plant_id=1, crop_slug="lettuce", center_px=(135, 120), current_radius_mm=50),

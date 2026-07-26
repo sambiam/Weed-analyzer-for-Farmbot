@@ -1,9 +1,9 @@
 # Companion FarmBot integration contract
 
 Contract version: **farmbot-vision-v2**. Minimum compatible companion FarmBot
-integration release: **1.2.0** (the release that implements the returned-JPEG
-checksum, source/oriented/processed dimensions, resize scales and processed
-calibration). Version 1.2.0 of the companion integration in the sibling
+integration release: **1.7.0** (the release that implements acknowledged
+soil-height capture and reviewed soil-point updates in addition to the
+returned-JPEG contract and known-weed writes). Version 1.7.0 of the companion integration in the sibling
 `Farmbot-for-Home-Assistant` repository implements this contract.
 
 All actions are in the `farmbot` domain. Response actions must support Home Assistant service response data. Unknown, invalid, or unauthorised fields must fail rather than be coerced. Timestamps are ISO-8601. The integration remains the only component that talks to FarmBot APIs.
@@ -54,6 +54,33 @@ Response (contract v2):
 
 The integration must resize before base64 encoding and must not return signed URLs. The app fetches sequentially and independently validates the checksum, base64, JPEG format, decoded dimensions, resize-scale consistency, aspect ratio, absence of upscaling, and payload/dimension limits. Older v1 responses (no `source_*`/`oriented_*`/`resize_scale_*`) are accepted as a legacy path but yield pixel-only diagnostics with no metric writes.
 
+## Soil-height services
+
+`farmbot.get_vision_soil_points` accepts `config_entry_id`. It returns active
+FarmBot `GenericPointer` records recognized only by
+`meta.created_by == "measure-soil-height"` or `meta.at_soil_level == true`,
+plus the current position, connected/busy/emergency-stop state, Z direction and
+axis bounds. A matching display name alone is never sufficient.
+
+`farmbot.start_vision_soil_capture` accepts `config_entry_id`, `point_id`,
+`capture_z`, `baseline_mm`, and `z_offsets_mm`. Use `[0]` for a measurement and
+`[0,25,50]` for calibration. It returns a `capture_id` immediately. The
+integration validates the bot and bounds, uses acknowledged safe-Z movement,
+captures `-baseline, 0, +baseline` along Y (or an actual-coordinate one-sided
+triplet at an edge), waits for processed images, claims those image IDs from
+ordinary photo analysis, and restores the initial position when possible.
+
+`farmbot.get_vision_soil_capture` accepts `config_entry_id` and `capture_id`.
+It returns `queued|running|waiting_images|complete|failed`, a sanitized
+message, and completed frames as `image_id`, `x`, `y`, `z`,
+`lateral_offset_mm`, and `z_offset_mm`.
+
+`farmbot.apply_vision_soil_height` accepts `config_entry_id`, `point_id`,
+`measurement_id`, expected `x/y/z`, `recommended_z_mm`, `confidence`, `apply`,
+and `human_approved`. Writes require both booleans, re-fetch the point, enforce
+a 0.5 mm coordinate tolerance and Z bounds, and patch only `z`. Missing,
+discarded, wrong-type, stale, non-finite, and unrecognized points fail closed.
+
 ## `farmbot.apply_vision_radius`
 
 Input:
@@ -73,6 +100,18 @@ Input:
 ```
 
 Values are diameters in millimetres. A new curve name must use `[FarmBot Vision]`. The integration must reject modification of non-adopted user curves and validate app-owned curve IDs. `apply:false` validates only. FarmBot Vision 0.1.0 does not call this advanced action automatically.
+
+## Known weed tracking
+
+`farmbot.update_vision_weed_radius` accepts `config_entry_id`, `weed_id`,
+`expected_current_radius_mm`, `recommended_radius_mm`, `confidence`, `apply`,
+and `human_approved`. It verifies that the point is a Weed, enforces optimistic
+concurrency, and never reduces the existing radius.
+
+`farmbot.remove_vision_weed` accepts `config_entry_id`, `weed_id`, `confidence`,
+`apply`, and `human_approved`. It verifies that the point is a Weed before
+removal. The app only calls it after the user enables automatic weed removal
+and the configured lower-confidence disappearance threshold is met.
 
 ## `farmbot.report_vision_status`
 
@@ -103,9 +142,9 @@ Automatic new-photo requests may instead omit `mode` and include a positive
 integer `image_id`. In that form the app uses its configured operating mode and
 processes only the named image. Manual requests retain the payload above.
 
-## Exact companion-integration work still required
+## Companion implementation status
 
-1. Register the five actions above with response support where specified.
+1. Register all documented actions with response support where specified.
 2. Resolve `config_entry_id` only against loaded FarmBot entries and authorise every resource/write.
 3. Add bounded image download/resize/JPEG encoding and SHA-256 response generation.
 4. Expose plant, image, spread-curve, and calibration serializers with the exact field semantics above.
@@ -114,7 +153,9 @@ processes only the named image. Manual requests retain the payload above.
 7. Add status entities or diagnostics with update de-duplication.
 8. Emit the request event from integration services/UI controls.
 9. Add contract, malformed-response, authentication, reauthentication, stale-write, and permission tests.
-10. Declare the minimum companion version once that integration release exists. **Done: companion 1.2.0 implements contract farmbot-vision-v2.**
+10. Declare the minimum companion version once that integration release exists.
+    **Done: companion 1.7.0 implements the image, known-weed and soil-height
+    contracts.**
 
 ## Contract v2 summary of required integration capabilities
 
@@ -123,4 +164,4 @@ processes only the named image. Manual requests retain the payload above.
 3. `resize_scale_x/y` equal to processed÷oriented in each axis.
 4. `processed_calibration` (basis `processed_image`) when calibration is known, plus reference dimensions on `camera_calibration`.
 
-The minimum compatible companion integration version implementing all four is **1.2.0**.
+The minimum compatible companion integration version is **1.7.0**.

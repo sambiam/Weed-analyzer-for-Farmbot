@@ -7,7 +7,13 @@ from collections.abc import Iterable
 from datetime import UTC, datetime
 from pathlib import Path
 
-from .models import Calibration, Measurement, OriginLocation
+from .models import (
+    Calibration,
+    Measurement,
+    OriginLocation,
+    SoilMeasurement,
+    SoilStereoCalibration,
+)
 
 MIGRATIONS = [
     """
@@ -144,6 +150,70 @@ MIGRATIONS = [
     """
     ALTER TABLE weed_detections ADD COLUMN review_path TEXT;
     """,
+    # Migration 9: multi-image measurement evidence/composites and persistent
+    # known-weed tracking for radius updates and disappearance observations.
+    """
+    ALTER TABLE measurements ADD COLUMN plant_center_px_x REAL;
+    ALTER TABLE measurements ADD COLUMN plant_center_px_y REAL;
+    ALTER TABLE measurements ADD COLUMN visible_fraction REAL NOT NULL DEFAULT 1;
+    ALTER TABLE measurements ADD COLUMN source_image_path TEXT;
+    ALTER TABLE measurements ADD COLUMN composite_path TEXT;
+    CREATE TABLE IF NOT EXISTS weed_tracks(
+      config_entry_id TEXT NOT NULL, weed_id INTEGER NOT NULL,
+      x REAL NOT NULL, y REAL NOT NULL, radius_mm REAL NOT NULL,
+      last_seen_at TEXT, absent_observations INTEGER NOT NULL DEFAULT 0,
+      confidence REAL NOT NULL DEFAULT 0, status TEXT NOT NULL DEFAULT 'active',
+      updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY(config_entry_id,weed_id)
+    );
+    """,
+    # Migration 10: supplemental virtual-stereo soil-height calibration,
+    # measurements, review decisions and restart-safe job state.
+    """
+    CREATE TABLE IF NOT EXISTS soil_calibrations(
+      id INTEGER PRIMARY KEY AUTOINCREMENT, config_entry_id TEXT NOT NULL,
+      point_id INTEGER NOT NULL, capture_z REAL NOT NULL, baseline_mm REAL NOT NULL,
+      reference_distance_mm REAL NOT NULL, z_direction INTEGER NOT NULL,
+      inverse_depth_slope REAL NOT NULL, inverse_depth_intercept REAL NOT NULL,
+      residual_mm REAL NOT NULL, processed_width INTEGER NOT NULL,
+      processed_height INTEGER NOT NULL, source_width INTEGER NOT NULL,
+      source_height INTEGER NOT NULL, source_image_ids_json TEXT NOT NULL,
+      camera_signature TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1,
+      created_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_soil_calibrations_active
+      ON soil_calibrations(config_entry_id,active,created_at DESC);
+    CREATE TABLE IF NOT EXISTS soil_jobs(
+      id TEXT PRIMARY KEY, config_entry_id TEXT NOT NULL, kind TEXT NOT NULL,
+      status TEXT NOT NULL, point_ids_json TEXT NOT NULL, current_point_id INTEGER,
+      completed_count INTEGER NOT NULL DEFAULT 0, failed_count INTEGER NOT NULL DEFAULT 0,
+      stop_requested INTEGER NOT NULL DEFAULT 0, message TEXT,
+      started_at TEXT NOT NULL, completed_at TEXT
+    );
+    CREATE TABLE IF NOT EXISTS soil_measurements(
+      measurement_id TEXT PRIMARY KEY, config_entry_id TEXT NOT NULL,
+      point_id INTEGER NOT NULL, point_name TEXT NOT NULL,
+      expected_x REAL NOT NULL, expected_y REAL NOT NULL, old_z_mm REAL NOT NULL,
+      proposed_z_mm REAL, confidence REAL NOT NULL, uncertainty_mm REAL,
+      status TEXT NOT NULL, reason TEXT NOT NULL, capture_id TEXT,
+      calibration_id INTEGER, frame_ids_json TEXT NOT NULL,
+      metrics_json TEXT NOT NULL, artifact_paths_json TEXT NOT NULL,
+      algorithm_version TEXT NOT NULL, created_at TEXT NOT NULL,
+      FOREIGN KEY(calibration_id) REFERENCES soil_calibrations(id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_soil_measurements_point_time
+      ON soil_measurements(config_entry_id,point_id,created_at DESC);
+    CREATE TABLE IF NOT EXISTS soil_decisions(
+      id INTEGER PRIMARY KEY AUTOINCREMENT, measurement_id TEXT NOT NULL,
+      action TEXT NOT NULL, details_json TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+    """,
+    """
+    ALTER TABLE soil_calibrations ADD COLUMN version INTEGER NOT NULL DEFAULT 1;
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_soil_calibrations_version
+      ON soil_calibrations(config_entry_id,version);
+    """,
 ]
 
 
@@ -167,6 +237,11 @@ class Database:
             self.connection.execute(
                 "UPDATE jobs SET status='interrupted',completed_at=?,message='container restarted' "
                 "WHERE status='running'",
+                (datetime.now(UTC).isoformat(),),
+            )
+            self.connection.execute(
+                "UPDATE soil_jobs SET status='interrupted',completed_at=?,"
+                "message='container restarted' WHERE status='running'",
                 (datetime.now(UTC).isoformat(),),
             )
 
@@ -352,6 +427,11 @@ class Database:
                     m.recorded_center_y,
                     m.recommended_center_px[0] if m.recommended_center_px else None,
                     m.recommended_center_px[1] if m.recommended_center_px else None,
+                    m.plant_center_px[0] if m.plant_center_px else None,
+                    m.plant_center_px[1] if m.plant_center_px else None,
+                    m.visible_fraction,
+                    m.source_image_path,
+                    m.composite_path,
                 )
             )
         with self.connection:
@@ -384,8 +464,9 @@ class Database:
                 calibration_source,calibrated,contract_version,artifact_paths_json,
                 vegetation_absent,absent_observations,safety_margin_mm,calibration_uncertainty_mm,
                 center_misaligned,recorded_center_x,recorded_center_y,
-                recommended_center_x,recommended_center_y)
-                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                recommended_center_x,recommended_center_y,plant_center_px_x,plant_center_px_y,
+                visible_fraction,source_image_path,composite_path)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 values,
             )
 
@@ -460,6 +541,50 @@ class Database:
                 "UPDATE weed_detections SET status=? WHERE detection_id=?",
                 (status, detection_id),
             )
+
+    def upsert_weed_track(
+        self,
+        *,
+        config_entry_id: str,
+        weed_id: int,
+        x: float,
+        y: float,
+        radius_mm: float,
+        confidence: float,
+        seen_at: datetime | None,
+        status: str = "active",
+        absent_observations: int = 0,
+    ) -> None:
+        with self.connection:
+            self.connection.execute(
+                """INSERT INTO weed_tracks(
+                config_entry_id,weed_id,x,y,radius_mm,last_seen_at,absent_observations,
+                confidence,status,updated_at) VALUES(?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP)
+                ON CONFLICT(config_entry_id,weed_id) DO UPDATE SET
+                x=excluded.x,y=excluded.y,radius_mm=excluded.radius_mm,
+                last_seen_at=COALESCE(excluded.last_seen_at,weed_tracks.last_seen_at),
+                absent_observations=excluded.absent_observations,
+                confidence=excluded.confidence,status=excluded.status,
+                updated_at=CURRENT_TIMESTAMP""",
+                (
+                    config_entry_id,
+                    weed_id,
+                    x,
+                    y,
+                    radius_mm,
+                    seen_at.isoformat() if seen_at else None,
+                    absent_observations,
+                    confidence,
+                    status,
+                ),
+            )
+
+    def weed_track(self, config_entry_id: str, weed_id: int) -> dict | None:
+        row = self.connection.execute(
+            "SELECT * FROM weed_tracks WHERE config_entry_id=? AND weed_id=?",
+            (config_entry_id, weed_id),
+        ).fetchone()
+        return None if row is None else dict(row)
 
     def has_weed_detection_near(self, x: float, y: float, tolerance_mm: float) -> bool:
         for row in self.connection.execute(
@@ -537,6 +662,110 @@ class Database:
                 row["artifact_paths"] = []
         return result
 
+    @staticmethod
+    def _weighted_median(values: list[tuple[float, float]]) -> float:
+        ordered = sorted(values, key=lambda item: item[0])
+        total = sum(weight for _, weight in ordered)
+        if total <= 0:
+            return ordered[-1][0]
+        threshold = total / 2
+        cumulative = 0.0
+        for value, weight in ordered:
+            cumulative += weight
+            if cumulative >= threshold:
+                return value
+        return ordered[-1][0]
+
+    @classmethod
+    def _consolidate_measurement_rows(cls, rows: list[dict]) -> dict:
+        """Return one robust judgement for repeated views of the same plant.
+
+        Confidence, the fraction of the canopy visible in each frame, and
+        recency all contribute to the weight. A weighted median prevents one
+        distant false-positive leaf from dominating the recommended radius.
+        """
+        if len(rows) == 1:
+            row = dict(rows[0])
+            row["source_measurement_ids"] = [row["measurement_id"]]
+            row["measurement_count"] = 1
+            return row
+        ordered = sorted(rows, key=lambda row: str(row["image_timestamp"]), reverse=True)
+        newest = datetime.fromisoformat(str(ordered[0]["image_timestamp"]))
+        weights: list[float] = []
+        for row in ordered:
+            timestamp = datetime.fromisoformat(str(row["image_timestamp"]))
+            age_days = max(0.0, (newest - timestamp).total_seconds() / 86_400)
+            recency = math.exp(-math.log(2) * age_days / 14.0)
+            visible = max(0.05, min(1.0, float(row.get("visible_fraction") or 0)))
+            confidence = max(0.05, min(1.0, float(row.get("confidence") or 0)))
+            weights.append(confidence * visible * recency)
+
+        present_weight = sum(
+            weight for row, weight in zip(ordered, weights, strict=True)
+            if not row.get("vegetation_absent")
+        )
+        absent_weight = sum(
+            weight for row, weight in zip(ordered, weights, strict=True)
+            if row.get("vegetation_absent")
+        )
+        use_absent = absent_weight > present_weight
+        selected = [
+            (row, weight)
+            for row, weight in zip(ordered, weights, strict=True)
+            if bool(row.get("vegetation_absent")) == use_absent
+        ] or list(zip(ordered, weights, strict=True))
+        # Keep the newest measurement ID as the actionable representative,
+        # while the values below come from the selected evidence class.
+        representative = dict(ordered[0])
+        selected_total = sum(weight for _, weight in selected)
+        representative["confidence"] = min(
+            0.99,
+            sum(float(row["confidence"]) * weight for row, weight in selected)
+            / max(selected_total, 1e-9)
+            + min(0.08, 0.02 * (len(selected) - 1)),
+        )
+        representative["visible_fraction"] = min(
+            1.0,
+            sum(float(row.get("visible_fraction") or 0) * weight for row, weight in selected)
+            / max(selected_total, 1e-9),
+        )
+        representative["vegetation_absent"] = int(use_absent)
+        if use_absent:
+            representative["typical_canopy_radius_mm"] = 0.0
+            representative["maximum_accepted_canopy_radius_mm"] = 0.0
+            representative["recommended_protection_radius_mm"] = 0.0
+            representative["absent_observations"] = max(
+                int(row.get("absent_observations") or 0) for row, _ in selected
+            )
+        else:
+            for field in (
+                "typical_canopy_radius_mm",
+                "maximum_accepted_canopy_radius_mm",
+                "recommended_protection_radius_mm",
+            ):
+                representative[field] = cls._weighted_median(
+                    [(float(row[field]), weight) for row, weight in selected]
+                )
+        paths: list[str] = []
+        for row in ordered:
+            candidates = []
+            if row.get("composite_path"):
+                candidates.append(row["composite_path"])
+            candidates.extend(row.get("artifact_paths") or [])
+            for path in candidates:
+                if path and path not in paths:
+                    paths.append(path)
+        representative["artifact_paths"] = paths
+        representative["source_measurement_ids"] = [
+            str(row["measurement_id"]) for row in ordered
+        ]
+        representative["measurement_count"] = len(ordered)
+        representative["reason"] = (
+            f"Consolidated from {len(ordered)} images using confidence, visible canopy "
+            "percentage and recency"
+        )
+        return representative
+
     def pending_measurements(self, limit: int = 100) -> list[dict]:
         rows = self.connection.execute(
             """SELECT m.* FROM measurements m
@@ -554,7 +783,20 @@ class Database:
                 row["artifact_paths"] = json.loads(row.get("artifact_paths_json") or "[]")
             except (TypeError, json.JSONDecodeError):
                 row["artifact_paths"] = []
-        return result
+        groups: dict[tuple[object, object], list[dict]] = {}
+        for row in result:
+            groups.setdefault((row.get("config_entry_id"), row["plant_id"]), []).append(row)
+        consolidated = []
+        for group in groups.values():
+            # One view per source image. Re-analysis of the same image is not
+            # independent evidence and must not add weight.
+            by_image: dict[int, dict] = {}
+            for row in group:
+                by_image.setdefault(int(row["image_id"]), row)
+            consolidated.append(self._consolidate_measurement_rows(list(by_image.values())))
+        return sorted(
+            consolidated, key=lambda row: str(row["image_timestamp"]), reverse=True
+        )[:limit]
 
     def has_terminal_decision(self, measurement_id: str) -> bool:
         return (
@@ -581,7 +823,81 @@ class Database:
         row = self.connection.execute(
             "SELECT * FROM measurements WHERE measurement_id=?", (measurement_id,)
         ).fetchone()
-        return None if row is None else dict(row)
+        if row is None:
+            return None
+        item = dict(row)
+        if self.has_terminal_decision(measurement_id):
+            return item
+        rows = self.connection.execute(
+            """SELECT m.* FROM measurements m WHERE m.config_entry_id=? AND m.plant_id=?
+            AND NOT EXISTS (
+              SELECT 1 FROM decisions d WHERE d.measurement_id=m.measurement_id
+              AND d.action IN
+                ('applied','approved_no_change','reject','removed','keep','superseded')
+            ) ORDER BY m.image_timestamp DESC""",
+            (item.get("config_entry_id"), item["plant_id"]),
+        ).fetchall()
+        result = [dict(candidate) for candidate in rows]
+        if not result or str(result[0]["measurement_id"]) != measurement_id:
+            return item
+        by_image: dict[int, dict] = {}
+        for candidate in result:
+            by_image.setdefault(int(candidate["image_id"]), candidate)
+        result = list(by_image.values())
+        for candidate in result:
+            try:
+                candidate["artifact_paths"] = json.loads(
+                    candidate.get("artifact_paths_json") or "[]"
+                )
+            except (TypeError, json.JSONDecodeError):
+                candidate["artifact_paths"] = []
+        return self._consolidate_measurement_rows(result) if result else item
+
+    def record_group_decision(self, measurement_id: str, action: str, details: dict) -> None:
+        """Apply a terminal review decision to every pending view in the group."""
+        row = self.connection.execute(
+            "SELECT config_entry_id,plant_id FROM measurements WHERE measurement_id=?",
+            (measurement_id,),
+        ).fetchone()
+        if row is None:
+            return
+        candidates = self.connection.execute(
+            """SELECT m.measurement_id FROM measurements m
+            WHERE m.config_entry_id=? AND m.plant_id=? AND NOT EXISTS (
+              SELECT 1 FROM decisions d WHERE d.measurement_id=m.measurement_id
+              AND d.action IN
+                ('applied','approved_no_change','reject','removed','keep','superseded')
+            )""",
+            (row[0], row[1]),
+        ).fetchall()
+        candidate_rows = list(candidates)
+        image_ids = {
+            candidate[1]
+            for candidate in self.connection.execute(
+                """SELECT m.measurement_id,m.image_id FROM measurements m
+                WHERE m.config_entry_id=? AND m.plant_id=? AND NOT EXISTS (
+                  SELECT 1 FROM decisions d WHERE d.measurement_id=m.measurement_id
+                  AND d.action IN
+                    ('applied','approved_no_change','reject','removed','keep','superseded')
+                )""",
+                (row[0], row[1]),
+            )
+        }
+        if len(image_ids) <= 1:
+            candidate_rows = [(measurement_id,)]
+        payload = json.dumps(details, separators=(",", ":"))
+        with self.connection:
+            self.connection.executemany(
+                "INSERT INTO decisions(measurement_id,action,details_json) VALUES(?,?,?)",
+                [(candidate[0], action, payload) for candidate in candidate_rows],
+            )
+
+    def set_composite_path(self, measurement_ids: list[str], path: str) -> None:
+        with self.connection:
+            self.connection.executemany(
+                "UPDATE measurements SET composite_path=? WHERE measurement_id=?",
+                [(path, measurement_id) for measurement_id in measurement_ids],
+            )
 
     def create_curve_proposal(
         self,
@@ -713,10 +1029,254 @@ class Database:
             )
         ]
 
+    def save_soil_calibration(
+        self, calibration: SoilStereoCalibration
+    ) -> SoilStereoCalibration:
+        with self.connection:
+            version = int(
+                self.connection.execute(
+                    """SELECT COALESCE(MAX(version),0)+1 FROM soil_calibrations
+                    WHERE config_entry_id=?""",
+                    (calibration.config_entry_id,),
+                ).fetchone()[0]
+            )
+            self.connection.execute(
+                "UPDATE soil_calibrations SET active=0 WHERE config_entry_id=?",
+                (calibration.config_entry_id,),
+            )
+            cursor = self.connection.execute(
+                """INSERT INTO soil_calibrations(
+                config_entry_id,point_id,capture_z,baseline_mm,reference_distance_mm,
+                z_direction,inverse_depth_slope,inverse_depth_intercept,residual_mm,
+                processed_width,processed_height,source_width,source_height,
+                source_image_ids_json,camera_signature,active,created_at,version)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    calibration.config_entry_id,
+                    calibration.point_id,
+                    calibration.capture_z,
+                    calibration.baseline_mm,
+                    calibration.reference_distance_mm,
+                    calibration.z_direction,
+                    calibration.inverse_depth_slope,
+                    calibration.inverse_depth_intercept,
+                    calibration.residual_mm,
+                    calibration.processed_width,
+                    calibration.processed_height,
+                    calibration.source_width,
+                    calibration.source_height,
+                    json.dumps(calibration.source_image_ids, separators=(",", ":")),
+                    calibration.camera_signature,
+                    int(calibration.active),
+                    calibration.created_at.isoformat(),
+                    version,
+                ),
+            )
+        return calibration.model_copy(
+            update={"calibration_id": int(cursor.lastrowid), "version": version}
+        )
+
+    def active_soil_calibration(
+        self, config_entry_id: str
+    ) -> SoilStereoCalibration | None:
+        row = self.connection.execute(
+            """SELECT * FROM soil_calibrations WHERE config_entry_id=? AND active=1
+            ORDER BY created_at DESC LIMIT 1""",
+            (config_entry_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        data = dict(row)
+        data["calibration_id"] = data.pop("id")
+        data["source_image_ids"] = json.loads(data.pop("source_image_ids_json"))
+        data["active"] = bool(data["active"])
+        return SoilStereoCalibration.model_validate(data)
+
+    def save_soil_measurement(self, measurement: SoilMeasurement) -> None:
+        with self.connection:
+            self.connection.execute(
+                """INSERT OR REPLACE INTO soil_measurements(
+                measurement_id,config_entry_id,point_id,point_name,expected_x,expected_y,
+                old_z_mm,proposed_z_mm,confidence,uncertainty_mm,status,reason,capture_id,
+                calibration_id,frame_ids_json,metrics_json,artifact_paths_json,
+                algorithm_version,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    str(measurement.measurement_id),
+                    measurement.config_entry_id,
+                    measurement.point_id,
+                    measurement.point_name,
+                    measurement.expected_x,
+                    measurement.expected_y,
+                    measurement.old_z_mm,
+                    measurement.proposed_z_mm,
+                    measurement.confidence,
+                    measurement.uncertainty_mm,
+                    measurement.status,
+                    measurement.reason,
+                    str(measurement.capture_id) if measurement.capture_id else None,
+                    measurement.calibration_id,
+                    json.dumps(measurement.frame_ids, separators=(",", ":")),
+                    json.dumps(measurement.metrics, separators=(",", ":")),
+                    json.dumps(measurement.artifact_paths, separators=(",", ":")),
+                    measurement.algorithm_version,
+                    measurement.created_at.isoformat(),
+                ),
+            )
+
+    @staticmethod
+    def _decode_soil_measurement(row: sqlite3.Row | dict) -> dict:
+        data = dict(row)
+        for source, target in (
+            ("frame_ids_json", "frame_ids"),
+            ("metrics_json", "metrics"),
+            ("artifact_paths_json", "artifact_paths"),
+        ):
+            try:
+                data[target] = json.loads(data.pop(source) or "[]")
+            except (TypeError, json.JSONDecodeError):
+                data[target] = {} if target == "metrics" else []
+        return data
+
+    def soil_measurement(self, measurement_id: str) -> dict | None:
+        row = self.connection.execute(
+            "SELECT * FROM soil_measurements WHERE measurement_id=?",
+            (measurement_id,),
+        ).fetchone()
+        return None if row is None else self._decode_soil_measurement(row)
+
+    def recent_soil_measurements(
+        self, config_entry_id: str | None = None, limit: int = 200
+    ) -> list[dict]:
+        if config_entry_id:
+            rows = self.connection.execute(
+                """SELECT * FROM soil_measurements WHERE config_entry_id=?
+                ORDER BY created_at DESC LIMIT ?""",
+                (config_entry_id, limit),
+            ).fetchall()
+        else:
+            rows = self.connection.execute(
+                "SELECT * FROM soil_measurements ORDER BY created_at DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [self._decode_soil_measurement(row) for row in rows]
+
+    def update_soil_measurement_status(
+        self, measurement_id: str, status: str, reason: str
+    ) -> None:
+        with self.connection:
+            self.connection.execute(
+                "UPDATE soil_measurements SET status=?,reason=? WHERE measurement_id=?",
+                (status, reason, measurement_id),
+            )
+
+    def record_soil_decision(
+        self, measurement_id: str, action: str, details: dict
+    ) -> None:
+        with self.connection:
+            self.connection.execute(
+                """INSERT INTO soil_decisions(measurement_id,action,details_json)
+                VALUES(?,?,?)""",
+                (
+                    measurement_id,
+                    action,
+                    json.dumps(details, separators=(",", ":")),
+                ),
+            )
+
+    def start_soil_job(
+        self,
+        job_id: str,
+        config_entry_id: str,
+        kind: str,
+        point_ids: list[int],
+    ) -> None:
+        with self.connection:
+            self.connection.execute(
+                """INSERT INTO soil_jobs(
+                id,config_entry_id,kind,status,point_ids_json,started_at,message)
+                VALUES(?,?,?,'running',?,?,?)""",
+                (
+                    job_id,
+                    config_entry_id,
+                    kind,
+                    json.dumps(point_ids, separators=(",", ":")),
+                    datetime.now(UTC).isoformat(),
+                    "Starting",
+                ),
+            )
+
+    def update_soil_job(
+        self,
+        job_id: str,
+        *,
+        status: str | None = None,
+        current_point_id: int | None = None,
+        completed_count: int | None = None,
+        failed_count: int | None = None,
+        stop_requested: bool | None = None,
+        message: str | None = None,
+        complete: bool = False,
+    ) -> None:
+        updates, values = [], []
+        for field, value in (
+            ("status", status),
+            ("current_point_id", current_point_id),
+            ("completed_count", completed_count),
+            ("failed_count", failed_count),
+            ("stop_requested", int(stop_requested) if stop_requested is not None else None),
+            ("message", message),
+        ):
+            if value is not None:
+                updates.append(f"{field}=?")
+                values.append(value)
+        if complete:
+            updates.append("completed_at=?")
+            values.append(datetime.now(UTC).isoformat())
+        if not updates:
+            return
+        values.append(job_id)
+        with self.connection:
+            self.connection.execute(
+                f"UPDATE soil_jobs SET {','.join(updates)} WHERE id=?",  # noqa: S608
+                values,
+            )
+
+    def soil_job(self, job_id: str) -> dict | None:
+        row = self.connection.execute(
+            "SELECT * FROM soil_jobs WHERE id=?", (job_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        data = dict(row)
+        data["point_ids"] = json.loads(data.pop("point_ids_json"))
+        data["stop_requested"] = bool(data["stop_requested"])
+        return data
+
+    def latest_soil_job(self, config_entry_id: str | None = None) -> dict | None:
+        if config_entry_id:
+            row = self.connection.execute(
+                """SELECT * FROM soil_jobs WHERE config_entry_id=?
+                ORDER BY started_at DESC LIMIT 1""",
+                (config_entry_id,),
+            ).fetchone()
+        else:
+            row = self.connection.execute(
+                "SELECT * FROM soil_jobs ORDER BY started_at DESC LIMIT 1"
+            ).fetchone()
+        if row is None:
+            return None
+        data = dict(row)
+        data["point_ids"] = json.loads(data.pop("point_ids_json"))
+        data["stop_requested"] = bool(data["stop_requested"])
+        return data
+
     def stats(self) -> dict[str, int]:
         return {
             "database_bytes": self.path.stat().st_size if self.path.exists() else 0,
             "measurements": self.connection.execute("SELECT COUNT(*) FROM measurements").fetchone()[
                 0
             ],
+            "soil_measurements": self.connection.execute(
+                "SELECT COUNT(*) FROM soil_measurements"
+            ).fetchone()[0],
         }

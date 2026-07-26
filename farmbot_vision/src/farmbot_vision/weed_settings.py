@@ -12,6 +12,11 @@ class WeedSettings(BaseModel):
 
     enabled: bool = False
     automatic_creation: bool = False
+    automatic_radius_adjustment: bool = False
+    radius_adjustment_confidence: float = Field(default=0.55, ge=0, le=1)
+    automatic_removal: bool = False
+    removal_confidence: float = Field(default=0.6, ge=0, le=1)
+    removal_min_consecutive_absent: int = Field(default=1, ge=1, le=10)
     minimum_area_mm2: float = Field(default=25, ge=5, le=10_000)
     maximum_area_mm2: float = Field(default=2_500, ge=10, le=100_000)
     plant_exclusion_margin_mm: float = Field(default=35, ge=0, le=500)

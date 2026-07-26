@@ -180,6 +180,22 @@ def _valid_component(stats: np.ndarray, label: int, params: ScaleParams) -> bool
     )
 
 
+def _circle_visible_fraction(
+    center: tuple[float, float], radius_px: float, width: int, height: int
+) -> float:
+    """Estimate how much of a circular canopy can be inspected in this frame."""
+    if radius_px <= 1:
+        x, y = center
+        return 1.0 if 0 <= x < width and 0 <= y < height else 0.0
+    axis = np.linspace(-1.0, 1.0, 61)
+    xx, yy = np.meshgrid(axis, axis)
+    inside = (xx * xx + yy * yy) <= 1.0
+    px = center[0] + xx * radius_px
+    py = center[1] + yy * radius_px
+    visible = inside & (px >= 0) & (px < width) & (py >= 0) & (py < height)
+    return float(np.count_nonzero(visible) / max(1, np.count_nonzero(inside)))
+
+
 _PLANT_COLORS: tuple[tuple[int, int, int], ...] = (
     (255, 180, 40),
     (180, 80, 255),
@@ -310,7 +326,14 @@ class ClassicalVisionEngine(ImageAnalysisEngine):
                     for plant_id, prior in previous_masks.items()
                 }
         height, width = mask.shape
-        labels_count, labels, stats, _ = cv2.connectedComponentsWithStats(mask, 8)
+        # Break hairline bridges before ownership. A weed touching a crop
+        # through a few green pixels must not become radius evidence.
+        ownership_input = cv2.morphologyEx(
+            mask,
+            cv2.MORPH_OPEN,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
+        )
+        labels_count, labels, stats, _ = cv2.connectedComponentsWithStats(ownership_input, 8)
         centers = np.array([seed.center_px for seed in seeds], dtype=np.float32)
         overlay = image.copy()
         weed_review = image.copy() if weed_settings and weed_settings.enabled else None
@@ -378,7 +401,14 @@ class ClassicalVisionEngine(ImageAnalysisEngine):
                 historical_overlap = (
                     prior is not None and prior.shape == mask.shape and np.any(prior[ys, xs] > 0)
                 )
-                if component_near_seed or historical_overlap:
+                candidate_farthest = float(
+                    np.max(np.sqrt((xs[candidate] - cx) ** 2 + (ys[candidate] - cy) ** 2))
+                )
+                bounded_historical_leaf = historical_overlap and candidate_farthest <= (
+                    max(seed.current_radius_mm * 1.5, seed.current_radius_mm + 30)
+                    * params.mean_ppm
+                )
+                if component_near_seed or bounded_historical_leaf:
                     ownership[ys[candidate], xs[candidate]] = index + 1
                     ambiguous[ys[candidate & is_ambiguous], xs[candidate & is_ambiguous]] = True
                 else:
@@ -394,12 +424,11 @@ class ClassicalVisionEngine(ImageAnalysisEngine):
                         nearest_distance < soft_radius_px
                         and component_area_mm2 >= max(MIN_COMPONENT_AREA_MM2 * 12, 600)
                     )
-                    if likely_disconnected_canopy:
-                        # Soft ownership keeps a known neighbouring plant
-                        # (for example marjoram beside spinach) out of the weed
-                        # list while retaining uncertainty for automation.
-                        ownership[ys[candidate], xs[candidate]] = index + 1
-                    if nearest_distance < soft_radius_px:
+                    # History and proximity may flag a region for review, but
+                    # disconnected vegetation never expands a crop radius.
+                    if likely_disconnected_canopy or historical_overlap:
+                        ambiguous[ys[candidate], xs[candidate]] = True
+                    if nearest_distance < soft_radius_px or historical_overlap:
                         uncertain_seeds.add(index)
 
         # Explain segmentation before adding geometry: all vegetation is green,
@@ -453,6 +482,12 @@ class ClassicalVisionEngine(ImageAnalysisEngine):
             core_vegetation = int(np.count_nonzero((mask > 0) & core))
             core_area = max(1, int(np.count_nonzero(core)))
             core_coverage = core_vegetation / core_area
+            visible_fraction = _circle_visible_fraction(
+                seed.center_px,
+                max(1.0, seed.current_radius_mm * params.mean_ppm),
+                width,
+                height,
+            )
             # A plant must have evidence at its recorded centre. Vegetation
             # merely touching the outer radius is not proof the plant remains.
             center_present = core_coverage >= 0.035 or (
@@ -496,6 +531,8 @@ class ClassicalVisionEngine(ImageAnalysisEngine):
                         calibration_source=calibration.source,
                         calibrated=True,
                         contract_version=CONTRACT_VERSION,
+                        plant_center_px=seed.center_px,
+                        visible_fraction=visible_fraction,
                     )
                 )
                 continue
@@ -547,6 +584,8 @@ class ClassicalVisionEngine(ImageAnalysisEngine):
                         calibration_source=calibration.source,
                         calibrated=True,
                         contract_version=CONTRACT_VERSION,
+                        plant_center_px=seed.center_px,
+                        visible_fraction=visible_fraction,
                     )
                 )
                 center = (round(seed.center_px[0]), round(seed.center_px[1]))
@@ -569,6 +608,12 @@ class ClassicalVisionEngine(ImageAnalysisEngine):
             distances_mm = np.sqrt(dx_mm**2 + dy_mm**2)
             typical = float(np.percentile(distances_mm, 90))
             maximum = float(distances_mm.max())
+            visible_fraction = _circle_visible_fraction(
+                seed.center_px,
+                max(seed.current_radius_mm, maximum) * params.mean_ppm,
+                width,
+                height,
+            )
             ambiguous_pixels = int(np.count_nonzero(ambiguous & owned))
             ambiguous_fraction = ambiguous_pixels / max(1, len(xs))
             # Overlap is expected in a mature bed. Only make the result
@@ -651,6 +696,8 @@ class ClassicalVisionEngine(ImageAnalysisEngine):
                     calibration_source=calibration.source,
                     calibrated=True,
                     contract_version=CONTRACT_VERSION,
+                    plant_center_px=seed.center_px,
+                    visible_fraction=visible_fraction,
                 )
             )
             color = (0, 165, 255) if plant_ambiguous else _PLANT_COLORS[index % len(_PLANT_COLORS)]
@@ -752,21 +799,25 @@ class ClassicalVisionEngine(ImageAnalysisEngine):
                         confidence=confidence,
                     )
                 )
-                cv2.drawMarker(
+                # Circle radius follows the detected blob, not the (larger)
+                # protection radius, with a small margin so the ring clears
+                # the weed's edges rather than tracing them.
+                weed_radius_px = max(
+                    10, round(math.sqrt(area_mm2 / math.pi) * params.mean_ppm * 1.25)
+                )
+                cv2.circle(
                     overlay,
                     (round(wx), round(wy)),
+                    weed_radius_px,
                     (0, 0, 255),
-                    cv2.MARKER_CROSS,
-                    18,
-                    2,
+                    3,
                 )
-                cv2.drawMarker(
+                cv2.circle(
                     weed_review,
                     (round(wx), round(wy)),
+                    weed_radius_px,
                     (0, 0, 255),
-                    cv2.MARKER_CROSS,
-                    18,
-                    2,
+                    3,
                 )
         _draw_legend(overlay)
         ok_mask, encoded_mask = cv2.imencode(".png", mask)

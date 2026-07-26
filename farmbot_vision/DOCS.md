@@ -7,7 +7,7 @@ the app. Close the old FarmBot Vision browser tab and reopen the Web UI so
 Home Assistant creates a fresh Ingress session. See
 [`CHANGELOG.md`](CHANGELOG.md) for what changed in each release; the
 companion integration only needs to change when a release raises the minimum
-compatible companion integration version (currently **1.4.0**).
+compatible companion integration version (currently **1.7.0**).
 
 Since 0.2.1 the app removes the explicit root Ingress entry and normalizes
 duplicate leading slashes at the ASGI boundary. Dashboard and calibration URLs
@@ -32,7 +32,7 @@ running job rather than being dropped.
 
 ## Before enabling it
 
-FarmBot Vision requires Home Assistant Core 2026.7 or newer and companion FarmBot integration 1.4.0 or newer. Start in **Observe** mode. Do not use early experimental output as the sole input to destructive weeding.
+FarmBot Vision requires Home Assistant Core 2026.7 or newer and companion FarmBot integration 1.7.0 or newer. Start in **Observe** mode. Do not use early experimental output as the sole input to destructive weeding.
 
 ## Modes
 
@@ -100,6 +100,38 @@ in pixel space about the image centre (mirroring FarmBot physically rotating
 each photo to align it to the garden axes). Offsets are in millimetres. Every
 observation retains the exact transform, resolution, resize scales, calibration
 source and version used.
+
+## Supplemental soil height
+
+Open **Soil height** to measure the existing FarmBot soil-height
+`GenericPointer` records. The app does not infer soil points from names: the
+companion must recognize FarmBot's `measure-soil-height` or `at_soil_level`
+metadata. Fewer than three usable points triggers a warning because FarmBot's
+`soil_height(x, y)` interpolation needs at least three measurements.
+
+Calibration is required once per bot/camera arrangement. Select clear textured
+soil, enter the manually measured camera-to-soil distance at capture Z, and
+confirm that moving 50 mm toward the soil is safe. The bot takes three lateral
+views at each of three Z levels. Calibration is activated only when the
+inverse-depth fit is monotonic and its maximum residual is at most 5 mm.
+Recalibrate after any camera move, rotation, refocus, remount, resolution,
+baseline, source-geometry, Z-direction, or declared camera-setting change.
+
+Measurements capture three views 15 mm apart, or a validated one-sided triplet
+near a Y-axis edge. The pipeline rectifies roll and vertical offset, computes
+StereoSGBM disparities for both adjacent pairs and the outer pair, masks green
+vegetation and inconsistent pixels, and fits the dominant soil plane with
+RANSAC. A result remains diagnostic-only unless coverage, plane support,
+left/right consistency, plane residual, cross-pair agreement, and propagated
+uncertainty all pass their quality gates.
+
+Use **Measure selected**, **Measure all**, or **Retry failed**. Points are
+visited in nearest-neighbour order. **Stop after current point** allows the
+companion's current atomic capture to finish and never sends an emergency stop.
+All valid results require explicit individual or selected approval. Apply
+re-fetches the same point and refuses stale coordinates; only its Z coordinate
+is updated. Restarted jobs are recorded as interrupted and never resume bot
+motion or apply results automatically.
 
 ## Image selection and analysis
 

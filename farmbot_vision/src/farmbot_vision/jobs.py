@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 import logging
 import math
 import time
@@ -32,6 +33,8 @@ from .models import (
     InventoryRequest,
     OperatingMode,
     PlantSeed,
+    RemoveWeedRequest,
+    UpdateWeedRadiusRequest,
     UpsertCurveRequest,
     VisionImageRequest,
     VisionStatus,
@@ -43,6 +46,89 @@ from .weed_settings import WeedSettingsStore
 from .zones import Zone, ZoneAspect, ZoneStore, evaluate
 
 LOGGER = logging.getLogger(__name__)
+
+
+def build_plant_composite(measurements: list, output_path: Path) -> bool:
+    """Stitch every available view around one plant in garden-scale space."""
+    frames = []
+    for item in measurements:
+        if not item.source_image_path or not item.plant_center_px:
+            continue
+        image = cv2.imread(item.source_image_path, cv2.IMREAD_COLOR)
+        if image is None:
+            continue
+        try:
+            transform = json.loads(item.transform_json or "{}")
+        except (TypeError, json.JSONDecodeError):
+            transform = {}
+        ppm_x = float(transform.get("pixels_per_mm_x") or 0)
+        ppm_y = float(transform.get("pixels_per_mm_y") or 0)
+        if ppm_x <= 0 or ppm_y <= 0:
+            continue
+        cx, cy = item.plant_center_px
+        height, width = image.shape[:2]
+        frames.append(
+            {
+                "item": item,
+                "image": image,
+                "ppm_x": ppm_x,
+                "ppm_y": ppm_y,
+                "bounds": (-cx / ppm_x, (width - cx) / ppm_x, -cy / ppm_y, (height - cy) / ppm_y),
+            }
+        )
+    if not frames:
+        return False
+    min_x = min(frame["bounds"][0] for frame in frames)
+    max_x = max(frame["bounds"][1] for frame in frames)
+    min_y = min(frame["bounds"][2] for frame in frames)
+    max_y = max(frame["bounds"][3] for frame in frames)
+    ppm = float(np.median([math.sqrt(frame["ppm_x"] * frame["ppm_y"]) for frame in frames]))
+    ppm = min(ppm, 2400 / max(1.0, max(max_x - min_x, max_y - min_y)))
+    canvas_width = max(1, round((max_x - min_x) * ppm))
+    canvas_height = max(1, round((max_y - min_y) * ppm))
+    canvas = np.zeros((canvas_height, canvas_width, 3), dtype=np.uint8)
+    for frame in sorted(frames, key=lambda frame: frame["item"].image_timestamp):
+        left, right, top, bottom = frame["bounds"]
+        x0, y0 = round((left - min_x) * ppm), round((top - min_y) * ppm)
+        width = max(1, round((right - left) * ppm))
+        height = max(1, round((bottom - top) * ppm))
+        resized = cv2.resize(frame["image"], (width, height), interpolation=cv2.INTER_AREA)
+        x1, y1 = min(canvas_width, x0 + width), min(canvas_height, y0 + height)
+        canvas[y0:y1, x0:x1] = resized[: y1 - y0, : x1 - x0]
+        cv2.rectangle(canvas, (x0, y0), (x1 - 1, y1 - 1), (215, 215, 215), 2)
+        mask_path = frame["item"].mask_path
+        if mask_path:
+            mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+            if mask is not None:
+                mask = cv2.resize(mask, (width, height), interpolation=cv2.INTER_NEAREST)
+                selected = mask[: y1 - y0, : x1 - x0] > 0
+                region = canvas[y0:y1, x0:x1]
+                region[selected] = (
+                    region[selected].astype(np.float32) * 0.55
+                    + np.asarray((255, 210, 30), dtype=np.float32) * 0.45
+                ).astype(np.uint8)
+    representative = Database._consolidate_measurement_rows(
+        [item.model_dump(mode="json") for item in measurements]
+    )
+    center = (round(-min_x * ppm), round(-min_y * ppm))
+    current = float(representative["current_radius_mm"])
+    planned = float(representative["recommended_protection_radius_mm"])
+    thickness = max(4, round(min(canvas_width, canvas_height) / 300))
+    cv2.circle(canvas, center, max(1, round(current * ppm)), (255, 255, 0), thickness)
+    cv2.circle(canvas, center, max(1, round(planned * ppm)), (0, 0, 255), thickness + 1)
+    cv2.drawMarker(canvas, center, (255, 255, 255), cv2.MARKER_CROSS, 22, 3)
+    label = f"original {current:.1f} mm | planned {planned:.1f} mm"
+    cv2.putText(
+        canvas,
+        label,
+        (12, max(28, round(canvas_height * 0.04))),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        max(0.6, min(1.1, canvas_width / 1400)),
+        (255, 255, 255),
+        max(2, thickness // 2),
+        cv2.LINE_AA,
+    )
+    return bool(cv2.imwrite(str(output_path), canvas, [cv2.IMWRITE_JPEG_QUALITY, 88]))
 
 
 class JobManager:
@@ -164,6 +250,107 @@ class JobManager:
             result,
         )
         return result
+
+    async def _apply_consolidated_automatic(
+        self,
+        *,
+        entry_id: str,
+        inventory,
+        measurements: list,
+        zones: list[Zone],
+    ) -> None:
+        """Apply at most one robust automatic judgement for repeated views."""
+        if len(measurements) < 2:
+            return
+        aggregate = Database._consolidate_measurement_rows(
+            [item.model_dump(mode="json") for item in measurements]
+        )
+        latest = max(measurements, key=lambda item: item.image_timestamp)
+        candidate = latest.model_copy(
+            update={
+                "typical_canopy_radius_mm": aggregate["typical_canopy_radius_mm"],
+                "maximum_accepted_canopy_radius_mm": aggregate[
+                    "maximum_accepted_canopy_radius_mm"
+                ],
+                "recommended_protection_radius_mm": aggregate[
+                    "recommended_protection_radius_mm"
+                ],
+                "confidence": aggregate["confidence"],
+                "visible_fraction": aggregate["visible_fraction"],
+                "vegetation_absent": bool(aggregate["vegetation_absent"]),
+                "absent_observations": aggregate.get("absent_observations", 0),
+                "reason": aggregate["reason"],
+            }
+        )
+        candidate = decide(
+            candidate,
+            OperatingMode.AUTO_RADIUS,
+            self.settings,
+            previously_observed_canopy=self.db.has_present_measurement(
+                entry_id, candidate.plant_id
+            ),
+        )
+        if candidate.decision == Decision.REMOVED:
+            try:
+                result = await self.client.apply_removal(
+                    ApplyRemovalRequest(
+                        config_entry_id=entry_id,
+                        plant_id=candidate.plant_id,
+                        measurement_id=candidate.measurement_id,
+                        expected_current_radius_mm=candidate.current_radius_mm,
+                        confidence=candidate.confidence,
+                        apply=True,
+                    )
+                )
+            except (HomeAssistantError, StaleRadiusError) as exc:
+                LOGGER.warning("Consolidated automatic plant removal failed: %s", exc)
+                return
+            if result.get("status") == "applied":
+                self.db.update_measurement_outcome(
+                    str(candidate.measurement_id), decision="removed", applied=True
+                )
+                self.db.record_group_decision(
+                    str(candidate.measurement_id), "removed", result
+                )
+            return
+        if candidate.decision != Decision.APPLIED or not candidate.calibrated:
+            return
+        if candidate.recorded_center_x is not None and candidate.recorded_center_y is not None:
+            verdict = evaluate(
+                zones,
+                ZoneAspect.RADIUS,
+                candidate.recorded_center_x,
+                candidate.recorded_center_y,
+                candidate.recommended_protection_radius_mm,
+            )
+            if not verdict.allowed:
+                self.current["zone_blocked_radius"] += 1
+                return
+        try:
+            result = await self.client.apply_radius(
+                ApplyRadiusRequest(
+                    config_entry_id=entry_id,
+                    plant_id=candidate.plant_id,
+                    measurement_id=candidate.measurement_id,
+                    expected_current_radius_mm=candidate.current_radius_mm,
+                    recommended_radius_mm=candidate.recommended_protection_radius_mm,
+                    confidence=candidate.confidence,
+                    apply=True,
+                )
+            )
+        except (HomeAssistantError, StaleRadiusError) as exc:
+            LOGGER.warning("Consolidated automatic radius update failed: %s", exc)
+            return
+        if result.get("status") == "applied":
+            self.db.update_measurement_outcome(
+                str(candidate.measurement_id), decision="applied", applied=True
+            )
+            self.db.record_group_decision(
+                str(candidate.measurement_id), "applied", result
+            )
+            await self._update_curve_after_radius(
+                entry_id, inventory, candidate, human_approved=False
+            )
 
     async def run(
         self,
@@ -309,6 +496,8 @@ class JobManager:
 
                 overlay_path = artifacts / f"{job_id}-{response.image_id}-overlay.jpg"
                 weed_review_path = artifacts / f"{job_id}-{response.image_id}-weed-review.jpg"
+                source_image_path = artifacts / f"{job_id}-{response.image_id}-photo.jpg"
+                source_image_path.write_bytes(image_bytes)
 
                 if resolved.calibration is None:
                     # No valid metric calibration: pixel-only diagnostics, no
@@ -404,7 +593,11 @@ class JobManager:
                     decided.append(
                         decide(
                             item,
-                            mode,
+                            (
+                                OperatingMode.RECOMMEND
+                                if mode == OperatingMode.AUTO_RADIUS and len(images) > 1
+                                else mode
+                            ),
                             self.settings,
                             previously_observed_canopy=self.db.has_present_measurement(
                                 entry_id, item.plant_id
@@ -415,6 +608,7 @@ class JobManager:
                     overlay_path.write_bytes(result.overlay_jpeg)
                 if result.weed_review_jpeg:
                     weed_review_path.write_bytes(result.weed_review_jpeg)
+                matched_known_weed_ids: set[int] = set()
                 for weed in result.weeds:
                     weed_x, weed_y = pixel_to_garden(
                         weed.center_px[0],
@@ -426,11 +620,75 @@ class JobManager:
                         calibration,
                     )
                     duplicate_distance = max(20.0, weed.radius_mm * 1.5)
-                    if any(
-                        math.hypot(existing.x - weed_x, existing.y - weed_y)
-                        <= max(duplicate_distance, existing.radius)
-                        for existing in inventory.weeds
-                    ) or self.db.has_weed_detection_near(weed_x, weed_y, duplicate_distance):
+                    known_weed = min(
+                        (
+                            existing
+                            for existing in inventory.weeds
+                            if math.hypot(existing.x - weed_x, existing.y - weed_y)
+                            <= max(duplicate_distance, existing.radius)
+                        ),
+                        key=lambda existing: math.hypot(existing.x - weed_x, existing.y - weed_y),
+                        default=None,
+                    )
+                    if known_weed is not None:
+                        matched_known_weed_ids.add(known_weed.id)
+                        target_radius = max(float(known_weed.radius), float(weed.radius_mm))
+                        status = "matched"
+                        if (
+                            weed_settings
+                            and weed_settings.automatic_radius_adjustment
+                            and target_radius > float(known_weed.radius) + 0.5
+                            and weed.confidence >= weed_settings.radius_adjustment_confidence
+                        ):
+                            try:
+                                update_result = await self.client.update_weed_radius(
+                                    UpdateWeedRadiusRequest(
+                                        config_entry_id=entry_id,
+                                        weed_id=known_weed.id,
+                                        expected_current_radius_mm=known_weed.radius,
+                                        recommended_radius_mm=target_radius,
+                                        confidence=weed.confidence,
+                                        apply=True,
+                                    )
+                                )
+                                if update_result.get("status") == "applied":
+                                    status = "radius_adjusted"
+                            except HomeAssistantError as exc:
+                                LOGGER.warning("Automatic weed radius adjustment failed: %s", exc)
+                        self.db.upsert_weed_track(
+                            config_entry_id=entry_id,
+                            weed_id=known_weed.id,
+                            x=known_weed.x,
+                            y=known_weed.y,
+                            radius_mm=target_radius if status == "radius_adjusted" else known_weed.radius,
+                            confidence=weed.confidence,
+                            seen_at=weed.image_timestamp,
+                            status=status,
+                            absent_observations=0,
+                        )
+                        self.db.save_weed_detection(
+                            detection_id=str(weed.detection_id),
+                            config_entry_id=entry_id,
+                            image_id=weed.image_id,
+                            image_timestamp=weed.image_timestamp,
+                            x=weed_x,
+                            y=weed_y,
+                            z=response.meta.z,
+                            area_mm2=weed.area_mm2,
+                            radius_mm=target_radius,
+                            confidence=weed.confidence,
+                            overlay_path=str(overlay_path) if result.overlay_jpeg else None,
+                            review_path=(
+                                str(weed_review_path) if result.weed_review_jpeg else None
+                            ),
+                            status=status,
+                            center_px_x=weed.center_px[0],
+                            center_px_y=weed.center_px[1],
+                            processed_width=response.width,
+                            processed_height=response.height,
+                        )
+                        continue
+                    if self.db.has_weed_detection_near(weed_x, weed_y, duplicate_distance):
                         continue
                     # Zones decide where a weed may exist at all: a position the
                     # user has ruled out is not stored, so it is never created
@@ -449,7 +707,7 @@ class JobManager:
                     if (
                         weed_settings
                         and weed_settings.automatic_creation
-                        and weed.confidence >= self.settings.minimum_auto_confidence
+                        and weed.confidence >= weed_settings.minimum_confidence
                     ):
                         try:
                             create_result = await self.client.create_weed(
@@ -489,6 +747,66 @@ class JobManager:
                         processed_width=response.width,
                         processed_height=response.height,
                     )
+                if weed_settings and weed_settings.enabled:
+                    for known_weed in inventory.weeds:
+                        px, py = garden_to_pixel(
+                            known_weed.x,
+                            known_weed.y,
+                            response.meta.x,
+                            response.meta.y,
+                            response.width,
+                            response.height,
+                            calibration,
+                        )
+                        margin_px = max(
+                            8.0,
+                            (known_weed.radius + weed_settings.plant_exclusion_margin_mm)
+                            * math.sqrt(
+                                calibration.pixels_per_mm_x * calibration.pixels_per_mm_y
+                            ),
+                        )
+                        fully_visible = (
+                            margin_px <= px < response.width - margin_px
+                            and margin_px <= py < response.height - margin_px
+                        )
+                        if not fully_visible or known_weed.id in matched_known_weed_ids:
+                            continue
+                        prior_track = self.db.weed_track(entry_id, known_weed.id)
+                        absent_observations = int(
+                            (prior_track or {}).get("absent_observations") or 0
+                        ) + 1
+                        absence_confidence = min(0.95, 0.58 + 0.12 * absent_observations)
+                        track_status = "removal_recommended"
+                        if (
+                            weed_settings.automatic_removal
+                            and absent_observations
+                            >= weed_settings.removal_min_consecutive_absent
+                            and absence_confidence >= weed_settings.removal_confidence
+                        ):
+                            try:
+                                removal_result = await self.client.remove_weed(
+                                    RemoveWeedRequest(
+                                        config_entry_id=entry_id,
+                                        weed_id=known_weed.id,
+                                        confidence=absence_confidence,
+                                        apply=True,
+                                    )
+                                )
+                                if removal_result.get("status") == "applied":
+                                    track_status = "removed"
+                            except HomeAssistantError as exc:
+                                LOGGER.warning("Automatic weed removal failed: %s", exc)
+                        self.db.upsert_weed_track(
+                            config_entry_id=entry_id,
+                            weed_id=known_weed.id,
+                            x=known_weed.x,
+                            y=known_weed.y,
+                            radius_mm=known_weed.radius,
+                            confidence=absence_confidence,
+                            seen_at=None,
+                            status=track_status,
+                            absent_observations=absent_observations,
+                        )
                 vegetation_path = artifacts / f"{job_id}-{response.image_id}-mask.png"
                 if result.mask:
                     vegetation_path.write_bytes(result.mask)
@@ -519,6 +837,7 @@ class JobManager:
                                 "overlay_path": str(overlay_path),
                                 "mask_path": str(mask_path) if ownership is not None else None,
                                 "artifact_paths": artifact_paths,
+                                "source_image_path": str(source_image_path),
                             }
                         )
                     )
@@ -528,7 +847,7 @@ class JobManager:
                 for plant_id, reason in result.skipped.items():
                     skip_reasons[str(plant_id)] = reason
                 del result
-                if mode == OperatingMode.AUTO_RADIUS:
+                if mode == OperatingMode.AUTO_RADIUS and len(images) == 1:
                     for item_index, item in enumerate(decided):
                         if item.decision == Decision.REMOVED:
                             try:
@@ -694,6 +1013,23 @@ class JobManager:
                                 )
                             )
                 all_measurements.extend(decided)
+            measurements_by_plant: dict[int, list] = {}
+            for measurement in all_measurements:
+                measurements_by_plant.setdefault(measurement.plant_id, []).append(measurement)
+            for plant_id, plant_measurements in measurements_by_plant.items():
+                if mode == OperatingMode.AUTO_RADIUS:
+                    await self._apply_consolidated_automatic(
+                        entry_id=entry_id,
+                        inventory=inventory,
+                        measurements=plant_measurements,
+                        zones=zones,
+                    )
+                composite_path = artifacts / f"{job_id}-plant-{plant_id}-composite.jpg"
+                if build_plant_composite(plant_measurements, composite_path):
+                    self.db.set_composite_path(
+                        [str(item.measurement_id) for item in plant_measurements],
+                        str(composite_path),
+                    )
             return await self._finish(
                 entry_id, job_id, "idle", start_wall, start_cpu, all_measurements, "completed"
             )

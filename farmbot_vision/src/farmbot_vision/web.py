@@ -5,9 +5,10 @@ import base64
 import json
 import logging
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from html import escape
 from pathlib import Path
+from typing import Annotated
 from uuid import UUID
 
 import cv2
@@ -38,6 +39,7 @@ from .models import (
     ApplyPlantCenterRequest,
     ApplyRadiusRequest,
     ApplyRemovalRequest,
+    ApplySoilHeightRequest,
     Calibration,
     CreateWeedRequest,
     InventoryRequest,
@@ -49,6 +51,7 @@ from .models import (
     VisionImageRequest,
 )
 from .settings import Settings
+from .soil_jobs import SoilJobManager
 from .vision import garden_to_pixel
 from .weed_settings import WeedSettings, WeedSettingsStore
 from .zones import (
@@ -70,6 +73,7 @@ client = HomeAssistantClient()
 weed_settings_store = WeedSettingsStore(settings.data_dir / "weed_settings.json")
 zone_store = ZoneStore(settings.data_dir / "zones.json")
 jobs = JobManager(settings, database, client, weed_settings_store, zone_store)
+soil_jobs = SoilJobManager(database, client, settings.data_dir, jobs.lock)
 
 
 def _calibration_from_input(entry_id: str, values: FarmbotCalibrationInput) -> Calibration:
@@ -346,10 +350,15 @@ _DASHBOARD_JS = r"""
   const queueRows=document.getElementById('queue-image-rows');
   const queueMessage=document.getElementById('queue-message');
   async function loadQueueImages(){
-    const hours=document.getElementById('queue-hours').value;
+    const dateFrom=document.getElementById('queue-from').value;
+    const dateTo=document.getElementById('queue-to').value;
+    if(!dateFrom||!dateTo){queueMessage.textContent='Choose both a from and to date';return;}
+    if(new Date(dateFrom)>new Date(dateTo)){queueMessage.textContent='From must be before to';return;}
     queueMessage.textContent='Loading images…';
     try{
-      const response=await fetch('api/analysis/images?hours='+encodeURIComponent(hours));
+      const query=new URLSearchParams({date_from:new Date(dateFrom).toISOString(),
+        date_to:new Date(dateTo).toISOString()});
+      const response=await fetch('api/analysis/images?'+query.toString());
       const data=await response.json();
       if(!response.ok) throw new Error(data.detail||('HTTP '+response.status));
       queueRows.innerHTML=(data.images||[]).map(function(image){
@@ -383,11 +392,14 @@ _DASHBOARD_JS = r"""
   let weedData=null, weedReturnFocus=null;
   function showWeedView(withOverlay){
     if(!weedData) return;
-    const useOverlay=withOverlay||!weedData.reviewArtifact;
+    const noCleanImage=!weedData.reviewArtifact;
+    const useOverlay=withOverlay||noCleanImage;
     weedImg.src=useOverlay?weedData.overlayArtifact:weedData.reviewArtifact;
-    weedWithoutOverlay.disabled=!weedData.reviewArtifact;
     weedWithoutOverlay.setAttribute('aria-pressed',String(!useOverlay));
     weedWithOverlay.setAttribute('aria-pressed',String(useOverlay));
+    weedMessage.textContent=(!withOverlay&&noCleanImage)
+      ?'No image without the overlay was saved for this older detection; showing the analysis overlay instead.'
+      :'';
   }
   function closeWeedModal(){
     weedModal.hidden=true; weedImg.removeAttribute('src'); weedData=null;
@@ -513,6 +525,15 @@ _DASHBOARD_JS = r"""
     if(!weedModal.hidden) closeWeedModal();
   });
   document.getElementById('queue-open').addEventListener('click',function(){
+    const to=new Date(), from=new Date(to.getTime()-72*60*60*1000);
+    function localValue(value){
+      const shifted=new Date(value.getTime()-value.getTimezoneOffset()*60000);
+      return shifted.toISOString().slice(0,16);
+    }
+    if(!document.getElementById('queue-to').value){
+      document.getElementById('queue-from').value=localValue(from);
+      document.getElementById('queue-to').value=localValue(to);
+    }
     queueModal.hidden=false;loadQueueImages();
   });
   document.getElementById('queue-close').addEventListener('click',function(){queueModal.hidden=true;});
@@ -788,6 +809,7 @@ async def lifespan(_: FastAPI):
     yield
     for task in tasks:
         task.cancel()
+    await soil_jobs.close()
     await client.close()
 
 
@@ -823,15 +845,13 @@ button{{background:var(--green);border:0;border-radius:6px;padding:.65rem 1rem;c
 .modal-controls{{display:flex;gap:.5rem;align-items:center;justify-content:center;margin-top:.6rem}}.legend{{font-size:.9rem;color:var(--muted)}}
 .queue-dialog{{width:min(95vw,900px)}}.button-row{{display:flex;gap:.5rem;flex-wrap:wrap;align-items:center}}
 .weed-dialog{{width:min(95vw,900px)}}.weed-image-wrap{{position:relative;display:inline-block;margin:auto}}
-.weed-marker{{position:absolute;width:26px;height:26px;margin-left:-13px;margin-top:-13px;pointer-events:none}}
-.weed-marker::before,.weed-marker::after{{content:'';position:absolute;background:#168cff;box-shadow:0 0 0 1px #001b3d}}
-.weed-marker::before{{left:50%;top:0;width:4px;height:100%;margin-left:-2px}}
-.weed-marker::after{{top:50%;left:0;height:4px;width:100%;margin-top:-2px}}
+.weed-marker{{position:absolute;width:34px;height:34px;margin-left:-17px;margin-top:-17px;pointer-events:none;
+border-radius:50%;border:3px solid #168cff;box-shadow:0 0 0 1px #001b3d}}
 .weed-view-toggle button[aria-pressed=true]{{background:#1672c4;color:white;box-shadow:inset 0 0 0 2px #0b4779}}
 td.actions{{min-width:9rem}}.actions-group{{display:flex;flex-direction:column;align-items:stretch;gap:.4rem}}
 .actions-group form{{margin:0}}.actions-group button{{width:100%;padding:.45rem .8rem;font-size:.9rem}}
 .actions-group button[data-artifacts]{{background:#e4ede7;color:var(--dark)}}
-</style></head><body><header><h1>🌱 FarmBot Vision</h1><nav><a href="./">Analysis</a><a href="settings">Calibration</a><a href="weed-settings">Weed settings</a><a href="zones">Boundaries &amp; zones</a><a href="api/health">Health JSON</a></nav></header>
+</style></head><body><header><h1>🌱 FarmBot Vision</h1><nav><a href="./">Analysis</a><a href="soil-height">Soil height</a><a href="settings">Calibration</a><a href="weed-settings">Weed settings</a><a href="zones">Boundaries &amp; zones</a><a href="api/health">Health JSON</a></nav></header>
 <main>{body}</main></body></html>"""
     )
 
@@ -880,21 +900,25 @@ async def dashboard(request: Request) -> HTMLResponse:
 
     def _artifact_button(r: dict) -> str:
         paths = r.get("artifact_paths") or []
+        if r.get("composite_path") and r["composite_path"] not in paths:
+            paths = [r["composite_path"], *paths]
         if not paths and r.get("overlay_path"):
             paths = [r["overlay_path"]]
         urls = [f"artifact/{Path(path).name}" for path in paths if path]
         if not urls:
             return "<span class=muted>None</span>"
-        uncertainty = float(r.get("calibration_uncertainty_mm") or 0)
+        center_x = r.get("recorded_center_x")
+        center_y = r.get("recorded_center_y")
+        center = (
+            f"({float(center_x):.1f}, {float(center_y):.1f})"
+            if center_x is not None and center_y is not None
+            else "(unavailable)"
+        )
         details = {
             "formula": (
-                f"Current {r['current_radius_mm']:.1f} mm; typical "
-                f"{r['typical_canopy_radius_mm']:.1f} mm; maximum "
-                f"{r['maximum_accepted_canopy_radius_mm']:.1f} mm. Recommended = maximum + "
-                f"safety {float(r.get('safety_margin_mm') or 0):.1f} + calibration "
-                f"uncertainty {uncertainty:.1f} = {r['recommended_protection_radius_mm']:.1f} mm. "
-                "Legend: green = vegetation; palette = plant ownership; red = ambiguous; "
-                "cyan/plant colour/white = typical/maximum/protected geometry."
+                f"Current {r['current_radius_mm']:.1f} mm; Recommended = "
+                f"{r['recommended_protection_radius_mm']:.1f} mm. "
+                f"Plant center = {center}; crop: {r.get('crop_slug', 'unknown')}."
             )
         }
         artifacts_json = escape(json.dumps(urls, separators=(",", ":")), quote=True)
@@ -903,6 +927,24 @@ async def dashboard(request: Request) -> HTMLResponse:
             f'<button type=button data-artifacts="{artifacts_json}" '
             f'data-details="{details_json}">View</button>'
         )
+
+    def _format_center(
+        x: object,
+        y: object,
+        *,
+        fallback: str = "Unavailable for older result",
+    ) -> str:
+        if x is None or y is None:
+            return f"<span class=muted>{escape(fallback)}</span>"
+        try:
+            return f"X {float(x):.1f}, Y {float(y):.1f}"
+        except (TypeError, ValueError):
+            return f"<span class=muted>{escape(fallback)}</span>"
+
+    def _format_coordinates(x: object, y: object) -> str:
+        if x is None or y is None:
+            return "<span class=muted>Unavailable</span>"
+        return f"({float(x):.1f}, {float(y):.1f})"
 
     def _review_controls(r: dict) -> str:
         # Approval is impossible without a valid calibration (Part 6, Part 10).
@@ -937,6 +979,7 @@ async def dashboard(request: Request) -> HTMLResponse:
 
     measurement_rows = "".join(
         f'<tr class=review-item id="measurement-{r["measurement_id"]}"><td>{escape(r["crop_slug"])}</td>'
+        f"<td>{_format_coordinates(r.get('recorded_center_x'), r.get('recorded_center_y'))}</td>"
         f"<td>{r['current_radius_mm']:.1f}</td>"
         f"<td>{r['maximum_accepted_canopy_radius_mm']:.1f}</td><td>{r['recommended_protection_radius_mm']:.1f}</td>"
         f"<td>{r['confidence']:.2f}</td>"
@@ -950,19 +993,6 @@ async def dashboard(request: Request) -> HTMLResponse:
         f"<tr><td>{escape(slug)}</td><td>{escape(str(curve))}</td><td>diameter mm</td></tr>"
         for slug, curve in curves.items()
     )
-
-    def _format_center(
-        x: object,
-        y: object,
-        *,
-        fallback: str = "Unavailable for older result",
-    ) -> str:
-        if x is None or y is None:
-            return f"<span class=muted>{escape(fallback)}</span>"
-        try:
-            return f"X {float(x):.1f}, Y {float(y):.1f}"
-        except (TypeError, ValueError):
-            return f"<span class=muted>{escape(fallback)}</span>"
 
     removal_rows = "".join(
         f'<tr class=review-item id="measurement-{r["measurement_id"]}">'
@@ -1110,7 +1140,7 @@ It affects automatic changes only; every result remains manually reviewable.</p>
 </div>
 <p><b>Calibration warnings</b></p><ul>{warning_html}</ul>
 <p><b>Skip reasons</b></p><ul>{skip_html}</ul></section>
-<section class=card><h2>Measurements</h2><table><thead><tr><th>Crop</th><th>Current</th><th>Max leaf</th><th>Recommended</th><th>Confidence</th><th>Decision</th><th>Reason</th><th>Actions</th></tr></thead><tbody>{measurement_rows or "<tr><td colspan=8>No measurements yet</td></tr>"}</tbody></table></section>
+<section class=card><h2>Measurements</h2><table><thead><tr><th>Crop</th><th>Coordinates (x, y)</th><th>Current</th><th>Max leaf</th><th>Recommended</th><th>Confidence</th><th>Decision</th><th>Reason</th><th>Actions</th></tr></thead><tbody>{measurement_rows or "<tr><td colspan=9>No measurements yet</td></tr>"}</tbody></table></section>
 <section class=card><h2>Removed / missing plants</h2><table><thead><tr><th>Crop</th><th>Recorded center (X, Y mm)</th><th>Move center to (X, Y mm)</th><th>Absent looks</th><th>Confidence</th><th>Reason</th><th>Diagnostic</th><th>Review</th></tr></thead><tbody>{removal_rows or "<tr><td colspan=8>No confirmed missing plants</td></tr>"}</tbody></table></section>
 <section class=card><h2>Detected weeds</h2><p class=muted>Unowned vegetation outside known plant protection areas.</p>
 <table><thead><tr><th>Image</th><th>Coordinates</th><th>Area mm²</th><th>Confidence</th><th>View</th><th>Review</th></tr></thead>
@@ -1122,7 +1152,7 @@ It affects automatic changes only; every result remains manually reviewable.</p>
 <div id=overlay-modal class=overlay-modal hidden role=dialog aria-modal=true aria-label="Analysis diagnostic"><figure>
 <button id=overlay-modal-close class=modal-close type=button aria-label=Close>&times;</button>
 <img id=overlay-modal-img alt="Plant analysis diagnostic"><figcaption id=overlay-modal-details></figcaption>
-<p class=legend>Vegetation mask and per-plant ownership are shown as separate gallery images.</p>
+<p class=legend>Cyan circle = original radius; red circle = planned radius.</p>
 <div class=modal-controls><button id=overlay-modal-prev type=button>Previous</button><span id=overlay-modal-counter></span><button id=overlay-modal-next type=button>Next</button></div>
 </figure></div>
 <div id=weed-modal class=overlay-modal hidden role=dialog aria-modal=true aria-label="Weed review">
@@ -1133,7 +1163,7 @@ It affects automatic changes only; every result remains manually reviewable.</p>
 </div>
 <div class=weed-image-wrap><img id=weed-modal-img alt="Weed detection"><div id=weed-modal-marker class=weed-marker hidden></div></div>
 <figcaption id=weed-modal-details></figcaption>
-<p class=legend>Blue cross = the weed being reviewed; red crosses = other detected weeds in this image.</p>
+<p class=legend>Blue circle = the weed being reviewed; red circles = other detected weeds in this image.</p>
 <div class=modal-controls>
 <button id=weed-modal-accept type=button>Accept weed</button>
 <button id=weed-modal-reject type=button>Reject weed</button>
@@ -1144,9 +1174,8 @@ It affects automatic changes only; every result remains manually reviewable.</p>
 <div id=queue-modal class=overlay-modal hidden role=dialog aria-modal=true aria-label="Add images to analysis queue">
 <figure class=queue-dialog><button id=queue-close class=modal-close type=button aria-label=Close>&times;</button>
 <h2>Add images to analysis queue</h2>
-<div class=button-row><label>Timeframe
-<select id=queue-hours><option value=24>Last 24 hours</option><option value=72 selected>Last 3 days</option>
-<option value=168>Last 7 days</option><option value=336>Last 14 days</option><option value=720>Last 30 days</option></select></label>
+<div class=button-row><label>From <input id=queue-from type=datetime-local></label>
+<label>To <input id=queue-to type=datetime-local></label>
 <button id=queue-refresh type=button>Refresh</button><label><input id=queue-select-all type=checkbox> Select all</label></div>
 <p id=queue-message class=muted></p><table><thead><tr><th>Select</th><th>Coordinates (x, y, z)</th>
 <th>Plants present</th><th>Date taken</th></tr></thead><tbody id=queue-image-rows></tbody></table>
@@ -1162,10 +1191,21 @@ async def analyse(background: BackgroundTasks) -> RedirectResponse:
 
 
 @app.get("/api/analysis/images")
-async def analysis_images(hours: int = 72) -> JSONResponse:
+async def analysis_images(
+    date_from: datetime | None = None, date_to: datetime | None = None
+) -> JSONResponse:
     if not settings.selected_config_entry_id:
         raise HTTPException(400, "Select a FarmBot before loading images")
-    hours = max(1, min(720, hours))
+    now = datetime.now(UTC)
+    date_to = date_to or now
+    date_from = date_from or (date_to - timedelta(hours=72))
+    if date_from.tzinfo is None:
+        date_from = date_from.replace(tzinfo=UTC)
+    if date_to.tzinfo is None:
+        date_to = date_to.replace(tzinfo=UTC)
+    if date_from > date_to:
+        raise HTTPException(422, "From must be before to")
+    hours = max(1, min(720, int((now - date_from).total_seconds() / 3600) + 1))
     try:
         inventory = await client.inventory(
             InventoryRequest(
@@ -1179,6 +1219,8 @@ async def analysis_images(hours: int = 72) -> JSONResponse:
     width, height = settings.analysis_width, settings.analysis_height
     items = []
     for image in sorted(inventory.images, key=lambda item: item.created_at, reverse=True):
+        if not date_from <= image.created_at <= date_to:
+            continue
         present = []
         for plant in inventory.plants:
             if calibration is not None:
@@ -1217,12 +1259,349 @@ async def analysis_images(hours: int = 72) -> JSONResponse:
                 "plants": present,
             }
         )
-    return JSONResponse({"images": items, "hours": hours})
+    return JSONResponse(
+        {"images": items, "date_from": date_from.isoformat(), "date_to": date_to.isoformat()}
+    )
 
 
 @app.post("/analysis/queue")
 async def add_analysis_queue(request: QueueImagesRequest) -> JSONResponse:
     return JSONResponse({"queue_length": jobs.add_to_queue(request.image_ids)})
+
+
+def _soil_artifacts(paths: list[str]) -> str:
+    links = []
+    for path in paths:
+        if not path:
+            continue
+        url = f"artifact/{Path(path).name}"
+        label = Path(path).stem.rsplit("-", 1)[-1]
+        links.append(
+            f'<a href="{escape(url, quote=True)}" target=_blank rel=noopener>'
+            f"{escape(label)}</a>"
+        )
+    return " ".join(links) or '<span class=muted>None</span>'
+
+
+@app.get("/soil-height", response_class=HTMLResponse)
+async def soil_height_page(request: Request) -> HTMLResponse:
+    entry_id = settings.selected_config_entry_id
+    inventory = None
+    inventory_error = ""
+    if entry_id:
+        try:
+            inventory = await client.soil_points(entry_id)
+        except HomeAssistantError as exc:
+            inventory_error = str(exc)
+    measurements = database.recent_soil_measurements(entry_id, 200)
+    calibration = database.active_soil_calibration(entry_id) if entry_id else None
+    persisted_job = database.latest_soil_job(entry_id)
+    current_job = soil_jobs.current if soil_jobs.running else (persisted_job or soil_jobs.current)
+
+    latest_by_point: dict[int, dict] = {}
+    for measurement in measurements:
+        latest_by_point.setdefault(int(measurement["point_id"]), measurement)
+
+    point_rows = ""
+    point_options = ""
+    retry_ids: list[int] = []
+    if inventory:
+        for point in inventory.points:
+            measurement = latest_by_point.get(point.id)
+            status = measurement["status"] if measurement else "not measured"
+            proposed = (
+                f'{measurement["proposed_z_mm"]:.0f} mm'
+                if measurement and measurement["proposed_z_mm"] is not None
+                else "—"
+            )
+            uncertainty = (
+                f'±{measurement["uncertainty_mm"]:.1f} mm'
+                if measurement and measurement["uncertainty_mm"] is not None
+                else "—"
+            )
+            confidence = (
+                f'{100 * measurement["confidence"]:.0f}%'
+                if measurement
+                else "—"
+            )
+            reason = escape(measurement["reason"] if measurement else "")
+            diagnostics = _soil_artifacts(
+                measurement["artifact_paths"] if measurement else []
+            )
+            if measurement and measurement["status"] == "failed":
+                retry_ids.append(point.id)
+            apply_control = ""
+            if measurement and measurement["status"] == "valid":
+                measurement_id = escape(measurement["measurement_id"], quote=True)
+                apply_control = (
+                    f'<form method=post action="soil/measurements/{measurement_id}/apply">'
+                    "<button type=submit>Apply</button></form>"
+                    f'<form method=post action="soil/measurements/{measurement_id}/reject">'
+                    "<button type=submit>Reject</button></form>"
+                )
+            point_rows += (
+                "<tr>"
+                f'<td><input form=measure-points type=checkbox name=point_ids value="{point.id}"></td>'
+                f"<td>{point.id}</td><td>{escape(point.name)}</td>"
+                f"<td>{point.x:.1f}, {point.y:.1f}</td><td>{point.z:.1f} mm</td>"
+                f"<td>{proposed}</td><td>{uncertainty}</td><td>{confidence}</td>"
+                f"<td>{escape(status)}</td><td>{reason}</td><td>{diagnostics}</td>"
+                f"<td>{apply_control}</td></tr>"
+            )
+            point_options += (
+                f'<option value="{point.id}">{escape(point.name)} '
+                f"({point.x:.0f}, {point.y:.0f})</option>"
+            )
+
+    valid_measurements = [item for item in measurements if item["status"] == "valid"]
+    measurement_rows = "".join(
+        "<tr>"
+        f'<td><input form=apply-selected type=checkbox name=measurement_ids '
+        f'value="{escape(item["measurement_id"], quote=True)}"></td>'
+        f"<td>{escape(item['point_name'])}</td><td>{item['old_z_mm']:.1f} mm</td>"
+        f"<td>{item['proposed_z_mm']:.0f} mm</td>"
+        f"<td>{100 * item['confidence']:.0f}%</td>"
+        f"<td>{escape(item['reason'])}</td></tr>"
+        for item in valid_measurements
+    )
+    point_count = len(inventory.points) if inventory else 0
+    warning = (
+        '<p class=warn>At least three valid soil points are required for FarmBot '
+        "soil-height interpolation.</p>"
+        if point_count < 3
+        else ""
+    )
+    motion = inventory.motion if inventory else None
+    motion_summary = (
+        f"connected={motion.connected}, busy={motion.busy}, emergency stop={motion.locked}, "
+        f"position={escape(json.dumps(motion.position))}"
+        if motion
+        else "unavailable"
+    )
+    calibration_summary = (
+        f"Active calibration #{calibration.calibration_id}: "
+        f"{calibration.processed_width}×{calibration.processed_height}, "
+        f"{calibration.baseline_mm:.0f} mm baseline, "
+        f"{calibration.residual_mm:.1f} mm residual"
+        if calibration
+        else "No active soil calibration. Complete the guided calibration before measuring."
+    )
+    default_capture_z = calibration.capture_z if calibration else 0
+    default_baseline = calibration.baseline_mm if calibration else 15
+    job_message = escape(str(current_job.get("message", "Not run")))
+    job_status = escape(str(current_job.get("status", "idle")))
+    retry_values = "".join(
+        f'<input type=hidden name=point_ids value="{point_id}">' for point_id in retry_ids
+    )
+    live_refresh = (
+        "<script>setTimeout(()=>location.reload(),3000)</script>" if soil_jobs.running else ""
+    )
+    body = f"""
+<h2>Supplemental soil-height measurement</h2>
+<p>Captures three virtual-stereo views at each recognized FarmBot soil point. Results
+are reviewed here; the bot point is never updated automatically.</p>
+{warning}
+<section class=grid>
+ <div class=card><h3>Bot</h3><p>{escape(entry_id or "No FarmBot selected")}</p>
+ <p class=muted>{motion_summary}</p><p>{escape(inventory_error)}</p></div>
+ <div class=card><h3>Calibration</h3><p>{escape(calibration_summary)}</p>
+ <p class=warn>Recalibrate after moving, rotating, or refocusing the camera.</p></div>
+ <div class=card><h3>Current job</h3><p><strong>{job_status}</strong>: {job_message}</p>
+ <form method=post action=soil/stop><button type=submit>Stop after current point</button></form></div>
+</section>
+<section class=card>
+ <h3>Guided calibration</h3>
+ <p>Choose clear, textured soil. Enter the manually measured camera-to-soil distance
+at the capture Z, then confirm that a 50 mm movement toward the soil is safe.</p>
+ <form method=post action=soil/calibrate>
+  <label>Soil point <select name=point_id required>{point_options}</select></label>
+  <label>Camera-to-soil distance (mm) <input type=number min=1 step=0.1
+   name=reference_distance_mm required></label>
+  <label>Capture Z (mm) <input type=number step=0.1 name=capture_z value=0 required></label>
+  <label>Baseline (mm) <input type=number min=5 max=30 step=0.1
+   name=baseline_mm value=15 required></label>
+  <label><input type=checkbox name=safety_confirm required> I confirm the automated
+   50 mm movement toward the soil is safe</label>
+  <button type=submit>Calibrate</button>
+ </form>
+</section>
+<section class=card>
+ <h3>Soil points ({point_count})</h3>
+ <form id=measure-points method=post action=soil/measure>
+  <label>Capture Z (mm) <input type=number step=0.1 name=capture_z
+   value="{default_capture_z:g}" required></label>
+  <label>Baseline (mm) <input type=number min=5 max=30 step=0.1 name=baseline_mm
+   value="{default_baseline:g}" required></label>
+  <button type=submit name=mode value=selected>Measure selected</button>
+  <button type=submit name=mode value=all>Measure all</button>
+ </form>
+ <form method=post action=soil/measure>{retry_values}
+  <input type=hidden name=capture_z value="{default_capture_z:g}">
+  <input type=hidden name=baseline_mm value="{default_baseline:g}">
+  <button type=submit name=mode value=retry {'disabled' if not retry_ids else ''}>Retry failed</button>
+ </form>
+ <table><thead><tr><th>Select</th><th>ID</th><th>Point</th><th>X, Y</th>
+ <th>Current Z</th><th>Proposed Z</th><th>Uncertainty</th><th>Confidence</th>
+ <th>Status</th><th>Message</th><th>Diagnostics</th><th>Review</th></tr></thead>
+ <tbody>{point_rows or '<tr><td colspan=12>No eligible soil points found.</td></tr>'}</tbody></table>
+</section>
+<section class=card>
+ <h3>Pending valid results</h3>
+ <form id=apply-selected method=post action=soil/apply-selected>
+  <button type=submit>Apply selected</button>
+ </form>
+ <table><thead><tr><th>Select</th><th>Point</th><th>Old Z</th><th>Proposed Z</th>
+ <th>Confidence</th><th>Quality result</th></tr></thead>
+ <tbody>{measurement_rows or '<tr><td colspan=6>No unapplied valid results.</td></tr>'}</tbody></table>
+</section>
+{live_refresh}"""
+    return layout(request, body, "Soil height · FarmBot Vision")
+
+
+@app.get("/api/soil/points")
+async def soil_points_api() -> JSONResponse:
+    entry_id = settings.selected_config_entry_id
+    if not entry_id:
+        raise HTTPException(409, "No FarmBot config entry is selected")
+    return JSONResponse((await client.soil_points(entry_id)).model_dump(mode="json"))
+
+
+@app.get("/api/soil/job")
+async def soil_job_api() -> JSONResponse:
+    return JSONResponse(soil_jobs.current)
+
+
+@app.post("/soil/calibrate")
+async def start_soil_calibration(
+    point_id: int = Form(...),
+    reference_distance_mm: float = Form(...),
+    capture_z: float = Form(0),
+    baseline_mm: float = Form(15),
+    safety_confirm: bool = Form(False),
+) -> RedirectResponse:
+    entry_id = settings.selected_config_entry_id
+    if not entry_id:
+        raise HTTPException(409, "No FarmBot config entry is selected")
+    if not safety_confirm:
+        raise HTTPException(422, "Confirm that the 50 mm calibration movement is safe")
+    inventory = await client.soil_points(entry_id)
+    if point_id not in {point.id for point in inventory.points}:
+        raise HTTPException(404, "Eligible soil point not found")
+    try:
+        soil_jobs.start_calibration(
+            config_entry_id=entry_id,
+            point_id=point_id,
+            capture_z=capture_z,
+            baseline_mm=baseline_mm,
+            reference_distance_mm=reference_distance_mm,
+            z_direction=inventory.motion.z_direction,
+        )
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return RedirectResponse("../soil-height", status_code=303)
+
+
+@app.post("/soil/measure")
+async def start_soil_measurement(
+    point_ids: Annotated[list[int] | None, Form()] = None,
+    mode: str = Form("selected"),
+    capture_z: float = Form(0),
+    baseline_mm: float = Form(15),
+) -> RedirectResponse:
+    entry_id = settings.selected_config_entry_id
+    if not entry_id:
+        raise HTTPException(409, "No FarmBot config entry is selected")
+    if mode == "all":
+        inventory = await client.soil_points(entry_id)
+        point_ids = [point.id for point in inventory.points]
+    point_ids = point_ids or []
+    try:
+        soil_jobs.start_measurements(
+            config_entry_id=entry_id,
+            point_ids=point_ids,
+            capture_z=capture_z,
+            baseline_mm=baseline_mm,
+        )
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return RedirectResponse("../soil-height", status_code=303)
+
+
+@app.post("/soil/stop")
+async def stop_soil_measurement() -> RedirectResponse:
+    if soil_jobs.running:
+        soil_jobs.request_stop()
+    return RedirectResponse("../soil-height", status_code=303)
+
+
+async def _apply_soil_measurement(measurement_id: str) -> dict:
+    measurement = database.soil_measurement(measurement_id)
+    if (
+        measurement is None
+        or measurement["status"] != "valid"
+        or measurement["proposed_z_mm"] is None
+    ):
+        raise HTTPException(404, "Applicable soil result not found")
+    apply_request = ApplySoilHeightRequest(
+        config_entry_id=measurement["config_entry_id"],
+        point_id=measurement["point_id"],
+        measurement_id=measurement["measurement_id"],
+        expected_x=measurement["expected_x"],
+        expected_y=measurement["expected_y"],
+        expected_z=measurement["old_z_mm"],
+        recommended_z_mm=measurement["proposed_z_mm"],
+        confidence=measurement["confidence"],
+        apply=True,
+        human_approved=True,
+    )
+    try:
+        response = await client.apply_soil_height(apply_request)
+    except HomeAssistantError as exc:
+        response = {"status": "conflict", "message": str(exc)}
+    response_status = str(response.get("status") or "rejected")
+    if response_status == "applied":
+        status, action = "applied", "approve"
+    elif response_status == "conflict":
+        status, action = "conflict", "stale_conflict"
+    else:
+        status, action = "rejected", "rejected_write"
+    reason = str(response.get("message") or response.get("status") or status)[:240]
+    database.update_soil_measurement_status(measurement_id, status, reason)
+    database.record_soil_decision(measurement_id, action, response)
+    return response
+
+
+@app.post("/soil/measurements/{measurement_id}/apply")
+async def apply_soil_measurement(measurement_id: UUID) -> RedirectResponse:
+    await _apply_soil_measurement(str(measurement_id))
+    return RedirectResponse("../../../soil-height", status_code=303)
+
+
+@app.post("/soil/apply-selected")
+async def apply_selected_soil_measurements(
+    measurement_ids: Annotated[list[str] | None, Form()] = None,
+) -> RedirectResponse:
+    for measurement_id in measurement_ids or []:
+        try:
+            UUID(measurement_id)
+        except ValueError as exc:
+            raise HTTPException(422, "Malformed soil measurement ID") from exc
+        await _apply_soil_measurement(measurement_id)
+    return RedirectResponse("../soil-height", status_code=303)
+
+
+@app.post("/soil/measurements/{measurement_id}/reject")
+async def reject_soil_measurement(measurement_id: UUID) -> RedirectResponse:
+    measurement = database.soil_measurement(str(measurement_id))
+    if measurement is None or measurement["status"] != "valid":
+        raise HTTPException(404, "Reviewable soil result not found")
+    database.update_soil_measurement_status(
+        str(measurement_id), "rejected", "Rejected during human review"
+    )
+    database.record_soil_decision(
+        str(measurement_id), "reject", {"status": "rejected"}
+    )
+    return RedirectResponse("../../../soil-height", status_code=303)
 
 
 @app.get("/weed-settings", response_class=HTMLResponse)
@@ -1239,6 +1618,13 @@ requires the companion integration's automatic weed-write permission.</p>
 <label><input type=checkbox name=enabled value=true{checked(values.enabled)}> Enable weed detection</label><br>
 <label><input type=checkbox name=automatic_creation value=true{checked(values.automatic_creation)}>
 Automatically create detected weeds in FarmBot</label><br>
+<label><input type=checkbox name=automatic_radius_adjustment value=true{checked(values.automatic_radius_adjustment)}>
+Automatically increase the radius of a matching known weed</label><br>
+<label>Radius adjustment confidence <input type=number name=radius_adjustment_confidence min=0 max=1 step=.01 value="{values.radius_adjustment_confidence:g}"></label><br>
+<label><input type=checkbox name=automatic_removal value=true{checked(values.automatic_removal)}>
+Automatically remove known weeds that disappear</label><br>
+<label>Removal confidence <input type=number name=removal_confidence min=0 max=1 step=.01 value="{values.removal_confidence:g}"></label><br>
+<label>Absent images before removal <input type=number name=removal_min_consecutive_absent min=1 max=10 step=1 value="{values.removal_min_consecutive_absent}"></label><br>
 <label>Minimum weed area (mm²) <input type=number name=minimum_area_mm2 min=5 step=1 value="{values.minimum_area_mm2:g}"></label><br>
 <label>Maximum weed area (mm²) <input type=number name=maximum_area_mm2 min=10 step=1 value="{values.maximum_area_mm2:g}"></label><br>
 <label>Extra exclusion around plants (mm) <input type=number name=plant_exclusion_margin_mm min=0 step=1 value="{values.plant_exclusion_margin_mm:g}"></label><br>
@@ -1252,6 +1638,11 @@ Automatically create detected weeds in FarmBot</label><br>
 async def save_weed_settings(
     enabled: bool = Form(False),
     automatic_creation: bool = Form(False),
+    automatic_radius_adjustment: bool = Form(False),
+    radius_adjustment_confidence: float = Form(0.55),
+    automatic_removal: bool = Form(False),
+    removal_confidence: float = Form(0.6),
+    removal_min_consecutive_absent: int = Form(1),
     minimum_area_mm2: float = Form(25),
     maximum_area_mm2: float = Form(2500),
     plant_exclusion_margin_mm: float = Form(35),
@@ -1262,6 +1653,11 @@ async def save_weed_settings(
         values = WeedSettings(
             enabled=enabled,
             automatic_creation=automatic_creation,
+            automatic_radius_adjustment=automatic_radius_adjustment,
+            radius_adjustment_confidence=radius_adjustment_confidence,
+            automatic_removal=automatic_removal,
+            removal_confidence=removal_confidence,
+            removal_min_consecutive_absent=removal_min_consecutive_absent,
             minimum_area_mm2=minimum_area_mm2,
             maximum_area_mm2=maximum_area_mm2,
             plant_exclusion_margin_mm=plant_exclusion_margin_mm,
@@ -1889,7 +2285,7 @@ async def recommendation(request: Request, measurement_id: str, action: str) -> 
                 request, "conflict", "Calibration is required", error_status=409
             )
         if row["recommended_protection_radius_mm"] == row["current_radius_mm"]:
-            database.record_decision(
+            database.record_group_decision(
                 measurement_id,
                 "approved_no_change",
                 {
@@ -1947,7 +2343,7 @@ async def recommendation(request: Request, measurement_id: str, action: str) -> 
                 error_status=409 if status == "conflict" else None,
             )
         database.update_measurement_outcome(measurement_id, decision="applied", applied=True)
-        database.record_decision(measurement_id, "applied", result)
+        database.record_group_decision(measurement_id, "applied", result)
         approved_measurement = _measurement_from_row(row)
         if approved_measurement.plant_age_days is None:
             curve_message = "skipped because plant age is unavailable"
@@ -1971,7 +2367,7 @@ async def recommendation(request: Request, measurement_id: str, action: str) -> 
             "applied",
             f"Radius applied. Curve update: {curve_message}",
         )
-    database.record_decision(measurement_id, "reject", {})
+    database.record_group_decision(measurement_id, "reject", {})
     return _action_response(request, "rejected", "Recommendation rejected")
 
 
@@ -1995,7 +2391,7 @@ async def removal(request: Request, measurement_id: str, action: str) -> Respons
             error_status=409,
         )
     if action == "keep":
-        database.record_decision(measurement_id, "keep", {})
+        database.record_group_decision(measurement_id, "keep", {})
         return _action_response(request, "rejected", "Plant kept")
     if action == "move-center":
         if not row.get("center_misaligned") or row.get("recommended_center_x") is None:
@@ -2031,7 +2427,7 @@ async def removal(request: Request, measurement_id: str, action: str) -> Respons
         )
         status = str(result.get("status", "error"))
         if status == "applied":
-            database.record_decision(measurement_id, "keep", result)
+            database.record_group_decision(measurement_id, "keep", result)
         return _action_response(
             request,
             status,
@@ -2059,7 +2455,7 @@ async def removal(request: Request, measurement_id: str, action: str) -> Respons
     if status != "applied":
         return _action_response(request, status, message, error_status=409)
     database.update_measurement_outcome(measurement_id, decision="removed", applied=True)
-    database.record_decision(measurement_id, "removed", result)
+    database.record_group_decision(measurement_id, "removed", result)
     return _action_response(request, "applied", message)
 
 

@@ -17,10 +17,17 @@ from .models import (
     ApplyPlantCenterRequest,
     ApplyRadiusRequest,
     ApplyRemovalRequest,
+    ApplySoilHeightRequest,
     BotList,
     CreateWeedRequest,
     Inventory,
     InventoryRequest,
+    RemoveWeedRequest,
+    SoilCaptureStartRequest,
+    SoilCaptureStartResponse,
+    SoilCaptureStatus,
+    SoilPointInventory,
+    UpdateWeedRadiusRequest,
     UpsertCurveRequest,
     VisionImage,
     VisionImageRequest,
@@ -227,6 +234,29 @@ class HomeAssistantClient:
     async def inventory(self, request: InventoryRequest) -> Inventory:
         return await self._service("get_vision_inventory", request, Inventory)  # type: ignore[return-value]
 
+    async def soil_points(self, config_entry_id: str) -> SoilPointInventory:
+        return await self._service(
+            "get_vision_soil_points",
+            {"config_entry_id": config_entry_id},
+            SoilPointInventory,
+        )  # type: ignore[return-value]
+
+    async def start_soil_capture(
+        self, request: SoilCaptureStartRequest
+    ) -> SoilCaptureStartResponse:
+        return await self._service(
+            "start_vision_soil_capture", request, SoilCaptureStartResponse
+        )  # type: ignore[return-value]
+
+    async def soil_capture_status(
+        self, config_entry_id: str, capture_id: str
+    ) -> SoilCaptureStatus:
+        return await self._service(
+            "get_vision_soil_capture",
+            {"config_entry_id": config_entry_id, "capture_id": capture_id},
+            SoilCaptureStatus,
+        )  # type: ignore[return-value]
+
     async def image(self, request: VisionImageRequest, max_payload_bytes: int) -> VisionImage:
         result = await self._service("get_vision_image", request, VisionImage)
         if not isinstance(result, VisionImage):
@@ -262,8 +292,17 @@ class HomeAssistantClient:
     async def apply_plant_center(self, request: ApplyPlantCenterRequest) -> dict[str, Any]:
         return await self._service("apply_vision_plant_center", request)  # type: ignore[return-value]
 
+    async def apply_soil_height(self, request: ApplySoilHeightRequest) -> dict[str, Any]:
+        return await self._service("apply_vision_soil_height", request)  # type: ignore[return-value]
+
     async def create_weed(self, request: CreateWeedRequest) -> dict[str, Any]:
         return await self._service("create_vision_weed", request)  # type: ignore[return-value]
+
+    async def update_weed_radius(self, request: UpdateWeedRadiusRequest) -> dict[str, Any]:
+        return await self._service("update_vision_weed_radius", request)  # type: ignore[return-value]
+
+    async def remove_weed(self, request: RemoveWeedRequest) -> dict[str, Any]:
+        return await self._service("remove_vision_weed", request)  # type: ignore[return-value]
 
     async def upsert_curve(self, request: UpsertCurveRequest) -> dict[str, Any]:
         # ``curve_id`` is optional in the Home Assistant service schema. Sending
