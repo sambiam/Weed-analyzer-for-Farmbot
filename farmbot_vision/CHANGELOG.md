@@ -28,6 +28,19 @@
   tracking, and separate automatic radius/removal confidence controls.
 - Replaced the queue timeframe dropdown with explicit from/to date-time inputs.
 
+## 1.1.7 - 2026-07-25
+
+- Re-cut the release: the `V1.1.6` GitHub release/tag was created against a
+  commit that predated the 1.1.6 version bump (same failure mode as 1.1.5),
+  so its build published the app image tagged `1.1.5` instead of `1.1.6`.
+  Since Home Assistant Supervisor matches the image tag to `config.yaml`'s
+  `version` field exactly, it could not find a `1.1.6` image and the update
+  failed with `manifest unknown`. This release is cut from the current
+  `main`, so its published image is correctly tagged `1.1.7` to match.
+- Added a release-workflow check that fails the publish job if the release
+  tag doesn't match the version baked into `config.yaml` at that commit,
+  instead of silently publishing a mismatched image.
+
 ## 1.1.6 - 2026-07-25
 
 - Added a **Boundaries & zones** tab. Boundaries enclose where things may be

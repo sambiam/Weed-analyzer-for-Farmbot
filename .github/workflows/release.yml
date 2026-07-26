@@ -20,6 +20,26 @@ jobs:
             exit 1
           fi
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+      - name: Verify release tag matches config.yaml version
+        env:
+          VERSION: ${{ steps.addon_version.outputs.version }}
+          TAG_NAME: ${{ github.event.release.tag_name }}
+        run: |
+          # The Supervisor pulls the image tag from config.yaml's `version`
+          # field, not the release tag name. If a release is published from a
+          # commit that predates the matching version bump (e.g. the tag was
+          # cut before "bump version" merged), this job would silently build
+          # and publish an image tagged with the *old* version while
+          # config.yaml on main already advertises the new one -- leaving
+          # Supervisor unable to find the update it just offered (404
+          # manifest unknown). Fail loudly instead so the release can be
+          # re-cut from the correct commit.
+          NORMALIZED_TAG=${TAG_NAME#v}
+          NORMALIZED_TAG=${NORMALIZED_TAG#V}
+          if [ "$NORMALIZED_TAG" != "$VERSION" ]; then
+            echo "::error::Release tag '$TAG_NAME' does not match config.yaml version '$VERSION'. This release was likely cut from a commit that predates the version bump. Re-cut the release from the commit where config.yaml was updated to $NORMALIZED_TAG."
+            exit 1
+          fi
       - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
