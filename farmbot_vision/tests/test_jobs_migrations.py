@@ -378,7 +378,7 @@ def test_rejected_weed_position_suppresses_future_detections_after_restart(tmp_p
     # The stored rejected radius extends the suppression area beyond the
     # current detection's duplicate tolerance.
     assert restarted.has_weed_detection_near("bot-1", 140, 200, 20) is True
-    assert restarted.has_weed_detection_near("bot-1", 146, 200, 20) is False
+    assert restarted.has_weed_detection_near("bot-1", 151, 200, 20) is False
     assert restarted.has_weed_detection_near("bot-2", 103, 202, 20) is False
 
 

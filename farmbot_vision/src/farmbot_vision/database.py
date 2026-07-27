@@ -959,11 +959,14 @@ class Database:
         self, config_entry_id: str, x: float, y: float, tolerance_mm: float
     ) -> bool:
         for row in self.connection.execute(
-            """SELECT x,y FROM weed_detections
+            """SELECT x,y,radius_mm,status FROM weed_detections
             WHERE config_entry_id=? AND status IN ('recommended','created','rejected')""",
             (config_entry_id,),
         ):
-            if math.hypot(float(row[0]) - x, float(row[1]) - y) <= tolerance_mm:
+            rejected_radius = float(row[2] or 0) * 1.5 if row[3] == "rejected" else 0
+            if math.hypot(float(row[0]) - x, float(row[1]) - y) <= max(
+                tolerance_mm, 20.0, rejected_radius
+            ):
                 return True
         return False
 

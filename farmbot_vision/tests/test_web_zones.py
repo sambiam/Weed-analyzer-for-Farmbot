@@ -243,9 +243,7 @@ async def test_bulk_weed_acceptance_is_idempotent_for_already_accepted_rows(monk
     web.database.update_weed_detection(already_accepted, "created")
 
     response = await web.accept_all_weeds(
-        web.WeedBulkAcceptRequest(
-            detection_ids=[UUID(first), UUID(second), UUID(already_accepted)]
-        )
+        web.WeedBulkAcceptRequest(detection_ids=[UUID(first), UUID(second), UUID(already_accepted)])
     )
     payload = json.loads(response.body)
 

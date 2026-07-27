@@ -889,6 +889,21 @@ async def test_dashboard_modal_uses_artifact_manifest_and_pending_rows(tmp_path,
         artifact_paths=[str(overlay), str(mask)],
     )
     web.database.save_measurements([measurement])
+    weed_id = str(uuid4())
+    web.database.save_weed_detection(
+        detection_id=weed_id,
+        config_entry_id="dashboard-bot",
+        image_id=42,
+        image_timestamp=datetime.now(UTC),
+        x=10,
+        y=20,
+        z=0,
+        area_mm2=80,
+        radius_mm=15,
+        confidence=0.9,
+        overlay_path=str(overlay),
+        review_path=str(overlay),
+    )
     monkeypatch.setattr(web.settings, "data_dir", tmp_path)
 
     status, _, body = await asgi_request("/")
@@ -898,6 +913,13 @@ async def test_dashboard_modal_uses_artifact_manifest_and_pending_rows(tmp_path,
     assert "data-artifacts=" in html
     assert "artifact/review-overlay.jpg" in html
     assert "artifact/review-mask.png" in html
+    assert "Previous weed" in html and "Next weed" in html
+    assert "Previous image" in html and "Next image" in html
+    assert "Reject as" in html
+    for label in ("Crop", "Mushroom", "Moss", "Soil", "Hardware"):
+        assert label in html
+    assert "Review / training label" not in html
+    assert '<button class=review-action data-url="weeds/' not in html
 
     # The modal still relies on the deliberately restricted artifact route.
     status, _, served = await asgi_request("/artifact/review-overlay.jpg")

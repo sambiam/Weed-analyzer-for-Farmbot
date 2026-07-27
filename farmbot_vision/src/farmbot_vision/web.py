@@ -964,7 +964,9 @@ _DASHBOARD_JS = r"""
       if(!weedData) return;
       button.disabled=true;
       try{
-        const result=await postWeedAction(weedData.detectionId,button.dataset.weedLabel);
+        const result=await postWeedAction(
+          weedData.detectionId,'label/'+button.dataset.weedLabel
+        );
         if(result.ok) closeWeedModal();
         else weedMessage.textContent=result.result.message||'Could not reject weed';
       }finally{button.disabled=false;}
