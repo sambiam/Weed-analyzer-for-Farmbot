@@ -845,12 +845,21 @@ class Database:
 
     def clear_pending_weed_detections(self) -> int:
         """Mark pending weed recommendations as superseded without deleting them."""
-        with self.connection:
-            cursor = self.connection.execute(
-                "UPDATE weed_detections SET status='superseded' "
+        detection_ids = [
+            row["detection_id"]
+            for row in self.connection.execute(
+                "SELECT detection_id FROM weed_detections "
                 "WHERE status IN ('recommended','observing')"
             )
-        return cursor.rowcount
+        ]
+        if not detection_ids:
+            return 0
+        with self.connection:
+            self.connection.executemany(
+                "UPDATE weed_detections SET status='superseded' WHERE detection_id=?",
+                ((detection_id,) for detection_id in detection_ids),
+            )
+        return len(detection_ids)
 
     def clear_flagged_curve_proposals(self) -> int:
         """Discard curve recommendations that are still awaiting review."""

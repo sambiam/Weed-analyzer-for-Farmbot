@@ -279,6 +279,36 @@ def test_clear_pending_review_items_preserves_history(tmp_path):
         confidence=0.9,
         overlay_path=None,
     )
+    observing_weed_id = str(uuid4())
+    database.save_weed_detection(
+        detection_id=observing_weed_id,
+        config_entry_id="clear-bot",
+        image_id=measurement.image_id + 1,
+        image_timestamp=measurement.image_timestamp,
+        x=120,
+        y=220,
+        z=0,
+        area_mm2=80,
+        radius_mm=10,
+        confidence=0.7,
+        overlay_path=None,
+        status="observing",
+    )
+    rejected_weed_id = str(uuid4())
+    database.save_weed_detection(
+        detection_id=rejected_weed_id,
+        config_entry_id="clear-bot",
+        image_id=measurement.image_id + 2,
+        image_timestamp=measurement.image_timestamp,
+        x=140,
+        y=240,
+        z=0,
+        area_mm2=60,
+        radius_mm=8,
+        confidence=0.6,
+        overlay_path=None,
+        status="rejected",
+    )
 
     assert database.clear_pending_measurements() == 1
     assert database.pending_measurements() == []
@@ -289,9 +319,12 @@ def test_clear_pending_review_items_preserves_history(tmp_path):
     ).fetchone()
     assert decision["action"] == "superseded"
 
-    assert database.clear_pending_weed_detections() == 1
+    assert database.clear_pending_weed_detections() == 2
     assert database.pending_weed_detections() == []
     assert database.weed_detection(weed_id)["status"] == "superseded"
+    assert database.weed_detection(observing_weed_id)["status"] == "superseded"
+    assert database.weed_detection(rejected_weed_id)["status"] == "rejected"
+    assert database.clear_pending_weed_detections() == 0
 
 
 def test_removal_artifacts_migrate_persist_and_count_distinct_images(tmp_path):
