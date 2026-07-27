@@ -171,20 +171,21 @@ class HomeAssistantClient:
                     )
                     raise StaleRadiusError("FarmBot radius changed; inventory refresh required")
                 if response.status_code in {400, 401, 403, 422}:
+                    snippet = _snippet(response.text)
                     LOGGER.error(
                         "Home Assistant service %s rejected the request with a non-retryable "
                         "HTTP %d: %s",
                         action,
                         response.status_code,
-                        _snippet(response.text),
+                        snippet,
                     )
-                    if action == "start_vision_grid_repair" and response.status_code == 400:
-                        raise HomeAssistantError(
-                            "The loaded FarmBot integration does not provide photo-grid "
-                            "repair. Install integration V2.0.0 and restart Home Assistant."
-                        )
+                    # A missing/outdated integration is diagnosed up front via the
+                    # advertised `photo_grid_repair` capability (see
+                    # web._require_grid_repair_capability), so a 400 reaching here means
+                    # the loaded integration rejected this specific request -- surface its
+                    # actual reason instead of guessing it is unsupported.
                     raise HomeAssistantError(
-                        f"non-retryable Home Assistant response {response.status_code}"
+                        f"non-retryable Home Assistant response {response.status_code}: {snippet}"
                     )
                 response.raise_for_status()
                 data = response.json()

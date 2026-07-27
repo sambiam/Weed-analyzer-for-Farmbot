@@ -96,16 +96,24 @@ async def test_inventory_accepts_flat_image_coordinates():
 
 
 @pytest.mark.asyncio
-async def test_grid_repair_400_explains_required_integration_upgrade():
+async def test_grid_repair_400_surfaces_the_integration_response():
+    """A 400 from ``start_vision_grid_repair`` must not be guessed as an
+    outdated integration -- ``web._require_grid_repair_capability`` already
+    checks the advertised ``photo_grid_repair`` capability before this call
+    is made, so a 400 here has some other cause. The caller needs the
+    integration's actual rejection reason to diagnose it, not a wrong claim
+    that the integration needs upgrading.
+    """
+
     async def handler(_request):
-        return httpx.Response(400, text="400: Bad Request")
+        return httpx.Response(400, text="extra keys not allowed @ data['targets'][0]['w']")
 
     client = HomeAssistantClient(token="test", base_url="http://test")
     await client._http.aclose()
     client._http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     with pytest.raises(
         HomeAssistantError,
-        match="Install integration V2.0.0 and restart Home Assistant",
+        match=r"extra keys not allowed",
     ):
         await client.start_grid_repair("entry", [{"x": 100.0, "y": 200.0, "z": 0.0}])
     await client.close()

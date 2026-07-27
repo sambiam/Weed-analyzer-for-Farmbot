@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from datetime import UTC, datetime
 from pathlib import Path
+from urllib.parse import unquote
 from uuid import uuid4
 
 import pytest
@@ -77,6 +78,69 @@ async def test_grid_repair_accepts_advertised_v2_capability(monkeypatch):
         await web._require_grid_repair_capability()
     finally:
         web.settings.selected_config_entry_id = previous
+
+
+@pytest.mark.asyncio
+async def test_grid_repair_recheck_forces_a_fresh_inventory_lookup(monkeypatch):
+    """The Recheck button must not be blocked by the 5-minute inspection cache
+    or by the photo_grid_repair capability check -- it only reads the grid
+    state, so it must work even when a repair itself can't be started.
+    """
+    import base64 as b64
+    from types import SimpleNamespace
+
+    import cv2
+    import numpy as np
+
+    previous = web.settings.selected_config_entry_id
+    web.settings.selected_config_entry_id = "entry-1"
+    web.grid_repair_state.update(run=None, checked_at=None, error="", message="")
+
+    def _image(image_id: int, minute: int, x: float, y: float) -> dict:
+        return {
+            "id": image_id,
+            "created_at": f"2026-07-27T01:{minute:02d}:00+00:00",
+            "x": x,
+            "y": y,
+            "z": 0,
+        }
+
+    async def inventory(_request):
+        return Inventory.model_validate(
+            {
+                "device_id": "42",
+                "generated_at": datetime.now(UTC),
+                "plants": [],
+                "images": [
+                    _image(1, 0, 0, 0),
+                    _image(2, 1, 0, 100),
+                    _image(3, 2, 0, 200),
+                    _image(4, 3, 100, 0),
+                    _image(5, 4, 100, 100),
+                    # (100, 200) is missing.
+                ],
+                "curves": [],
+                "camera_calibration": {"available": False},
+            }
+        )
+
+    plain_frame = np.full((120, 160, 3), (35, 90, 35), np.uint8)
+    _, encoded = cv2.imencode(".jpg", plain_frame)
+    plain_jpeg_base64 = b64.b64encode(encoded.tobytes()).decode()
+
+    async def image(_request, _max_bytes):
+        return SimpleNamespace(image_base64=plain_jpeg_base64)
+
+    monkeypatch.setattr(web.client, "inventory", inventory)
+    monkeypatch.setattr(web.client, "image", image)
+    try:
+        status, headers, _ = await asgi_request("/grid-repair/recheck", method="POST")
+    finally:
+        web.settings.selected_config_entry_id = previous
+
+    assert status == 303
+    location = unquote(headers[b"location"].decode())
+    assert "Found 1 missing and 0 gantry" in location
 
 
 def _review_measurement(**updates) -> Measurement:
