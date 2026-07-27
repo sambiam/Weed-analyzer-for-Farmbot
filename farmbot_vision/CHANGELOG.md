@@ -1,5 +1,25 @@
 # Changelog
 
+## 2.0.5 - 2026-07-27
+
+- Photo-grid repair now runs automatically a configurable number of minutes
+  (5 by default) after the latest photo grid finishes, instead of at a fixed
+  time of day. Enabled by default; the delay and the on/off toggle are set
+  from the "Repair photo grid" card.
+
+## 2.0.4 - 2026-07-27
+
+- Now requires companion integration 2.0.2 and its
+  `position_verified_photo_grid_repair` capability. This prevents repair from
+  running against the earlier movement payload that FarmBot accepted as a
+  no-op.
+- Repair movement is confirmed from live FarmBot status before the camera is
+  triggered; failures distinguish the requested cell from the last observed
+  position.
+- Camera capture now allows six failed attempts per cell. If all six fail, the
+  session records that cell and continues repairing the remaining cells
+  instead of repeatedly blocking on the same location.
+
 ## 2.0.3 - 2026-07-27
 
 - Replaced twelve-image repair batches with a background, one-cell-at-a-time

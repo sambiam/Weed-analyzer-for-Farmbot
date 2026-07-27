@@ -1,9 +1,9 @@
 # Companion FarmBot integration contract
 
 Contract version: **farmbot-vision-v2**. Minimum compatible companion FarmBot
-integration release: **2.0.1** (the release that advertises and implements
+integration release: **2.0.2** (the release that advertises and implements
 photo-grid repair in addition to clear-site soil-height capture, the
-returned-JPEG contract and known-weed writes). Version 2.0.1 of the companion integration in the sibling
+returned-JPEG contract and known-weed writes). Version 2.0.2 of the companion integration in the sibling
 `Farmbot-for-Home-Assistant` repository implements this contract.
 
 All actions are in the `farmbot` domain. Response actions must support Home Assistant service response data. Unknown, invalid, or unauthorised fields must fail rather than be coerced. Timestamps are ISO-8601. The integration remains the only component that talks to FarmBot APIs.
@@ -13,7 +13,7 @@ All actions are in the `farmbot` domain. Response actions must support Home Assi
 No input. Response:
 
 ```json
-{"bots":[{"config_entry_id":"string","device_id":"string","name":"string","integration_version":"2.0.1","capabilities":["photo_grid_repair","verified_photo_grid_repair"]}]}
+{"bots":[{"config_entry_id":"string","device_id":"string","name":"string","integration_version":"2.0.2","capabilities":["photo_grid_repair","verified_photo_grid_repair","position_verified_photo_grid_repair"]}]}
 ```
 
 ## `farmbot.get_vision_inventory`
@@ -60,11 +60,15 @@ The integration must resize before base64 encoding and must not return signed UR
 `targets`, each containing finite `x`, `y`, and `z` coordinates. It validates
 connection, emergency-stop, busy state, and all axis bounds before queuing
 each acknowledged safe-Z move separately from its settle/photo request. A
-target is complete only when the REST image inventory contains a new,
+photo request must not be sent until a fresh FarmBot status report places all
+three axes within 5 mm of the requested target. A target is complete only when
+the REST image inventory contains a new,
 fully-processed image within 25 mm of its requested X/Y/Z coordinates.
-`take_photo` may be retried three times because FarmBot OS reports its camera
-errors asynchronously. It returns a `repair_id` immediately and restores the
-initial position when the command finishes or fails.
+`take_photo` may be retried six times because FarmBot OS reports its camera
+errors asynchronously. After six failed attempts the app records that cell as
+failed for the current session and continues repairing the remaining cells.
+It returns a `repair_id` immediately and restores the initial position when
+the command finishes or fails.
 
 `farmbot.get_vision_grid_repair` accepts `config_entry_id` and `repair_id`.
 It returns `queued|running|waiting_images|complete|failed`, a sanitized
@@ -186,4 +190,4 @@ processes only the named image. Manual requests retain the payload above.
 3. `resize_scale_x/y` equal to processed÷oriented in each axis.
 4. `processed_calibration` (basis `processed_image`) when calibration is known, plus reference dimensions on `camera_calibration`.
 
-The minimum compatible companion integration version is **1.8.0**.
+The minimum compatible companion integration version is **2.0.2**.

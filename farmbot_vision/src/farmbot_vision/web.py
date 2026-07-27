@@ -4,6 +4,7 @@ import asyncio
 import base64
 import json
 import logging
+import math
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from html import escape
@@ -36,9 +37,11 @@ from .curve_edit import propose_curve_point
 from .curves import fit_monotonic_curve
 from .database import Database
 from .grid_repair import (
+    COORDINATE_TOLERANCE_MM,
     GridRepairSettings,
     GridRepairSettingsStore,
     GridRun,
+    RepairTarget,
     detect_latest_grid_run,
     looks_like_gantry_photo,
     target_payload,
@@ -104,7 +107,6 @@ grid_repair_state: dict[str, object] = {
 grid_repair_task: asyncio.Task | None = None
 GRID_REPAIR_STATUS_POLL_SECONDS = 5
 GRID_REPAIR_BUSY_RETRY_SECONDS = 30
-GRID_REPAIR_FAILURE_RETRY_SECONDS = 60
 
 
 async def inspect_photo_grid(*, force: bool = False) -> GridRun | None:
@@ -181,7 +183,7 @@ async def _require_grid_repair_capability() -> None:
         (item for item in bots if item.config_entry_id == settings.selected_config_entry_id),
         None,
     )
-    if bot is None or not bot.supports("verified_photo_grid_repair"):
+    if bot is None or not bot.supports("position_verified_photo_grid_repair"):
         version = bot.integration_version if bot is not None else None
         loaded = f" (loaded version {version})" if version else ""
         raise HomeAssistantError(
@@ -198,10 +200,35 @@ def _ordered_repair_targets(run: GridRun):
     )
 
 
-async def _queue_one_repair_target(run: GridRun) -> dict[str, object]:
-    target = _ordered_repair_targets(run)[0]
+def _next_repair_target(
+    run: GridRun,
+    skipped: list[tuple[float, float]],
+) -> RepairTarget | None:
+    """Return the next cell not already exhausted during this repair session."""
+    return next(
+        (
+            target
+            for target in _ordered_repair_targets(run)
+            if not any(
+                math.hypot(target.x - failed_x, target.y - failed_y) <= COORDINATE_TOLERANCE_MM
+                for failed_x, failed_y in skipped
+            )
+        ),
+        None,
+    )
+
+
+async def _queue_one_repair_target(
+    run: GridRun,
+    *,
+    skipped: list[tuple[float, float]] | None = None,
+) -> tuple[dict[str, object], RepairTarget]:
+    target = _next_repair_target(run, skipped or [])
+    if target is None:
+        raise HomeAssistantError("No untried photo-grid cell remains")
     payload = target_payload((target,))
-    return await client.start_grid_repair(settings.selected_config_entry_id, payload)
+    result = await client.start_grid_repair(settings.selected_config_entry_id, payload)
+    return result, target
 
 
 async def _photo_grid_repair_worker(
@@ -211,7 +238,8 @@ async def _photo_grid_repair_worker(
     active_repair_id: str | None,
 ) -> None:
     """Repair one verified image at a time until the detected grid is whole."""
-    consecutive_failures = 0
+    skipped: list[tuple[float, float]] = []
+    active_target = _next_repair_target(run, skipped)
     try:
         while True:
             if active_repair_id:
@@ -232,24 +260,17 @@ async def _photo_grid_repair_worker(
                 if status in {"queued", "running", "waiting_images"}:
                     await asyncio.sleep(GRID_REPAIR_STATUS_POLL_SECONDS)
                     continue
-                if status == "complete":
-                    consecutive_failures = 0
-                else:
-                    consecutive_failures += 1
+                if status != "complete" and active_target is not None:
+                    skipped.append((active_target.x, active_target.y))
                     grid_repair_state.update(
                         status="retrying",
                         message=(
-                            f"{message}. The cell remains queued and will be retried "
-                            "after the camera recovers."
+                            f"{message}. This cell exhausted six camera attempts; "
+                            "repair is moving to the next cell."
                         ),
                     )
-                    await asyncio.sleep(
-                        min(
-                            GRID_REPAIR_FAILURE_RETRY_SECONDS * consecutive_failures,
-                            5 * 60,
-                        )
-                    )
                 active_repair_id = None
+                active_target = None
                 run = await inspect_photo_grid(force=True)
                 while run is None:
                     grid_repair_state.update(
@@ -267,9 +288,21 @@ async def _photo_grid_repair_worker(
                         message="Photo-grid repair complete; every cell has a usable image",
                     )
                     return
+                active_target = _next_repair_target(run, skipped)
+                if active_target is None:
+                    count = len(skipped)
+                    grid_repair_state.update(
+                        status="failed",
+                        message=(
+                            "Photo-grid repair finished the remaining cells, but "
+                            f"{count} cell{'s' if count != 1 else ''} could not be captured "
+                            "after six camera attempts"
+                        ),
+                    )
+                    return
 
             try:
-                result = await _queue_one_repair_target(run)
+                result, active_target = await _queue_one_repair_target(run, skipped=skipped)
             except HomeAssistantError as exc:
                 grid_repair_state.update(
                     status="queued",
@@ -332,7 +365,7 @@ async def start_photo_grid_repair() -> dict[str, object]:
     # newly processed image exists at the requested coordinates. This both
     # avoids FarmBot's asynchronous take_photo error and naturally stays below
     # the integration's legacy twelve-target service limit.
-    result = await _queue_one_repair_target(run)
+    result, _ = await _queue_one_repair_target(run)
     status = str(result.get("status") or "")
     message = str(result.get("message") or status)
     active_repair_id = str(result.get("repair_id") or "") or None
@@ -1078,7 +1111,7 @@ async def resolve_config_entry() -> None:
 
 async def scheduler() -> None:
     last_run_date = None
-    last_repair_date = None
+    last_repair_completed_at: datetime | None = None
     while True:
         now = datetime.now().astimezone()
         if (
@@ -1091,18 +1124,22 @@ async def scheduler() -> None:
             last_run_date = now.date()
             await jobs.run(trigger="schedule")
         repair_settings = grid_repair_settings_store.load()
-        if (
-            repair_settings.enabled
-            and settings.selected_config_entry_id
-            and now.strftime("%H:%M") == repair_settings.repair_time
-            and now.date() != last_repair_date
-        ):
-            last_repair_date = now.date()
-            try:
-                result = await start_photo_grid_repair()
-                LOGGER.info("Scheduled photo-grid repair: %s", result.get("message"))
-            except HomeAssistantError as exc:
-                LOGGER.warning("Scheduled photo-grid repair failed to start: %s", exc)
+        if repair_settings.enabled and settings.selected_config_entry_id:
+            # inspect_photo_grid() caches its inventory lookup for 5 minutes,
+            # so polling every tick here does not add extra Home Assistant load.
+            candidate_run = await inspect_photo_grid()
+            if (
+                candidate_run is not None
+                and candidate_run.completed_at != last_repair_completed_at
+                and now - candidate_run.completed_at.astimezone()
+                >= timedelta(minutes=repair_settings.delay_minutes)
+            ):
+                last_repair_completed_at = candidate_run.completed_at
+                try:
+                    result = await start_photo_grid_repair()
+                    LOGGER.info("Automatic photo-grid repair: %s", result.get("message"))
+                except HomeAssistantError as exc:
+                    LOGGER.warning("Automatic photo-grid repair failed to start: %s", exc)
         await asyncio.sleep(30)
 
 
@@ -1623,8 +1660,9 @@ It affects automatic changes only; every result remains manually reviewable.</p>
 <section class=card><h2>Repair photo grid</h2><p>{repair_summary}</p>
 <p class=muted>{repair_details}</p>
 <form method=post action="grid-repair/settings">
-<label><input type=checkbox name=enabled value=true{repair_checked}> Repair automatically at</label>
-<input type=time name=repair_time value="{escape(repair_values.repair_time, quote=True)}" required>
+<label><input type=checkbox name=enabled value=true{repair_checked}> Repair automatically</label>
+<input type=number name=delay_minutes min=1 max=1440 step=1
+value="{repair_values.delay_minutes}" required> minutes after the photo grid completes
 <button>Save</button></form>
 <form method=post action="grid-repair/run"><button{repair_disabled}>Repair now</button></form>
 <form method=post action="grid-repair/recheck"><button>Recheck grid</button></form>
@@ -1703,10 +1741,10 @@ It affects automatic changes only; every result remains manually reviewable.</p>
 
 @app.post("/grid-repair/settings")
 async def save_grid_repair_settings(
-    repair_time: Annotated[str, Form()],
+    delay_minutes: Annotated[int, Form()],
     enabled: Annotated[bool | None, Form()] = None,
 ) -> RedirectResponse:
-    values = GridRepairSettings(enabled=bool(enabled), repair_time=repair_time)
+    values = GridRepairSettings(enabled=bool(enabled), delay_minutes=delay_minutes)
     grid_repair_settings_store.save(values)
     return RedirectResponse(
         f"../?repair={quote('Photo-grid repair schedule saved')}", status_code=303

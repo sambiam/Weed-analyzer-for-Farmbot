@@ -28,17 +28,15 @@ MAX_REPAIR_TARGETS_PER_CALL = 12
 class GridRepairSettings(BaseModel):
     """User-owned settings persisted independently of Supervisor options."""
 
-    enabled: bool = False
-    repair_time: str = "05:00"
+    enabled: bool = True
+    delay_minutes: int = 5
 
-    @field_validator("repair_time")
+    @field_validator("delay_minutes")
     @classmethod
-    def valid_time(cls, value: str) -> str:
-        try:
-            parsed = datetime.strptime(value, "%H:%M")
-        except ValueError as exc:
-            raise ValueError("repair_time must be HH:MM") from exc
-        return parsed.strftime("%H:%M")
+    def valid_delay(cls, value: int) -> int:
+        if not 1 <= value <= 1440:
+            raise ValueError("delay_minutes must be between 1 and 1440")
+        return value
 
 
 class GridRepairSettingsStore:

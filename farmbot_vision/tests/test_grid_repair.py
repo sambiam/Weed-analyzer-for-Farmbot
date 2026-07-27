@@ -93,5 +93,9 @@ def test_gantry_detector_rejects_partial_bright_bed_edge():
 
 def test_repair_settings_round_trip(tmp_path):
     store = GridRepairSettingsStore(tmp_path / "grid_repair.json")
-    store.save(GridRepairSettings(enabled=True, repair_time="04:35"))
-    assert store.load() == GridRepairSettings(enabled=True, repair_time="04:35")
+    store.save(GridRepairSettings(enabled=True, delay_minutes=10))
+    assert store.load() == GridRepairSettings(enabled=True, delay_minutes=10)
+
+
+def test_repair_settings_default_to_enabled_five_minutes():
+    assert GridRepairSettings() == GridRepairSettings(enabled=True, delay_minutes=5)

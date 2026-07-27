@@ -37,6 +37,11 @@ async def test_grid_repair_requires_advertised_v2_capability(monkeypatch):
                         "config_entry_id": "entry-1",
                         "device_id": "42",
                         "name": "FarmBot",
+                        "integration_version": "2.0.1",
+                        "capabilities": [
+                            "photo_grid_repair",
+                            "verified_photo_grid_repair",
+                        ],
                     }
                 ]
             }
@@ -46,7 +51,7 @@ async def test_grid_repair_requires_advertised_v2_capability(monkeypatch):
     try:
         with pytest.raises(
             web.HomeAssistantError,
-            match="requires FarmBot integration V2.0.1",
+            match="requires FarmBot integration V2.0.2",
         ):
             await web._require_grid_repair_capability()
     finally:
@@ -66,10 +71,11 @@ async def test_grid_repair_accepts_advertised_v2_capability(monkeypatch):
                         "config_entry_id": "entry-1",
                         "device_id": "42",
                         "name": "FarmBot",
-                        "integration_version": "2.0.1",
+                        "integration_version": "2.0.2",
                         "capabilities": [
                             "photo_grid_repair",
                             "verified_photo_grid_repair",
+                            "position_verified_photo_grid_repair",
                         ],
                     }
                 ]
@@ -177,10 +183,11 @@ async def test_grid_repair_queues_only_one_verified_target_at_a_time(monkeypatch
                         "config_entry_id": "entry-1",
                         "device_id": "42",
                         "name": "FarmBot",
-                        "integration_version": "2.0.1",
+                        "integration_version": "2.0.2",
                         "capabilities": [
                             "photo_grid_repair",
                             "verified_photo_grid_repair",
+                            "position_verified_photo_grid_repair",
                         ],
                     }
                 ]
@@ -274,13 +281,16 @@ async def test_grid_repair_worker_continues_after_each_processed_image(monkeypat
         assert force is True
         return next(inspections)
 
-    async def queue_one(run):
+    async def queue_one(run, **_kwargs):
         queued.append(run.targets[0])
-        return {
-            "status": "queued",
-            "repair_id": "r2",
-            "message": "Photo-grid repair queued",
-        }
+        return (
+            {
+                "status": "queued",
+                "repair_id": "r2",
+                "message": "Photo-grid repair queued",
+            },
+            run.targets[0],
+        )
 
     monkeypatch.setattr(web.settings, "selected_config_entry_id", "entry-1")
     monkeypatch.setattr(web.client, "grid_repair_status", status)
@@ -296,6 +306,77 @@ async def test_grid_repair_worker_continues_after_each_processed_image(monkeypat
     assert queued == [second]
     assert web.grid_repair_state["status"] == "complete"
     assert "every cell" in str(web.grid_repair_state["message"])
+
+
+@pytest.mark.asyncio
+async def test_grid_repair_worker_moves_on_after_six_failed_camera_attempts(monkeypatch):
+    from farmbot_vision.grid_repair import GridRun, RepairTarget
+
+    now = datetime.now(UTC)
+
+    def repair_run(*targets):
+        return GridRun(
+            started_at=now,
+            completed_at=now,
+            images=(),
+            expected_count=4,
+            coverage=0.5,
+            targets=targets,
+        )
+
+    first = RepairTarget(100, 200, 0, "missing")
+    second = RepairTarget(300, 400, 0, "missing")
+    initial = repair_run(first, second)
+    after_failure = repair_run(first, second)
+    only_failed_cell_left = repair_run(first)
+    inspections = iter([after_failure, only_failed_cell_left])
+    statuses = iter(
+        [
+            {
+                "status": "failed",
+                "repair_id": "r1",
+                "message": "No image after 6 attempts",
+            },
+            {
+                "status": "complete",
+                "repair_id": "r2",
+                "message": "Processed target image verified",
+            },
+        ]
+    )
+    queued = []
+
+    async def status(_entry_id, _repair_id):
+        return next(statuses)
+
+    async def inspect(*, force=False):
+        assert force is True
+        return next(inspections)
+
+    async def start_grid_repair(_entry_id, payload):
+        queued.append(payload)
+        return {
+            "status": "queued",
+            "repair_id": "r2",
+            "message": "Photo-grid repair queued",
+        }
+
+    monkeypatch.setattr(web.settings, "selected_config_entry_id", "entry-1")
+    monkeypatch.setattr(web.client, "grid_repair_status", status)
+    monkeypatch.setattr(web.client, "start_grid_repair", start_grid_repair)
+    monkeypatch.setattr(web, "inspect_photo_grid", inspect)
+
+    await web._photo_grid_repair_worker(
+        session_id="session-1",
+        run=initial,
+        active_repair_id="r1",
+    )
+
+    assert queued == [[{"x": 300, "y": 400, "z": 0}]]
+    assert web.grid_repair_state["status"] == "failed"
+    assert "1 cell could not be captured after six camera attempts" in str(
+        web.grid_repair_state["message"]
+    )
 
 
 @pytest.mark.asyncio
