@@ -1,5 +1,20 @@
 # Changelog
 
+## 2.0.0 - 2026-07-27
+
+- Added repair detection for missing photo-grid cells and gantry images, a
+  persisted automatic repair time, and a manual Repair now action.
+- Gantry content is treated as expected on the minimum and maximum Y rows of
+  the garden bed; only gantry content at an interior Y coordinate is marked
+  for replacement.
+- Fixed the generic HTTP 400 failure by requiring an advertised
+  `photo_grid_repair` capability before calling Home Assistant. The app now
+  reports that integration V2.0.0 must be installed and Home Assistant
+  restarted when the loaded integration cannot repair grids.
+- Photo-grid retakes use the V2 companion service, which validates axis bounds,
+  waits after each move, takes only replacement photos, and restores the
+  FarmBot's starting position.
+
 ## 1.5.0 - 2026-07-26
 
 - Rejecting a weed recommendation now permanently suppresses that position

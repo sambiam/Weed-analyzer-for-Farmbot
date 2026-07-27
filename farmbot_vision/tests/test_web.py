@@ -23,6 +23,62 @@ from farmbot_vision.models import (
 )
 
 
+@pytest.mark.asyncio
+async def test_grid_repair_requires_advertised_v2_capability(monkeypatch):
+    previous = web.settings.selected_config_entry_id
+    web.settings.selected_config_entry_id = "entry-1"
+
+    async def list_bots():
+        return BotList.model_validate(
+            {
+                "bots": [
+                    {
+                        "config_entry_id": "entry-1",
+                        "device_id": "42",
+                        "name": "FarmBot",
+                    }
+                ]
+            }
+        )
+
+    monkeypatch.setattr(web.client, "list_bots", list_bots)
+    try:
+        with pytest.raises(
+            web.HomeAssistantError,
+            match="requires FarmBot integration V2.0.0",
+        ):
+            await web._require_grid_repair_capability()
+    finally:
+        web.settings.selected_config_entry_id = previous
+
+
+@pytest.mark.asyncio
+async def test_grid_repair_accepts_advertised_v2_capability(monkeypatch):
+    previous = web.settings.selected_config_entry_id
+    web.settings.selected_config_entry_id = "entry-1"
+
+    async def list_bots():
+        return BotList.model_validate(
+            {
+                "bots": [
+                    {
+                        "config_entry_id": "entry-1",
+                        "device_id": "42",
+                        "name": "FarmBot",
+                        "integration_version": "2.0.0",
+                        "capabilities": ["photo_grid_repair"],
+                    }
+                ]
+            }
+        )
+
+    monkeypatch.setattr(web.client, "list_bots", list_bots)
+    try:
+        await web._require_grid_repair_capability()
+    finally:
+        web.settings.selected_config_entry_id = previous
+
+
 def _review_measurement(**updates) -> Measurement:
     values = {
         "measurement_id": uuid4(),

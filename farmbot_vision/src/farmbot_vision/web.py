@@ -9,6 +9,7 @@ from datetime import UTC, datetime, timedelta
 from html import escape
 from pathlib import Path
 from typing import Annotated
+from urllib.parse import quote
 from uuid import UUID
 
 import cv2
@@ -33,6 +34,14 @@ from .calibration_store import CalibrationStore, FarmbotCalibrationInput
 from .curve_edit import propose_curve_point
 from .curves import fit_monotonic_curve
 from .database import Database
+from .grid_repair import (
+    GridRepairSettings,
+    GridRepairSettingsStore,
+    GridRun,
+    detect_latest_grid_run,
+    looks_like_gantry_photo,
+    target_payload,
+)
 from .home_assistant import HomeAssistantClient, HomeAssistantError, StaleRadiusError
 from .jobs import JobManager
 from .models import (
@@ -71,9 +80,104 @@ database = Database(settings.data_dir / "farmbot_vision.db")
 calibration_store = CalibrationStore(settings.data_dir / "farmbot_calibration.json")
 client = HomeAssistantClient()
 weed_settings_store = WeedSettingsStore(settings.data_dir / "weed_settings.json")
+grid_repair_settings_store = GridRepairSettingsStore(
+    settings.data_dir / "grid_repair_settings.json"
+)
 zone_store = ZoneStore(settings.data_dir / "zones.json")
 jobs = JobManager(settings, database, client, weed_settings_store, zone_store)
 soil_jobs = SoilJobManager(database, client, settings.data_dir, jobs.lock, zone_store)
+grid_repair_state: dict[str, object] = {
+    "run": None,
+    "checked_at": None,
+    "error": "",
+    "message": "",
+}
+
+
+async def inspect_photo_grid(*, force: bool = False) -> GridRun | None:
+    entry_id = settings.selected_config_entry_id
+    if not entry_id:
+        grid_repair_state.update(run=None, error="Select a FarmBot first")
+        return None
+    now = datetime.now(UTC)
+    checked_at = grid_repair_state.get("checked_at")
+    if not force and isinstance(checked_at, datetime) and now - checked_at < timedelta(minutes=5):
+        cached = grid_repair_state.get("run")
+        return cached if isinstance(cached, GridRun) else None
+    try:
+        inventory = await client.inventory(
+            InventoryRequest(
+                config_entry_id=entry_id,
+                image_lookback_hours=min(720, max(72, settings.image_lookback_hours)),
+            )
+        )
+        candidate = detect_latest_grid_run(inventory.images)
+        gantry_ids: set[int] = set()
+        if candidate is not None:
+            semaphore = asyncio.Semaphore(4)
+
+            async def classify(image) -> None:
+                if image.meta.name and "gantry" in image.meta.name.casefold():
+                    gantry_ids.add(image.id)
+                    return
+                async with semaphore:
+                    processed = await client.image(
+                        VisionImageRequest(
+                            config_entry_id=entry_id,
+                            image_id=image.id,
+                            max_width=320,
+                            max_height=240,
+                        ),
+                        settings.max_image_payload_bytes,
+                    )
+                jpeg = base64.b64decode(processed.image_base64, validate=True)
+                if looks_like_gantry_photo(jpeg, image.meta.name):
+                    gantry_ids.add(image.id)
+
+            results = await asyncio.gather(
+                *(classify(image) for image in candidate.images),
+                return_exceptions=True,
+            )
+            failures = sum(isinstance(result, Exception) for result in results)
+            if failures:
+                LOGGER.warning(
+                    "Could not inspect %d photo-grid image(s) for gantry content",
+                    failures,
+                )
+            candidate = detect_latest_grid_run(inventory.images, gantry_ids)
+        grid_repair_state.update(run=candidate, checked_at=now, error="")
+        return candidate
+    except HomeAssistantError as exc:
+        grid_repair_state.update(run=None, checked_at=now, error=str(exc))
+        return None
+
+
+async def _require_grid_repair_capability() -> None:
+    bots = (await client.list_bots()).bots
+    bot = next(
+        (item for item in bots if item.config_entry_id == settings.selected_config_entry_id),
+        None,
+    )
+    if bot is None or not bot.supports("photo_grid_repair"):
+        version = bot.integration_version if bot is not None else None
+        loaded = f" (loaded version {version})" if version else ""
+        raise HomeAssistantError(
+            "Photo-grid repair requires FarmBot integration V2.0.0"
+            f"{loaded}. Install/update it and restart Home Assistant."
+        )
+
+
+async def start_photo_grid_repair() -> dict[str, object]:
+    await _require_grid_repair_capability()
+    run = await inspect_photo_grid(force=True)
+    if run is None:
+        return {"status": "rejected", "message": "No recent photo-grid run was found"}
+    targets = target_payload(run.targets)
+    if not targets:
+        return {"status": "complete", "message": "The latest photo grid is complete"}
+    result = await client.start_grid_repair(settings.selected_config_entry_id, targets)
+    grid_repair_state["message"] = str(result.get("message") or "")
+    return result
 
 
 def _calibration_from_input(entry_id: str, values: FarmbotCalibrationInput) -> Calibration:
@@ -738,6 +842,7 @@ async def resolve_config_entry() -> None:
 
 async def scheduler() -> None:
     last_run_date = None
+    last_repair_date = None
     while True:
         now = datetime.now().astimezone()
         if (
@@ -749,6 +854,19 @@ async def scheduler() -> None:
         ):
             last_run_date = now.date()
             await jobs.run(trigger="schedule")
+        repair_settings = grid_repair_settings_store.load()
+        if (
+            repair_settings.enabled
+            and settings.selected_config_entry_id
+            and now.strftime("%H:%M") == repair_settings.repair_time
+            and now.date() != last_repair_date
+        ):
+            last_repair_date = now.date()
+            try:
+                result = await start_photo_grid_repair()
+                LOGGER.info("Scheduled photo-grid repair: %s", result.get("message"))
+            except HomeAssistantError as exc:
+                LOGGER.warning("Scheduled photo-grid repair did not start: %s", exc)
         await asyncio.sleep(30)
 
 
@@ -897,6 +1015,8 @@ async def health() -> JSONResponse:
 
 @app.get("/", response_class=HTMLResponse)
 async def dashboard(request: Request) -> HTMLResponse:
+    grid_run = await inspect_photo_grid()
+    repair_values = grid_repair_settings_store.load()
     rows = database.pending_measurements()
     crop_slugs = sorted({row["crop_slug"] for row in rows})
     curves = {
@@ -1102,6 +1222,31 @@ async def dashboard(request: Request) -> HTMLResponse:
     )
     resolution = settings.resolution
 
+    if grid_run is None:
+        repair_summary = escape(
+            str(grid_repair_state.get("error") or "No recent photo-grid run found")
+        )
+        repair_details = (
+            "A grid is identified when most coordinates form a 2-D lattice within one hour."
+        )
+        repair_disabled = " disabled"
+    else:
+        missing_count = sum(target.reason == "missing" for target in grid_run.targets)
+        gantry_count = sum(target.reason == "gantry" for target in grid_run.targets)
+        repair_summary = (
+            f"<b>{len(grid_run.images)} of {grid_run.expected_count} grid cells found</b>"
+        )
+        repair_details = (
+            f"{missing_count} missing · {gantry_count} gantry photo"
+            f"{'s' if gantry_count != 1 else ''} · last run "
+            f"{escape(grid_run.completed_at.astimezone().strftime('%d %b %Y %H:%M'))}"
+        )
+        repair_disabled = " disabled" if not grid_run.targets else ""
+    repair_checked = " checked" if repair_values.enabled else ""
+    repair_message = escape(
+        request.query_params.get("repair", "") or str(grid_repair_state.get("message") or "")
+    )
+
     def _dims(value: object) -> str:
         if isinstance(value, list) and len(value) == 2 and value[0] is not None:
             return f"{value[0]}x{value[1]}"
@@ -1132,6 +1277,14 @@ async def dashboard(request: Request) -> HTMLResponse:
 <p><b>{settings.minimum_auto_confidence:.0%} confidence</b></p>
 <p class=muted>Set <code>minimum_auto_confidence</code> in the add-on configuration.
 It affects automatic changes only; every result remains manually reviewable.</p></section>
+<section class=card><h2>Repair photo grid</h2><p>{repair_summary}</p>
+<p class=muted>{repair_details}</p>
+<form method=post action="grid-repair/settings">
+<label><input type=checkbox name=enabled value=true{repair_checked}> Repair automatically at</label>
+<input type=time name=repair_time value="{escape(repair_values.repair_time, quote=True)}" required>
+<button>Save</button></form>
+<form method=post action="grid-repair/run"><button{repair_disabled}>Repair now</button></form>
+<small class=action-message>{repair_message}</small></section>
 <section class=card><h2>Analysis</h2><p><span id=queue-count>{len(jobs.queued_image_ids)}</span> queued</p>
 <div class=button-row><form method=post action="analyse"><button>Analyse queue</button></form>
 <button id=queue-open type=button>Add to queue</button></div></section></div>
@@ -1190,6 +1343,29 @@ It affects automatic changes only; every result remains manually reviewable.</p>
 <div class=button-row><button id=queue-add type=button>Add selected images to queue</button></div>
 </figure></div><script>{_DASHBOARD_JS}</script>"""
     return layout(request, body)
+
+
+@app.post("/grid-repair/settings")
+async def save_grid_repair_settings(
+    repair_time: Annotated[str, Form()],
+    enabled: Annotated[bool | None, Form()] = None,
+) -> RedirectResponse:
+    values = GridRepairSettings(enabled=bool(enabled), repair_time=repair_time)
+    grid_repair_settings_store.save(values)
+    return RedirectResponse(
+        f"../?repair={quote('Photo-grid repair schedule saved')}",
+        status_code=303,
+    )
+
+
+@app.post("/grid-repair/run")
+async def run_grid_repair() -> RedirectResponse:
+    try:
+        result = await start_photo_grid_repair()
+        message = str(result.get("message") or result.get("status") or "Repair requested")
+    except HomeAssistantError as exc:
+        message = f"Could not start repair: {exc}"
+    return RedirectResponse(f"../?repair={quote(message)}", status_code=303)
 
 
 @app.post("/analyse")

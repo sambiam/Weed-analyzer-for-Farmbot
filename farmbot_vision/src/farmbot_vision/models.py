@@ -29,6 +29,11 @@ class Bot(StrictModel):
     config_entry_id: str
     device_id: str
     name: str
+    integration_version: str | None = None
+    capabilities: list[str] = Field(default_factory=list)
+
+    def supports(self, capability: str) -> bool:
+        return capability in self.capabilities
 
 
 class BotList(StrictModel):

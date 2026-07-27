@@ -178,6 +178,11 @@ class HomeAssistantClient:
                         response.status_code,
                         _snippet(response.text),
                     )
+                    if action == "start_vision_grid_repair" and response.status_code == 400:
+                        raise HomeAssistantError(
+                            "The loaded FarmBot integration does not provide photo-grid "
+                            "repair. Install integration V2.0.0 and restart Home Assistant."
+                        )
                     raise HomeAssistantError(
                         f"non-retryable Home Assistant response {response.status_code}"
                     )
@@ -251,6 +256,20 @@ class HomeAssistantClient:
             "get_vision_soil_capture",
             {"config_entry_id": config_entry_id, "capture_id": capture_id},
             SoilCaptureStatus,
+        )  # type: ignore[return-value]
+
+    async def start_grid_repair(
+        self, config_entry_id: str, targets: list[dict[str, float]]
+    ) -> dict[str, Any]:
+        return await self._service(
+            "start_vision_grid_repair",
+            {"config_entry_id": config_entry_id, "targets": targets},
+        )  # type: ignore[return-value]
+
+    async def grid_repair_status(self, config_entry_id: str, repair_id: str) -> dict[str, Any]:
+        return await self._service(
+            "get_vision_grid_repair",
+            {"config_entry_id": config_entry_id, "repair_id": repair_id},
         )  # type: ignore[return-value]
 
     async def image(self, request: VisionImageRequest, max_payload_bytes: int) -> VisionImage:

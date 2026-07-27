@@ -96,6 +96,22 @@ async def test_inventory_accepts_flat_image_coordinates():
 
 
 @pytest.mark.asyncio
+async def test_grid_repair_400_explains_required_integration_upgrade():
+    async def handler(_request):
+        return httpx.Response(400, text="400: Bad Request")
+
+    client = HomeAssistantClient(token="test", base_url="http://test")
+    await client._http.aclose()
+    client._http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    with pytest.raises(
+        HomeAssistantError,
+        match="Install integration V2.0.0 and restart Home Assistant",
+    ):
+        await client.start_grid_repair("entry", [{"x": 100.0, "y": 200.0, "z": 0.0}])
+    await client.close()
+
+
+@pytest.mark.asyncio
 async def test_inventory_accepts_unrecognized_camera_calibration_basis():
     """A companion integration build observed in production sends a
     ``camera_calibration.basis`` value outside the two documented literals.
