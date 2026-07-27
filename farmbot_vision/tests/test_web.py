@@ -143,6 +143,97 @@ async def test_grid_repair_recheck_forces_a_fresh_inventory_lookup(monkeypatch):
     assert "Found 1 missing and 0 gantry" in location
 
 
+@pytest.mark.asyncio
+async def test_grid_repair_caps_targets_at_the_service_limit(monkeypatch):
+    """start_vision_grid_repair accepts at most MAX_REPAIR_TARGETS_PER_CALL
+    targets per call (docs/integration-contract.md: "one to twelve"). A grid
+    large enough to have more missing cells than that must be sent in a
+    capped first batch, not all at once -- an uncapped request is rejected
+    by the integration's schema with a bare HTTP 400.
+    """
+    import base64 as b64
+    from types import SimpleNamespace
+
+    import cv2
+    import numpy as np
+
+    previous = web.settings.selected_config_entry_id
+    web.settings.selected_config_entry_id = "entry-1"
+    web.grid_repair_state.update(run=None, checked_at=None, error="", message="")
+
+    # A 6x6 grid (36 expected cells) with a 3x4 block plus one extra cell
+    # missing (13 missing, exceeding the 12-per-call cap) while every row and
+    # column keeps at least one present image, so all 6 x/y axis positions are
+    # still detected -- an entirely absent row/column wouldn't register as
+    # "missing" at all, since the grid axes are derived from present images.
+    xs = [i * 100 for i in range(6)]
+    ys = [i * 100 for i in range(6)]
+    missing_cells = {(x, y) for x in xs[3:] for y in ys[2:]} | {(xs[2], ys[5])}
+    present_cells = [(x, y) for x in xs for y in ys if (x, y) not in missing_cells]
+
+    async def list_bots():
+        return BotList.model_validate(
+            {
+                "bots": [
+                    {
+                        "config_entry_id": "entry-1",
+                        "device_id": "42",
+                        "name": "FarmBot",
+                        "integration_version": "2.0.0",
+                        "capabilities": ["photo_grid_repair"],
+                    }
+                ]
+            }
+        )
+
+    async def inventory(_request):
+        return Inventory.model_validate(
+            {
+                "device_id": "42",
+                "generated_at": datetime.now(UTC),
+                "plants": [],
+                "images": [
+                    {
+                        "id": index,
+                        "created_at": f"2026-07-27T01:{index % 60:02d}:00+00:00",
+                        "x": x,
+                        "y": y,
+                        "z": 0,
+                    }
+                    for index, (x, y) in enumerate(present_cells)
+                ],
+                "curves": [],
+                "camera_calibration": {"available": False},
+            }
+        )
+
+    plain_frame = np.full((120, 160, 3), (35, 90, 35), np.uint8)
+    _, encoded = cv2.imencode(".jpg", plain_frame)
+    plain_jpeg_base64 = b64.b64encode(encoded.tobytes()).decode()
+
+    async def image(_request, _max_bytes):
+        return SimpleNamespace(image_base64=plain_jpeg_base64)
+
+    captured_targets = []
+
+    async def start_grid_repair(_entry_id, targets):
+        captured_targets.append(targets)
+        return {"status": "queued", "repair_id": "r1", "message": "Photo-grid repair queued"}
+
+    monkeypatch.setattr(web.client, "list_bots", list_bots)
+    monkeypatch.setattr(web.client, "inventory", inventory)
+    monkeypatch.setattr(web.client, "image", image)
+    monkeypatch.setattr(web.client, "start_grid_repair", start_grid_repair)
+    try:
+        result = await web.start_photo_grid_repair()
+    finally:
+        web.settings.selected_config_entry_id = previous
+
+    assert len(captured_targets[0]) == web.MAX_REPAIR_TARGETS_PER_CALL
+    assert result["status"] == "queued"
+    assert "1 more cell(s) need a follow-up repair" in result["message"]
+
+
 def _review_measurement(**updates) -> Measurement:
     values = {
         "measurement_id": uuid4(),

@@ -1,5 +1,16 @@
 # Changelog
 
+## 2.0.2 - 2026-07-27
+
+- Fixed photo-grid repair always failing with a bare HTTP 400 on any grid with
+  more than 12 missing/gantry cells. The companion integration's
+  `start_vision_grid_repair` service accepts at most twelve targets per call
+  (a limit the app never enforced); requests over that limit were rejected by
+  the integration's schema validation before ever reaching the handler, which
+  Home Assistant reports as an empty, detail-free 400 response. Repair now
+  sends the first 12 cells (missing cells before gantry-obstructed ones) and
+  reports how many remain for a follow-up run.
+
 ## 2.0.1 - 2026-07-27
 
 - Fixed a 2.0.0 build that shipped with unresolved merge-conflict markers

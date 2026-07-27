@@ -36,6 +36,7 @@ from .curve_edit import propose_curve_point
 from .curves import fit_monotonic_curve
 from .database import Database
 from .grid_repair import (
+    MAX_REPAIR_TARGETS_PER_CALL,
     GridRepairSettings,
     GridRepairSettingsStore,
     GridRun,
@@ -178,11 +179,22 @@ async def start_photo_grid_repair() -> dict[str, object]:
     run = await inspect_photo_grid(force=True)
     if run is None:
         return {"status": "rejected", "message": "No recent photo-grid run was found"}
-    targets = target_payload(run.targets)
-    if not targets:
+    if not run.targets:
         return {"status": "complete", "message": "The latest photo grid is complete"}
+    # start_vision_grid_repair accepts at most MAX_REPAIR_TARGETS_PER_CALL targets
+    # (docs/integration-contract.md); a larger grid must be repaired in batches.
+    # Missing cells are photographed before gantry-obstructed ones since a
+    # missing cell has no usable photo at all.
+    ordered = sorted(run.targets, key=lambda target: target.reason != "missing")
+    batch = ordered[:MAX_REPAIR_TARGETS_PER_CALL]
+    remaining = len(ordered) - len(batch)
+    targets = target_payload(tuple(batch))
     result = await client.start_grid_repair(settings.selected_config_entry_id, targets)
-    grid_repair_state["message"] = str(result.get("message") or "")
+    message = str(result.get("message") or "")
+    if remaining:
+        message = f"{message} ({remaining} more cell(s) need a follow-up repair)".strip()
+        result = {**result, "message": message}
+    grid_repair_state["message"] = message
     return result
 
 

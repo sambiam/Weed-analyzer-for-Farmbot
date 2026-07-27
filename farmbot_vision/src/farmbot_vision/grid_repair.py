@@ -18,6 +18,12 @@ CLUSTER_WINDOW = timedelta(hours=1)
 COORDINATE_TOLERANCE_MM = 25.0
 MINIMUM_GRID_COVERAGE = 0.6
 
+# The companion integration's start_vision_grid_repair service accepts one to
+# twelve targets per call (see docs/integration-contract.md); a larger grid
+# with more missing/gantry cells than this must be repaired across more than
+# one call.
+MAX_REPAIR_TARGETS_PER_CALL = 12
+
 
 class GridRepairSettings(BaseModel):
     """User-owned settings persisted independently of Supervisor options."""
