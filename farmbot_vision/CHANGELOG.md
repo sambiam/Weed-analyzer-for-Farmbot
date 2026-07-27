@@ -1,6 +1,5 @@
 # Changelog
 
-<<<<<<< HEAD
 ## 2.0.0 - 2026-07-27
 
 - Added repair detection for missing photo-grid cells and gantry images, a
@@ -15,7 +14,7 @@
 - Photo-grid retakes use the V2 companion service, which validates axis bounds,
   waits after each move, takes only replacement photos, and restores the
   FarmBot's starting position.
-=======
+
 ## 1.9.0 - 2026-07-27
 
 - Added photo-grid repair detection to the Analysis page. The app identifies
@@ -68,7 +67,6 @@
   plant's centre to stay inside it, matching weeds and plant centres. A
   protection radius may extend past a boundary's edge; it still must not
   overlap a forbidding exclusion zone, since those mark real hazards.
->>>>>>> bc38d1dbfa49b8da40610f5fd40efa7ae8477584
 
 ## 1.5.0 - 2026-07-26
 
