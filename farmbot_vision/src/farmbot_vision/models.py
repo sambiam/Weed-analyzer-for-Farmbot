@@ -49,6 +49,10 @@ class QueueImagesRequest(StrictModel):
     image_ids: list[Annotated[int, Field(gt=0, strict=True)]]
 
 
+class WeedBulkAcceptRequest(StrictModel):
+    detection_ids: list[UUID] = Field(min_length=1, max_length=100)
+
+
 class Plant(StrictModel):
     id: int
     name: str

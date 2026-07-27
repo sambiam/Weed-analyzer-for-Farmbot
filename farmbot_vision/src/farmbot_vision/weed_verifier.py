@@ -31,7 +31,18 @@ FEATURE_NAMES = (
 )
 
 POSITIVE_LABEL = "weed"
-NEGATIVE_LABELS = {"crop", "mulch_soil", "fungus_moss", "hardware_other"}
+# The legacy grouped labels remain valid for existing training samples. The
+# review UI now offers the more useful individual hard-negative categories.
+NEGATIVE_LABELS = {
+    "crop",
+    "mushroom",
+    "moss",
+    "soil",
+    "hardware",
+    "mulch_soil",
+    "fungus_moss",
+    "hardware_other",
+}
 ALL_LABELS = {POSITIVE_LABEL, *NEGATIVE_LABELS}
 
 
@@ -157,6 +168,14 @@ class WeedVisualVerifier:
                 self.model = None
         except (OSError, ValueError, TypeError):
             self.model = None
+
+    def clear(self) -> None:
+        """Forget the active model and remove its persisted file."""
+        self.model = None
+        try:
+            self.path.unlink()
+        except FileNotFoundError:
+            pass
 
     def predict(self, features: dict[str, float]) -> float | None:
         if self.model is None:

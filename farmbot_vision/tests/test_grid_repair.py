@@ -6,8 +6,11 @@ import numpy as np
 from farmbot_vision.grid_repair import (
     GridRepairSettings,
     GridRepairSettingsStore,
+    RepairCaptures,
+    RepairCaptureStore,
     detect_latest_grid_run,
     looks_like_gantry_photo,
+    same_grid_run,
 )
 from farmbot_vision.models import InventoryImage
 
@@ -69,6 +72,97 @@ def test_skips_newer_non_grid_cluster():
         for index, item in enumerate(grid[:2])
     ]
     assert detect_latest_grid_run(grid + later).completed_at == grid[-1].created_at
+
+
+def _grid_images() -> list[InventoryImage]:
+    return [
+        _image(1, 0, 0, 0),
+        _image(2, 1, 0, 100),
+        _image(3, 2, 0, 200),
+        _image(4, 3, 100, 0),
+        _image(5, 4, 100, 100),
+        # (100, 200) is missing.
+        _image(7, 6, 200, 0),
+        _image(8, 7, 200, 100),
+        _image(9, 8, 200, 200),
+    ]
+
+
+def _repair_photo(image_id: int, x: float, y: float, hours: int = 3) -> InventoryImage:
+    """A photo taken well outside the run's cluster, as a real repair is."""
+    return InventoryImage.model_validate(
+        {
+            "id": image_id,
+            "created_at": datetime(2026, 7, 26, 1, 0, tzinfo=UTC) + timedelta(hours=hours),
+            "meta": {"x": x, "y": y, "z": 0},
+        }
+    )
+
+
+def test_repair_photo_fills_its_cell_even_though_it_is_hours_later():
+    """The core loop bug: a repair photo never joins the run's time cluster."""
+    images = [*_grid_images(), _repair_photo(30, 100, 200)]
+    captures = RepairCaptures(
+        run_started_at=datetime(2026, 7, 26, 1, 0, tzinfo=UTC), image_ids=[30]
+    )
+    run = detect_latest_grid_run(images, None, captures)
+    assert run is not None
+    assert run.targets == ()
+    assert run.filled_count == 9
+    assert run.coverage == 1
+
+
+def test_repair_photo_replaces_the_gantry_photo_it_was_taken_for():
+    images = [*_grid_images(), _repair_photo(30, 100, 100)]
+    captures = RepairCaptures(
+        run_started_at=datetime(2026, 7, 26, 1, 0, tzinfo=UTC), image_ids=[30]
+    )
+    # Image 5 (the interior cell) was the gantry photo; its replacement is not.
+    run = detect_latest_grid_run(images, {5}, captures)
+    assert run is not None
+    assert {(item.x, item.y, item.reason) for item in run.targets} == {(100, 200, "missing")}
+    assert run.filled_count == 8
+
+
+def test_repair_photos_never_form_a_grid_run_of_their_own():
+    """Four repair photos make a 2x2 lattice; they must not outrank the run."""
+    repairs = [
+        _repair_photo(30 + index, x, y)
+        for index, (x, y) in enumerate([(0, 0), (0, 100), (100, 0), (100, 100)])
+    ]
+    captures = RepairCaptures(
+        run_started_at=datetime(2026, 7, 26, 1, 0, tzinfo=UTC),
+        image_ids=[item.id for item in repairs],
+    )
+    run = detect_latest_grid_run([*_grid_images(), *repairs], None, captures)
+    assert run is not None
+    assert run.expected_count == 9
+
+
+def test_repair_photos_from_an_older_run_do_not_fill_a_newer_run():
+    older_run_start = datetime(2026, 7, 26, 1, 0, tzinfo=UTC) - timedelta(days=1)
+    captures = RepairCaptures(run_started_at=older_run_start, image_ids=[30])
+    images = [*_grid_images(), _repair_photo(30, 100, 200)]
+    run = detect_latest_grid_run(images, None, captures)
+    assert run is not None
+    assert {(item.x, item.y, item.reason) for item in run.targets} == {(100, 200, "missing")}
+
+
+def test_same_grid_run_tolerates_start_drift_but_not_a_new_run():
+    start = datetime(2026, 7, 26, 1, 0, tzinfo=UTC)
+    assert same_grid_run(start, start)
+    # Retiring the run's earliest photo moves its start time forward.
+    assert same_grid_run(start + timedelta(minutes=20), start)
+    assert not same_grid_run(start + timedelta(hours=6), start)
+    assert not same_grid_run(start, None)
+
+
+def test_repair_capture_store_round_trip(tmp_path):
+    store = RepairCaptureStore(tmp_path / "captures.json")
+    assert store.load() == RepairCaptures()
+    value = RepairCaptures(run_started_at=datetime(2026, 7, 26, 1, 0, tzinfo=UTC), image_ids=[4, 9])
+    store.save(value)
+    assert store.load() == value
 
 
 def test_gantry_detector_finds_bright_vertical_rail():

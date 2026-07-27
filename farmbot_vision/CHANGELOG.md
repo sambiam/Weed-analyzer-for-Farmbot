@@ -1,5 +1,21 @@
 # Changelog
 
+## 2.1.0 - 2026-07-27
+
+- Fixed photo-grid repair endlessly re-photographing the same cells. A repair
+  photo is taken hours after the grid run it belongs to, so it never joined
+  that run's one-hour time cluster and the cell stayed "missing" forever. The
+  app now remembers which photos it captured for which run and credits them to
+  the right cells, so every successful repair raises "grid cells found" by one
+  and lowers the missing count by one immediately.
+- A gantry-obscured photo is now deleted from FarmBot once a usable photo of
+  the same cell has replaced it (requires companion integration 2.1.0; older
+  integrations simply leave the old photo in place).
+- A cell that still has no usable photo after two fresh captures is now
+  reported and skipped instead of being retried indefinitely.
+- The "grid cells found" count now counts filled cells rather than images, so
+  a cell photographed more than once is no longer counted twice.
+
 ## 2.0.5 - 2026-07-27
 
 - Photo-grid repair now runs automatically a configurable number of minutes

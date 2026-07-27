@@ -273,6 +273,12 @@ class HomeAssistantClient:
             {"config_entry_id": config_entry_id, "repair_id": repair_id},
         )  # type: ignore[return-value]
 
+    async def delete_image(self, config_entry_id: str, image_id: int) -> dict[str, Any]:
+        return await self._service(
+            "delete_vision_image",
+            {"config_entry_id": config_entry_id, "image_id": int(image_id)},
+        )  # type: ignore[return-value]
+
     async def image(self, request: VisionImageRequest, max_payload_bytes: int) -> VisionImage:
         result = await self._service("get_vision_image", request, VisionImage)
         if not isinstance(result, VisionImage):

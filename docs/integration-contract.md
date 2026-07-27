@@ -75,6 +75,21 @@ It returns `queued|running|waiting_images|complete|failed`, a sanitized
 message, the validated target coordinates, verified frames, per-target
 completion/failure details, and the current photo-attempt number.
 
+`farmbot.delete_vision_image` accepts `config_entry_id` and `image_id`, and
+returns `deleted|rejected` with the image ID and a sanitized message. It
+deletes the image only when it belongs to the config entry's own FarmBot, and
+reports an already-absent image as `deleted` so a retry is safe. The app calls
+it only to retire a gantry-obscured grid cell's photo once a usable photo of
+the same cell has replaced it. It is advertised as the `vision_image_deletion`
+capability; an integration without it keeps the replaced photo, which is a
+cosmetic loss only, because the app credits the replacement to the cell
+regardless.
+
+Each verified repair frame's `image_id` is what lets the app attribute a
+repair photo to the grid run that needed it. A repair happens well outside the
+one-hour window that defines a run, so without those IDs the repaired cell
+would keep reading as missing and would be re-photographed forever.
+
 ## Soil-height services
 
 `farmbot.get_vision_soil_points` accepts `config_entry_id`. It returns active

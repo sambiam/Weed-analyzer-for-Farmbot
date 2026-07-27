@@ -380,6 +380,131 @@ async def test_grid_repair_worker_moves_on_after_six_failed_camera_attempts(monk
 
 
 @pytest.mark.asyncio
+async def test_grid_repair_credits_each_new_photo_and_retires_the_gantry_frame(
+    monkeypatch, tmp_path
+):
+    """A completed cell must stop being requested, and its gantry photo must go."""
+    from farmbot_vision.grid_repair import GridRun, RepairCaptureStore, RepairTarget
+
+    now = datetime.now(UTC)
+    target = RepairTarget(100, 100, 0, "gantry", 5)
+    initial = GridRun(
+        started_at=now,
+        completed_at=now,
+        images=(),
+        expected_count=4,
+        coverage=1,
+        targets=(target,),
+    )
+    repaired = GridRun(
+        started_at=now,
+        completed_at=now,
+        images=(),
+        expected_count=4,
+        coverage=1,
+        targets=(),
+    )
+    deleted: list[int] = []
+
+    async def status(_entry_id, repair_id):
+        return {
+            "status": "complete",
+            "repair_id": repair_id,
+            "message": "Processed target image verified",
+            "frames": [{"image_id": 30, "x": 100, "y": 100, "z": 0}],
+        }
+
+    async def inspect(*, force=False):
+        return repaired
+
+    async def list_bots():
+        return BotList.model_validate(
+            {
+                "bots": [
+                    {
+                        "config_entry_id": "entry-1",
+                        "device_id": "42",
+                        "name": "FarmBot",
+                        "integration_version": "2.1.0",
+                        "capabilities": ["vision_image_deletion"],
+                    }
+                ]
+            }
+        )
+
+    async def delete_image(_entry_id, image_id):
+        deleted.append(image_id)
+        return {"status": "deleted", "image_id": image_id}
+
+    store = RepairCaptureStore(tmp_path / "captures.json")
+    monkeypatch.setattr(web, "repair_capture_store", store)
+    monkeypatch.setattr(web.settings, "selected_config_entry_id", "entry-1")
+    monkeypatch.setattr(web.client, "grid_repair_status", status)
+    monkeypatch.setattr(web.client, "list_bots", list_bots)
+    monkeypatch.setattr(web.client, "delete_image", delete_image)
+    monkeypatch.setattr(web, "inspect_photo_grid", inspect)
+
+    await web._photo_grid_repair_worker(session_id="session-1", run=initial, active_repair_id="r1")
+
+    assert deleted == [5]
+    assert store.load().image_ids == [30]
+    assert store.load().run_started_at == now
+    assert web.grid_repair_state["status"] == "complete"
+
+
+@pytest.mark.asyncio
+async def test_grid_repair_gives_up_on_a_cell_that_stays_unusable(monkeypatch, tmp_path):
+    """A cell that photographs the gantry every time must not loop forever."""
+    from farmbot_vision.grid_repair import GridRun, RepairCaptureStore, RepairTarget
+
+    now = datetime.now(UTC)
+    target = RepairTarget(100, 100, 0, "gantry", 5)
+    stuck = GridRun(
+        started_at=now,
+        completed_at=now,
+        images=(),
+        expected_count=4,
+        coverage=1,
+        targets=(target,),
+    )
+    frame_ids = iter(range(30, 40))
+    queued = []
+
+    async def status(_entry_id, repair_id):
+        return {
+            "status": "complete",
+            "repair_id": repair_id,
+            "message": "Processed target image verified",
+            "frames": [{"image_id": next(frame_ids), "x": 100, "y": 100, "z": 0}],
+        }
+
+    async def inspect(*, force=False):
+        return stuck
+
+    async def queue_one(run, **_kwargs):
+        queued.append(run.targets[0])
+        return ({"status": "queued", "repair_id": "r2", "message": "queued"}, run.targets[0])
+
+    async def delete_replaced(_image_id):
+        return None
+
+    monkeypatch.setattr(web, "repair_capture_store", RepairCaptureStore(tmp_path / "c.json"))
+    monkeypatch.setattr(web.settings, "selected_config_entry_id", "entry-1")
+    monkeypatch.setattr(web.client, "grid_repair_status", status)
+    monkeypatch.setattr(web, "inspect_photo_grid", inspect)
+    monkeypatch.setattr(web, "_queue_one_repair_target", queue_one)
+    monkeypatch.setattr(web, "_delete_replaced_gantry_image", delete_replaced)
+
+    await web._photo_grid_repair_worker(session_id="session-1", run=stuck, active_repair_id="r1")
+
+    assert queued == [target]
+    assert web.grid_repair_state["status"] == "failed"
+    assert "1 cell still had no usable photo after 2 fresh captures" in str(
+        web.grid_repair_state["message"]
+    )
+
+
+@pytest.mark.asyncio
 async def test_dashboard_gantry_debug_view_shows_photos_coordinates_and_disposition(
     monkeypatch,
 ):
@@ -585,6 +710,9 @@ async def test_root_and_duplicate_leading_slash_routes():
     status, _, body = await asgi_request("/")
     assert status == 200
     assert b"FarmBot Vision" in body
+    assert b'action="analysis/clear-recommendations"' in body
+    assert b'action="analysis/clear-weeds"' in body
+    assert b'action="analysis/clear-measurements"' in body
 
     for path in ("//", "///"):
         status, _, body = await asgi_request(path)
@@ -794,6 +922,8 @@ async def test_weed_settings_page_exposes_pipeline_training_and_automation_contr
     assert "Learned visual verifier" in html
     assert "name=automatic_creation_confidence" in html
     assert 'action="weed-model/train"' in html
+    assert 'action="weed-model/clear"' in html
+    assert "Clear all training images" in html
 
 
 @pytest.mark.asyncio

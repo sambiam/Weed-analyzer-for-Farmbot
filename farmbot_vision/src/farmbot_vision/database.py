@@ -706,11 +706,17 @@ class Database:
         self, config_entry_id: str, x: float, y: float, tolerance_mm: float
     ) -> bool:
         for row in self.connection.execute(
-            """SELECT x,y FROM weed_detections
+            """SELECT x,y,radius_mm,status FROM weed_detections
             WHERE config_entry_id=? AND status IN ('created','rejected')""",
             (config_entry_id,),
         ):
-            if math.hypot(float(row[0]) - x, float(row[1]) - y) <= tolerance_mm:
+            # A rejection is a position suppression, not just a decision on
+            # one UUID. Keep using the rejected detection's radius as a floor
+            # so a later, slightly shifted detection cannot be surfaced again.
+            rejected_radius = float(row[2] or 0) * 1.5 if row[3] == "rejected" else 0
+            if math.hypot(float(row[0]) - x, float(row[1]) - y) <= max(
+                tolerance_mm, 20.0, rejected_radius
+            ):
                 return True
         return False
 
@@ -732,6 +738,28 @@ class Database:
             )
         return True
 
+    def update_weed_training_sample_label(self, detection_id: str, label: str) -> bool:
+        """Change the label of an existing verifier sample without changing review state."""
+        with self.connection:
+            cursor = self.connection.execute(
+                "UPDATE weed_training_samples SET label=?,created_at=CURRENT_TIMESTAMP "
+                "WHERE detection_id=?",
+                (label, detection_id),
+            )
+        return cursor.rowcount > 0
+
+    def clear_weed_training_samples(self) -> list[str]:
+        """Remove all verifier samples and return their stored crop paths."""
+        paths = [
+            str(row["crop_path"])
+            for row in self.connection.execute(
+                "SELECT crop_path FROM weed_training_samples WHERE crop_path IS NOT NULL"
+            )
+        ]
+        with self.connection:
+            self.connection.execute("DELETE FROM weed_training_samples")
+        return paths
+
     def weed_training_samples(self) -> list[dict]:
         samples = []
         for row in self.connection.execute(
@@ -749,6 +777,10 @@ class Database:
         summary = {
             "weed": 0,
             "crop": 0,
+            "mushroom": 0,
+            "moss": 0,
+            "soil": 0,
+            "hardware": 0,
             "mulch_soil": 0,
             "fungus_moss": 0,
             "hardware_other": 0,
@@ -784,6 +816,50 @@ class Database:
             )
         ]
 
+    def clear_pending_measurements(self) -> int:
+        """Mark every pending plant measurement as superseded.
+
+        Keep the measurement and its audit history so clearing the review queue
+        does not remove diagnostic evidence or make a later re-analysis appear
+        to have overwritten an older result.
+        """
+        rows = self.connection.execute(
+            """SELECT m.measurement_id FROM measurements m
+            WHERE NOT EXISTS (
+              SELECT 1 FROM decisions d WHERE d.measurement_id=m.measurement_id
+              AND d.action IN
+                ('applied','approved_no_change','reject','removed','keep','superseded')
+            )"""
+        ).fetchall()
+        if not rows:
+            return 0
+        details = json.dumps(
+            {"reason": "cleared from Analysis review queue"}, separators=(",", ":")
+        )
+        with self.connection:
+            self.connection.executemany(
+                "INSERT INTO decisions(measurement_id,action,details_json) VALUES(?,?,?)",
+                [(row[0], "superseded", details) for row in rows],
+            )
+        return len(rows)
+
+    def clear_pending_weed_detections(self) -> int:
+        """Mark pending weed recommendations as superseded without deleting them."""
+        with self.connection:
+            cursor = self.connection.execute(
+                "UPDATE weed_detections SET status='superseded' "
+                "WHERE status IN ('recommended','observing')"
+            )
+        return cursor.rowcount
+
+    def clear_flagged_curve_proposals(self) -> int:
+        """Discard curve recommendations that are still awaiting review."""
+        with self.connection:
+            cursor = self.connection.execute(
+                "UPDATE curve_proposals SET status='rejected' WHERE status='flagged'"
+            )
+        return cursor.rowcount
+
     def weed_detection(self, detection_id: str) -> dict | None:
         row = self.connection.execute(
             "SELECT * FROM weed_detections WHERE detection_id=?", (detection_id,)
@@ -805,7 +881,7 @@ class Database:
         duplicates at the same position.
         """
         target = self.connection.execute(
-            "SELECT config_entry_id,x,y FROM weed_detections WHERE detection_id=?",
+            "SELECT config_entry_id,x,y,candidate_track_id FROM weed_detections WHERE detection_id=?",
             (detection_id,),
         ).fetchone()
         if target is None:
@@ -828,6 +904,11 @@ class Database:
                 "UPDATE weed_detections SET status='rejected' WHERE detection_id=?",
                 ((nearby_id,) for nearby_id in nearby_ids),
             )
+            if target["candidate_track_id"] is not None:
+                self.connection.execute(
+                    "UPDATE weed_candidate_tracks SET status='rejected' WHERE id=?",
+                    (target["candidate_track_id"],),
+                )
         return True
 
     def upsert_weed_track(

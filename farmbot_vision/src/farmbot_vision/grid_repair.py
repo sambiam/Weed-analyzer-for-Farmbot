@@ -10,7 +10,7 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, Field, field_validator
 
 from .models import InventoryImage
 
@@ -55,6 +55,54 @@ class GridRepairSettingsStore:
         temporary.replace(self.path)
 
 
+def same_grid_run(started_at: datetime, remembered: datetime | None) -> bool:
+    """Is a freshly detected run the same photo-grid run as a remembered one?
+
+    A run is identified by when it started. That timestamp can drift forward a
+    little while a repair is under way -- retiring a replaced photo removes it
+    from the cluster the start time is taken from -- but never by more than
+    the cluster window, because a cluster only ever spans one hour. Two
+    genuinely different runs are always more than a cluster window apart, so
+    the window is exactly the right slack to allow.
+    """
+    if remembered is None:
+        return False
+    return timedelta(0) <= started_at - remembered <= CLUSTER_WINDOW
+
+
+class RepairCaptures(BaseModel):
+    """Photos this app captured while repairing one specific grid run.
+
+    A repair photo is created hours after the run it belongs to, so ordinary
+    time clustering can never fold it back into that run -- which is why the
+    same cells were otherwise re-photographed forever. Remembering the image
+    IDs (and which run they were taken for) lets detection credit them to the
+    right cells, and survives an add-on restart mid-repair.
+    """
+
+    run_started_at: datetime | None = None
+    image_ids: list[int] = Field(default_factory=list)
+
+
+class RepairCaptureStore:
+    def __init__(self, path: Path):
+        self.path = path
+
+    def load(self) -> RepairCaptures:
+        if not self.path.exists():
+            return RepairCaptures()
+        try:
+            return RepairCaptures.model_validate_json(self.path.read_text(encoding="utf-8"))
+        except ValueError:
+            return RepairCaptures()
+
+    def save(self, value: RepairCaptures) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = self.path.with_suffix(".tmp")
+        temporary.write_text(value.model_dump_json(indent=2) + "\n", encoding="utf-8")
+        temporary.replace(self.path)
+
+
 @dataclass(frozen=True)
 class RepairTarget:
     x: float
@@ -72,6 +120,11 @@ class GridRun:
     expected_count: int
     coverage: float
     targets: tuple[RepairTarget, ...]
+
+    @property
+    def filled_count(self) -> int:
+        """Grid cells that hold an image, counting repaired cells as filled."""
+        return self.expected_count - sum(target.reason == "missing" for target in self.targets)
 
 
 def _axis(values: list[float]) -> list[float]:
@@ -101,11 +154,24 @@ def _time_clusters(images: list[InventoryImage]) -> list[list[InventoryImage]]:
 
 
 def detect_latest_grid_run(
-    images: list[InventoryImage], gantry_image_ids: set[int] | None = None
+    images: list[InventoryImage],
+    gantry_image_ids: set[int] | None = None,
+    repair_captures: RepairCaptures | None = None,
 ) -> GridRun | None:
-    """Return the newest hour-scale cluster that forms most of a 2-D grid."""
+    """Return the newest hour-scale cluster that forms most of a 2-D grid.
+
+    ``repair_captures`` names photos this app took to repair a specific
+    earlier run. They are kept out of cluster formation (a handful of repair
+    photos must never be mistaken for a grid run of their own) and are instead
+    credited to that run's cells, so each successful repair reduces the
+    missing count instead of being re-requested forever.
+    """
     gantry_image_ids = gantry_image_ids or set()
-    for cluster in reversed(_time_clusters(images)):
+    repair_captures = repair_captures or RepairCaptures()
+    repair_image_ids = set(repair_captures.image_ids)
+    repairs = [image for image in images if image.id in repair_image_ids]
+    ordinary = [image for image in images if image.id not in repair_image_ids]
+    for cluster in reversed(_time_clusters(ordinary)):
         if len(cluster) < 4:
             continue
         xs = _axis([item.meta.x for item in cluster])
@@ -118,6 +184,20 @@ def detect_latest_grid_run(
             current = cells.get(cell)
             if current is None or image.created_at > current.created_at:
                 cells[cell] = image
+        started_at = min(item.created_at for item in cluster)
+        adopted: list[InventoryImage] = []
+        if same_grid_run(started_at, repair_captures.run_started_at):
+            for image in repairs:
+                cell = (_nearest(image.meta.x, xs), _nearest(image.meta.y, ys))
+                if (
+                    abs(image.meta.x - cell[0]) > COORDINATE_TOLERANCE_MM
+                    or abs(image.meta.y - cell[1]) > COORDINATE_TOLERANCE_MM
+                ):
+                    continue
+                adopted.append(image)
+                current = cells.get(cell)
+                if current is None or image.created_at > current.created_at:
+                    cells[cell] = image
         expected = len(xs) * len(ys)
         coverage = len(cells) / expected
         if coverage < MINIMUM_GRID_COVERAGE:
@@ -143,9 +223,13 @@ def detect_latest_grid_run(
                 ):
                     targets.append(RepairTarget(x, y, image.meta.z, "gantry", image.id))
         return GridRun(
-            started_at=min(item.created_at for item in cluster),
+            # Both timestamps describe the FarmBot photo-grid run itself, not
+            # the repairs bolted onto it: ``started_at`` is the run's stable
+            # identity across repairs, and holding ``completed_at`` still keeps
+            # the automatic-repair delay from restarting with every new photo.
+            started_at=started_at,
             completed_at=max(item.created_at for item in cluster),
-            images=tuple(cluster),
+            images=tuple(cluster) + tuple(adopted),
             expected_count=expected,
             coverage=coverage,
             targets=tuple(targets),

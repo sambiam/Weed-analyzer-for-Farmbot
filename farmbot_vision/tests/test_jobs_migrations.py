@@ -261,6 +261,39 @@ def test_reanalysis_supersedes_the_old_review_row_without_deleting_history(tmp_p
     assert database.measurement(str(first.measurement_id)) is not None
 
 
+def test_clear_pending_review_items_preserves_history(tmp_path):
+    database = Database(tmp_path / "db.sqlite")
+    measurement = _measurement(config_entry_id="clear-bot")
+    database.save_measurements([measurement])
+    weed_id = str(uuid4())
+    database.save_weed_detection(
+        detection_id=weed_id,
+        config_entry_id="clear-bot",
+        image_id=measurement.image_id,
+        image_timestamp=measurement.image_timestamp,
+        x=100,
+        y=200,
+        z=0,
+        area_mm2=100,
+        radius_mm=12,
+        confidence=0.9,
+        overlay_path=None,
+    )
+
+    assert database.clear_pending_measurements() == 1
+    assert database.pending_measurements() == []
+    assert database.measurement(str(measurement.measurement_id)) is not None
+    decision = database.connection.execute(
+        "SELECT action FROM decisions WHERE measurement_id=?",
+        (str(measurement.measurement_id),),
+    ).fetchone()
+    assert decision["action"] == "superseded"
+
+    assert database.clear_pending_weed_detections() == 1
+    assert database.pending_weed_detections() == []
+    assert database.weed_detection(weed_id)["status"] == "superseded"
+
+
 def test_removal_artifacts_migrate_persist_and_count_distinct_images(tmp_path):
     database = Database(tmp_path / "db.sqlite")
     timestamp = datetime(2026, 7, 23, tzinfo=UTC)
@@ -319,7 +352,7 @@ def test_rejected_weed_position_suppresses_future_detections_after_restart(tmp_p
         "image_timestamp": datetime(2026, 7, 23, tzinfo=UTC),
         "z": 0,
         "area_mm2": 100,
-        "radius_mm": 12,
+        "radius_mm": 30,
         "confidence": 0.9,
         "overlay_path": None,
     }
@@ -342,6 +375,10 @@ def test_rejected_weed_position_suppresses_future_detections_after_restart(tmp_p
 
     restarted = Database(path)
     assert restarted.has_weed_detection_near("bot-1", 103, 202, 20) is True
+    # The stored rejected radius extends the suppression area beyond the
+    # current detection's duplicate tolerance.
+    assert restarted.has_weed_detection_near("bot-1", 140, 200, 20) is True
+    assert restarted.has_weed_detection_near("bot-1", 146, 200, 20) is False
     assert restarted.has_weed_detection_near("bot-2", 103, 202, 20) is False
 
 
@@ -410,6 +447,32 @@ def test_weed_candidate_tracking_and_training_labels_survive_restart(tmp_path):
     assert sample["label"] == "weed"
     assert sample["features"]["strong_green_fraction"] == 0.8
     assert restarted.weed_detection(detection_id)["observation_count"] == 2
+
+
+def test_weed_training_samples_can_be_relabelled_and_cleared(tmp_path):
+    database = Database(tmp_path / "db.sqlite")
+    detection_id = str(uuid4())
+    database.save_weed_detection(
+        detection_id=detection_id,
+        config_entry_id="bot-1",
+        image_id=1,
+        image_timestamp=datetime(2026, 7, 24, tzinfo=UTC),
+        x=104,
+        y=202,
+        z=0,
+        area_mm2=90,
+        radius_mm=15,
+        confidence=0.85,
+        features={"strong_green_fraction": 0.8},
+        crop_path="/data/artifacts/candidate.jpg",
+        overlay_path=None,
+    )
+
+    assert database.label_weed_detection(detection_id, "weed") is True
+    assert database.update_weed_training_sample_label(detection_id, "crop") is True
+    assert database.weed_training_samples()[0]["label"] == "crop"
+    assert database.clear_weed_training_samples() == ["/data/artifacts/candidate.jpg"]
+    assert database.weed_training_samples() == []
 
 
 @pytest.mark.asyncio

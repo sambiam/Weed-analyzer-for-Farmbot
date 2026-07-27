@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from datetime import UTC, datetime
 from urllib.parse import urlencode
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 from test_web import _review_measurement, asgi_request
@@ -226,6 +226,36 @@ async def test_weed_approval_is_refused_inside_an_exclusion_zone(monkeypatch):
     response = await web.approve_weed(allowed)
     assert json.loads(response.body)["status"] == "applied"
     assert len(created) == 1
+
+
+@pytest.mark.asyncio
+async def test_bulk_weed_acceptance_is_idempotent_for_already_accepted_rows(monkeypatch):
+    created = []
+
+    async def create_weed(request):
+        created.append(request)
+        return {"status": "applied", "message": "weed created"}
+
+    monkeypatch.setattr(web.client, "create_weed", create_weed)
+    first = _weed_detection(2_000, 2_000)
+    second = _weed_detection(2_100, 2_100)
+    already_accepted = _weed_detection(2_200, 2_200)
+    web.database.update_weed_detection(already_accepted, "created")
+
+    response = await web.accept_all_weeds(
+        web.WeedBulkAcceptRequest(
+            detection_ids=[UUID(first), UUID(second), UUID(already_accepted)]
+        )
+    )
+    payload = json.loads(response.body)
+
+    assert response.status_code == 200
+    assert payload["status"] == "applied"
+    assert payload["failed_ids"] == []
+    assert set(payload["accepted_ids"]) == {first, second, already_accepted}
+    assert len(created) == 2
+    assert web.database.weed_detection(first)["status"] == "created"
+    assert web.database.weed_detection(second)["status"] == "created"
 
 
 @pytest.mark.asyncio

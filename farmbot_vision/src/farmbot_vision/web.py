@@ -41,9 +41,12 @@ from .grid_repair import (
     GridRepairSettings,
     GridRepairSettingsStore,
     GridRun,
+    RepairCaptures,
+    RepairCaptureStore,
     RepairTarget,
     detect_latest_grid_run,
     looks_like_gantry_photo,
+    same_grid_run,
     target_payload,
 )
 from .home_assistant import HomeAssistantClient, HomeAssistantError, StaleRadiusError
@@ -62,6 +65,7 @@ from .models import (
     QueueImagesRequest,
     UpsertCurveRequest,
     VisionImageRequest,
+    WeedBulkAcceptRequest,
 )
 from .settings import Settings
 from .soil_jobs import SoilJobManager
@@ -91,6 +95,7 @@ canopy_fusion_settings_store = CanopyFusionSettingsStore(
 grid_repair_settings_store = GridRepairSettingsStore(
     settings.data_dir / "grid_repair_settings.json"
 )
+repair_capture_store = RepairCaptureStore(settings.data_dir / "grid_repair_captures.json")
 weed_verifier = WeedVisualVerifier(settings.data_dir / "weed_visual_model.json")
 zone_store = ZoneStore(settings.data_dir / "zones.json")
 jobs = JobManager(settings, database, client, weed_settings_store, zone_store)
@@ -107,6 +112,21 @@ grid_repair_state: dict[str, object] = {
 grid_repair_task: asyncio.Task | None = None
 GRID_REPAIR_STATUS_POLL_SECONDS = 5
 GRID_REPAIR_BUSY_RETRY_SECONDS = 30
+# A cell whose fresh photo still shows the gantry will photograph the gantry
+# again; give it one retry, then move on rather than loop on it forever.
+MAX_REPAIR_ATTEMPTS_PER_CELL = 2
+TRAINING_LABELS = (
+    "weed",
+    "crop",
+    "mushroom",
+    "moss",
+    "soil",
+    "hardware",
+    # Keep old grouped labels selectable for samples saved by older versions.
+    "mulch_soil",
+    "fungus_moss",
+    "hardware_other",
+)
 
 
 async def inspect_photo_grid(*, force: bool = False) -> GridRun | None:
@@ -127,7 +147,19 @@ async def inspect_photo_grid(*, force: bool = False) -> GridRun | None:
                 image_lookback_hours=min(720, max(72, settings.image_lookback_hours)),
             )
         )
-        candidate = detect_latest_grid_run(inventory.images)
+        captures = repair_capture_store.load()
+        candidate = detect_latest_grid_run(inventory.images, None, captures)
+        # Once FarmBot runs a fresh photo grid, the previous run's repair
+        # photos say nothing about it; drop them so they can never fill a new
+        # run's genuinely missing cells with stale images.
+        if (
+            candidate is not None
+            and captures.run_started_at is not None
+            and not same_grid_run(candidate.started_at, captures.run_started_at)
+        ):
+            captures = RepairCaptures()
+            repair_capture_store.save(captures)
+            candidate = detect_latest_grid_run(inventory.images)
         gantry_ids: set[int] = set()
         if candidate is not None:
             semaphore = asyncio.Semaphore(4)
@@ -159,7 +191,7 @@ async def inspect_photo_grid(*, force: bool = False) -> GridRun | None:
                 LOGGER.warning(
                     "Could not inspect %d photo-grid image(s) for gantry content", failed
                 )
-            candidate = detect_latest_grid_run(inventory.images, gantry_ids)
+            candidate = detect_latest_grid_run(inventory.images, gantry_ids, captures)
         grid_repair_state.update(
             run=candidate,
             checked_at=now,
@@ -200,22 +232,106 @@ def _ordered_repair_targets(run: GridRun):
     )
 
 
+def _cell_attempts(cells: list[tuple[float, float]], target: RepairTarget) -> int:
+    """Count how many recorded attempts refer to the same grid cell.
+
+    Grid-axis positions are averages of the photos taken at them, so they
+    shift slightly whenever the images behind a cell change; cells are matched
+    by proximity rather than equality for that reason.
+    """
+    return sum(
+        1 for x, y in cells if math.hypot(target.x - x, target.y - y) <= COORDINATE_TOLERANCE_MM
+    )
+
+
 def _next_repair_target(
     run: GridRun,
     skipped: list[tuple[float, float]],
 ) -> RepairTarget | None:
     """Return the next cell not already exhausted during this repair session."""
     return next(
-        (
-            target
-            for target in _ordered_repair_targets(run)
-            if not any(
-                math.hypot(target.x - failed_x, target.y - failed_y) <= COORDINATE_TOLERANCE_MM
-                for failed_x, failed_y in skipped
-            )
-        ),
+        (target for target in _ordered_repair_targets(run) if not _cell_attempts(skipped, target)),
         None,
     )
+
+
+def _unrepaired_message(
+    skipped: list[tuple[float, float]],
+    exhausted: list[tuple[float, float]],
+) -> str:
+    """Explain which cells the session gave up on, and why."""
+    reasons = []
+    if skipped:
+        reasons.append(
+            f"{len(skipped)} cell{'s' if len(skipped) != 1 else ''} could not be captured "
+            "after six camera attempts"
+        )
+    if exhausted:
+        reasons.append(
+            f"{len(exhausted)} cell{'s' if len(exhausted) != 1 else ''} still had no usable "
+            f"photo after {MAX_REPAIR_ATTEMPTS_PER_CELL} fresh captures"
+        )
+    return "Photo-grid repair finished the remaining cells, but " + " and ".join(reasons)
+
+
+def _record_repair_captures(run: GridRun, image_ids: list[int]) -> None:
+    """Credit newly captured photos to the grid run they were taken for."""
+    if not image_ids:
+        return
+    captures = repair_capture_store.load()
+    if not same_grid_run(run.started_at, captures.run_started_at):
+        captures = RepairCaptures()
+    captures.run_started_at = run.started_at
+    captures.image_ids = sorted(set(captures.image_ids) | set(image_ids))
+    repair_capture_store.save(captures)
+
+
+def _repaired_image_ids(result: dict[str, object]) -> list[int]:
+    """Image IDs the integration verified at the repaired coordinates."""
+    frames = result.get("frames")
+    if not isinstance(frames, list):
+        return []
+    image_ids = []
+    for frame in frames:
+        if not isinstance(frame, dict):
+            continue
+        try:
+            image_ids.append(int(frame["image_id"]))
+        except (KeyError, TypeError, ValueError):
+            continue
+    return image_ids
+
+
+async def _delete_replaced_gantry_image(image_id: int) -> None:
+    """Retire a gantry-obscured photo now that a usable one has replaced it.
+
+    Deletion is best effort: an older companion integration does not offer it,
+    and a failure here must not abort a repair that has already succeeded.
+    """
+    try:
+        bots = (await client.list_bots()).bots
+        bot = next(
+            (item for item in bots if item.config_entry_id == settings.selected_config_entry_id),
+            None,
+        )
+        if bot is None or not bot.supports("vision_image_deletion"):
+            LOGGER.info(
+                "Replaced gantry photo %d was left in place: the loaded FarmBot "
+                "integration does not support image deletion",
+                image_id,
+            )
+            return
+        result = await client.delete_image(settings.selected_config_entry_id, image_id)
+        if str(result.get("status") or "") != "deleted":
+            LOGGER.warning(
+                "Could not delete replaced gantry photo %d: %s",
+                image_id,
+                result.get("message") or result.get("status"),
+            )
+            return
+        LOGGER.info("Deleted gantry photo %d after a usable replacement was captured", image_id)
+    except HomeAssistantError as exc:
+        LOGGER.warning("Could not delete replaced gantry photo %d: %s", image_id, exc)
 
 
 async def _queue_one_repair_target(
@@ -238,8 +354,13 @@ async def _photo_grid_repair_worker(
     active_repair_id: str | None,
 ) -> None:
     """Repair one verified image at a time until the detected grid is whole."""
+    # Cells FarmBot could not photograph at all.
     skipped: list[tuple[float, float]] = []
-    active_target = _next_repair_target(run, skipped)
+    # Cells that were photographed successfully but still read as unusable
+    # (a genuinely gantry-obscured cell photographs the gantry every time).
+    exhausted: list[tuple[float, float]] = []
+    captured: list[tuple[float, float]] = []
+    active_target = _next_repair_target(run, skipped + exhausted)
     try:
         while True:
             if active_repair_id:
@@ -269,6 +390,22 @@ async def _photo_grid_repair_worker(
                             "repair is moving to the next cell."
                         ),
                     )
+                elif status == "complete" and active_target is not None:
+                    # Credit the new photo to this run so the cell counts as
+                    # filled from here on, and retire the frame it replaced.
+                    _record_repair_captures(run, _repaired_image_ids(result))
+                    captured.append((active_target.x, active_target.y))
+                    if (
+                        active_target.reason == "gantry"
+                        and active_target.image_id is not None
+                        and any(
+                            image_id != active_target.image_id
+                            for image_id in _repaired_image_ids(result)
+                        )
+                    ):
+                        await _delete_replaced_gantry_image(active_target.image_id)
+                    if _cell_attempts(captured, active_target) >= MAX_REPAIR_ATTEMPTS_PER_CELL:
+                        exhausted.append((active_target.x, active_target.y))
                 active_repair_id = None
                 active_target = None
                 run = await inspect_photo_grid(force=True)
@@ -288,21 +425,18 @@ async def _photo_grid_repair_worker(
                         message="Photo-grid repair complete; every cell has a usable image",
                     )
                     return
-                active_target = _next_repair_target(run, skipped)
+                active_target = _next_repair_target(run, skipped + exhausted)
                 if active_target is None:
-                    count = len(skipped)
                     grid_repair_state.update(
                         status="failed",
-                        message=(
-                            "Photo-grid repair finished the remaining cells, but "
-                            f"{count} cell{'s' if count != 1 else ''} could not be captured "
-                            "after six camera attempts"
-                        ),
+                        message=_unrepaired_message(skipped, exhausted),
                     )
                     return
 
             try:
-                result, active_target = await _queue_one_repair_target(run, skipped=skipped)
+                result, active_target = await _queue_one_repair_target(
+                    run, skipped=skipped + exhausted
+                )
             except HomeAssistantError as exc:
                 grid_repair_state.update(
                     status="queued",
@@ -724,11 +858,43 @@ _DASHBOARD_JS = r"""
   const weedDetails=document.getElementById('weed-modal-details');
   const weedMessage=document.getElementById('weed-modal-message');
   const weedAccept=document.getElementById('weed-modal-accept');
-  const weedReject=document.getElementById('weed-modal-reject');
   const weedAcceptAll=document.getElementById('weed-modal-accept-all');
+  const weedRejectButtons=[...document.querySelectorAll('[data-weed-label]')];
+  const weedPrevious=document.getElementById('weed-modal-prev-weed');
+  const weedNext=document.getElementById('weed-modal-next-weed');
+  const weedPreviousImage=document.getElementById('weed-modal-prev-image');
+  const weedNextImage=document.getElementById('weed-modal-next-image');
+  const weedCounter=document.getElementById('weed-modal-weed-counter');
+  const weedImageCounter=document.getElementById('weed-modal-image-counter');
   const weedWithoutOverlay=document.getElementById('weed-modal-without-overlay');
   const weedWithOverlay=document.getElementById('weed-modal-with-overlay');
-  let weedData=null, weedReturnFocus=null;
+  let weedData=null, weedReturnFocus=null, weedViewers=[], weedImageGroups=[];
+  let weedIndex=0, weedImageIndex=0;
+  function parseWeedViewer(viewer){
+    try{return JSON.parse(viewer.dataset.weed||'null');}catch(_){return null;}
+  }
+  function refreshWeedNavigation(){
+    weedViewers=[...document.querySelectorAll('.weed-view')];
+    const groups=new Map();
+    weedViewers.forEach(function(viewer){
+      const data=parseWeedViewer(viewer);
+      if(!data) return;
+      const key=String(data.imageId);
+      if(!groups.has(key)) groups.set(key,[]);
+      groups.get(key).push(viewer);
+    });
+    weedImageGroups=[...groups.values()];
+  }
+  function updateWeedNavigation(){
+    const group=weedImageGroups[weedImageIndex]||[];
+    weedCounter.textContent=group.length?(weedIndex+1)+' / '+group.length:'0 / 0';
+    weedImageCounter.textContent=weedImageGroups.length
+      ?(weedImageIndex+1)+' / '+weedImageGroups.length:'0 / 0';
+    weedPrevious.disabled=weedIndex<=0;
+    weedNext.disabled=weedIndex<0||weedIndex>=group.length-1;
+    weedPreviousImage.disabled=weedImageIndex<=0;
+    weedNextImage.disabled=weedImageIndex<0||weedImageIndex>=weedImageGroups.length-1;
+  }
   function showWeedView(withOverlay){
     if(!weedData) return;
     const noCleanImage=!weedData.reviewArtifact;
@@ -744,8 +910,23 @@ _DASHBOARD_JS = r"""
     weedModal.hidden=true; weedImg.removeAttribute('src'); weedData=null;
     if(weedReturnFocus) weedReturnFocus.focus();
   }
-  function openWeedModal(data,trigger){
-    weedData=data; weedReturnFocus=trigger; weedMessage.textContent='';
+  function openWeedModal(data,trigger,keepFocus){
+    weedData=data;
+    if(!keepFocus) weedReturnFocus=trigger;
+    weedMessage.textContent='';
+    refreshWeedNavigation();
+    weedImageIndex=weedImageGroups.findIndex(function(group){
+      return group.some(function(viewer){
+        const viewerData=parseWeedViewer(viewer);
+        return viewerData&&String(viewerData.detectionId)===String(data.detectionId);
+      });
+    });
+    if(weedImageIndex<0) weedImageIndex=0;
+    const group=weedImageGroups[weedImageIndex]||[];
+    weedIndex=Math.max(0,group.findIndex(function(viewer){
+      const viewerData=parseWeedViewer(viewer);
+      return viewerData&&String(viewerData.detectionId)===String(data.detectionId);
+    }));
     showWeedView(false);
     if(data.x!=null&&data.y!=null&&data.width&&data.height){
       weedMarker.style.left=(data.x/data.width*100)+'%';
@@ -757,6 +938,7 @@ _DASHBOARD_JS = r"""
       +' · '+(data.observations||1)+' independent look(s)'
       +(data.verifierConfidence!=null?(' · verifier '+data.verifierConfidence.toFixed(2)):'')
       +(others?(' · '+others+' other weed(s) in this image'):'');
+    updateWeedNavigation();
     weedModal.hidden=false; weedModal.querySelector('.modal-close').focus();
   }
   async function postWeedAction(id,action){
@@ -765,35 +947,74 @@ _DASHBOARD_JS = r"""
       const result=await response.json().catch(function(){return {};});
       const ok=response.ok&&(result.status==='applied'||result.status==='rejected');
       if(ok){const row=document.getElementById('weed-'+id); if(row) row.remove();}
-      return ok;
-    }catch(_){return false;}
+      return {ok:ok,result:result};
+    }catch(error){return {ok:false,result:{message:'Request failed: '+error.message}};}
   }
   weedAccept.addEventListener('click',async function(){
     if(!weedData) return;
     weedAccept.disabled=true;
     try{
-      const ok=await postWeedAction(weedData.detectionId,'approve');
-      if(ok) closeWeedModal(); else weedMessage.textContent='Could not accept weed';
+      const result=await postWeedAction(weedData.detectionId,'approve');
+      if(result.ok) closeWeedModal();
+      else weedMessage.textContent=result.result.message||'Could not accept weed';
     }finally{weedAccept.disabled=false;}
   });
-  weedReject.addEventListener('click',async function(){
-    if(!weedData) return;
-    weedReject.disabled=true;
-    try{
-      const ok=await postWeedAction(weedData.detectionId,'reject');
-      if(ok) closeWeedModal(); else weedMessage.textContent='Could not reject weed';
-    }finally{weedReject.disabled=false;}
+  weedRejectButtons.forEach(function(button){
+    button.addEventListener('click',async function(){
+      if(!weedData) return;
+      button.disabled=true;
+      try{
+        const result=await postWeedAction(weedData.detectionId,button.dataset.weedLabel);
+        if(result.ok) closeWeedModal();
+        else weedMessage.textContent=result.result.message||'Could not reject weed';
+      }finally{button.disabled=false;}
+    });
   });
   weedAcceptAll.addEventListener('click',async function(){
     if(!weedData) return;
     weedAcceptAll.disabled=true;
     try{
-      const ids=(weedData.siblings&&weedData.siblings.length)?weedData.siblings:[weedData.detectionId];
-      let failures=0;
-      for(const id of ids){ if(!await postWeedAction(id,'approve')) failures++; }
-      if(!failures) closeWeedModal();
-      else weedMessage.textContent=failures+' weed(s) could not be accepted';
+      refreshWeedNavigation();
+      const ids=weedViewers.map(function(viewer){
+        const data=parseWeedViewer(viewer);
+        return data&&String(data.imageId)===String(weedData.imageId)?data.detectionId:null;
+      }).filter(Boolean);
+      if(!ids.length) ids.push(weedData.detectionId);
+      const response=await fetch('weeds/accept-all',{
+        method:'POST',headers:{Accept:'application/json','Content-Type':'application/json'},
+        body:JSON.stringify({detection_ids:[...new Set(ids)]})
+      });
+      const result=await response.json().catch(function(){return {};});
+      const acceptedIds=result.accepted_ids||[];
+      const failedIds=result.failed_ids||[];
+      if(response.ok&&(result.status==='applied'||result.status==='partial')){
+        acceptedIds.forEach(function(id){
+          const row=document.getElementById('weed-'+id); if(row) row.remove();
+        });
+        if(!failedIds.length) closeWeedModal();
+        else{
+          refreshWeedNavigation(); updateWeedNavigation();
+          weedMessage.textContent=failedIds.length+' weed(s) could not be accepted: '
+            +(result.message||'check the individual detections');
+        }
+      }else weedMessage.textContent=result.message||'Could not accept weeds';
     }finally{weedAcceptAll.disabled=false;}
+  });
+  weedPrevious.addEventListener('click',function(){
+    const group=weedImageGroups[weedImageIndex]||[], target=group[weedIndex-1];
+    if(target) openWeedModal(parseWeedViewer(target),weedReturnFocus,true);
+  });
+  weedNext.addEventListener('click',function(){
+    const group=weedImageGroups[weedImageIndex]||[], target=group[weedIndex+1];
+    if(target) openWeedModal(parseWeedViewer(target),weedReturnFocus,true);
+  });
+  weedPreviousImage.addEventListener('click',function(){
+    const target=weedImageGroups[weedImageIndex-1];
+    if(target&&target.length) openWeedModal(parseWeedViewer(target[0]),weedReturnFocus,true);
+  });
+  weedNextImage.addEventListener('click',function(){
+    const target=weedImageGroups[weedImageIndex+1];
+    if(target&&target.length) openWeedModal(parseWeedViewer(target[0]),weedReturnFocus,true);
   });
   weedWithoutOverlay.addEventListener('click',function(){showWeedView(false);});
   weedWithOverlay.addEventListener('click',function(){showWeedView(true);});
@@ -804,7 +1025,7 @@ _DASHBOARD_JS = r"""
   document.addEventListener('click',async function(event){
     const weedViewer=event.target.closest('.weed-view');
     if(weedViewer){
-      let data=null; try{data=JSON.parse(weedViewer.dataset.weed||'null');}catch(_){data=null;}
+      const data=parseWeedViewer(weedViewer);
       if(data) openWeedModal(data,weedViewer);
       return;
     }
@@ -1243,7 +1464,12 @@ button{{background:var(--green);border:0;border-radius:6px;padding:.65rem 1rem;c
 .modal-controls{{display:flex;gap:.5rem;align-items:center;justify-content:center;margin-top:.6rem}}.legend{{font-size:.9rem;color:var(--muted)}}
 .modal-controls[hidden]{{display:none}}
 .queue-dialog{{width:min(95vw,900px)}}.button-row{{display:flex;gap:.5rem;flex-wrap:wrap;align-items:center}}
-.weed-dialog{{width:min(95vw,900px)}}.weed-image-wrap{{position:relative;display:inline-block;margin:auto}}
+.clear-actions{{margin-top:.5rem}}.clear-actions form{{margin:0}}
+button.clear-button{{background:#a40000;color:white}}
+.training-crop{{width:96px;height:96px;object-fit:contain;background:#181d19;border-radius:6px}}
+.weed-dialog{{width:min(95vw,900px)}}.weed-navigation{{justify-content:space-between}}
+.weed-actions fieldset{{border:1px solid #d5ded8;border-radius:6px;margin-top:.7rem}}
+.weed-image-wrap{{position:relative;display:inline-block;margin:auto}}
 .weed-marker{{position:absolute;width:34px;height:34px;margin-left:-17px;margin-top:-17px;pointer-events:none;
 border-radius:50%;border:3px solid #168cff;box-shadow:0 0 0 1px #001b3d}}
 .weed-view-toggle button[aria-pressed=true]{{background:#1672c4;color:white;box-shadow:inset 0 0 0 2px #0b4779}}
@@ -1519,6 +1745,7 @@ async def dashboard(request: Request) -> HTMLResponse:
             "reviewArtifact": (
                 f"artifact/{Path(w['review_path']).name}" if w.get("review_path") else None
             ),
+            "imageId": w["image_id"],
             "x": w.get("center_px_x"),
             "y": w.get("center_px_y"),
             "width": w.get("processed_width"),
@@ -1544,18 +1771,7 @@ async def dashboard(request: Request) -> HTMLResponse:
             f"<td>{w['x']:.1f}, {w['y']:.1f}, {w['z']:.1f}</td>"
             f"<td>{w['area_mm2']:.1f}</td><td>{w.get('observation_count', 1)}</td>"
             f"<td>{float(w.get('heuristic_confidence') or w['confidence']):.2f}</td>"
-            f"<td>{verifier}</td><td>{_weed_view_button(w)}</td><td>"
-            f'<form><button class=review-action data-url="weeds/{w["detection_id"]}/approve">'
-            "Create weed</button></form>"
-            f'<form><button class=review-action data-url="weeds/{w["detection_id"]}/reject">'
-            "Reject as mulch/soil</button></form>"
-            f'<button class=review-action data-url="weeds/{w["detection_id"]}/label/crop">'
-            "Crop</button>"
-            f'<button class=review-action data-url="weeds/{w["detection_id"]}/label/fungus_moss">'
-            "Fungus/moss</button>"
-            f'<button class=review-action data-url="weeds/{w["detection_id"]}/label/hardware_other">'
-            "Hardware/other</button>"
-            "<small class=action-message></small></td></tr>"
+            f"<td>{verifier}</td><td>{_weed_view_button(w)}</td></tr>"
         )
 
     weed_rows = "".join(_weed_row(w) for w in pending_weeds)
@@ -1573,7 +1789,7 @@ async def dashboard(request: Request) -> HTMLResponse:
         missing_count = sum(target.reason == "missing" for target in grid_run.targets)
         gantry_count = sum(target.reason == "gantry" for target in grid_run.targets)
         repair_summary = (
-            f"<b>{len(grid_run.images)} of {grid_run.expected_count} grid cells found</b>"
+            f"<b>{grid_run.filled_count} of {grid_run.expected_count} grid cells found</b>"
         )
         repair_details = (
             f"{missing_count} missing · {gantry_count} gantry photo"
@@ -1670,7 +1886,14 @@ value="{repair_values.delay_minutes}" required> minutes after the photo grid com
 <small class=action-message>{repair_message}</small></section>
 <section class=card><h2>Analysis</h2><p><span id=queue-count>{len(jobs.queued_image_ids)}</span> queued</p>
 <div class=button-row><form method=post action="analyse"><button>Analyse queue</button></form>
-<button id=queue-open type=button>Add to queue</button></div></section></div>
+<button id=queue-open type=button>Add to queue</button></div>
+<div class="button-row clear-actions">
+<form method=post action="analysis/clear-recommendations" onsubmit="return confirm('Clear all pending recommendations?');">
+<button type=submit class=clear-button>Clear all recommendations</button></form>
+<form method=post action="analysis/clear-weeds" onsubmit="return confirm('Clear all pending weed recommendations?');">
+<button type=submit class=clear-button>Clear all weed recommendations</button></form>
+<form method=post action="analysis/clear-measurements" onsubmit="return confirm('Clear all pending measurements?');">
+<button type=submit class=clear-button>Clear all measurements</button></form></div></section></div>
 <section class=card><h2>Last job</h2>
 <p>{escape(last.get("message", "Never run"))}</p>
 <div class=grid>
@@ -1688,8 +1911,8 @@ value="{repair_values.delay_minutes}" required> minutes after the photo grid com
 <section class=card><h2>Removed / missing plants</h2><table><thead><tr><th>Crop</th><th>Recorded center (X, Y mm)</th><th>Move center to (X, Y mm)</th><th>Absent looks</th><th>Confidence</th><th>Reason</th><th>Diagnostic</th><th>Review</th></tr></thead><tbody>{removal_rows or "<tr><td colspan=8>No confirmed missing plants</td></tr>"}</tbody></table></section>
 <section class=card><h2>Detected weeds</h2><p class=muted>Unowned vegetation outside known plant protection areas.</p>
 <table><thead><tr><th>Image</th><th>Coordinates</th><th>Area mm²</th><th>Looks</th>
-<th>Heuristic</th><th>Verifier</th><th>View</th><th>Review / training label</th></tr></thead>
-<tbody>{weed_rows or "<tr><td colspan=8>No weed recommendations</td></tr>"}</tbody></table></section>
+<th>Heuristic</th><th>Verifier</th><th>View</th></tr></thead>
+<tbody>{weed_rows or "<tr><td colspan=7>No weed recommendations</td></tr>"}</tbody></table></section>
 <section class=card><h2>Growth-curve updates</h2><p class=muted>Flagged per-plant diameter points require review.</p><table><tbody>{flagged_curve_rows or "<tr><td>No flagged curve updates</td></tr>"}</tbody></table></section>
 <section class=card><h2>Crop protection spread proposals</h2><p class=muted>Monotonic and limited to 10 points. FarmBot values are diameters; assignment requires approval.</p><table><tbody>{curve_rows or "<tr><td>No curve is ready</td></tr>"}</tbody></table></section>
 <section class=card><h2>Approval and rollback history</h2><table><tbody>{decision_rows or "<tr><td>No decisions yet</td></tr>"}</tbody></table></section>
@@ -1713,10 +1936,26 @@ value="{repair_values.delay_minutes}" required> minutes after the photo grid com
 <div class=weed-image-wrap><img id=weed-modal-img alt="Weed detection"><div id=weed-modal-marker class=weed-marker hidden></div></div>
 <figcaption id=weed-modal-details></figcaption>
 <p class=legend>Blue circle = the weed being reviewed; red circles = other detected weeds in this image.</p>
-<div class=modal-controls>
-<button id=weed-modal-accept type=button>Accept weed</button>
-<button id=weed-modal-reject type=button>Reject weed</button>
-<button id=weed-modal-accept-all type=button>Accept all weeds</button>
+<div class="modal-controls weed-navigation" aria-label="Navigate weeds in this image">
+<button id=weed-modal-prev-weed type=button>Previous weed</button>
+<span>Weed <span id=weed-modal-weed-counter>0 / 0</span></span>
+<button id=weed-modal-next-weed type=button>Next weed</button>
+</div>
+<div class="modal-controls weed-navigation" aria-label="Navigate weed images">
+<button id=weed-modal-prev-image type=button>Previous image</button>
+<span>Image <span id=weed-modal-image-counter>0 / 0</span></span>
+<button id=weed-modal-next-image type=button>Next image</button>
+</div>
+<div class="weed-actions">
+<div class=button-row><button id=weed-modal-accept type=button>Accept</button>
+<button id=weed-modal-accept-all type=button>Accept all</button></div>
+<fieldset><legend>Reject as</legend><div class=button-row>
+<button type=button data-weed-label=crop>Crop</button>
+<button type=button data-weed-label=mushroom>Mushroom</button>
+<button type=button data-weed-label=moss>Moss</button>
+<button type=button data-weed-label=soil>Soil</button>
+<button type=button data-weed-label=hardware>Hardware</button>
+</div></fieldset>
 </div>
 <small id=weed-modal-message class=action-message></small>
 </figure></div>
@@ -1858,6 +2097,26 @@ async def analysis_images(
 @app.post("/analysis/queue")
 async def add_analysis_queue(request: QueueImagesRequest) -> JSONResponse:
     return JSONResponse({"queue_length": jobs.add_to_queue(request.image_ids)})
+
+
+@app.post("/analysis/clear-recommendations")
+async def clear_all_recommendations() -> RedirectResponse:
+    database.clear_pending_measurements()
+    database.clear_pending_weed_detections()
+    database.clear_flagged_curve_proposals()
+    return RedirectResponse("../", status_code=303)
+
+
+@app.post("/analysis/clear-weeds")
+async def clear_weed_recommendations() -> RedirectResponse:
+    database.clear_pending_weed_detections()
+    return RedirectResponse("../", status_code=303)
+
+
+@app.post("/analysis/clear-measurements")
+async def clear_measurements() -> RedirectResponse:
+    database.clear_pending_measurements()
+    return RedirectResponse("../", status_code=303)
 
 
 def _soil_artifacts(paths: list[str]) -> str:
@@ -2335,6 +2594,7 @@ async def save_canopy_settings(
 async def weed_settings_page(request: Request) -> HTMLResponse:
     values = weed_settings_store.load()
     labels = database.weed_training_summary()
+    training_samples = database.weed_training_samples()
     weed_verifier.reload()
     model = weed_verifier.model
 
@@ -2350,6 +2610,40 @@ async def weed_settings_page(request: Request) -> HTMLResponse:
     )
     training_notice = request.query_params.get("training")
     training_notice_html = f"<p class=warn>{escape(training_notice)}</p>" if training_notice else ""
+
+    def training_sample_row(sample: dict) -> str:
+        detection_id = str(sample["detection_id"])
+        crop_path = sample.get("crop_path")
+        crop = (
+            f'<img class=training-crop src="artifact/{escape(Path(crop_path).name, quote=True)}" '
+            f'alt="Candidate crop {escape(detection_id, quote=True)}">'
+            if crop_path
+            else "<span class=muted>No crop image</span>"
+        )
+        options = "".join(
+            f'<option value="{escape(label, quote=True)}"'
+            f"{' selected' if sample['label'] == label else ''}>"
+            f"{escape(label.replace('_', '/'))}</option>"
+            for label in TRAINING_LABELS
+        )
+        return (
+            "<tr>"
+            f"<td>{crop}</td>"
+            f"<td><code>{escape(detection_id)}</code></td>"
+            f"<td>{escape(str(sample['created_at']))}</td>"
+            f'<td><form method=post action="weed-model/samples/{escape(detection_id, quote=True)}">'
+            f'<select name=label aria-label="Training label for {escape(detection_id, quote=True)}">'
+            f"{options}</select> <button>Save tag</button></form></td>"
+            "</tr>"
+        )
+
+    training_sample_rows = "".join(training_sample_row(sample) for sample in training_samples)
+    training_samples_html = (
+        "<p>No labeled training images.</p>"
+        if not training_samples
+        else f"<table><thead><tr><th>Image</th><th>Detection</th><th>Labeled</th>"
+        f"<th>Tag</th></tr></thead><tbody>{training_sample_rows}</tbody></table>"
+    )
     body = f"""<section class=card><h2>Weed detection and automation</h2>
 <p>Every stage is configurable. Start in review/shadow mode, label real examples, train the
 local verifier, then enable enforcement or automatic FarmBot creation when its validation
@@ -2410,11 +2704,15 @@ Automatically remove known weeds that disappear</label><br>
 </fieldset>
 <button>Save all weed settings</button></form></section>
 <section class=card><h2>Verifier training</h2>{training_notice_html}<p>{model_status}</p>
-<p>Labels: {labels["weed"]} weeds · {labels["crop"]} crops · {labels["mulch_soil"]} mulch/soil ·
-{labels["fungus_moss"]} fungus/moss · {labels["hardware_other"]} hardware/other.</p>
-<form method=post action="weed-model/train"><button>Train verifier now</button></form>
+<p>Labels: {labels["weed"]} weeds · {labels["crop"]} crops · {labels["mushroom"]} mushrooms ·
+{labels["moss"]} moss · {labels["soil"]} soil · {labels["hardware"]} hardware.</p>
+<div class=button-row><form method=post action="weed-model/train"><button>Train verifier now</button></form>
+<form method=post action="weed-model/clear" onsubmit="return confirm('Clear all labeled training images and the trained verifier?');">
+<button type=submit>Clear all training images</button></form></div>
 <p class=muted>Accepting a weed records a positive label. Rejection and the category buttons on
-the Analysis page record hard negative examples from this FarmBot.</p></section>"""
+the Analysis page record hard negative examples from this FarmBot. Edit a tag below if a
+review decision was wrong. Saving a tag does not change the detection review status.</p>
+{training_samples_html}</section>"""
     return layout(request, body, "Weed settings")
 
 
@@ -2552,39 +2850,140 @@ async def train_weed_model() -> RedirectResponse:
     )
 
 
-@app.post("/weeds/{detection_id}/approve")
-async def approve_weed(detection_id: UUID) -> JSONResponse:
+@app.post("/weed-model/samples/{detection_id}")
+async def edit_weed_training_sample(detection_id: UUID, label: str = Form(...)) -> RedirectResponse:
+    if label not in ALL_LABELS:
+        raise HTTPException(422, "Unsupported training label")
+    if not database.update_weed_training_sample_label(str(detection_id), label):
+        raise HTTPException(404, "Training sample not found")
+
+    message = f"Updated training tag to {label.replace('_', '/')}"
+    if weed_settings_store.load().automatic_retraining:
+        try:
+            model = await _train_weed_verifier()
+            message += f" and retrained from {model['sample_count']} labels"
+        except ValueError:
+            message += "; retraining will start when both classes have enough labels"
+    return RedirectResponse(f"../weed-settings?training={quote(message)}", status_code=303)
+
+
+def _remove_weed_training_crops(paths: list[str]) -> int:
+    """Delete only candidate crops owned by the app's artifact directory."""
+    artifact_dir = (settings.data_dir / "artifacts").resolve()
+    removed = 0
+    for raw_path in set(paths):
+        try:
+            path = Path(raw_path).resolve()
+        except (OSError, RuntimeError):
+            continue
+        if path.parent != artifact_dir:
+            continue
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            continue
+        except OSError:
+            LOGGER.warning("Could not remove cleared weed training crop %s", path)
+            continue
+        removed += 1
+    return removed
+
+
+@app.post("/weed-model/clear")
+async def clear_weed_training() -> RedirectResponse:
+    paths = database.clear_weed_training_samples()
+    weed_verifier.clear()
+    removed = _remove_weed_training_crops(paths)
+    message = f"Cleared {len(paths)} labeled training image(s) and unloaded the verifier"
+    if removed != len(set(paths)):
+        message += f"; removed {removed} stored crop file(s)"
+    return RedirectResponse(f"../weed-settings?training={quote(message)}", status_code=303)
+
+
+async def _approve_weed_detection(
+    detection_id: UUID, *, allow_already_accepted: bool = False
+) -> tuple[dict, int]:
     detection = database.weed_detection(str(detection_id))
-    if detection is None or detection["status"] not in ("recommended", "observing"):
-        raise HTTPException(404, "Weed recommendation not found")
+    if detection is None:
+        return {"status": "not_found", "message": "Weed recommendation not found"}, 404
+    if allow_already_accepted and detection["status"] in ("created", "labelled"):
+        return {"status": "applied", "message": "Weed was already accepted"}, 200
+    if detection["status"] not in ("recommended", "observing"):
+        return {"status": "not_found", "message": "Weed recommendation not found"}, 404
     verdict = zone_verdict(ZoneAspect.WEEDS, detection["x"], detection["y"])
     if not verdict.allowed:
         # The recommendation stays pending so the zones can be corrected instead
         # of losing the detection.
-        return JSONResponse(
-            {
-                "status": "conflict",
-                "message": f"Weeds are not allowed at this position: {verdict.reason}",
-            },
-            status_code=409,
+        return {
+            "status": "conflict",
+            "message": f"Weeds are not allowed at this position: {verdict.reason}",
+        }, 409
+    try:
+        result = await client.create_weed(
+            CreateWeedRequest(
+                config_entry_id=detection["config_entry_id"],
+                detection_id=detection_id,
+                x=detection["x"],
+                y=detection["y"],
+                z=detection["z"],
+                radius=detection["radius_mm"],
+                confidence=detection["confidence"],
+                apply=True,
+                human_approved=True,
+            )
         )
-    result = await client.create_weed(
-        CreateWeedRequest(
-            config_entry_id=detection["config_entry_id"],
-            detection_id=detection_id,
-            x=detection["x"],
-            y=detection["y"],
-            z=detection["z"],
-            radius=detection["radius_mm"],
-            confidence=detection["confidence"],
-            apply=True,
-            human_approved=True,
-        )
-    )
+    except HomeAssistantError as exc:
+        return {"status": "error", "message": f"Could not create weed: {exc}"}, 502
     if result.get("status") == "applied":
         database.update_weed_detection(str(detection_id), "created")
         await _record_weed_label(detection_id, "weed")
-    return JSONResponse(result)
+    return result, 200
+
+
+@app.post("/weeds/{detection_id}/approve")
+async def approve_weed(detection_id: UUID) -> JSONResponse:
+    result, status_code = await _approve_weed_detection(detection_id)
+    if status_code == 404:
+        raise HTTPException(404, result["message"])
+    return JSONResponse(result, status_code=status_code)
+
+
+@app.post("/weeds/accept-all")
+async def accept_all_weeds(request: WeedBulkAcceptRequest) -> JSONResponse:
+    accepted_ids: list[str] = []
+    failed: list[dict[str, str]] = []
+    for detection_id in dict.fromkeys(request.detection_ids):
+        result, _status_code = await _approve_weed_detection(
+            detection_id, allow_already_accepted=True
+        )
+        detection_id_text = str(detection_id)
+        if result.get("status") == "applied":
+            accepted_ids.append(detection_id_text)
+        else:
+            failed.append(
+                {
+                    "detection_id": detection_id_text,
+                    "message": str(result.get("message") or "Could not accept weed"),
+                }
+            )
+    failed_ids = [item["detection_id"] for item in failed]
+    if failed:
+        message = f"{len(failed)} weed(s) could not be accepted"
+        if accepted_ids:
+            message = f"{len(accepted_ids)} weed(s) accepted; {message}"
+        status = "partial"
+    else:
+        message = f"{len(accepted_ids)} weed(s) accepted"
+        status = "applied"
+    return JSONResponse(
+        {
+            "status": status,
+            "accepted_ids": accepted_ids,
+            "failed_ids": failed_ids,
+            "failures": failed,
+            "message": message,
+        }
+    )
 
 
 @app.post("/weeds/{detection_id}/reject")
@@ -2595,7 +2994,7 @@ async def reject_weed(detection_id: UUID) -> JSONResponse:
     database.reject_weed_detection(
         str(detection_id), max(20.0, float(detection["radius_mm"]) * 1.5)
     )
-    await _record_weed_label(detection_id, "mulch_soil")
+    await _record_weed_label(detection_id, "soil")
     return JSONResponse({"status": "rejected", "message": "Weed recommendation rejected"})
 
 
