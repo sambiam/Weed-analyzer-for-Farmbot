@@ -4,11 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "farmbot-vision"
-<<<<<<< HEAD
 version = "2.0.0"
-=======
-version = "1.9.0"
->>>>>>> bc38d1dbfa49b8da40610f5fd40efa7ae8477584
 description = "Resource-conscious plant canopy analysis for FarmBot and Home Assistant"
 requires-python = ">=3.12"
 dependencies = [
