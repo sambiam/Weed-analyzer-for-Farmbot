@@ -429,6 +429,65 @@ async def test_dashboard_modal_uses_artifact_manifest_and_pending_rows(tmp_path,
 
 
 @pytest.mark.asyncio
+async def test_weed_settings_page_exposes_pipeline_training_and_automation_controls():
+    status, _, body = await asgi_request("/weed-settings")
+    html = body.decode()
+
+    assert status == 200
+    assert "Candidate size, colour and shape" in html
+    assert "Known crop protection" in html
+    assert "Multi-image confirmation" in html
+    assert "Learned visual verifier" in html
+    assert "name=automatic_creation_confidence" in html
+    assert 'action="weed-model/train"' in html
+
+
+@pytest.mark.asyncio
+async def test_canopy_settings_page_exposes_fusion_and_automation_controls():
+    status, _, body = await asgi_request("/canopy-settings")
+    html = body.decode()
+
+    assert status == 200
+    assert "Multi-image canopy fusion" in html
+    assert "name=always_fuse_when_available" in html
+    assert "name=minimum_angular_coverage" in html
+    assert "name=automatic_requires_reliable_fusion" in html
+    assert "name=save_diagnostics" in html
+
+
+@pytest.mark.asyncio
+async def test_dashboard_plant_view_uses_only_clean_and_mask_composites(tmp_path, monkeypatch):
+    artifact_dir = tmp_path / "artifacts"
+    artifact_dir.mkdir()
+    clean = artifact_dir / "plant-composite.jpg"
+    composite_overlay = artifact_dir / "plant-composite-overlay.jpg"
+    diagnostic_overlay = artifact_dir / "frame-overlay.jpg"
+    raw_mask = artifact_dir / "frame-mask.png"
+    for path in (clean, composite_overlay, diagnostic_overlay, raw_mask):
+        path.write_bytes(b"image")
+    measurement = _review_measurement(
+        composite_path=str(clean),
+        composite_overlay_path=str(composite_overlay),
+        overlay_path=str(diagnostic_overlay),
+        mask_path=str(raw_mask),
+        artifact_paths=[str(diagnostic_overlay), str(raw_mask)],
+    )
+    web.database.save_measurements([measurement])
+    monkeypatch.setattr(web.settings, "data_dir", tmp_path)
+
+    status, _, body = await asgi_request("/")
+    html = body.decode()
+
+    assert status == 200
+    assert 'data-composite-clean="artifact/plant-composite.jpg"' in html
+    assert 'data-composite-overlay="artifact/plant-composite-overlay.jpg"' in html
+    assert "Original images" in html
+    assert "Show mask overlay" in html
+    assert "artifact/frame-overlay.jpg" not in html
+    assert "artifact/frame-mask.png" not in html
+
+
+@pytest.mark.asyncio
 async def test_missing_plant_table_shows_crop_and_center_coordinates():
     measurement = _review_measurement(
         vegetation_absent=True,

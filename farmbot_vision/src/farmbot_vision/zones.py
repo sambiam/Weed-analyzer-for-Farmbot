@@ -22,8 +22,12 @@ Decisions follow one fixed precedence, so overlapping zones are predictable:
    empty configuration keeps the previous behaviour.
 
 "Touched" and "fits inside" are point tests for weeds and plant centres. For
-the radius aspect the geometry is the protection disc: it must fit entirely
-inside an allowing boundary and must not overlap a forbidding zone at all.
+the radius aspect, a boundary only ever tests the centre point -- a plant's
+protection disc is free to extend past a boundary's edge, since it is the
+plant (and the weed) that must stay inside the growing area, not its
+clearance disc. Exclusion zones are different: they mark real hazards, so the
+full protection disc must not overlap a forbidding exclusion zone, and must
+fit entirely inside an exclusion zone that explicitly allows it.
 """
 
 from __future__ import annotations
@@ -238,8 +242,13 @@ def evaluate(
                 reason=f'exclusion zone "{zone.name}" does not permit {label}',
                 zone_name=zone.name,
             )
+    # A boundary marks the growing area, not a hazard: only the centre point
+    # needs to stay inside one, so a protection radius may extend past its
+    # edge. Exclusion zones mark real hazards, so they keep the full disc
+    # test above.
+    boundary_radius_mm = 0.0 if aspect is ZoneAspect.RADIUS else radius_mm
     for zone in boundaries:
-        if not zone.allows(aspect) and zone.overlaps_disc(x, y, radius_mm):
+        if not zone.allows(aspect) and zone.overlaps_disc(x, y, boundary_radius_mm):
             return ZoneVerdict(
                 allowed=False,
                 reason=f'boundary "{zone.name}" does not permit {label}',
@@ -248,13 +257,13 @@ def evaluate(
     allowing = [zone for zone in boundaries if zone.allows(aspect)]
     if allowing:
         for zone in allowing:
-            if zone.contains_disc(x, y, radius_mm):
+            if zone.contains_disc(x, y, boundary_radius_mm):
                 return ZoneVerdict(
                     allowed=True,
                     reason=f'inside boundary "{zone.name}"',
                     zone_name=zone.name,
                 )
-        fit = "does not fit inside" if radius_mm > 0 else "is outside"
+        fit = "does not fit inside" if boundary_radius_mm > 0 else "is outside"
         return ZoneVerdict(
             allowed=False,
             reason=f"the position {fit} every boundary that permits {label}",

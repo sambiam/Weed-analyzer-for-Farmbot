@@ -692,6 +692,18 @@ class Measurement(StrictModel):
     calibration_uncertainty_mm: float = Field(default=0, ge=0)
     source_image_path: str | None = None
     composite_path: str | None = None
+    composite_overlay_path: str | None = None
+    fused_canopy: bool = False
+    fused_typical_radius_mm: float | None = Field(default=None, ge=0)
+    fused_maximum_radius_mm: float | None = Field(default=None, ge=0)
+    fused_recommended_radius_mm: float | None = Field(default=None, ge=0)
+    fused_confidence: float | None = Field(default=None, ge=0, le=1)
+    fusion_view_count: int = Field(default=0, ge=0)
+    fusion_angular_coverage: float = Field(default=0, ge=0, le=1)
+    fusion_corroborated_fraction: float = Field(default=0, ge=0, le=1)
+    fusion_disagreement_mm: float | None = Field(default=None, ge=0)
+    fusion_reliable: bool = False
+    fusion_diagnostic_path: str | None = None
     # Resolution / calibration provenance (contract v2).
     analysis_resolution: str | None = None
     processed_width: int | None = None
@@ -719,3 +731,7 @@ class WeedDetection(StrictModel):
     area_mm2: float
     radius_mm: float
     confidence: float = Field(ge=0, le=1)
+    heuristic_confidence: float = Field(default=0, ge=0, le=1)
+    verifier_confidence: float | None = Field(default=None, ge=0, le=1)
+    features: dict[str, float] = Field(default_factory=dict)
+    crop_jpeg: bytes | None = None

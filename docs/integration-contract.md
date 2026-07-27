@@ -1,9 +1,15 @@
 # Companion FarmBot integration contract
 
 Contract version: **farmbot-vision-v2**. Minimum compatible companion FarmBot
+<<<<<<< HEAD
 integration release: **2.0.0** (the release that advertises and implements
 photo-grid repair in addition to clear-site soil-height capture, the
 returned-JPEG contract and known-weed writes). Version 2.0.0 of the companion integration in the sibling
+=======
+integration release: **1.9.0** (the release that adds bounded photo-grid
+repair in addition to clear-site soil-height capture, the returned-JPEG
+contract and known-weed writes). Version 1.9.0 of the companion integration in the sibling
+>>>>>>> bc38d1dbfa49b8da40610f5fd40efa7ae8477584
 `Farmbot-for-Home-Assistant` repository implements this contract.
 
 All actions are in the `farmbot` domain. Response actions must support Home Assistant service response data. Unknown, invalid, or unauthorised fields must fail rather than be coerced. Timestamps are ISO-8601. The integration remains the only component that talks to FarmBot APIs.

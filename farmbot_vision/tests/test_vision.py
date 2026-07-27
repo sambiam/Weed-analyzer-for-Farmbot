@@ -204,6 +204,25 @@ def test_edge_plant_is_low_confidence_reviewable_not_skipped_or_removed(calibrat
     assert result.measurements[0].confidence <= 0.2
 
 
+def test_fully_out_of_frame_plant_is_reviewable_not_skipped(calibration):
+    far_seed = PlantSeed(
+        plant_id=11,
+        crop_slug="lettuce",
+        center_px=(-5000, -5000),
+        current_radius_mm=60,
+    )
+    result = analyse([], far_seed, calibration)
+
+    assert result.skipped == {}
+    assert len(result.measurements) == 1
+    measurement = result.measurements[0]
+    assert measurement.plant_id == 11
+    assert measurement.decision == Decision.UNCERTAIN
+    assert measurement.confidence <= 0.1
+    assert measurement.applied is False
+    assert measurement.current_radius_mm == measurement.recommended_protection_radius_mm
+
+
 def test_overlay_and_binary_masks_explain_vegetation_ownership(calibration):
     seeds = [
         PlantSeed(plant_id=1, crop_slug="lettuce", center_px=(100, 120), current_radius_mm=30),

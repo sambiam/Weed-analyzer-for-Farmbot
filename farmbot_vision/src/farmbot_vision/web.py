@@ -31,6 +31,7 @@ from . import (
 )
 from .calibration import from_farmbot_calibration
 from .calibration_store import CalibrationStore, FarmbotCalibrationInput
+from .canopy_settings import CanopyFusionSettings, CanopyFusionSettingsStore
 from .curve_edit import propose_curve_point
 from .curves import fit_monotonic_curve
 from .database import Database
@@ -63,6 +64,7 @@ from .settings import Settings
 from .soil_jobs import SoilJobManager
 from .vision import garden_to_pixel
 from .weed_settings import WeedSettings, WeedSettingsStore
+from .weed_verifier import ALL_LABELS, WeedVisualVerifier
 from .zones import (
     Zone,
     ZoneAspect,
@@ -80,9 +82,19 @@ database = Database(settings.data_dir / "farmbot_vision.db")
 calibration_store = CalibrationStore(settings.data_dir / "farmbot_calibration.json")
 client = HomeAssistantClient()
 weed_settings_store = WeedSettingsStore(settings.data_dir / "weed_settings.json")
+<<<<<<< HEAD
 grid_repair_settings_store = GridRepairSettingsStore(
     settings.data_dir / "grid_repair_settings.json"
 )
+=======
+canopy_fusion_settings_store = CanopyFusionSettingsStore(
+    settings.data_dir / "canopy_fusion_settings.json"
+)
+grid_repair_settings_store = GridRepairSettingsStore(
+    settings.data_dir / "grid_repair_settings.json"
+)
+weed_verifier = WeedVisualVerifier(settings.data_dir / "weed_visual_model.json")
+>>>>>>> bc38d1dbfa49b8da40610f5fd40efa7ae8477584
 zone_store = ZoneStore(settings.data_dir / "zones.json")
 jobs = JobManager(settings, database, client, weed_settings_store, zone_store)
 soil_jobs = SoilJobManager(database, client, settings.data_dir, jobs.lock, zone_store)
@@ -95,12 +107,21 @@ grid_repair_state: dict[str, object] = {
 
 
 async def inspect_photo_grid(*, force: bool = False) -> GridRun | None:
+<<<<<<< HEAD
+=======
+    """Inspect and cache the latest likely grid, including gantry content."""
+>>>>>>> bc38d1dbfa49b8da40610f5fd40efa7ae8477584
     entry_id = settings.selected_config_entry_id
     if not entry_id:
         grid_repair_state.update(run=None, error="Select a FarmBot first")
         return None
+<<<<<<< HEAD
     now = datetime.now(UTC)
     checked_at = grid_repair_state.get("checked_at")
+=======
+    checked_at = grid_repair_state.get("checked_at")
+    now = datetime.now(UTC)
+>>>>>>> bc38d1dbfa49b8da40610f5fd40efa7ae8477584
     if not force and isinstance(checked_at, datetime) and now - checked_at < timedelta(minutes=5):
         cached = grid_repair_state.get("run")
         return cached if isinstance(cached, GridRun) else None
@@ -138,11 +159,18 @@ async def inspect_photo_grid(*, force: bool = False) -> GridRun | None:
                 *(classify(image) for image in candidate.images),
                 return_exceptions=True,
             )
+<<<<<<< HEAD
             failures = sum(isinstance(result, Exception) for result in results)
             if failures:
                 LOGGER.warning(
                     "Could not inspect %d photo-grid image(s) for gantry content",
                     failures,
+=======
+            failed = sum(isinstance(result, Exception) for result in results)
+            if failed:
+                LOGGER.warning(
+                    "Could not inspect %d photo-grid image(s) for gantry content", failed
+>>>>>>> bc38d1dbfa49b8da40610f5fd40efa7ae8477584
                 )
             candidate = detect_latest_grid_run(inventory.images, gantry_ids)
         grid_repair_state.update(run=candidate, checked_at=now, error="")
@@ -152,6 +180,7 @@ async def inspect_photo_grid(*, force: bool = False) -> GridRun | None:
         return None
 
 
+<<<<<<< HEAD
 async def _require_grid_repair_capability() -> None:
     bots = (await client.list_bots()).bots
     bot = next(
@@ -169,6 +198,9 @@ async def _require_grid_repair_capability() -> None:
 
 async def start_photo_grid_repair() -> dict[str, object]:
     await _require_grid_repair_capability()
+=======
+async def start_photo_grid_repair() -> dict[str, object]:
+>>>>>>> bc38d1dbfa49b8da40610f5fd40efa7ae8477584
     run = await inspect_photo_grid(force=True)
     if run is None:
         return {"status": "rejected", "message": "No recent photo-grid run was found"}
@@ -449,7 +481,13 @@ _DASHBOARD_JS = r"""
   const modalDetails=document.getElementById('overlay-modal-details');
   const closeButton=document.getElementById('overlay-modal-close');
   const counter=document.getElementById('overlay-modal-counter');
+  const plantToggle=document.getElementById('plant-view-toggle');
+  const plantWithoutOverlay=document.getElementById('plant-modal-without-overlay');
+  const plantWithOverlay=document.getElementById('plant-modal-with-overlay');
+  const artifactControls=document.getElementById('artifact-controls');
+  const overlayLegend=document.getElementById('overlay-modal-legend');
   let artifacts=[], index=0, returnFocus=null;
+  let plantComposite=null;
   const queueModal=document.getElementById('queue-modal');
   const queueRows=document.getElementById('queue-image-rows');
   const queueMessage=document.getElementById('queue-message');
@@ -481,7 +519,15 @@ _DASHBOARD_JS = r"""
   }
   function closeModal(){
     modal.hidden=true; modalImg.removeAttribute('src');
+    plantComposite=null;
     if(returnFocus) returnFocus.focus();
+  }
+  function showPlantComposite(withOverlay){
+    if(!plantComposite) return;
+    const useOverlay=withOverlay&&plantComposite.overlay;
+    modalImg.src=useOverlay?plantComposite.overlay:plantComposite.clean;
+    plantWithoutOverlay.setAttribute('aria-pressed',String(!useOverlay));
+    plantWithOverlay.setAttribute('aria-pressed',String(Boolean(useOverlay)));
   }
   const weedModal=document.getElementById('weed-modal');
   const weedImg=document.getElementById('weed-modal-img');
@@ -519,6 +565,8 @@ _DASHBOARD_JS = r"""
     } else weedMarker.hidden=true;
     const others=Math.max(0,(data.siblings||[]).length-1);
     weedDetails.textContent='Area '+data.areaMm2.toFixed(1)+' mm² · confidence '+data.confidence.toFixed(2)
+      +' · '+(data.observations||1)+' independent look(s)'
+      +(data.verifierConfidence!=null?(' · verifier '+data.verifierConfidence.toFixed(2)):'')
       +(others?(' · '+others+' other weed(s) in this image'):'');
     weedModal.hidden=false; weedModal.querySelector('.modal-close').focus();
   }
@@ -562,12 +610,30 @@ _DASHBOARD_JS = r"""
   weedWithOverlay.addEventListener('click',function(){showWeedView(true);});
   document.getElementById('weed-modal-close').addEventListener('click',closeWeedModal);
   weedModal.addEventListener('click',function(event){if(event.target===weedModal) closeWeedModal();});
+  plantWithoutOverlay.addEventListener('click',function(){showPlantComposite(false);});
+  plantWithOverlay.addEventListener('click',function(){showPlantComposite(true);});
   document.addEventListener('click',async function(event){
     const weedViewer=event.target.closest('.weed-view');
     if(weedViewer){
       let data=null; try{data=JSON.parse(weedViewer.dataset.weed||'null');}catch(_){data=null;}
       if(data) openWeedModal(data,weedViewer);
       return;
+    }
+    const plantViewer=event.target.closest('[data-composite-clean]');
+    if(plantViewer){
+      plantComposite={
+        clean:plantViewer.dataset.compositeClean,
+        overlay:plantViewer.dataset.compositeOverlay||null
+      };
+      if(!plantComposite.clean) return;
+      returnFocus=plantViewer;
+      let details={}; try{details=JSON.parse(plantViewer.dataset.details||'{}');}catch(_){}
+      modalDetails.textContent=details.formula||'';
+      plantToggle.hidden=false;
+      artifactControls.hidden=true;
+      plantWithOverlay.disabled=!plantComposite.overlay;
+      overlayLegend.textContent='Cyan circle = original radius; red circle = new radius; white dot = plant center.';
+      modal.hidden=false; showPlantComposite(false); closeButton.focus(); return;
     }
     const viewer=event.target.closest('[data-artifacts]');
     if(viewer){
@@ -576,6 +642,9 @@ _DASHBOARD_JS = r"""
       index=0; returnFocus=viewer;
       let details={}; try{details=JSON.parse(viewer.dataset.details||'{}');}catch(_){}
       modalDetails.textContent=details.formula||'';
+      plantToggle.hidden=true;
+      artifactControls.hidden=false;
+      overlayLegend.textContent='Cyan circle = original radius; red circle = planned radius.';
       modal.hidden=false; showArtifact(); closeButton.focus(); return;
     }
     const action=event.target.closest('.review-action');
@@ -866,7 +935,11 @@ async def scheduler() -> None:
                 result = await start_photo_grid_repair()
                 LOGGER.info("Scheduled photo-grid repair: %s", result.get("message"))
             except HomeAssistantError as exc:
+<<<<<<< HEAD
                 LOGGER.warning("Scheduled photo-grid repair did not start: %s", exc)
+=======
+                LOGGER.warning("Scheduled photo-grid repair failed to start: %s", exc)
+>>>>>>> bc38d1dbfa49b8da40610f5fd40efa7ae8477584
         await asyncio.sleep(30)
 
 
@@ -961,18 +1034,20 @@ button{{background:var(--green);border:0;border-radius:6px;padding:.65rem 1rem;c
 .overlay-modal figure{{position:relative;background:white;border-radius:10px;margin:0;padding:1rem;max-width:min(95vw,1000px);max-height:95vh;overflow:auto}}
 .overlay-modal img{{display:block;max-height:70vh;margin:auto}}.modal-close{{position:absolute;right:.5rem;top:.5rem;font-size:1.5rem}}
 .modal-controls{{display:flex;gap:.5rem;align-items:center;justify-content:center;margin-top:.6rem}}.legend{{font-size:.9rem;color:var(--muted)}}
+.modal-controls[hidden]{{display:none}}
 .queue-dialog{{width:min(95vw,900px)}}.button-row{{display:flex;gap:.5rem;flex-wrap:wrap;align-items:center}}
 .weed-dialog{{width:min(95vw,900px)}}.weed-image-wrap{{position:relative;display:inline-block;margin:auto}}
 .weed-marker{{position:absolute;width:34px;height:34px;margin-left:-17px;margin-top:-17px;pointer-events:none;
 border-radius:50%;border:3px solid #168cff;box-shadow:0 0 0 1px #001b3d}}
 .weed-view-toggle button[aria-pressed=true]{{background:#1672c4;color:white;box-shadow:inset 0 0 0 2px #0b4779}}
+.plant-view-toggle button[aria-pressed=true]{{background:#1672c4;color:white;box-shadow:inset 0 0 0 2px #0b4779}}
 td.actions{{min-width:9rem}}.actions-group{{display:flex;flex-direction:column;align-items:stretch;gap:.4rem}}
 .actions-group form{{margin:0}}.actions-group button{{width:100%;padding:.45rem .8rem;font-size:.9rem}}
 .actions-group button[data-artifacts]{{background:#e4ede7;color:var(--dark)}}
 .hint{{display:inline-flex;align-items:center;justify-content:center;width:1.1em;height:1.1em;
 border-radius:50%;background:var(--muted);color:white;font-size:.72em;font-weight:bold;
 margin-left:.3em;cursor:help;vertical-align:middle;line-height:1}}
-</style></head><body><header><h1>🌱 FarmBot Vision</h1><nav><a href="./">Analysis</a><a href="soil-height">Soil height</a><a href="settings">Calibration</a><a href="weed-settings">Weed settings</a><a href="zones">Boundaries &amp; zones</a><a href="api/health">Health JSON</a></nav></header>
+</style></head><body><header><h1>🌱 FarmBot Vision</h1><nav><a href="./">Analysis</a><a href="soil-height">Soil height</a><a href="settings">Calibration</a><a href="weed-settings">Weed settings</a><a href="canopy-settings">Canopy fusion</a><a href="zones">Boundaries &amp; zones</a><a href="api/health">Health JSON</a></nav></header>
 <main>{body}</main></body></html>"""
     )
 
@@ -1007,6 +1082,7 @@ async def health() -> JSONResponse:
             "relative_workload": resolution.relative_workload,
             "job": jobs.current,
             "last_job": jobs.last,
+            "canopy_fusion": canopy_fusion_settings_store.load().model_dump(),
             "database": database.stats(),
             "artifact_bytes": artifact_bytes,
         }
@@ -1027,14 +1103,6 @@ async def dashboard(request: Request) -> HTMLResponse:
     }
 
     def _artifact_button(r: dict) -> str:
-        paths = r.get("artifact_paths") or []
-        if r.get("composite_path") and r["composite_path"] not in paths:
-            paths = [r["composite_path"], *paths]
-        if not paths and r.get("overlay_path"):
-            paths = [r["overlay_path"]]
-        urls = [f"artifact/{Path(path).name}" for path in paths if path]
-        if not urls:
-            return "<span class=muted>None</span>"
         center_x = r.get("recorded_center_x")
         center_y = r.get("recorded_center_y")
         center = (
@@ -1046,11 +1114,58 @@ async def dashboard(request: Request) -> HTMLResponse:
             "formula": (
                 f"Current {r['current_radius_mm']:.1f} mm; Recommended = "
                 f"{r['recommended_protection_radius_mm']:.1f} mm. "
-                f"Plant center = {center}; crop: {r.get('crop_slug', 'unknown')}."
+                f"Plant center = {center}; crop: {r.get('crop_slug', 'unknown')}. "
+                + (
+                    f"Fused from {r.get('fusion_view_count', 0)} calibrated views; "
+                    f"angular coverage {float(r.get('fusion_angular_coverage') or 0):.0%}; "
+                    f"corroborated pixels "
+                    f"{float(r.get('fusion_corroborated_fraction') or 0):.0%}."
+                    if r.get("fused_canopy")
+                    else "Measured from one image or consolidated per-image radii."
+                )
             )
         }
-        artifacts_json = escape(json.dumps(urls, separators=(",", ":")), quote=True)
         details_json = escape(json.dumps(details, separators=(",", ":")), quote=True)
+        if r.get("composite_path"):
+            clean_url = escape(
+                f"artifact/{Path(r['composite_path']).name}",
+                quote=True,
+            )
+            overlay_url = (
+                escape(
+                    f"artifact/{Path(r['composite_overlay_path']).name}",
+                    quote=True,
+                )
+                if r.get("composite_overlay_path")
+                else ""
+            )
+            composite_button = (
+                f'<button type=button data-composite-clean="{clean_url}" '
+                f'data-composite-overlay="{overlay_url}" '
+                f'data-details="{details_json}">View</button>'
+            )
+            if r.get("fusion_diagnostic_path"):
+                fusion_url = escape(
+                    json.dumps(
+                        [f"artifact/{Path(r['fusion_diagnostic_path']).name}"],
+                        separators=(",", ":"),
+                    ),
+                    quote=True,
+                )
+                composite_button += (
+                    f'<button type=button data-artifacts="{fusion_url}" '
+                    f'data-details="{details_json}">Fusion</button>'
+                )
+            return composite_button
+        paths = r.get("artifact_paths") or []
+        if not paths and r.get("overlay_path"):
+            paths = [r["overlay_path"]]
+        if r.get("fusion_diagnostic_path"):
+            paths = [*paths, r["fusion_diagnostic_path"]]
+        urls = [f"artifact/{Path(path).name}" for path in paths if path]
+        if not urls:
+            return "<span class=muted>None</span>"
+        artifacts_json = escape(json.dumps(urls, separators=(",", ":")), quote=True)
         return (
             f'<button type=button data-artifacts="{artifacts_json}" '
             f'data-details="{details_json}">View</button>'
@@ -1205,21 +1320,38 @@ async def dashboard(request: Request) -> HTMLResponse:
             "siblings": siblings,
             "areaMm2": w["area_mm2"],
             "confidence": w["confidence"],
+            "observations": w.get("observation_count", 1),
+            "verifierConfidence": w.get("verifier_confidence"),
         }
         marker_json = escape(json.dumps(marker, separators=(",", ":")), quote=True)
         return f'<button type=button class=weed-view data-weed="{marker_json}">View</button>'
 
-    weed_rows = "".join(
-        f'<tr class=review-item id="weed-{w["detection_id"]}"><td>{w["image_id"]}</td>'
-        f"<td>{w['x']:.1f}, {w['y']:.1f}, {w['z']:.1f}</td>"
-        f"<td>{w['area_mm2']:.1f}</td><td>{w['confidence']:.2f}</td>"
-        f"<td>{_weed_view_button(w)}</td><td>"
-        f'<form><button class=review-action data-url="weeds/{w["detection_id"]}/approve">'
-        "Create weed</button></form>"
-        f'<form><button class=review-action data-url="weeds/{w["detection_id"]}/reject">'
-        "Reject</button></form><small class=action-message></small></td></tr>"
-        for w in pending_weeds
-    )
+    def _weed_row(w: dict) -> str:
+        verifier = (
+            f"{float(w['verifier_confidence']):.2f}"
+            if w.get("verifier_confidence") is not None
+            else "—"
+        )
+        return (
+            f'<tr class=review-item id="weed-{w["detection_id"]}"><td>{w["image_id"]}</td>'
+            f"<td>{w['x']:.1f}, {w['y']:.1f}, {w['z']:.1f}</td>"
+            f"<td>{w['area_mm2']:.1f}</td><td>{w.get('observation_count', 1)}</td>"
+            f"<td>{float(w.get('heuristic_confidence') or w['confidence']):.2f}</td>"
+            f"<td>{verifier}</td><td>{_weed_view_button(w)}</td><td>"
+            f'<form><button class=review-action data-url="weeds/{w["detection_id"]}/approve">'
+            "Create weed</button></form>"
+            f'<form><button class=review-action data-url="weeds/{w["detection_id"]}/reject">'
+            "Reject as mulch/soil</button></form>"
+            f'<button class=review-action data-url="weeds/{w["detection_id"]}/label/crop">'
+            "Crop</button>"
+            f'<button class=review-action data-url="weeds/{w["detection_id"]}/label/fungus_moss">'
+            "Fungus/moss</button>"
+            f'<button class=review-action data-url="weeds/{w["detection_id"]}/label/hardware_other">'
+            "Hardware/other</button>"
+            "<small class=action-message></small></td></tr>"
+        )
+
+    weed_rows = "".join(_weed_row(w) for w in pending_weeds)
     resolution = settings.resolution
 
     if grid_run is None:
@@ -1238,8 +1370,13 @@ async def dashboard(request: Request) -> HTMLResponse:
         )
         repair_details = (
             f"{missing_count} missing · {gantry_count} gantry photo"
+<<<<<<< HEAD
             f"{'s' if gantry_count != 1 else ''} · last run "
             f"{escape(grid_run.completed_at.astimezone().strftime('%d %b %Y %H:%M'))}"
+=======
+            f"{'s' if gantry_count != 1 else ''} · "
+            f"last run {escape(grid_run.completed_at.astimezone().strftime('%d %b %Y %H:%M'))}"
+>>>>>>> bc38d1dbfa49b8da40610f5fd40efa7ae8477584
         )
         repair_disabled = " disabled" if not grid_run.targets else ""
     repair_checked = " checked" if repair_values.enabled else ""
@@ -1304,17 +1441,22 @@ It affects automatic changes only; every result remains manually reviewable.</p>
 <section class=card><h2>Measurements</h2><table><thead><tr><th>Crop</th><th>Coordinates (x, y)</th><th>Current</th><th>Max leaf</th><th>Recommended</th><th>Confidence</th><th>Decision</th><th>Reason</th><th>Actions</th></tr></thead><tbody>{measurement_rows or "<tr><td colspan=9>No measurements yet</td></tr>"}</tbody></table></section>
 <section class=card><h2>Removed / missing plants</h2><table><thead><tr><th>Crop</th><th>Recorded center (X, Y mm)</th><th>Move center to (X, Y mm)</th><th>Absent looks</th><th>Confidence</th><th>Reason</th><th>Diagnostic</th><th>Review</th></tr></thead><tbody>{removal_rows or "<tr><td colspan=8>No confirmed missing plants</td></tr>"}</tbody></table></section>
 <section class=card><h2>Detected weeds</h2><p class=muted>Unowned vegetation outside known plant protection areas.</p>
-<table><thead><tr><th>Image</th><th>Coordinates</th><th>Area mm²</th><th>Confidence</th><th>View</th><th>Review</th></tr></thead>
-<tbody>{weed_rows or "<tr><td colspan=6>No weed recommendations</td></tr>"}</tbody></table></section>
+<table><thead><tr><th>Image</th><th>Coordinates</th><th>Area mm²</th><th>Looks</th>
+<th>Heuristic</th><th>Verifier</th><th>View</th><th>Review / training label</th></tr></thead>
+<tbody>{weed_rows or "<tr><td colspan=8>No weed recommendations</td></tr>"}</tbody></table></section>
 <section class=card><h2>Growth-curve updates</h2><p class=muted>Flagged per-plant diameter points require review.</p><table><tbody>{flagged_curve_rows or "<tr><td>No flagged curve updates</td></tr>"}</tbody></table></section>
 <section class=card><h2>Crop protection spread proposals</h2><p class=muted>Monotonic and limited to 10 points. FarmBot values are diameters; assignment requires approval.</p><table><tbody>{curve_rows or "<tr><td>No curve is ready</td></tr>"}</tbody></table></section>
 <section class=card><h2>Approval and rollback history</h2><table><tbody>{decision_rows or "<tr><td>No decisions yet</td></tr>"}</tbody></table></section>
 <section class=card><h2>Safety warning</h2><p class=warn>Early experimental vision results must not be the sole basis for destructive automatic weeding.</p></section>
 <div id=overlay-modal class=overlay-modal hidden role=dialog aria-modal=true aria-label="Analysis diagnostic"><figure>
 <button id=overlay-modal-close class=modal-close type=button aria-label=Close>&times;</button>
+<div id=plant-view-toggle class="modal-controls plant-view-toggle" role=group aria-label="Plant image view" hidden>
+<button id=plant-modal-without-overlay type=button aria-pressed=true>Original images</button>
+<button id=plant-modal-with-overlay type=button aria-pressed=false>Show mask overlay</button>
+</div>
 <img id=overlay-modal-img alt="Plant analysis diagnostic"><figcaption id=overlay-modal-details></figcaption>
-<p class=legend>Cyan circle = original radius; red circle = planned radius.</p>
-<div class=modal-controls><button id=overlay-modal-prev type=button>Previous</button><span id=overlay-modal-counter></span><button id=overlay-modal-next type=button>Next</button></div>
+<p id=overlay-modal-legend class=legend>Cyan circle = original radius; red circle = planned radius.</p>
+<div id=artifact-controls class=modal-controls><button id=overlay-modal-prev type=button>Previous</button><span id=overlay-modal-counter></span><button id=overlay-modal-next type=button>Next</button></div>
 </figure></div>
 <div id=weed-modal class=overlay-modal hidden role=dialog aria-modal=true aria-label="Weed review">
 <figure class=weed-dialog><button id=weed-modal-close class=modal-close type=button aria-label=Close>&times;</button>
@@ -1353,8 +1495,12 @@ async def save_grid_repair_settings(
     values = GridRepairSettings(enabled=bool(enabled), repair_time=repair_time)
     grid_repair_settings_store.save(values)
     return RedirectResponse(
+<<<<<<< HEAD
         f"../?repair={quote('Photo-grid repair schedule saved')}",
         status_code=303,
+=======
+        f"../?repair={quote('Photo-grid repair schedule saved')}", status_code=303
+>>>>>>> bc38d1dbfa49b8da40610f5fd40efa7ae8477584
     )
 
 
@@ -1833,33 +1979,181 @@ async def reject_soil_measurement(measurement_id: UUID) -> RedirectResponse:
     return RedirectResponse("../../../soil-height", status_code=303)
 
 
-@app.get("/weed-settings", response_class=HTMLResponse)
-async def weed_settings_page(request: Request) -> HTMLResponse:
-    values = weed_settings_store.load()
+@app.get("/canopy-settings", response_class=HTMLResponse)
+async def canopy_settings_page(request: Request) -> HTMLResponse:
+    values = canopy_fusion_settings_store.load()
 
     def checked(value: bool) -> str:
         return " checked" if value else ""
 
-    body = f"""<section class=card><h2>Weed settings</h2>
-<p>Detection is off by default. Recommendations require review; automatic creation also
-requires the companion integration's automatic weed-write permission.</p>
+    body = f"""<section class=card><h2>Multi-image canopy fusion</h2>
+<p>Plant segmentation still runs on each original image. When a plant reaches an image edge,
+the resulting ownership masks are aligned in calibrated garden coordinates and fused before
+its radius is measured. This avoids seams and duplicate leaves from an RGB panorama.</p>
+<form method=post action="canopy-settings">
+<fieldset><legend>Activation</legend>
+<label><input type=checkbox name=enabled value=true{checked(values.enabled)}> Enable calibrated mask fusion</label><br>
+<label><input type=checkbox name=always_fuse_when_available value=true{checked(values.always_fuse_when_available)}> Fuse whenever enough views are available</label><br>
+<label>Fuse below visible fraction <input type=number name=activation_visible_fraction min=0 max=1 step=.01 value="{values.activation_visible_fraction:g}"></label><br>
+<label>Minimum views <input type=number name=minimum_views min=2 max=20 step=1 value="{values.minimum_views}"></label><br>
+<label>Maximum time gap (hours) <input type=number name=maximum_time_gap_hours min=.1 max=720 step=.1 value="{values.maximum_time_gap_hours:g}"></label>
+</fieldset>
+<fieldset><legend>Evidence acceptance</legend>
+<label>Minimum per-view confidence <input type=number name=minimum_view_confidence min=0 max=1 step=.01 value="{values.minimum_view_confidence:g}"></label><br>
+<label>Supporting views required per pixel <input type=number name=minimum_supporting_views min=1 max=10 step=1 value="{values.minimum_supporting_views}"></label><br>
+<label>Single-view pixel confidence <input type=number name=single_view_acceptance_confidence min=0 max=1 step=.01 value="{values.single_view_acceptance_confidence:g}"></label><br>
+<label>Source-edge evidence margin (mm) <input type=number name=source_edge_margin_mm min=0 max=250 step=1 value="{values.source_edge_margin_mm:g}"></label>
+</fieldset>
+<fieldset><legend>Radius measurement</legend>
+<label>Outer radial percentile <input type=number name=radial_percentile min=80 max=100 step=.1 value="{values.radial_percentile:g}"></label><br>
+<label>Angular sectors <input type=number name=angular_sectors min=12 max=360 step=1 value="{values.angular_sectors}"></label><br>
+<label>Maximum fusion canvas (pixels) <input type=number name=maximum_canvas_pixels min=480 max=6000 step=10 value="{values.maximum_canvas_pixels}"></label>
+</fieldset>
+<fieldset><legend>Automatic-action guardrails</legend>
+<label><input type=checkbox name=automatic_requires_reliable_fusion value=true{checked(values.automatic_requires_reliable_fusion)}> Require reliable fusion when partial views are present</label><br>
+<label>Minimum angular coverage <input type=number name=minimum_angular_coverage min=0 max=1 step=.01 value="{values.minimum_angular_coverage:g}"></label><br>
+<label>Minimum corroborated mask fraction <input type=number name=minimum_corroborated_fraction min=0 max=1 step=.01 value="{values.minimum_corroborated_fraction:g}"></label><br>
+<label>Maximum disagreement with per-image estimate (mm) <input type=number name=maximum_automatic_disagreement_mm min=0 max=500 step=1 value="{values.maximum_automatic_disagreement_mm:g}"></label><br>
+<label><input type=checkbox name=save_diagnostics value=true{checked(values.save_diagnostics)}> Save fusion diagnostics for review</label>
+</fieldset>
+<button>Save canopy fusion settings</button></form>
+<p class=muted>Disabling a guardrail permits more automation but does not remove the normal
+confidence, calibration, zone, or plant-safety checks.</p></section>"""
+    return layout(request, body, "Canopy fusion")
+
+
+@app.post("/canopy-settings")
+async def save_canopy_settings(
+    enabled: bool = Form(False),
+    always_fuse_when_available: bool = Form(False),
+    activation_visible_fraction: float = Form(0.92),
+    minimum_views: int = Form(2),
+    maximum_time_gap_hours: float = Form(6),
+    minimum_view_confidence: float = Form(0.35),
+    minimum_supporting_views: int = Form(2),
+    single_view_acceptance_confidence: float = Form(0.82),
+    source_edge_margin_mm: float = Form(20),
+    radial_percentile: float = Form(97),
+    angular_sectors: int = Form(72),
+    minimum_angular_coverage: float = Form(0.70),
+    minimum_corroborated_fraction: float = Form(0.05),
+    maximum_automatic_disagreement_mm: float = Form(35),
+    automatic_requires_reliable_fusion: bool = Form(False),
+    maximum_canvas_pixels: int = Form(2400),
+    save_diagnostics: bool = Form(False),
+) -> RedirectResponse:
+    try:
+        values = CanopyFusionSettings(
+            enabled=enabled,
+            always_fuse_when_available=always_fuse_when_available,
+            activation_visible_fraction=activation_visible_fraction,
+            minimum_views=minimum_views,
+            maximum_time_gap_hours=maximum_time_gap_hours,
+            minimum_view_confidence=minimum_view_confidence,
+            minimum_supporting_views=minimum_supporting_views,
+            single_view_acceptance_confidence=single_view_acceptance_confidence,
+            source_edge_margin_mm=source_edge_margin_mm,
+            radial_percentile=radial_percentile,
+            angular_sectors=angular_sectors,
+            minimum_angular_coverage=minimum_angular_coverage,
+            minimum_corroborated_fraction=minimum_corroborated_fraction,
+            maximum_automatic_disagreement_mm=maximum_automatic_disagreement_mm,
+            automatic_requires_reliable_fusion=automatic_requires_reliable_fusion,
+            maximum_canvas_pixels=maximum_canvas_pixels,
+            save_diagnostics=save_diagnostics,
+        )
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    if values.minimum_supporting_views > values.minimum_views:
+        raise HTTPException(422, "Supporting views per pixel cannot exceed the minimum view count")
+    canopy_fusion_settings_store.save(values)
+    return RedirectResponse("canopy-settings", status_code=303)
+
+
+@app.get("/weed-settings", response_class=HTMLResponse)
+async def weed_settings_page(request: Request) -> HTMLResponse:
+    values = weed_settings_store.load()
+    labels = database.weed_training_summary()
+    weed_verifier.reload()
+    model = weed_verifier.model
+
+    def checked(value: bool) -> str:
+        return " checked" if value else ""
+
+    model_status = (
+        f"Trained {escape(str(model['created_at']))} from {model['sample_count']} labels; "
+        f"validation precision {model['metrics']['precision']:.1%}, "
+        f"recall {model['metrics']['recall']:.1%}."
+        if model
+        else "No trained verifier model yet."
+    )
+    training_notice = request.query_params.get("training")
+    training_notice_html = f"<p class=warn>{escape(training_notice)}</p>" if training_notice else ""
+    body = f"""<section class=card><h2>Weed detection and automation</h2>
+<p>Every stage is configurable. Start in review/shadow mode, label real examples, train the
+local verifier, then enable enforcement or automatic FarmBot creation when its validation
+results and field behaviour are satisfactory.</p>
 <form method=post action="weed-settings">
+<fieldset><legend>Operation</legend>
 <label><input type=checkbox name=enabled value=true{checked(values.enabled)}> Enable weed detection</label><br>
 <label><input type=checkbox name=automatic_creation value=true{checked(values.automatic_creation)}>
 Automatically create detected weeds in FarmBot</label><br>
+<label>Review/recommendation confidence <input type=number name=minimum_confidence min=0 max=1 step=.01 value="{values.minimum_confidence:g}"></label><br>
+<label>Automatic creation confidence <input type=number name=automatic_creation_confidence min=0 max=1 step=.01 value="{values.automatic_creation_confidence:g}"></label><br>
+<label>Created weed radius (mm) <input type=number name=weed_radius_mm min=1 step=1 value="{values.weed_radius_mm:g}"></label>
+</fieldset>
+<fieldset><legend>Candidate size, colour and shape</legend>
+<label>Minimum weed area (mm²) <input type=number name=minimum_area_mm2 min=5 step=1 value="{values.minimum_area_mm2:g}"></label><br>
+<label>Maximum weed area (mm²) <input type=number name=maximum_area_mm2 min=10 step=1 value="{values.maximum_area_mm2:g}"></label><br>
+<label><input type=checkbox name=shape_filter_enabled value=true{checked(values.shape_filter_enabled)}> Enable colour/shape filter</label><br>
+<label>Strong-green hue range <input type=number name=green_hue_min min=0 max=179 step=1 value="{values.green_hue_min}"> to
+<input type=number name=green_hue_max min=0 max=179 step=1 value="{values.green_hue_max}"></label><br>
+<label>Strong-green minimum saturation <input type=number name=strong_green_minimum_saturation min=0 max=255 step=1 value="{values.strong_green_minimum_saturation}"></label><br>
+<label>Strong-green minimum Excess Green <input type=number name=strong_green_minimum_excess_green min=-255 max=510 step=1 value="{values.strong_green_minimum_excess_green}"></label><br>
+<label>Minimum strong-green fraction <input type=number name=minimum_green_purity min=0 max=1 step=.01 value="{values.minimum_green_purity:g}"></label><br>
+<label>Minimum solidity <input type=number name=minimum_solidity min=0 max=1 step=.01 value="{values.minimum_solidity:g}"></label><br>
+<label>Minimum circularity <input type=number name=minimum_circularity min=0 max=1 step=.01 value="{values.minimum_circularity:g}"></label><br>
+<label>Maximum aspect ratio <input type=number name=maximum_aspect_ratio min=1 max=50 step=.1 value="{values.maximum_aspect_ratio:g}"></label>
+</fieldset>
+<fieldset><legend>Known crop protection</legend>
+<label><input type=checkbox name=crop_protection_enabled value=true{checked(values.crop_protection_enabled)}> Protect all known and previously observed crops</label><br>
+<label>Canopy radius multiplier <input type=number name=crop_support_radius_multiplier min=.5 max=5 step=.05 value="{values.crop_support_radius_multiplier:g}"></label><br>
+<label>Minimum extra canopy support (mm) <input type=number name=crop_support_extra_mm min=0 max=500 step=1 value="{values.crop_support_extra_mm:g}"></label><br>
+<label>Extra exclusion around plants (mm) <input type=number name=plant_exclusion_margin_mm min=0 step=1 value="{values.plant_exclusion_margin_mm:g}"></label>
+</fieldset>
+<fieldset><legend>Multi-image confirmation</legend>
+<label><input type=checkbox name=temporal_confirmation_enabled value=true{checked(values.temporal_confirmation_enabled)}> Enable temporal confirmation</label><br>
+<label>Looks before recommendation <input type=number name=recommendation_min_observations min=1 max=20 step=1 value="{values.recommendation_min_observations}"></label><br>
+<label>Looks before automatic creation <input type=number name=automatic_min_observations min=1 max=20 step=1 value="{values.automatic_min_observations}"></label><br>
+<label>Position matching distance (mm) <input type=number name=temporal_match_distance_mm min=1 max=250 step=1 value="{values.temporal_match_distance_mm:g}"></label><br>
+<label>Maximum gap between looks (hours) <input type=number name=temporal_max_gap_hours min=1 max=8760 step=1 value="{values.temporal_max_gap_hours}"></label>
+</fieldset>
+<fieldset><legend>Learned visual verifier</legend>
+<label><input type=checkbox name=visual_verifier_enabled value=true{checked(values.visual_verifier_enabled)}> Enable learned verifier</label><br>
+<label><input type=checkbox name=visual_verifier_shadow_mode value=true{checked(values.visual_verifier_shadow_mode)}> Shadow mode (score but do not reject)</label><br>
+<label><input type=checkbox name=visual_verifier_required_for_automatic value=true{checked(values.visual_verifier_required_for_automatic)}> Require verifier approval for automatic creation</label><br>
+<label>Verifier confidence threshold <input type=number name=visual_verifier_minimum_confidence min=0 max=1 step=.01 value="{values.visual_verifier_minimum_confidence:g}"></label><br>
+<label>Verifier weight in final score <input type=number name=visual_verifier_weight min=0 max=1 step=.05 value="{values.visual_verifier_weight:g}"></label><br>
+<label>Minimum weed and non-weed labels for training <input type=number name=training_minimum_per_class min=2 step=1 value="{values.training_minimum_per_class}"></label><br>
+<label><input type=checkbox name=automatic_retraining value=true{checked(values.automatic_retraining)}> Retrain automatically after each new label once enough labels exist</label><br>
+<label><input type=checkbox name=candidate_crop_storage_enabled value=true{checked(values.candidate_crop_storage_enabled)}> Store candidate crops for review/training</label>
+</fieldset>
+<fieldset><legend>Existing weed maintenance</legend>
 <label><input type=checkbox name=automatic_radius_adjustment value=true{checked(values.automatic_radius_adjustment)}>
 Automatically increase the radius of a matching known weed</label><br>
 <label>Radius adjustment confidence <input type=number name=radius_adjustment_confidence min=0 max=1 step=.01 value="{values.radius_adjustment_confidence:g}"></label><br>
 <label><input type=checkbox name=automatic_removal value=true{checked(values.automatic_removal)}>
 Automatically remove known weeds that disappear</label><br>
 <label>Removal confidence <input type=number name=removal_confidence min=0 max=1 step=.01 value="{values.removal_confidence:g}"></label><br>
-<label>Absent images before removal <input type=number name=removal_min_consecutive_absent min=1 max=10 step=1 value="{values.removal_min_consecutive_absent}"></label><br>
-<label>Minimum weed area (mm²) <input type=number name=minimum_area_mm2 min=5 step=1 value="{values.minimum_area_mm2:g}"></label><br>
-<label>Maximum weed area (mm²) <input type=number name=maximum_area_mm2 min=10 step=1 value="{values.maximum_area_mm2:g}"></label><br>
-<label>Extra exclusion around plants (mm) <input type=number name=plant_exclusion_margin_mm min=0 step=1 value="{values.plant_exclusion_margin_mm:g}"></label><br>
-<label>Minimum confidence <input type=number name=minimum_confidence min=0 max=1 step=.01 value="{values.minimum_confidence:g}"></label><br>
-<label>Created weed radius (mm) <input type=number name=weed_radius_mm min=1 step=1 value="{values.weed_radius_mm:g}"></label><br>
-<button>Save weed settings</button></form></section>"""
+<label>Absent images before removal <input type=number name=removal_min_consecutive_absent min=1 max=10 step=1 value="{values.removal_min_consecutive_absent}"></label>
+</fieldset>
+<button>Save all weed settings</button></form></section>
+<section class=card><h2>Verifier training</h2>{training_notice_html}<p>{model_status}</p>
+<p>Labels: {labels["weed"]} weeds · {labels["crop"]} crops · {labels["mulch_soil"]} mulch/soil ·
+{labels["fungus_moss"]} fungus/moss · {labels["hardware_other"]} hardware/other.</p>
+<form method=post action="weed-model/train"><button>Train verifier now</button></form>
+<p class=muted>Accepting a weed records a positive label. Rejection and the category buttons on
+the Analysis page record hard negative examples from this FarmBot.</p></section>"""
     return layout(request, body, "Weed settings")
 
 
@@ -1872,10 +2166,36 @@ async def save_weed_settings(
     automatic_removal: bool = Form(False),
     removal_confidence: float = Form(0.6),
     removal_min_consecutive_absent: int = Form(1),
-    minimum_area_mm2: float = Form(25),
+    minimum_area_mm2: float = Form(75),
     maximum_area_mm2: float = Form(2500),
     plant_exclusion_margin_mm: float = Form(35),
-    minimum_confidence: float = Form(0.75),
+    crop_protection_enabled: bool = Form(False),
+    crop_support_radius_multiplier: float = Form(1.2),
+    crop_support_extra_mm: float = Form(25),
+    shape_filter_enabled: bool = Form(False),
+    green_hue_min: int = Form(25),
+    green_hue_max: int = Form(100),
+    strong_green_minimum_saturation: int = Form(45),
+    strong_green_minimum_excess_green: int = Form(20),
+    minimum_green_purity: float = Form(0.45),
+    minimum_solidity: float = Form(0.25),
+    minimum_circularity: float = Form(0.03),
+    maximum_aspect_ratio: float = Form(7),
+    minimum_confidence: float = Form(0.70),
+    automatic_creation_confidence: float = Form(0.90),
+    temporal_confirmation_enabled: bool = Form(False),
+    recommendation_min_observations: int = Form(1),
+    automatic_min_observations: int = Form(3),
+    temporal_match_distance_mm: float = Form(25),
+    temporal_max_gap_hours: int = Form(168),
+    visual_verifier_enabled: bool = Form(False),
+    visual_verifier_shadow_mode: bool = Form(False),
+    visual_verifier_required_for_automatic: bool = Form(False),
+    visual_verifier_minimum_confidence: float = Form(0.85),
+    visual_verifier_weight: float = Form(0.7),
+    training_minimum_per_class: int = Form(10),
+    automatic_retraining: bool = Form(False),
+    candidate_crop_storage_enabled: bool = Form(False),
     weed_radius_mm: float = Form(15),
 ) -> RedirectResponse:
     try:
@@ -1890,21 +2210,91 @@ async def save_weed_settings(
             minimum_area_mm2=minimum_area_mm2,
             maximum_area_mm2=maximum_area_mm2,
             plant_exclusion_margin_mm=plant_exclusion_margin_mm,
+            crop_protection_enabled=crop_protection_enabled,
+            crop_support_radius_multiplier=crop_support_radius_multiplier,
+            crop_support_extra_mm=crop_support_extra_mm,
+            shape_filter_enabled=shape_filter_enabled,
+            green_hue_min=green_hue_min,
+            green_hue_max=green_hue_max,
+            strong_green_minimum_saturation=strong_green_minimum_saturation,
+            strong_green_minimum_excess_green=strong_green_minimum_excess_green,
+            minimum_green_purity=minimum_green_purity,
+            minimum_solidity=minimum_solidity,
+            minimum_circularity=minimum_circularity,
+            maximum_aspect_ratio=maximum_aspect_ratio,
             minimum_confidence=minimum_confidence,
+            automatic_creation_confidence=automatic_creation_confidence,
+            temporal_confirmation_enabled=temporal_confirmation_enabled,
+            recommendation_min_observations=recommendation_min_observations,
+            automatic_min_observations=automatic_min_observations,
+            temporal_match_distance_mm=temporal_match_distance_mm,
+            temporal_max_gap_hours=temporal_max_gap_hours,
+            visual_verifier_enabled=visual_verifier_enabled,
+            visual_verifier_shadow_mode=visual_verifier_shadow_mode,
+            visual_verifier_required_for_automatic=visual_verifier_required_for_automatic,
+            visual_verifier_minimum_confidence=visual_verifier_minimum_confidence,
+            visual_verifier_weight=visual_verifier_weight,
+            training_minimum_per_class=training_minimum_per_class,
+            automatic_retraining=automatic_retraining,
+            candidate_crop_storage_enabled=candidate_crop_storage_enabled,
             weed_radius_mm=weed_radius_mm,
         )
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from exc
     if values.minimum_area_mm2 > values.maximum_area_mm2:
         raise HTTPException(422, "Minimum weed area cannot exceed maximum weed area")
+    if values.green_hue_min > values.green_hue_max:
+        raise HTTPException(422, "Minimum green hue cannot exceed maximum green hue")
+    if values.recommendation_min_observations > values.automatic_min_observations:
+        raise HTTPException(
+            422, "Looks before recommendation cannot exceed looks before automatic creation"
+        )
     weed_settings_store.save(values)
     return RedirectResponse("weed-settings", status_code=303)
+
+
+async def _train_weed_verifier() -> dict:
+    values = weed_settings_store.load()
+    model = await asyncio.to_thread(
+        weed_verifier.train,
+        database.weed_training_samples(),
+        values.training_minimum_per_class,
+    )
+    database.record_weed_model_run(model)
+    return model
+
+
+async def _record_weed_label(detection_id: UUID, label: str) -> None:
+    if label not in ALL_LABELS:
+        raise HTTPException(422, "Unsupported training label")
+    if not database.label_weed_detection(str(detection_id), label):
+        raise HTTPException(404, "Weed detection not found")
+    if weed_settings_store.load().automatic_retraining:
+        try:
+            await _train_weed_verifier()
+        except ValueError:
+            # Label collection intentionally starts before the minimum dataset
+            # exists. The settings page shows the live counts.
+            pass
+
+
+@app.post("/weed-model/train")
+async def train_weed_model() -> RedirectResponse:
+    try:
+        model = await _train_weed_verifier()
+    except ValueError as exc:
+        return RedirectResponse(f"../weed-settings?training={quote(str(exc))}", status_code=303)
+    message = f"Trained from {model['sample_count']} labels"
+    return RedirectResponse(
+        f"../weed-settings?training={quote(message)}",
+        status_code=303,
+    )
 
 
 @app.post("/weeds/{detection_id}/approve")
 async def approve_weed(detection_id: UUID) -> JSONResponse:
     detection = database.weed_detection(str(detection_id))
-    if detection is None or detection["status"] != "recommended":
+    if detection is None or detection["status"] not in ("recommended", "observing"):
         raise HTTPException(404, "Weed recommendation not found")
     verdict = zone_verdict(ZoneAspect.WEEDS, detection["x"], detection["y"])
     if not verdict.allowed:
@@ -1932,6 +2322,7 @@ async def approve_weed(detection_id: UUID) -> JSONResponse:
     )
     if result.get("status") == "applied":
         database.update_weed_detection(str(detection_id), "created")
+        await _record_weed_label(detection_id, "weed")
     return JSONResponse(result)
 
 
@@ -1943,7 +2334,25 @@ async def reject_weed(detection_id: UUID) -> JSONResponse:
     database.reject_weed_detection(
         str(detection_id), max(20.0, float(detection["radius_mm"]) * 1.5)
     )
+    await _record_weed_label(detection_id, "mulch_soil")
     return JSONResponse({"status": "rejected", "message": "Weed recommendation rejected"})
+
+
+@app.post("/weeds/{detection_id}/label/{label}")
+async def label_weed(detection_id: UUID, label: str) -> JSONResponse:
+    detection = database.weed_detection(str(detection_id))
+    if detection is None:
+        raise HTTPException(404, "Weed detection not found")
+    await _record_weed_label(detection_id, label)
+    if label == "weed":
+        database.update_weed_detection(str(detection_id), "labelled")
+    else:
+        database.reject_weed_detection(
+            str(detection_id), max(20.0, float(detection["radius_mm"]) * 1.5)
+        )
+    return JSONResponse(
+        {"status": "applied", "message": f"Saved {label.replace('_', '/')} training label"}
+    )
 
 
 def zone_verdict(aspect: ZoneAspect, x: float, y: float, radius_mm: float = 0.0) -> ZoneVerdict:
@@ -2027,9 +2436,11 @@ protection radius may extend into it.</p>
 aspect is an explicit exception and wins; otherwise any zone that forbids the
 aspect and is touched by the position denies it; otherwise, if at least one
 boundary allows that aspect, the position must fall inside one of them. With no
-zones configured nothing is restricted. Weeds and plant centres are tested as
-points; a protection radius must fit entirely inside an allowing boundary and
-must not overlap a forbidding zone.</p>
+zones configured nothing is restricted. Weeds, plant centres, and a boundary's
+test of a protection radius are all point tests: a radius may extend past a
+boundary's edge, since only the plant itself has to stay inside the growing
+area. Exclusion zones are different -- they mark real hazards, so the full
+protection disc must not overlap a forbidding exclusion zone.</p>
 <p class=warn>Zones gate both automatic writes and manual approvals: a blocked
 weed is never created, a blocked centre move and a blocked radius increase are
 refused with the zone's name.</p></section>

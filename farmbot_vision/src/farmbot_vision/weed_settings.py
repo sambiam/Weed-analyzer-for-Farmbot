@@ -17,10 +17,36 @@ class WeedSettings(BaseModel):
     automatic_removal: bool = False
     removal_confidence: float = Field(default=0.6, ge=0, le=1)
     removal_min_consecutive_absent: int = Field(default=1, ge=1, le=10)
-    minimum_area_mm2: float = Field(default=25, ge=5, le=10_000)
+    minimum_area_mm2: float = Field(default=75, ge=5, le=10_000)
     maximum_area_mm2: float = Field(default=2_500, ge=10, le=100_000)
     plant_exclusion_margin_mm: float = Field(default=35, ge=0, le=500)
-    minimum_confidence: float = Field(default=0.75, ge=0, le=1)
+    crop_protection_enabled: bool = True
+    crop_support_radius_multiplier: float = Field(default=1.2, ge=0.5, le=5)
+    crop_support_extra_mm: float = Field(default=25, ge=0, le=500)
+    shape_filter_enabled: bool = True
+    green_hue_min: int = Field(default=25, ge=0, le=179)
+    green_hue_max: int = Field(default=100, ge=0, le=179)
+    strong_green_minimum_saturation: int = Field(default=45, ge=0, le=255)
+    strong_green_minimum_excess_green: int = Field(default=20, ge=-255, le=510)
+    minimum_green_purity: float = Field(default=0.45, ge=0, le=1)
+    minimum_solidity: float = Field(default=0.25, ge=0, le=1)
+    minimum_circularity: float = Field(default=0.03, ge=0, le=1)
+    maximum_aspect_ratio: float = Field(default=7, ge=1, le=50)
+    minimum_confidence: float = Field(default=0.70, ge=0, le=1)
+    automatic_creation_confidence: float = Field(default=0.90, ge=0, le=1)
+    temporal_confirmation_enabled: bool = True
+    recommendation_min_observations: int = Field(default=1, ge=1, le=20)
+    automatic_min_observations: int = Field(default=3, ge=1, le=20)
+    temporal_match_distance_mm: float = Field(default=25, ge=1, le=250)
+    temporal_max_gap_hours: int = Field(default=168, ge=1, le=8_760)
+    visual_verifier_enabled: bool = False
+    visual_verifier_shadow_mode: bool = True
+    visual_verifier_required_for_automatic: bool = True
+    visual_verifier_minimum_confidence: float = Field(default=0.85, ge=0, le=1)
+    visual_verifier_weight: float = Field(default=0.7, ge=0, le=1)
+    training_minimum_per_class: int = Field(default=10, ge=2, le=10_000)
+    automatic_retraining: bool = False
+    candidate_crop_storage_enabled: bool = True
     weed_radius_mm: float = Field(default=15, ge=1, le=250)
 
 

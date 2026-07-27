@@ -150,7 +150,16 @@ def _manager(tmp_path, monkeypatch, *, zones: list[Zone], weed_center_px) -> Job
     for zone in zones:
         store.add(zone)
     weed_settings_store = WeedSettingsStore(tmp_path / "weed_settings.json")
-    weed_settings_store.save(WeedSettings(enabled=True, automatic_creation=True))
+    # This suite isolates zone gating, so deliberately lower the independent
+    # temporal/verifier automation gates tested by the weed pipeline suite.
+    weed_settings_store.save(
+        WeedSettings(
+            enabled=True,
+            automatic_creation=True,
+            temporal_confirmation_enabled=False,
+            visual_verifier_required_for_automatic=False,
+        )
+    )
     manager = JobManager(
         Settings(data_dir=tmp_path, minimum_auto_confidence=0.5),
         Database(tmp_path / "db.sqlite"),

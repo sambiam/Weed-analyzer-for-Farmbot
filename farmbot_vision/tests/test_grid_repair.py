@@ -29,6 +29,10 @@ def test_latest_grid_detects_missing_and_gantry_cells():
         _image(3, 2, 0, 200),
         _image(4, 3, 100, 0),
         _image(5, 4, 100, 100),
+<<<<<<< HEAD
+=======
+        # (100, 200) is missing.
+>>>>>>> bc38d1dbfa49b8da40610f5fd40efa7ae8477584
         _image(7, 6, 200, 0),
         _image(8, 7, 200, 100),
         _image(9, 8, 200, 200),
@@ -36,12 +40,17 @@ def test_latest_grid_detects_missing_and_gantry_cells():
     run = detect_latest_grid_run(images, {5})
     assert run is not None
     assert run.expected_count == 9
+<<<<<<< HEAD
+=======
+    assert run.coverage == 8 / 9
+>>>>>>> bc38d1dbfa49b8da40610f5fd40efa7ae8477584
     assert {(item.x, item.y, item.reason) for item in run.targets} == {
         (100, 100, "gantry"),
         (100, 200, "missing"),
     }
 
 
+<<<<<<< HEAD
 def test_gantry_photos_on_minimum_and_maximum_y_edges_are_expected():
     images = [
         _image(1, 0, 0, 0),
@@ -56,6 +65,8 @@ def test_gantry_photos_on_minimum_and_maximum_y_edges_are_expected():
     assert [(item.image_id, item.y, item.reason) for item in run.targets] == [(5, 100, "gantry")]
 
 
+=======
+>>>>>>> bc38d1dbfa49b8da40610f5fd40efa7ae8477584
 def test_skips_newer_non_grid_cluster():
     grid = [
         _image(i + 1, i, x, y) for i, (x, y) in enumerate([(0, 0), (0, 100), (100, 0), (100, 100)])

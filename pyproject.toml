@@ -4,7 +4,11 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "farmbot-vision"
+<<<<<<< HEAD
 version = "2.0.0"
+=======
+version = "1.9.0"
+>>>>>>> bc38d1dbfa49b8da40610f5fd40efa7ae8477584
 description = "Resource-conscious plant canopy analysis for FarmBot and Home Assistant"
 requires-python = ">=3.12"
 dependencies = [
@@ -43,4 +47,4 @@ select = ["E", "F", "I", "B", "UP", "S", "ASYNC"]
 ignore = ["E501", "S104"]
 
 [tool.ruff.lint.per-file-ignores]
-"farmbot_vision/tests/*" = ["S101", "S106"]
+"farmbot_vision/tests/*" = ["S101", "S106", "S603"]

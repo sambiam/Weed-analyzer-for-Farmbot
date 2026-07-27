@@ -1,5 +1,6 @@
 # Changelog
 
+<<<<<<< HEAD
 ## 2.0.0 - 2026-07-27
 
 - Added repair detection for missing photo-grid cells and gantry images, a
@@ -14,6 +15,60 @@
 - Photo-grid retakes use the V2 companion service, which validates axis bounds,
   waits after each move, takes only replacement photos, and restores the
   FarmBot's starting position.
+=======
+## 1.9.0 - 2026-07-27
+
+- Added photo-grid repair detection to the Analysis page. The app identifies
+  the latest hour-scale grid, reports missing cells and likely gantry photos,
+  and can retake only those coordinates.
+- Added an app-managed automatic repair time, persisted in the add-on data
+  directory, plus a manual Repair now action.
+- Repair movement is bounded by the FarmBot axis limits, settles before each
+  photo, and restores the bot's starting position.
+
+## 1.8.0 - 2026-07-26
+
+- Added calibrated multi-image canopy fusion. Plant ownership is segmented in
+  each original image, aligned on a plant-centred metric canvas, and measured
+  from the fused mask when partial views cross image boundaries.
+- Added app-managed fusion controls for activation, view and pixel evidence,
+  radial statistics, angular coverage, disagreement tolerance, diagnostics,
+  and automatic-action reliability requirements.
+- Added a locally trained weed visual verifier with in-app hard-negative
+  labelling, manual or automatic retraining, validation metrics, shadow mode,
+  enforcement thresholds, and automation gates.
+- Added configurable colour/shape filtering, complete known-crop protection,
+  temporal weed confirmation, candidate-crop storage, and conservative
+  automatic weed creation, radius maintenance, and disappearance handling.
+- Fusion provenance and diagnostics are persisted with each measurement; an
+  unreliable partial-view fusion stays reviewable and cannot trigger an
+  automatic plant-radius change while its guardrail is enabled.
+
+## 1.7.0 - 2026-07-26
+
+- Plants whose protection area falls entirely outside the analysed image are
+  no longer silently skipped. They now get a low-confidence, uncertain
+  measurement so they still appear for manual review; no automatic change is
+  ever applied to them.
+
+## 1.6.0 - 2026-07-26
+
+- Plant-radius review now opens one stitched composite containing every source
+  image that identified the plant, aligned with the saved calibration's scale,
+  rotation, and coordinate-origin settings.
+- The review composite marks the original radius in cyan, the new radius in
+  red, and the plant centre with a white dot.
+- Reviewers can switch between the original stitched photos and the same
+  composite with the plant ownership mask overlaid. Raw masks and per-frame
+  diagnostic images are no longer included in the plant-radius viewer.
+
+## 1.5.1 - 2026-07-26
+
+- Fixed plant-protection-radius zone checks: a boundary now only requires the
+  plant's centre to stay inside it, matching weeds and plant centres. A
+  protection radius may extend past a boundary's edge; it still must not
+  overlap a forbidding exclusion zone, since those mark real hazards.
+>>>>>>> bc38d1dbfa49b8da40610f5fd40efa7ae8477584
 
 ## 1.5.0 - 2026-07-26
 
