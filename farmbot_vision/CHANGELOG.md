@@ -1,5 +1,18 @@
 # Changelog
 
+## 2.0.1 - 2026-07-27
+
+- Fixed a 2.0.0 build that shipped with unresolved merge-conflict markers
+  still committed in several source files, which made the app fail to start.
+- Fixed the photo-grid repair capability check falsely reporting "integration
+  does not provide photo-grid repair" for a correctly loaded V2.0.0
+  integration; a 400 response from an already-capability-checked repair
+  request now surfaces the integration's actual rejection reason instead of
+  guessing it is unsupported.
+- Added a **Recheck grid** action so the photo-grid status can be refreshed
+  on demand instead of only on the next scheduled inspection or repair
+  attempt.
+
 ## 2.0.0 - 2026-07-27
 
 - Added repair detection for missing photo-grid cells and gantry images, a
