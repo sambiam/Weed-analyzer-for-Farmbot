@@ -44,7 +44,7 @@ def test_latest_grid_detects_missing_and_gantry_cells():
     }
 
 
-def test_gantry_photos_on_minimum_and_maximum_y_edges_are_expected():
+def test_gantry_photos_anywhere_on_grid_perimeter_are_not_repair_targets():
     images = [
         _image(1, 0, 0, 0),
         _image(2, 1, 0, 100),
@@ -55,7 +55,7 @@ def test_gantry_photos_on_minimum_and_maximum_y_edges_are_expected():
     ]
     run = detect_latest_grid_run(images, {1, 3, 5, 6})
     assert run is not None
-    assert [(item.image_id, item.y, item.reason) for item in run.targets] == [(5, 100, "gantry")]
+    assert run.targets == ()
 
 
 def test_skips_newer_non_grid_cluster():
@@ -80,6 +80,13 @@ def test_gantry_detector_finds_bright_vertical_rail():
 
 def test_gantry_detector_rejects_plain_garden():
     frame = np.full((240, 320, 3), (35, 90, 35), np.uint8)
+    ok, encoded = cv2.imencode(".jpg", frame)
+    assert ok and not looks_like_gantry_photo(encoded.tobytes())
+
+
+def test_gantry_detector_rejects_partial_bright_bed_edge():
+    frame = np.full((240, 320, 3), (35, 90, 35), np.uint8)
+    frame[:160, 145:175] = (190, 190, 190)
     ok, encoded = cv2.imencode(".jpg", frame)
     assert ok and not looks_like_gantry_photo(encoded.tobytes())
 

@@ -46,7 +46,7 @@ async def test_grid_repair_requires_advertised_v2_capability(monkeypatch):
     try:
         with pytest.raises(
             web.HomeAssistantError,
-            match="requires FarmBot integration V2.0.0",
+            match="requires FarmBot integration V2.0.1",
         ):
             await web._require_grid_repair_capability()
     finally:
@@ -66,8 +66,11 @@ async def test_grid_repair_accepts_advertised_v2_capability(monkeypatch):
                         "config_entry_id": "entry-1",
                         "device_id": "42",
                         "name": "FarmBot",
-                        "integration_version": "2.0.0",
-                        "capabilities": ["photo_grid_repair"],
+                        "integration_version": "2.0.1",
+                        "capabilities": [
+                            "photo_grid_repair",
+                            "verified_photo_grid_repair",
+                        ],
                     }
                 ]
             }
@@ -144,13 +147,8 @@ async def test_grid_repair_recheck_forces_a_fresh_inventory_lookup(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_grid_repair_caps_targets_at_the_service_limit(monkeypatch):
-    """start_vision_grid_repair accepts at most MAX_REPAIR_TARGETS_PER_CALL
-    targets per call (docs/integration-contract.md: "one to twelve"). A grid
-    large enough to have more missing cells than that must be sent in a
-    capped first batch, not all at once -- an uncapped request is rejected
-    by the integration's schema with a bare HTTP 400.
-    """
+async def test_grid_repair_queues_only_one_verified_target_at_a_time(monkeypatch):
+    """Large repairs no longer rely on the legacy twelve-target batch limit."""
     import base64 as b64
     from types import SimpleNamespace
 
@@ -179,8 +177,11 @@ async def test_grid_repair_caps_targets_at_the_service_limit(monkeypatch):
                         "config_entry_id": "entry-1",
                         "device_id": "42",
                         "name": "FarmBot",
-                        "integration_version": "2.0.0",
-                        "capabilities": ["photo_grid_repair"],
+                        "integration_version": "2.0.1",
+                        "capabilities": [
+                            "photo_grid_repair",
+                            "verified_photo_grid_repair",
+                        ],
                     }
                 ]
             }
@@ -227,11 +228,128 @@ async def test_grid_repair_caps_targets_at_the_service_limit(monkeypatch):
     try:
         result = await web.start_photo_grid_repair()
     finally:
+        if web.grid_repair_task is not None:
+            web.grid_repair_task.cancel()
+            await web.asyncio.gather(web.grid_repair_task, return_exceptions=True)
+            web.grid_repair_task = None
         web.settings.selected_config_entry_id = previous
 
-    assert len(captured_targets[0]) == web.MAX_REPAIR_TARGETS_PER_CALL
+    assert len(captured_targets[0]) == 1
     assert result["status"] == "queued"
-    assert "1 more cell(s) need a follow-up repair" in result["message"]
+    assert "13 cells remaining" in result["message"]
+
+
+@pytest.mark.asyncio
+async def test_grid_repair_worker_continues_after_each_processed_image(monkeypatch):
+    from farmbot_vision.grid_repair import GridRun, RepairTarget
+
+    now = datetime.now(UTC)
+
+    def repair_run(*targets):
+        return GridRun(
+            started_at=now,
+            completed_at=now,
+            images=(),
+            expected_count=4,
+            coverage=0.5,
+            targets=targets,
+        )
+
+    first = RepairTarget(100, 200, 0, "missing")
+    second = RepairTarget(300, 400, 0, "missing")
+    initial = repair_run(first, second)
+    after_first = repair_run(second)
+    complete = repair_run()
+    inspections = iter([after_first, complete])
+    queued = []
+
+    async def status(_entry_id, repair_id):
+        return {
+            "status": "complete",
+            "repair_id": repair_id,
+            "message": "Processed target image verified",
+        }
+
+    async def inspect(*, force=False):
+        assert force is True
+        return next(inspections)
+
+    async def queue_one(run):
+        queued.append(run.targets[0])
+        return {
+            "status": "queued",
+            "repair_id": "r2",
+            "message": "Photo-grid repair queued",
+        }
+
+    monkeypatch.setattr(web.settings, "selected_config_entry_id", "entry-1")
+    monkeypatch.setattr(web.client, "grid_repair_status", status)
+    monkeypatch.setattr(web, "inspect_photo_grid", inspect)
+    monkeypatch.setattr(web, "_queue_one_repair_target", queue_one)
+
+    await web._photo_grid_repair_worker(
+        session_id="session-1",
+        run=initial,
+        active_repair_id="r1",
+    )
+
+    assert queued == [second]
+    assert web.grid_repair_state["status"] == "complete"
+    assert "every cell" in str(web.grid_repair_state["message"])
+
+
+@pytest.mark.asyncio
+async def test_dashboard_gantry_debug_view_shows_photos_coordinates_and_disposition(
+    monkeypatch,
+):
+    from farmbot_vision.grid_repair import GridRun, RepairTarget
+    from farmbot_vision.models import InventoryImage
+
+    now = datetime.now(UTC)
+    images = tuple(
+        InventoryImage.model_validate({"id": index + 1, "created_at": now, "x": x, "y": y, "z": 0})
+        for index, (x, y) in enumerate(
+            [
+                (0, 0),
+                (0, 100),
+                (0, 200),
+                (100, 0),
+                (100, 100),
+                (100, 200),
+                (200, 0),
+                (200, 100),
+                (200, 200),
+            ]
+        )
+    )
+    run = GridRun(
+        started_at=now,
+        completed_at=now,
+        images=images,
+        expected_count=9,
+        coverage=1,
+        targets=(RepairTarget(100, 100, 0, "gantry", 5),),
+    )
+
+    async def inspect(*, force=False):
+        return run
+
+    monkeypatch.setattr(web.settings, "selected_config_entry_id", "debug-entry")
+    monkeypatch.setattr(web, "inspect_photo_grid", inspect)
+    monkeypatch.setitem(web.grid_repair_state, "gantry_image_ids", (2, 5))
+
+    status, _, body = await asgi_request("/")
+    html = body.decode()
+
+    assert status == 200
+    assert "View gantry photos (2)" in html
+    assert "id=gantry-modal" in html
+    assert "Image #2" in html
+    assert "X 0.0, Y 100.0, Z 0.0 mm" in html
+    assert "Perimeter positive — ignored for repair" in html
+    assert "Image #5" in html
+    assert "Interior repair target" in html
+    assert "gantryModal.hidden=false" in html
 
 
 def _review_measurement(**updates) -> Measurement:

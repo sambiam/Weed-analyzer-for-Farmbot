@@ -10,7 +10,7 @@ from html import escape
 from pathlib import Path
 from typing import Annotated
 from urllib.parse import quote
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import cv2
 from fastapi import BackgroundTasks, FastAPI, Form, HTTPException, Request
@@ -36,7 +36,6 @@ from .curve_edit import propose_curve_point
 from .curves import fit_monotonic_curve
 from .database import Database
 from .grid_repair import (
-    MAX_REPAIR_TARGETS_PER_CALL,
     GridRepairSettings,
     GridRepairSettingsStore,
     GridRun,
@@ -98,7 +97,14 @@ grid_repair_state: dict[str, object] = {
     "checked_at": None,
     "error": "",
     "message": "",
+    "gantry_image_ids": (),
+    "status": "idle",
+    "repair_id": "",
 }
+grid_repair_task: asyncio.Task | None = None
+GRID_REPAIR_STATUS_POLL_SECONDS = 5
+GRID_REPAIR_BUSY_RETRY_SECONDS = 30
+GRID_REPAIR_FAILURE_RETRY_SECONDS = 60
 
 
 async def inspect_photo_grid(*, force: bool = False) -> GridRun | None:
@@ -152,10 +158,20 @@ async def inspect_photo_grid(*, force: bool = False) -> GridRun | None:
                     "Could not inspect %d photo-grid image(s) for gantry content", failed
                 )
             candidate = detect_latest_grid_run(inventory.images, gantry_ids)
-        grid_repair_state.update(run=candidate, checked_at=now, error="")
+        grid_repair_state.update(
+            run=candidate,
+            checked_at=now,
+            error="",
+            gantry_image_ids=tuple(sorted(gantry_ids)),
+        )
         return candidate
     except HomeAssistantError as exc:
-        grid_repair_state.update(run=None, checked_at=now, error=str(exc))
+        grid_repair_state.update(
+            run=None,
+            checked_at=now,
+            error=str(exc),
+            gantry_image_ids=(),
+        )
         return None
 
 
@@ -165,37 +181,189 @@ async def _require_grid_repair_capability() -> None:
         (item for item in bots if item.config_entry_id == settings.selected_config_entry_id),
         None,
     )
-    if bot is None or not bot.supports("photo_grid_repair"):
+    if bot is None or not bot.supports("verified_photo_grid_repair"):
         version = bot.integration_version if bot is not None else None
         loaded = f" (loaded version {version})" if version else ""
         raise HomeAssistantError(
-            "Photo-grid repair requires FarmBot integration V2.0.0"
+            f"Photo-grid repair requires FarmBot integration V{MINIMUM_INTEGRATION_VERSION}"
             f"{loaded}. Install/update it and restart Home Assistant."
         )
 
 
+def _ordered_repair_targets(run: GridRun):
+    """Prioritize empty cells, then keep travel deterministic."""
+    return sorted(
+        run.targets,
+        key=lambda target: (target.reason != "missing", target.x, target.y),
+    )
+
+
+async def _queue_one_repair_target(run: GridRun) -> dict[str, object]:
+    target = _ordered_repair_targets(run)[0]
+    payload = target_payload((target,))
+    return await client.start_grid_repair(settings.selected_config_entry_id, payload)
+
+
+async def _photo_grid_repair_worker(
+    *,
+    session_id: str,
+    run: GridRun,
+    active_repair_id: str | None,
+) -> None:
+    """Repair one verified image at a time until the detected grid is whole."""
+    consecutive_failures = 0
+    try:
+        while True:
+            if active_repair_id:
+                try:
+                    result = await client.grid_repair_status(
+                        settings.selected_config_entry_id, active_repair_id
+                    )
+                except HomeAssistantError as exc:
+                    grid_repair_state.update(
+                        status="queued",
+                        message=f"Repair status check is waiting for Home Assistant: {exc}",
+                    )
+                    await asyncio.sleep(GRID_REPAIR_BUSY_RETRY_SECONDS)
+                    continue
+                status = str(result.get("status") or "")
+                message = str(result.get("message") or status)
+                grid_repair_state.update(status=status, message=message)
+                if status in {"queued", "running", "waiting_images"}:
+                    await asyncio.sleep(GRID_REPAIR_STATUS_POLL_SECONDS)
+                    continue
+                if status == "complete":
+                    consecutive_failures = 0
+                else:
+                    consecutive_failures += 1
+                    grid_repair_state.update(
+                        status="retrying",
+                        message=(
+                            f"{message}. The cell remains queued and will be retried "
+                            "after the camera recovers."
+                        ),
+                    )
+                    await asyncio.sleep(
+                        min(
+                            GRID_REPAIR_FAILURE_RETRY_SECONDS * consecutive_failures,
+                            5 * 60,
+                        )
+                    )
+                active_repair_id = None
+                run = await inspect_photo_grid(force=True)
+                while run is None:
+                    grid_repair_state.update(
+                        status="queued",
+                        message=(
+                            "The completed repair is waiting for a fresh grid "
+                            "inventory before the next cell is sent"
+                        ),
+                    )
+                    await asyncio.sleep(GRID_REPAIR_BUSY_RETRY_SECONDS)
+                    run = await inspect_photo_grid(force=True)
+                if not run.targets:
+                    grid_repair_state.update(
+                        status="complete",
+                        message="Photo-grid repair complete; every cell has a usable image",
+                    )
+                    return
+
+            try:
+                result = await _queue_one_repair_target(run)
+            except HomeAssistantError as exc:
+                grid_repair_state.update(
+                    status="queued",
+                    message=f"Repair is waiting for Home Assistant: {exc}",
+                )
+                await asyncio.sleep(GRID_REPAIR_BUSY_RETRY_SECONDS)
+                continue
+            status = str(result.get("status") or "")
+            message = str(result.get("message") or status)
+            repair_id = str(result.get("repair_id") or "")
+            if status == "rejected":
+                if "busy" not in message.casefold():
+                    raise HomeAssistantError(message or "FarmBot rejected the repair cell")
+                grid_repair_state.update(
+                    status="queued",
+                    message="FarmBot is busy; the next repair cell remains queued",
+                )
+                await asyncio.sleep(GRID_REPAIR_BUSY_RETRY_SECONDS)
+                continue
+            if not repair_id:
+                raise HomeAssistantError(message or "FarmBot did not return a repair session ID")
+            remaining = len(run.targets)
+            active_repair_id = repair_id
+            grid_repair_state.update(
+                status="running",
+                message=(
+                    f"Repairing one verified cell at a time "
+                    f"({remaining} cell{'s' if remaining != 1 else ''} remaining)"
+                ),
+            )
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # pylint: disable=broad-except
+        LOGGER.exception("Photo-grid repair session %s stopped", session_id)
+        grid_repair_state.update(
+            status="failed",
+            error=str(exc),
+            message=f"Photo-grid repair stopped: {exc}",
+        )
+
+
 async def start_photo_grid_repair() -> dict[str, object]:
+    global grid_repair_task
+    if grid_repair_task is not None and not grid_repair_task.done():
+        return {
+            "status": str(grid_repair_state.get("status") or "queued"),
+            "repair_id": str(grid_repair_state.get("repair_id") or ""),
+            "message": str(
+                grid_repair_state.get("message") or "Photo-grid repair is already queued"
+            ),
+        }
     await _require_grid_repair_capability()
     run = await inspect_photo_grid(force=True)
     if run is None:
         return {"status": "rejected", "message": "No recent photo-grid run was found"}
     if not run.targets:
         return {"status": "complete", "message": "The latest photo grid is complete"}
-    # start_vision_grid_repair accepts at most MAX_REPAIR_TARGETS_PER_CALL targets
-    # (docs/integration-contract.md); a larger grid must be repaired in batches.
-    # Missing cells are photographed before gantry-obstructed ones since a
-    # missing cell has no usable photo at all.
-    ordered = sorted(run.targets, key=lambda target: target.reason != "missing")
-    batch = ordered[:MAX_REPAIR_TARGETS_PER_CALL]
-    remaining = len(ordered) - len(batch)
-    targets = target_payload(tuple(batch))
-    result = await client.start_grid_repair(settings.selected_config_entry_id, targets)
-    message = str(result.get("message") or "")
-    if remaining:
-        message = f"{message} ({remaining} more cell(s) need a follow-up repair)".strip()
-        result = {**result, "message": message}
-    grid_repair_state["message"] = message
-    return result
+
+    # Queue only one target. The integration does not mark it complete until a
+    # newly processed image exists at the requested coordinates. This both
+    # avoids FarmBot's asynchronous take_photo error and naturally stays below
+    # the integration's legacy twelve-target service limit.
+    result = await _queue_one_repair_target(run)
+    status = str(result.get("status") or "")
+    message = str(result.get("message") or status)
+    active_repair_id = str(result.get("repair_id") or "") or None
+    if status == "rejected" and "busy" not in message.casefold():
+        grid_repair_state.update(status=status, message=message)
+        return result
+
+    session_id = str(uuid4())
+    queued_message = (
+        f"Photo-grid repair queued one verified image at a time "
+        f"({len(run.targets)} cell{'s' if len(run.targets) != 1 else ''} remaining)"
+    )
+    grid_repair_state.update(
+        status="queued",
+        repair_id=session_id,
+        message=queued_message,
+        error="",
+    )
+    grid_repair_task = asyncio.create_task(
+        _photo_grid_repair_worker(
+            session_id=session_id,
+            run=run,
+            active_repair_id=active_repair_id,
+        ),
+        name=f"photo-grid-repair-{session_id}",
+    )
+    return {
+        "status": "queued",
+        "repair_id": session_id,
+        "message": queued_message,
+    }
 
 
 def _calibration_from_input(entry_id: str, values: FarmbotCalibrationInput) -> Calibration:
@@ -477,6 +645,8 @@ _DASHBOARD_JS = r"""
   const queueModal=document.getElementById('queue-modal');
   const queueRows=document.getElementById('queue-image-rows');
   const queueMessage=document.getElementById('queue-message');
+  const gantryModal=document.getElementById('gantry-modal');
+  const gantryOpen=document.getElementById('gantry-debug-open');
   async function loadQueueImages(){
     const dateFrom=document.getElementById('queue-from').value;
     const dateTo=document.getElementById('queue-to').value;
@@ -682,6 +852,7 @@ _DASHBOARD_JS = r"""
     if(event.key!=='Escape') return;
     if(!modal.hidden) closeModal();
     if(!weedModal.hidden) closeWeedModal();
+    if(!gantryModal.hidden) gantryModal.hidden=true;
   });
   document.getElementById('queue-open').addEventListener('click',function(){
     const to=new Date(), from=new Date(to.getTime()-72*60*60*1000);
@@ -696,6 +867,16 @@ _DASHBOARD_JS = r"""
     queueModal.hidden=false;loadQueueImages();
   });
   document.getElementById('queue-close').addEventListener('click',function(){queueModal.hidden=true;});
+  if(gantryOpen) gantryOpen.addEventListener('click',function(){
+    gantryModal.hidden=false;
+    gantryModal.querySelector('.modal-close').focus();
+  });
+  document.getElementById('gantry-close').addEventListener('click',function(){
+    gantryModal.hidden=true;
+  });
+  gantryModal.addEventListener('click',function(event){
+    if(event.target===gantryModal) gantryModal.hidden=true;
+  });
   document.getElementById('queue-refresh').addEventListener('click',loadQueueImages);
   document.getElementById('queue-select-all').addEventListener('change',function(){
     document.querySelectorAll('.queue-checkbox').forEach(box=>box.checked=this.checked);
@@ -982,6 +1163,10 @@ async def lifespan(_: FastAPI):
     yield
     for task in tasks:
         task.cancel()
+    if grid_repair_task is not None and not grid_repair_task.done():
+        grid_repair_task.cancel()
+        await asyncio.gather(grid_repair_task, return_exceptions=True)
+    await asyncio.gather(*tasks, return_exceptions=True)
     await soil_jobs.close()
     await client.close()
 
@@ -1015,6 +1200,9 @@ button{{background:var(--green);border:0;border-radius:6px;padding:.65rem 1rem;c
 .overlay-modal{{position:fixed;inset:0;z-index:1000;background:#000b;display:flex;align-items:center;justify-content:center;padding:1rem}}
 .overlay-modal figure{{position:relative;background:white;border-radius:10px;margin:0;padding:1rem;max-width:min(95vw,1000px);max-height:95vh;overflow:auto}}
 .overlay-modal img{{display:block;max-height:70vh;margin:auto}}.modal-close{{position:absolute;right:.5rem;top:.5rem;font-size:1.5rem}}
+.gantry-gallery{{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:1rem;min-width:min(85vw,900px)}}
+.gantry-gallery figure{{margin:0;padding:0;overflow:hidden}}.gantry-gallery img{{width:100%;height:180px;object-fit:contain;background:#111}}
+.gantry-gallery figcaption{{padding:.5rem 0}}.gantry-target{{color:#a40000;font-weight:bold}}
 .modal-controls{{display:flex;gap:.5rem;align-items:center;justify-content:center;margin-top:.6rem}}.legend{{font-size:.9rem;color:var(--muted)}}
 .modal-controls[hidden]{{display:none}}
 .queue-dialog{{width:min(95vw,900px)}}.button-row{{display:flex;gap:.5rem;flex-wrap:wrap;align-items:center}}
@@ -1360,6 +1548,47 @@ async def dashboard(request: Request) -> HTMLResponse:
     repair_message = escape(
         request.query_params.get("repair", "") or str(grid_repair_state.get("message") or "")
     )
+    gantry_ids = {
+        image_id
+        for image_id in grid_repair_state.get("gantry_image_ids", ())
+        if isinstance(image_id, int)
+    }
+    gantry_target_ids = (
+        {
+            target.image_id
+            for target in grid_run.targets
+            if target.reason == "gantry" and target.image_id is not None
+        }
+        if grid_run is not None
+        else set()
+    )
+    gantry_images = (
+        [image for image in grid_run.images if image.id in gantry_ids]
+        if grid_run is not None
+        else []
+    )
+    gantry_entry = quote(settings.selected_config_entry_id or "")
+    gantry_cards = (
+        "".join(
+            (
+                "<figure>"
+                f'<img loading=lazy src="api/vision/image/{image.id}.jpg?entry_id={gantry_entry}" '
+                f'alt="Gantry classifier photo {image.id}">'
+                "<figcaption>"
+                f"<b>Image #{image.id}</b><br>"
+                f"X {image.meta.x:.1f}, Y {image.meta.y:.1f}, Z {image.meta.z:.1f} mm<br>"
+                + (
+                    "<span class=gantry-target>Interior repair target</span>"
+                    if image.id in gantry_target_ids
+                    else "<span class=muted>Perimeter positive — ignored for repair</span>"
+                )
+                + "</figcaption></figure>"
+            )
+            for image in gantry_images
+        )
+        or "<p>No images in the latest grid were classified as gantry photos.</p>"
+    )
+    gantry_debug_disabled = " disabled" if not gantry_images else ""
 
     def _dims(value: object) -> str:
         if isinstance(value, list) and len(value) == 2 and value[0] is not None:
@@ -1399,6 +1628,7 @@ It affects automatic changes only; every result remains manually reviewable.</p>
 <button>Save</button></form>
 <form method=post action="grid-repair/run"><button{repair_disabled}>Repair now</button></form>
 <form method=post action="grid-repair/recheck"><button>Recheck grid</button></form>
+<button id=gantry-debug-open type=button{gantry_debug_disabled}>View gantry photos ({len(gantry_images)})</button>
 <small class=action-message>{repair_message}</small></section>
 <section class=card><h2>Analysis</h2><p><span id=queue-count>{len(jobs.queued_image_ids)}</span> queued</p>
 <div class=button-row><form method=post action="analyse"><button>Analyse queue</button></form>
@@ -1461,7 +1691,13 @@ It affects automatic changes only; every result remains manually reviewable.</p>
 <p id=queue-message class=muted></p><table><thead><tr><th>Select</th><th>Coordinates (x, y, z)</th>
 <th>Plants present</th><th>Date taken</th></tr></thead><tbody id=queue-image-rows></tbody></table>
 <div class=button-row><button id=queue-add type=button>Add selected images to queue</button></div>
-</figure></div><script>{_DASHBOARD_JS}</script>"""
+</figure></div>
+<div id=gantry-modal class=overlay-modal hidden role=dialog aria-modal=true aria-label="Gantry classifier debug photos">
+<figure><button id=gantry-close class=modal-close type=button aria-label=Close>&times;</button>
+<h2>Gantry classifier debug</h2>
+<p class=muted>Every positive from the latest photo batch is shown. Perimeter positives are displayed for diagnosis but are not repair targets.</p>
+<div class=gantry-gallery>{gantry_cards}</div>
+</figure></div><script>{_DASHBOARD_JS}</script>"""  # noqa: S608 - HTML template
     return layout(request, body)
 
 

@@ -134,10 +134,15 @@ def detect_latest_grid_run(
                 image = cells.get((x, y))
                 if image is None:
                     targets.append(RepairTarget(x, y, typical_z, "missing"))
-                # Gantry hardware is expected in photos along the two Y edges
-                # of the bed. It is only evidence of a misplaced frame when it
-                # appears in an interior row.
-                elif image.id in gantry_image_ids and y not in {ys[0], ys[-1]}:
+                # Metal garden-bed edging is easily mistaken for the gantry in
+                # perimeter photos. Only a positive in a fully interior cell
+                # is repair evidence; all classifier positives remain
+                # available to the dashboard's debug viewer.
+                elif (
+                    image.id in gantry_image_ids
+                    and x not in {xs[0], xs[-1]}
+                    and y not in {ys[0], ys[-1]}
+                ):
                     targets.append(RepairTarget(x, y, image.meta.z, "gantry", image.id))
         return GridRun(
             started_at=min(item.created_at for item in cluster),
@@ -169,8 +174,8 @@ def looks_like_gantry_photo(jpeg: bytes, name: str | None = None) -> bool:
         height, width = frame.shape[:2]
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    bright = ((hsv[:, :, 1] < 95) & (hsv[:, :, 2] > 135)).astype(np.uint8)
-    candidates = np.flatnonzero(bright.mean(axis=0) > 0.62)
+    bright = ((hsv[:, :, 1] < 70) & (hsv[:, :, 2] > 155)).astype(np.uint8)
+    candidates = np.flatnonzero(bright.mean(axis=0) > 0.75)
     if not len(candidates):
         return False
     minimum_width = max(6, round(width * 0.018))
@@ -186,7 +191,8 @@ def looks_like_gantry_photo(jpeg: bytes, name: str | None = None) -> bool:
         right_edge = np.abs(
             gray[:, right].astype(np.int16) - gray[:, right + margin].astype(np.int16)
         )
-        if (left_edge > 24).mean() > 0.45 and (right_edge > 24).mean() > 0.45:
+        strip = bright[:, left : right + 1]
+        if strip.mean() > 0.8 and (left_edge > 24).mean() > 0.6 and (right_edge > 24).mean() > 0.6:
             return True
     return False
 

@@ -1,5 +1,23 @@
 # Changelog
 
+## 2.0.3 - 2026-07-27
+
+- Replaced twelve-image repair batches with a background, one-cell-at-a-time
+  queue. Each next cell is submitted only after the companion integration has
+  verified a newly processed image at the previous target coordinates.
+- Repairs now remain queued while FarmBot is busy and automatically continue
+  after ordinary tasks, Home Assistant interruptions, or retryable camera
+  failures.
+- Added a gantry-classifier debug viewer showing every positive photo with its
+  X/Y/Z coordinates and whether it is an interior repair target or an ignored
+  perimeter positive.
+- Reduced gantry false positives by requiring a brighter, more continuous
+  low-saturation rail with stronger parallel edges. Positives on any outer
+  row or column are treated as garden-bed edging and excluded from repair.
+- Now requires companion integration 2.0.1 and its
+  `verified_photo_grid_repair` capability so an older unverified repair
+  implementation cannot silently reproduce stale-position photos.
+
 ## 2.0.2 - 2026-07-27
 
 - Fixed photo-grid repair always failing with a bare HTTP 400 on any grid with
