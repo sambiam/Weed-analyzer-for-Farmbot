@@ -1,5 +1,10 @@
 # Changelog
 
+## 2.1.1 - 2026-07-27
+
+- Fixed bulk clearing of weeds to properly handle multiple selections and update
+  state correctly.
+
 ## 2.1.0 - 2026-07-27
 
 - Fixed photo-grid repair endlessly re-photographing the same cells. A repair
