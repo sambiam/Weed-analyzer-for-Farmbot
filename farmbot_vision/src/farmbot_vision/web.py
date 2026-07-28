@@ -868,8 +868,19 @@ _DASHBOARD_JS = r"""
   const weedImageCounter=document.getElementById('weed-modal-image-counter');
   const weedWithoutOverlay=document.getElementById('weed-modal-without-overlay');
   const weedWithOverlay=document.getElementById('weed-modal-with-overlay');
+  const weedCloseUp=document.getElementById('weed-modal-closeup');
+  const weedImageWrap=document.getElementById('weed-image-wrap');
+  const weedLegend=document.getElementById('weed-modal-legend');
+  const weedZoomRow=document.getElementById('weed-modal-zoom');
+  const weedZoom=document.getElementById('weed-modal-zoom-level');
+  const weedZoomValue=document.getElementById('weed-modal-zoom-value');
+  const weedUnknown=document.getElementById('weed-modal-unknown');
+  const weedActionButtons=[weedAccept,weedAcceptAll,weedUnknown,...weedRejectButtons];
   let weedData=null, weedReturnFocus=null, weedViewers=[], weedImageGroups=[];
   let weedIndex=0, weedImageIndex=0;
+  /* Kept across navigation so a reviewer who chose close-up (or the overlay)
+     stays in that view while working through a run of detections. */
+  let weedViewMode='clean';
   function parseWeedViewer(viewer){
     try{return JSON.parse(viewer.dataset.weed||'null');}catch(_){return null;}
   }
@@ -895,25 +906,110 @@ _DASHBOARD_JS = r"""
     weedPreviousImage.disabled=weedImageIndex<=0;
     weedNextImage.disabled=weedImageIndex<0||weedImageIndex>=weedImageGroups.length-1;
   }
-  function showWeedView(withOverlay){
+  function setWeedMessage(text,isError){
+    weedMessage.textContent=text||'';
+    weedMessage.classList.toggle('notice',Boolean(text)&&!isError);
+  }
+  function hasWeedGeometry(data){
+    return Boolean(data&&data.x!=null&&data.y!=null&&data.width&&data.height);
+  }
+  function canCloseUp(data){
+    /* A close-up needs both the pixel geometry to centre on and a clean image
+       to crop: zooming the overlay would only magnify the circles. */
+    return hasWeedGeometry(data)&&Boolean(data.reviewArtifact);
+  }
+  function applyCloseUp(){
+    /* Percentage translations resolve against the image's own box, so the
+       framing stays correct once the image finishes loading and whenever the
+       dialog is resized -- no pixel measurements needed. */
+    const zoom=Number(weedZoom.value)||5;
+    const px=weedData.x/weedData.width, py=weedData.y/weedData.height;
+    const limit=1-1/zoom;
+    const tx=Math.min(0,Math.max(-limit,0.5/zoom-px));
+    const ty=Math.min(0,Math.max(-limit,0.5/zoom-py));
+    weedImg.style.transform='scale('+zoom+') translate('+(tx*100)+'%,'+(ty*100)+'%)';
+    weedZoomValue.textContent=zoom+'×';
+  }
+  function showWeedView(mode){
     if(!weedData) return;
+    /* Remember what was asked for, not what this particular detection can
+       show: an older weed with no clean image must not silently drop every
+       later weed out of close-up. */
+    weedViewMode=mode;
     const noCleanImage=!weedData.reviewArtifact;
-    const useOverlay=withOverlay||noCleanImage;
-    weedImg.src=useOverlay?weedData.overlayArtifact:weedData.reviewArtifact;
-    weedWithoutOverlay.setAttribute('aria-pressed',String(!useOverlay));
-    weedWithOverlay.setAttribute('aria-pressed',String(useOverlay));
-    weedMessage.textContent=(!withOverlay&&noCleanImage)
-      ?'No image without the overlay was saved for this older detection; showing the analysis overlay instead.'
-      :'';
+    if(mode==='closeup'&&!canCloseUp(weedData)) mode='clean';
+    if(mode==='clean'&&noCleanImage) mode='overlay';
+    const closeUp=mode==='closeup';
+    weedImg.src=mode==='overlay'?weedData.overlayArtifact:weedData.reviewArtifact;
+    weedWithoutOverlay.setAttribute('aria-pressed',String(mode==='clean'));
+    weedWithOverlay.setAttribute('aria-pressed',String(mode==='overlay'));
+    weedCloseUp.setAttribute('aria-pressed',String(closeUp));
+    weedCloseUp.disabled=!canCloseUp(weedData);
+    weedImageWrap.classList.toggle('closeup',closeUp);
+    weedZoomRow.hidden=!closeUp;
+    if(closeUp) applyCloseUp(); else weedImg.style.transform='';
+    /* The marker ring is the "which one is it" cue on the wide shot; in the
+       close-up the weed already fills the frame, so the ring would only hide it. */
+    weedMarker.hidden=closeUp||!hasWeedGeometry(weedData);
+    weedLegend.textContent=closeUp
+      ?'Close-up of the detected weed on the original image, without any marker or overlay.'
+      :'Blue circle = the weed being reviewed; red circles = other detected weeds in this image.';
+    setWeedMessage(
+      (weedViewMode!=='overlay'&&noCleanImage)
+        ?'No image without the overlay was saved for this older detection; showing the analysis overlay instead.'
+        :'',
+      true
+    );
   }
   function closeWeedModal(){
-    weedModal.hidden=true; weedImg.removeAttribute('src'); weedData=null;
+    weedModal.hidden=true; weedImg.removeAttribute('src'); weedImg.style.transform='';
+    weedImageWrap.classList.remove('closeup'); weedZoomRow.hidden=true; weedData=null;
     if(weedReturnFocus) weedReturnFocus.focus();
+  }
+  function showWeedEmptyState(){
+    /* The dialog only closes when the reviewer says so, so an exhausted queue
+       becomes an empty state rather than a dialog that vanishes under them. */
+    weedData=null;
+    weedImg.removeAttribute('src'); weedImg.style.transform='';
+    weedImageWrap.classList.remove('closeup'); weedZoomRow.hidden=true;
+    weedMarker.hidden=true;
+    weedDetails.textContent='Every weed recommendation has been reviewed.';
+    weedLegend.textContent='';
+    weedCounter.textContent='0 / 0'; weedImageCounter.textContent='0 / 0';
+    [weedPrevious,weedNext,weedPreviousImage,weedNextImage].forEach(function(button){
+      button.disabled=true;
+    });
+    weedActionButtons.forEach(function(button){button.disabled=true;});
+    [weedWithoutOverlay,weedWithOverlay,weedCloseUp].forEach(function(button){
+      button.disabled=true;
+    });
+    setWeedMessage('Nothing left to review. Close this dialog when you are ready.',false);
+    weedModal.querySelector('.modal-close').focus();
+  }
+  function advanceAfterReview(){
+    /* The reviewed row is already gone from the table, so rebuilding the
+       groups from the DOM reflows the indices for us: the next weed in this
+       image lands on the current index, and if the image emptied out, the
+       next image slides into the current image index. */
+    const imageId=weedData?String(weedData.imageId):null;
+    const previousWeedIndex=weedIndex, previousImageIndex=weedImageIndex;
+    refreshWeedNavigation();
+    const sameImage=weedImageGroups.find(function(group){
+      const data=parseWeedViewer(group[0]);
+      return data&&String(data.imageId)===imageId;
+    });
+    const target=sameImage
+      ? sameImage[Math.min(previousWeedIndex,sameImage.length-1)]
+      : (weedImageGroups[previousImageIndex]||weedImageGroups[previousImageIndex-1]||[])[0];
+    if(!target){showWeedEmptyState(); return;}
+    openWeedModal(parseWeedViewer(target),weedReturnFocus,true);
   }
   function openWeedModal(data,trigger,keepFocus){
     weedData=data;
     if(!keepFocus) weedReturnFocus=trigger;
-    weedMessage.textContent='';
+    setWeedMessage('',true);
+    weedActionButtons.forEach(function(button){button.disabled=false;});
+    [weedWithoutOverlay,weedWithOverlay].forEach(function(button){button.disabled=false;});
     refreshWeedNavigation();
     weedImageIndex=weedImageGroups.findIndex(function(group){
       return group.some(function(viewer){
@@ -927,54 +1023,65 @@ _DASHBOARD_JS = r"""
       const viewerData=parseWeedViewer(viewer);
       return viewerData&&String(viewerData.detectionId)===String(data.detectionId);
     }));
-    showWeedView(false);
-    if(data.x!=null&&data.y!=null&&data.width&&data.height){
+    if(hasWeedGeometry(data)){
       weedMarker.style.left=(data.x/data.width*100)+'%';
       weedMarker.style.top=(data.y/data.height*100)+'%';
-      weedMarker.hidden=false;
-    } else weedMarker.hidden=true;
+    }
+    showWeedView(weedViewMode);
     const others=Math.max(0,(data.siblings||[]).length-1);
     weedDetails.textContent='Area '+data.areaMm2.toFixed(1)+' mm² · confidence '+data.confidence.toFixed(2)
       +' · '+(data.observations||1)+' independent look(s)'
       +(data.verifierConfidence!=null?(' · verifier '+data.verifierConfidence.toFixed(2)):'')
       +(others?(' · '+others+' other weed(s) in this image'):'');
     updateWeedNavigation();
-    weedModal.hidden=false; weedModal.querySelector('.modal-close').focus();
+    /* Only grab focus when the dialog first appears. Advancing after a label
+       must leave focus on the button that was pressed, so the reviewer can
+       keep pressing Enter -- and never lands on Close by surprise. */
+    const wasHidden=weedModal.hidden;
+    weedModal.hidden=false;
+    if(wasHidden) weedModal.querySelector('.modal-close').focus();
   }
   async function postWeedAction(id,action){
     try{
       const response=await fetch('weeds/'+id+'/'+action,{method:'POST',headers:{Accept:'application/json'}});
       const result=await response.json().catch(function(){return {};});
-      const ok=response.ok&&(result.status==='applied'||result.status==='rejected');
+      const ok=response.ok&&(result.status==='applied'||result.status==='rejected'
+        ||result.status==='dismissed');
       if(ok){const row=document.getElementById('weed-'+id); if(row) row.remove();}
       return {ok:ok,result:result};
     }catch(error){return {ok:false,result:{message:'Request failed: '+error.message}};}
   }
-  weedAccept.addEventListener('click',async function(){
+  async function reviewCurrentWeed(button,action,failureMessage){
     if(!weedData) return;
-    weedAccept.disabled=true;
+    button.disabled=true;
+    let advanced=false;
     try{
-      const result=await postWeedAction(weedData.detectionId,'approve');
-      if(result.ok) closeWeedModal();
-      else weedMessage.textContent=result.result.message||'Could not accept weed';
-    }finally{weedAccept.disabled=false;}
+      const result=await postWeedAction(weedData.detectionId,action);
+      /* Advance rather than close: reviewing a long list should not cost a
+         dialog dismissal and a fresh "View" click for every single weed. */
+      if(result.ok){advanced=true; advanceAfterReview();}
+      else setWeedMessage(result.result.message||failureMessage,true);
+    }finally{
+      /* advanceAfterReview() owns the button state from here -- re-enabled for
+         the next weed, or left disabled once the queue is empty. */
+      if(!advanced) button.disabled=false;
+    }
+  }
+  weedAccept.addEventListener('click',function(){
+    reviewCurrentWeed(weedAccept,'approve','Could not accept weed');
+  });
+  weedUnknown.addEventListener('click',function(){
+    reviewCurrentWeed(weedUnknown,'dismiss','Could not discard weed');
   });
   weedRejectButtons.forEach(function(button){
-    button.addEventListener('click',async function(){
-      if(!weedData) return;
-      button.disabled=true;
-      try{
-        const result=await postWeedAction(
-          weedData.detectionId,'label/'+button.dataset.weedLabel
-        );
-        if(result.ok) closeWeedModal();
-        else weedMessage.textContent=result.result.message||'Could not reject weed';
-      }finally{button.disabled=false;}
+    button.addEventListener('click',function(){
+      reviewCurrentWeed(button,'label/'+button.dataset.weedLabel,'Could not reject weed');
     });
   });
   weedAcceptAll.addEventListener('click',async function(){
     if(!weedData) return;
     weedAcceptAll.disabled=true;
+    let advanced=false;
     try{
       refreshWeedNavigation();
       const ids=weedViewers.map(function(viewer){
@@ -993,14 +1100,14 @@ _DASHBOARD_JS = r"""
         acceptedIds.forEach(function(id){
           const row=document.getElementById('weed-'+id); if(row) row.remove();
         });
-        if(!failedIds.length) closeWeedModal();
+        if(!failedIds.length){advanced=true; advanceAfterReview();}
         else{
           refreshWeedNavigation(); updateWeedNavigation();
-          weedMessage.textContent=failedIds.length+' weed(s) could not be accepted: '
-            +(result.message||'check the individual detections');
+          setWeedMessage(failedIds.length+' weed(s) could not be accepted: '
+            +(result.message||'check the individual detections'),true);
         }
-      }else weedMessage.textContent=result.message||'Could not accept weeds';
-    }finally{weedAcceptAll.disabled=false;}
+      }else setWeedMessage(result.message||'Could not accept weeds',true);
+    }finally{if(!advanced) weedAcceptAll.disabled=false;}
   });
   weedPrevious.addEventListener('click',function(){
     const group=weedImageGroups[weedImageIndex]||[], target=group[weedIndex-1];
@@ -1018,8 +1125,10 @@ _DASHBOARD_JS = r"""
     const target=weedImageGroups[weedImageIndex+1];
     if(target&&target.length) openWeedModal(parseWeedViewer(target[0]),weedReturnFocus,true);
   });
-  weedWithoutOverlay.addEventListener('click',function(){showWeedView(false);});
-  weedWithOverlay.addEventListener('click',function(){showWeedView(true);});
+  weedWithoutOverlay.addEventListener('click',function(){showWeedView('clean');});
+  weedWithOverlay.addEventListener('click',function(){showWeedView('overlay');});
+  weedCloseUp.addEventListener('click',function(){showWeedView('closeup');});
+  weedZoom.addEventListener('input',function(){if(weedData&&weedViewMode==='closeup') applyCloseUp();});
   document.getElementById('weed-modal-close').addEventListener('click',closeWeedModal);
   weedModal.addEventListener('click',function(event){if(event.target===weedModal) closeWeedModal();});
   plantWithoutOverlay.addEventListener('click',function(){showPlantComposite(false);});
@@ -1456,7 +1565,7 @@ body{{font:15px system-ui;margin:0;background:#f3f7f4;color:var(--dark)}}header{
 main{{max-width:1100px;margin:auto;padding:1.2rem}}nav a{{color:white;margin-right:1rem}}.grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:1rem}}
 .card{{background:white;border-radius:10px;padding:1rem;box-shadow:0 1px 4px #0002;overflow:auto}}table{{width:100%;border-collapse:collapse}}td,th{{padding:.5rem;text-align:left;border-bottom:1px solid #ddd}}
 button{{background:var(--green);border:0;border-radius:6px;padding:.65rem 1rem;cursor:pointer}}.warn{{color:#9b4b00}}.muted{{color:var(--muted)}}input,select{{padding:.5rem;max-width:100%}}img{{max-width:100%}}
-.action-message{{display:block;color:#a40000;max-width:24rem}}.overlay-modal[hidden]{{display:none}}
+.action-message{{display:block;color:#a40000;max-width:24rem}}.action-message.notice{{color:var(--muted)}}.overlay-modal[hidden]{{display:none}}
 .overlay-modal{{position:fixed;inset:0;z-index:1000;background:#000b;display:flex;align-items:center;justify-content:center;padding:1rem}}
 .overlay-modal figure{{position:relative;background:white;border-radius:10px;margin:0;padding:1rem;max-width:min(95vw,1000px);max-height:95vh;overflow:auto}}
 .overlay-modal img{{display:block;max-height:70vh;margin:auto}}.modal-close{{position:absolute;right:.5rem;top:.5rem;font-size:1.5rem}}
@@ -1472,6 +1581,10 @@ button.clear-button{{background:#a40000;color:white}}
 .weed-dialog{{width:min(95vw,900px)}}.weed-navigation{{justify-content:space-between}}
 .weed-actions fieldset{{border:1px solid #d5ded8;border-radius:6px;margin-top:.7rem}}
 .weed-image-wrap{{position:relative;display:inline-block;margin:auto}}
+.weed-image-wrap.closeup{{overflow:hidden;background:#111}}
+.weed-image-wrap.closeup img{{transform-origin:0 0;image-rendering:auto}}
+.weed-zoom[hidden]{{display:none}}.weed-zoom input[type=range]{{flex:1;max-width:16rem}}
+button.unknown-button{{background:#e4ede7;color:var(--dark);box-shadow:inset 0 0 0 1px #b6c6bb}}
 .weed-marker{{position:absolute;width:34px;height:34px;margin-left:-17px;margin-top:-17px;pointer-events:none;
 border-radius:50%;border:3px solid #168cff;box-shadow:0 0 0 1px #001b3d}}
 .weed-view-toggle button[aria-pressed=true]{{background:#1672c4;color:white;box-shadow:inset 0 0 0 2px #0b4779}}
@@ -1934,10 +2047,16 @@ value="{repair_values.delay_minutes}" required> minutes after the photo grid com
 <div class="modal-controls weed-view-toggle" role=group aria-label="Weed image view">
 <button id=weed-modal-without-overlay type=button aria-pressed=true>Without overlay</button>
 <button id=weed-modal-with-overlay type=button aria-pressed=false>With overlay</button>
+<button id=weed-modal-closeup type=button aria-pressed=false>Close-up</button>
 </div>
-<div class=weed-image-wrap><img id=weed-modal-img alt="Weed detection"><div id=weed-modal-marker class=weed-marker hidden></div></div>
+<div class="modal-controls weed-zoom" id=weed-modal-zoom hidden>
+<label for=weed-modal-zoom-level>Zoom</label>
+<input id=weed-modal-zoom-level type=range min=2 max=12 step=1 value=5>
+<span id=weed-modal-zoom-value>5&times;</span>
+</div>
+<div id=weed-image-wrap class=weed-image-wrap><img id=weed-modal-img alt="Weed detection"><div id=weed-modal-marker class=weed-marker hidden></div></div>
 <figcaption id=weed-modal-details></figcaption>
-<p class=legend>Blue circle = the weed being reviewed; red circles = other detected weeds in this image.</p>
+<p id=weed-modal-legend class=legend>Blue circle = the weed being reviewed; red circles = other detected weeds in this image.</p>
 <div class="modal-controls weed-navigation" aria-label="Navigate weeds in this image">
 <button id=weed-modal-prev-weed type=button>Previous weed</button>
 <span>Weed <span id=weed-modal-weed-counter>0 / 0</span></span>
@@ -1950,7 +2069,8 @@ value="{repair_values.delay_minutes}" required> minutes after the photo grid com
 </div>
 <div class="weed-actions">
 <div class=button-row><button id=weed-modal-accept type=button>Accept</button>
-<button id=weed-modal-accept-all type=button>Accept all</button></div>
+<button id=weed-modal-accept-all type=button>Accept all</button>
+<button id=weed-modal-unknown type=button class=unknown-button>Unknown</button></div>
 <fieldset><legend>Reject as</legend><div class=button-row>
 <button type=button data-weed-label=crop>Crop</button>
 <button type=button data-weed-label=mushroom>Mushroom</button>
@@ -1958,6 +2078,9 @@ value="{repair_values.delay_minutes}" required> minutes after the photo grid com
 <button type=button data-weed-label=soil>Soil</button>
 <button type=button data-weed-label=hardware>Hardware</button>
 </div></fieldset>
+<p class=muted><small>Unknown discards an unclear detection without accepting, rejecting,
+or adding it to the verifier's training data. Reviewing keeps the dialog open and moves
+on to the next weed.</small></p>
 </div>
 <small id=weed-modal-message class=action-message></small>
 </figure></div>
@@ -2866,7 +2989,8 @@ async def edit_weed_training_sample(detection_id: UUID, label: str = Form(...)) 
             message += f" and retrained from {model['sample_count']} labels"
         except ValueError:
             message += "; retraining will start when both classes have enough labels"
-    return RedirectResponse(f"../weed-settings?training={quote(message)}", status_code=303)
+    # Two levels up: this route lives at /weed-model/samples/{detection_id}.
+    return RedirectResponse(f"../../weed-settings?training={quote(message)}", status_code=303)
 
 
 def _remove_weed_training_crops(paths: list[str]) -> int:
@@ -2998,6 +3122,25 @@ async def reject_weed(detection_id: UUID) -> JSONResponse:
     )
     await _record_weed_label(detection_id, "soil")
     return JSONResponse({"status": "rejected", "message": "Weed recommendation rejected"})
+
+
+@app.post("/weeds/{detection_id}/dismiss")
+async def dismiss_weed(detection_id: UUID) -> JSONResponse:
+    """Discard an ambiguous detection: neither accepted, rejected, nor labelled.
+
+    Some candidates cannot honestly be called: clipped at the image edge, or
+    only a few pixels across. Forcing a decision would poison the verifier's
+    training set, so nothing is recorded beyond suppressing the position.
+    """
+    detection = database.weed_detection(str(detection_id))
+    if detection is None:
+        raise HTTPException(404, "Weed recommendation not found")
+    database.dismiss_weed_detection(
+        str(detection_id), max(20.0, float(detection["radius_mm"]) * 1.5)
+    )
+    return JSONResponse(
+        {"status": "dismissed", "message": "Weed recommendation discarded as unknown"}
+    )
 
 
 @app.post("/weeds/{detection_id}/label/{label}")

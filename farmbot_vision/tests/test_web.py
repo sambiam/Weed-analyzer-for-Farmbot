@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from datetime import UTC, datetime
 from pathlib import Path
-from urllib.parse import unquote
+from urllib.parse import unquote, urlencode, urljoin, urlsplit
 from uuid import uuid4
 
 import pytest
@@ -585,12 +585,20 @@ async def asgi_request(
     method: str = "GET",
     query_string: bytes = b"",
     headers: list[tuple[bytes, bytes]] | None = None,
+    form: dict[str, str] | None = None,
 ) -> tuple[int, dict[bytes, bytes], bytes]:
     messages: list[dict] = []
     body = bytearray()
+    request_body = urlencode(form).encode() if form is not None else b""
+    request_headers = list(headers or [])
+    if form is not None:
+        request_headers += [
+            (b"content-type", b"application/x-www-form-urlencoded"),
+            (b"content-length", str(len(request_body)).encode()),
+        ]
 
     async def receive() -> dict:
-        return {"type": "http.request", "body": b"", "more_body": False}
+        return {"type": "http.request", "body": request_body, "more_body": False}
 
     async def send(message: dict) -> None:
         messages.append(message)
@@ -607,7 +615,7 @@ async def asgi_request(
         "path": path,
         "raw_path": encoded_path,
         "query_string": query_string,
-        "headers": headers or [],
+        "headers": request_headers,
         "client": ("127.0.0.1", 1234),
         "server": ("testserver", 80),
     }
@@ -933,6 +941,75 @@ async def test_dashboard_modal_uses_artifact_manifest_and_pending_rows(tmp_path,
 
 
 @pytest.mark.asyncio
+async def test_dashboard_weed_modal_offers_unknown_and_close_up_controls(tmp_path, monkeypatch):
+    artifact_dir = tmp_path / "artifacts"
+    artifact_dir.mkdir()
+    overlay = artifact_dir / "closeup-overlay.jpg"
+    overlay.write_bytes(b"overlay")
+    web.database.save_weed_detection(
+        detection_id=str(uuid4()),
+        config_entry_id="dashboard-bot",
+        image_id=7,
+        image_timestamp=datetime.now(UTC),
+        x=10,
+        y=20,
+        z=0,
+        area_mm2=80,
+        radius_mm=15,
+        confidence=0.9,
+        overlay_path=str(overlay),
+        review_path=str(overlay),
+    )
+    monkeypatch.setattr(web.settings, "data_dir", tmp_path)
+
+    status, _, body = await asgi_request("/")
+    html = body.decode()
+
+    assert status == 200
+    assert "id=weed-modal-unknown" in html
+    assert "id=weed-modal-closeup" in html
+    assert "id=weed-modal-zoom-level" in html
+
+
+@pytest.mark.asyncio
+async def test_dismiss_weed_suppresses_position_without_recording_a_label():
+    detection_id = str(uuid4())
+    web.database.save_weed_detection(
+        detection_id=detection_id,
+        config_entry_id="unknown-bot",
+        image_id=11,
+        image_timestamp=datetime.now(UTC),
+        x=100,
+        y=200,
+        z=0,
+        area_mm2=60,
+        radius_mm=14,
+        confidence=0.8,
+        overlay_path=None,
+    )
+
+    status, _, body = await asgi_request(f"/weeds/{detection_id}/dismiss", method="POST")
+
+    assert status == 200
+    assert json.loads(body)["status"] == "dismissed"
+    # Neither accepted nor rejected: it leaves the queue, teaches the verifier
+    # nothing, and never comes back at the same position.
+    assert web.database.weed_detection(detection_id)["status"] == "dismissed"
+    assert detection_id not in {
+        row["detection_id"] for row in web.database.pending_weed_detections()
+    }
+    assert web.database.weed_training_samples() == []
+    assert web.database.has_terminal_weed_detection_near("unknown-bot", 100, 200, 20) is True
+
+
+@pytest.mark.asyncio
+async def test_dismiss_weed_rejects_an_unknown_detection():
+    status, _, _ = await asgi_request(f"/weeds/{uuid4()}/dismiss", method="POST")
+
+    assert status == 404
+
+
+@pytest.mark.asyncio
 async def test_weed_settings_page_exposes_pipeline_training_and_automation_controls():
     status, _, body = await asgi_request("/weed-settings")
     html = body.decode()
@@ -946,6 +1023,48 @@ async def test_weed_settings_page_exposes_pipeline_training_and_automation_contr
     assert 'action="weed-model/train"' in html
     assert 'action="weed-model/clear"' in html
     assert "Clear all training images" in html
+
+
+@pytest.mark.asyncio
+async def test_editing_a_training_tag_saves_and_redirects_back_to_the_settings_page(monkeypatch):
+    """The nested sample route needs two levels up, or the redirect 404s."""
+    detection_id = str(uuid4())
+    web.database.save_weed_detection(
+        detection_id=detection_id,
+        config_entry_id="tag-bot",
+        image_id=7,
+        image_timestamp=datetime.now(UTC),
+        x=10,
+        y=20,
+        z=0,
+        area_mm2=80,
+        radius_mm=15,
+        confidence=0.9,
+        overlay_path=None,
+    )
+    assert web.database.label_weed_detection(detection_id, "weed")
+    manual = web.weed_settings_store.load().model_copy(update={"automatic_retraining": False})
+    monkeypatch.setattr(web.weed_settings_store, "load", lambda: manual)
+
+    status, headers, _ = await asgi_request(
+        f"/weed-model/samples/{detection_id}",
+        method="POST",
+        form={"label": "mulch_soil"},
+    )
+
+    assert status == 303
+    location = headers[b"location"].decode()
+    assert location.split("?")[0] == "../../weed-settings"
+    assert "Updated training tag to mulch/soil" in unquote(location)
+
+    # The redirect target must resolve to the settings page, not /weed-model/....
+    resolved = urljoin(f"http://testserver/weed-model/samples/{detection_id}", location)
+    assert urlsplit(resolved).path == "/weed-settings"
+
+    labels = {
+        sample["detection_id"]: sample["label"] for sample in web.database.weed_training_samples()
+    }
+    assert labels[detection_id] == "mulch_soil"
 
 
 @pytest.mark.asyncio

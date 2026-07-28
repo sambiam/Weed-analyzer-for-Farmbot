@@ -36,6 +36,10 @@ MIN_COMPONENT_AREA_MM2 = 12.0  # noise floor at 1 px/mm -> 12 px
 IRRIGATION_AREA_FACTOR = 20.0  # long thin components above this are rejected
 MORPH_OPEN_MM = 3.0
 MORPH_CLOSE_MM = 5.0
+# Weed leaves and thin stems often separate during colour segmentation even
+# though they belong to one plant. Group nearby vegetation over this physical
+# gap while retaining only the original vegetation pixels for area/features.
+WEED_GROUP_MAX_GAP_MM = 12.0
 
 
 class InvalidImageError(ValueError):
@@ -179,6 +183,20 @@ def _valid_component(stats: np.ndarray, label: int, params: ScaleParams) -> bool
     return params.min_area <= area <= params.max_area and not (
         aspect > 9 and area > params.irrigation_area
     )
+
+
+def _nearby_component_labels(binary: np.ndarray, max_gap_px: float) -> tuple[int, np.ndarray]:
+    """Label foreground islands as one object when their edges are nearby.
+
+    Labels are calculated on a dilated support mask, but callers select pixels
+    from the original binary mask. The joining pixels therefore affect only
+    grouping, never measured weed area, colour, shape, or the review crop.
+    """
+    radius = max(1, round(max_gap_px / 2))
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (radius * 2 + 1, radius * 2 + 1))
+    support = cv2.dilate((binary > 0).astype(np.uint8), kernel)
+    count, labels = cv2.connectedComponents(support, 8)
+    return count, labels
 
 
 def _circle_visible_fraction(
@@ -814,17 +832,41 @@ class ClassicalVisionEngine(ImageAnalysisEngine):
                         (prior == 0).astype(np.uint8), cv2.DIST_L2, 5
                     )
                     exclusion[distance_from_prior <= prior_margin_px] = 255
-            candidate_mask = ((mask > 0) & ~claimed & (exclusion == 0)).astype(np.uint8) * 255
-            count, candidate_labels, candidate_stats, candidate_centroids = (
-                cv2.connectedComponentsWithStats(candidate_mask, 8)
+            group_gap_px = WEED_GROUP_MAX_GAP_MM * params.mean_ppm
+
+            # Protect a complete vegetation cluster when any part of it belongs
+            # to a crop or crosses a known crop's exclusion area. Previously
+            # the circular exclusion cut through outer leaves and the remaining
+            # leaf tips were emitted as separate weeds.
+            vegetation = (mask > 0).astype(np.uint8) * 255
+            _, vegetation_groups = _nearby_component_labels(vegetation, group_gap_px)
+            crop_anchor = (mask > 0) & (claimed | (exclusion > 0))
+            crop_group_ids = np.unique(vegetation_groups[crop_anchor])
+            crop_group_ids = crop_group_ids[crop_group_ids > 0]
+            crop_supported = (
+                np.isin(vegetation_groups, crop_group_ids)
+                if len(crop_group_ids)
+                else np.zeros_like(claimed)
             )
+            candidate_mask = ((mask > 0) & ~claimed & (exclusion == 0) & ~crop_supported).astype(
+                np.uint8
+            ) * 255
+
+            # Label on a proximity-expanded support mask so the leaves and
+            # stem fragments of one continuous weed produce one detection.
+            count, candidate_labels = _nearby_component_labels(candidate_mask, group_gap_px)
             area_scale = calibration.pixels_per_mm_x * calibration.pixels_per_mm_y
             owned_seed_indices = [
                 index for index in range(len(seeds)) if np.any(ownership == index + 1)
             ]
             for label in range(1, count):
-                area_mm2 = float(candidate_stats[label, cv2.CC_STAT_AREA] / area_scale)
-                wx, wy = candidate_centroids[label]
+                component = (candidate_mask > 0) & (candidate_labels == label)
+                ys, xs = np.where(component)
+                if not len(xs):
+                    continue
+                area_mm2 = float(len(xs) / area_scale)
+                points = np.column_stack((xs, ys)).astype(np.float32).reshape(-1, 1, 2)
+                (wx, wy), _ = cv2.minEnclosingCircle(points)
                 supported_seed = None
                 supported_distance = math.inf
                 for seed_index in owned_seed_indices:
@@ -857,7 +899,6 @@ class ClassicalVisionEngine(ImageAnalysisEngine):
                     weed_settings.minimum_area_mm2 <= area_mm2 <= weed_settings.maximum_area_mm2
                 ):
                     continue
-                component = candidate_labels == label
                 features = extract_visual_features(
                     image,
                     component,
@@ -912,6 +953,14 @@ class ClassicalVisionEngine(ImageAnalysisEngine):
                         continue
                 if confidence < weed_settings.minimum_confidence:
                     continue
+                component_radius_mm = float(
+                    np.max(
+                        np.sqrt(
+                            ((xs - wx) / calibration.pixels_per_mm_x) ** 2
+                            + ((ys - wy) / calibration.pixels_per_mm_y) ** 2
+                        )
+                    )
+                )
                 weed_detections.append(
                     WeedDetection(
                         detection_id=uuid4(),
@@ -919,7 +968,7 @@ class ClassicalVisionEngine(ImageAnalysisEngine):
                         image_timestamp=image_timestamp,
                         center_px=(float(wx), float(wy)),
                         area_mm2=area_mm2,
-                        radius_mm=max(weed_settings.weed_radius_mm, math.sqrt(area_mm2 / math.pi)),
+                        radius_mm=max(weed_settings.weed_radius_mm, component_radius_mm),
                         confidence=confidence,
                         heuristic_confidence=heuristic_confidence,
                         verifier_confidence=verifier_confidence,
@@ -931,11 +980,11 @@ class ClassicalVisionEngine(ImageAnalysisEngine):
                         ),
                     )
                 )
-                # Circle radius follows the detected blob, not the (larger)
-                # protection radius, with a small margin so the ring clears
-                # the weed's edges rather than tracing them.
+                # Enclose the full grouped weed rather than drawing an
+                # equivalent-area circle around only its densest leaf.
                 weed_radius_px = max(
-                    10, round(math.sqrt(area_mm2 / math.pi) * params.mean_ppm * 1.25)
+                    10,
+                    round(np.max(np.sqrt((xs - wx) ** 2 + (ys - wy) ** 2)) * 1.12),
                 )
                 cv2.circle(
                     overlay,

@@ -65,13 +65,9 @@ def extract_visual_features(
     area_px = float(len(xs))
     component_u8 = component.astype(np.uint8) * 255
     contours, _ = cv2.findContours(component_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    contour = max(contours, key=cv2.contourArea) if contours else None
-    perimeter = float(cv2.arcLength(contour, True)) if contour is not None else 0.0
-    hull_area = (
-        float(cv2.contourArea(cv2.convexHull(contour)))
-        if contour is not None and len(contour) >= 3
-        else 0
-    )
+    perimeter = float(sum(cv2.arcLength(contour, True) for contour in contours))
+    all_points = np.column_stack((xs, ys)).astype(np.int32).reshape(-1, 1, 2)
+    hull_area = float(cv2.contourArea(cv2.convexHull(all_points))) if len(all_points) >= 3 else 0
     hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
     pixels = image[component].astype(np.float32)
     hsv_pixels = hsv[component].astype(np.float32)

@@ -1,5 +1,57 @@
 # Changelog
 
+## 2.2.0 - 2026-07-28
+
+- Weed leaf and stem fragments separated by small segmentation gaps are now
+  grouped into one detection. Its centre and radius enclose the complete
+  grouped weed rather than marking each leaf with a separate small circle.
+- Crop protection now excludes the complete vegetation cluster when part of a
+  leaf crosses a known crop's protection boundary, preventing exposed crop
+  edges from being reported as weeds. As before, weeds overlapping a crop may
+  be conservatively excluded.
+- Added an **Unknown** button to the weed review dialog. Detections clipped by
+  the edge of the frame, or only a few pixels across, often cannot honestly be
+  called either way, but until now the only way to clear one from the
+  recommendations was to accept or reject it — which also fed a guess into the
+  visual verifier's training data. Unknown discards the detection instead: it
+  is neither accepted nor rejected, no training label is recorded, and the
+  position is suppressed so the same ambiguous candidate is not offered again.
+- Reviewing a weed no longer closes the dialog. Choosing a label now advances
+  to the next weed in the same image, then to the next image, then back to the
+  previous image — so a queue can be worked through without clicking **View**
+  again for every detection. The dialog closes only on Close, Escape, or a
+  click outside it, and shows an empty state once nothing is left to review.
+  Focus stays on the button that was pressed, so the same key can be used
+  repeatedly on a run of similar detections.
+- Added a **Close-up** view alongside *Without overlay* and *With overlay*,
+  showing the weed magnified on the original photo with no marker ring or
+  analysis overlay drawn over it, plus a zoom slider (2×–12×). The chosen view
+  persists as the review advances from one weed to the next.
+
+## 2.1.3 - 2026-07-28
+
+- Fixed consolidated recommendations showing the same unrecognisable picture
+  for every plant. The composite stitched *every* analysed photo, including the
+  ones where the plant's protection circle was entirely outside the frame —
+  those views hold no pixels of the plant and only stretched the canvas across
+  the whole photo grid, so each plant ended up with a near-identical
+  garden-wide mosaic in which it was an invisible speck. Composites now use
+  only the photos that actually saw the plant and are cropped to its
+  neighbourhood, so each recommendation shows that plant filling the frame with
+  its current and recommended radii drawn on top.
+- The consolidation note no longer counts photos that never contained the
+  plant, so "Consolidated from 5 images" now reads, for example, "Consolidated
+  from 2 of 5 images (3 did not show the plant)".
+
+## 2.1.2 - 2026-07-28
+
+- Fixed "Save tag" on the verifier's labeled training images returning
+  `{"detail":"Not Found"}`. The new tag was written to the database, but the
+  route at `/weed-model/samples/{detection_id}` redirected one directory level
+  up instead of two, landing on `/weed-model/weed-settings` — which does not
+  exist. It now redirects back to the weed settings page and shows the
+  confirmation notice.
+
 ## 2.1.1 - 2026-07-27
 
 - Fixed bulk clearing of weeds to properly handle multiple selections and update

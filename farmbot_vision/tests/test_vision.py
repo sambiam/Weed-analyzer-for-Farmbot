@@ -145,6 +145,98 @@ def test_unowned_component_becomes_weed_only_when_enabled(seed, calibration):
     assert result.weed_review_jpeg is not None
 
 
+def test_nearby_leaf_fragments_become_one_full_weed(seed, calibration):
+    from farmbot_vision.weed_settings import WeedSettings
+
+    result = ClassicalVisionEngine().analyse(
+        jpeg(
+            [
+                ("circle", ((160, 120), 25)),
+                # Four separate segmented leaves belonging to one rosette.
+                ("circle", ((268, 45), 7)),
+                ("circle", ((285, 45), 7)),
+                ("circle", ((276, 30), 7)),
+                ("circle", ((276, 60), 7)),
+            ]
+        ),
+        9,
+        NOW,
+        [seed],
+        calibration,
+        {},
+        WeedSettings(
+            enabled=True,
+            plant_exclusion_margin_mm=10,
+            minimum_area_mm2=25,
+            minimum_confidence=0.65,
+        ),
+    )
+
+    assert len(result.weeds) == 1
+    weed = result.weeds[0]
+    assert weed.area_mm2 > 450
+    assert 270 < weed.center_px[0] < 282
+    assert 40 < weed.center_px[1] < 50
+    assert weed.radius_mm >= 22
+
+
+def test_separate_weeds_beyond_joining_gap_remain_separate(seed, calibration):
+    from farmbot_vision.weed_settings import WeedSettings
+
+    result = ClassicalVisionEngine().analyse(
+        jpeg(
+            [
+                ("circle", ((160, 120), 25)),
+                ("circle", ((250, 35), 8)),
+                ("circle", ((290, 35), 8)),
+            ]
+        ),
+        9,
+        NOW,
+        [seed],
+        calibration,
+        {},
+        WeedSettings(
+            enabled=True,
+            plant_exclusion_margin_mm=10,
+            minimum_area_mm2=25,
+            minimum_confidence=0.65,
+        ),
+    )
+
+    assert len(result.weeds) == 2
+
+
+def test_crop_exclusion_protects_entire_outer_leaf_not_just_circle_interior(seed, calibration):
+    from farmbot_vision.weed_settings import WeedSettings
+
+    result = ClassicalVisionEngine().analyse(
+        jpeg(
+            [
+                ("circle", ((160, 120), 25)),
+                # A segmented crop leaf straddles the circular exclusion
+                # boundary. Its outer edge must not become a tiny weed.
+                ("circle", ((230, 120), 15)),
+            ]
+        ),
+        9,
+        NOW,
+        [seed],
+        calibration,
+        {},
+        WeedSettings(
+            enabled=True,
+            crop_support_radius_multiplier=0.5,
+            crop_support_extra_mm=0,
+            plant_exclusion_margin_mm=40,
+            minimum_area_mm2=12,
+            minimum_confidence=0.65,
+        ),
+    )
+
+    assert result.weeds == []
+
+
 def test_known_neighbouring_plant_is_not_a_weed_but_small_bottom_weed_is(calibration):
     from farmbot_vision.weed_settings import WeedSettings
 

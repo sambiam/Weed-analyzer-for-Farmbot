@@ -707,13 +707,15 @@ class Database:
     ) -> bool:
         for row in self.connection.execute(
             """SELECT x,y,radius_mm,status FROM weed_detections
-            WHERE config_entry_id=? AND status IN ('created','rejected')""",
+            WHERE config_entry_id=? AND status IN ('created','rejected','dismissed')""",
             (config_entry_id,),
         ):
             # A rejection is a position suppression, not just a decision on
             # one UUID. Keep using the rejected detection's radius as a floor
             # so a later, slightly shifted detection cannot be surfaced again.
-            rejected_radius = float(row[2] or 0) * 1.5 if row[3] == "rejected" else 0
+            # "dismissed" (the reviewer could not tell) suppresses the position
+            # the same way, but without asserting the position is not a weed.
+            rejected_radius = float(row[2] or 0) * 1.5 if row[3] in ("rejected", "dismissed") else 0
             if math.hypot(float(row[0]) - x, float(row[1]) - y) <= max(
                 tolerance_mm, 20.0, rejected_radius
             ):
@@ -916,6 +918,46 @@ class Database:
             if target["candidate_track_id"] is not None:
                 self.connection.execute(
                     "UPDATE weed_candidate_tracks SET status='rejected' WHERE id=?",
+                    (target["candidate_track_id"],),
+                )
+        return True
+
+    def dismiss_weed_detection(self, detection_id: str, tolerance_mm: float) -> bool:
+        """Discard an ambiguous detection without judging it either way.
+
+        Mirrors :meth:`reject_weed_detection` as a coordinate-based
+        suppression — detection UUIDs change on every analysis, so the row is
+        kept as a marker rather than deleted — but records no training label
+        and never claims the position is weed-free. The reviewer simply could
+        not tell, so the position stops being offered for review.
+        """
+        target = self.connection.execute(
+            "SELECT config_entry_id,x,y,candidate_track_id FROM weed_detections WHERE detection_id=?",
+            (detection_id,),
+        ).fetchone()
+        if target is None:
+            return False
+        with self.connection:
+            nearby_ids = [
+                row[0]
+                for row in self.connection.execute(
+                    """SELECT detection_id,x,y FROM weed_detections
+                    WHERE config_entry_id=? AND status IN ('recommended','observing','dismissed')""",
+                    (target["config_entry_id"],),
+                )
+                if math.hypot(
+                    float(row[1]) - float(target["x"]),
+                    float(row[2]) - float(target["y"]),
+                )
+                <= tolerance_mm
+            ]
+            self.connection.executemany(
+                "UPDATE weed_detections SET status='dismissed' WHERE detection_id=?",
+                ((nearby_id,) for nearby_id in nearby_ids),
+            )
+            if target["candidate_track_id"] is not None:
+                self.connection.execute(
+                    "UPDATE weed_candidate_tracks SET status='dismissed' WHERE id=?",
                     (target["candidate_track_id"],),
                 )
         return True
@@ -1215,6 +1257,9 @@ class Database:
         representative["artifact_paths"] = paths
         representative["source_measurement_ids"] = [str(row["measurement_id"]) for row in ordered]
         representative["measurement_count"] = len(ordered)
+        # Images that never contained the plant are recorded so it surfaces for
+        # review, but counting them as evidence overstated how much was seen.
+        contributing = sum(1 for row in ordered if float(row.get("visible_fraction") or 0) > 0)
         representative["reason"] = (
             (
                 f"Fused plant ownership masks from {representative['fusion_view_count']} "
@@ -1223,8 +1268,14 @@ class Database:
                 f"{float(representative['fusion_corroborated_fraction']):.0%}"
             )
             if representative.get("fused_canopy")
-            else f"Consolidated from {len(ordered)} images using confidence, visible canopy "
-            "percentage and recency"
+            else (
+                f"Consolidated from {contributing} of {len(ordered)} images "
+                f"({len(ordered) - contributing} did not show the plant) using confidence, "
+                "visible canopy percentage and recency"
+                if contributing < len(ordered)
+                else f"Consolidated from {len(ordered)} images using confidence, visible canopy "
+                "percentage and recency"
+            )
         )
         return representative
 

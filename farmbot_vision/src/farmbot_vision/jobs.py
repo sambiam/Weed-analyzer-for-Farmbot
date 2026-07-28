@@ -67,6 +67,13 @@ def build_plant_composite(
     for item in measurements:
         if not item.source_image_path or not item.plant_center_px:
             continue
+        # Photos where the protection circle never entered the frame hold no
+        # pixels of this plant (vision.py records them only so the plant
+        # surfaces for review). Stitching them anyway stretched the canvas
+        # across the whole photo grid, so every plant's composite came out as
+        # the same garden-wide mosaic with the plant an invisible speck.
+        if item.visible_fraction <= 0:
+            continue
         image = cv2.imread(item.source_image_path, cv2.IMREAD_COLOR)
         if image is None:
             continue
@@ -123,10 +130,28 @@ def build_plant_composite(
         )
     if not frames:
         return False
+    representative = Database._consolidate_measurement_rows(
+        [item.model_dump(mode="json") for item in measurements]
+    )
+    current = float(representative["current_radius_mm"])
+    planned = float(representative["recommended_protection_radius_mm"])
     min_x = min(frame["bounds"][0] for frame in frames)
     max_x = max(frame["bounds"][1] for frame in frames)
     min_y = min(frame["bounds"][2] for frame in frames)
     max_y = max(frame["bounds"][3] for frame in frames)
+    # The stitched frames cover far more garden than this plant. Crop to the
+    # plant's own neighbourhood so it fills the composite and each plant gets a
+    # visibly different picture, keeping enough surroundings to judge the
+    # annotated radii against neighbouring vegetation.
+    focus_mm = max(60.0, max(current, planned) * 2.5)
+    focused = (
+        max(min_x, -focus_mm),
+        min(max_x, focus_mm),
+        max(min_y, -focus_mm),
+        min(max_y, focus_mm),
+    )
+    if focused[1] - focused[0] > 1 and focused[3] - focused[2] > 1:
+        min_x, max_x, min_y, max_y = focused
     ppm = float(np.median([frame["scale"] for frame in frames]))
     ppm = min(ppm, 2400 / max(1.0, max(max_x - min_x, max_y - min_y)))
     canvas_width = max(1, round((max_x - min_x) * ppm))
@@ -177,12 +202,7 @@ def build_plant_composite(
         overlay_canvas[selected].astype(np.float32) * 0.58
         + np.asarray((255, 190, 20), dtype=np.float32) * 0.42
     ).astype(np.uint8)
-    representative = Database._consolidate_measurement_rows(
-        [item.model_dump(mode="json") for item in measurements]
-    )
     center = (round(-min_x * ppm), round(-min_y * ppm))
-    current = float(representative["current_radius_mm"])
-    planned = float(representative["recommended_protection_radius_mm"])
     thickness = max(4, round(min(canvas_width, canvas_height) / 300))
     label = f"original {current:.1f} mm | new {planned:.1f} mm"
 
