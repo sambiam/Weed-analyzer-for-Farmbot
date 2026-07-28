@@ -67,6 +67,15 @@ from .models import (
     VisionImageRequest,
     WeedBulkAcceptRequest,
 )
+from .photo_grid import (
+    PHOTO_GRID_CHUNK_SIZE,
+    PhotoGridFrame,
+    PhotoGridRecord,
+    PhotoGridStore,
+    PhotoGridTarget,
+    match_verified_frames,
+    plan_photo_grid,
+)
 from .settings import Settings
 from .soil_jobs import SoilJobManager
 from .vision import garden_to_pixel
@@ -96,6 +105,7 @@ grid_repair_settings_store = GridRepairSettingsStore(
     settings.data_dir / "grid_repair_settings.json"
 )
 repair_capture_store = RepairCaptureStore(settings.data_dir / "grid_repair_captures.json")
+photo_grid_store = PhotoGridStore(settings.data_dir / "photo_grid_latest.json")
 weed_verifier = WeedVisualVerifier(settings.data_dir / "weed_visual_model.json")
 zone_store = ZoneStore(settings.data_dir / "zones.json")
 jobs = JobManager(settings, database, client, weed_settings_store, zone_store)
@@ -110,6 +120,7 @@ grid_repair_state: dict[str, object] = {
     "repair_id": "",
 }
 grid_repair_task: asyncio.Task | None = None
+photo_grid_task: asyncio.Task | None = None
 GRID_REPAIR_STATUS_POLL_SECONDS = 5
 GRID_REPAIR_BUSY_RETRY_SECONDS = 30
 # A cell whose fresh photo still shows the gantry will photograph the gantry
@@ -209,17 +220,22 @@ async def inspect_photo_grid(*, force: bool = False) -> GridRun | None:
         return None
 
 
-async def _require_grid_repair_capability() -> None:
+async def _require_grid_repair_capability(*, require_lighting: bool = False) -> None:
     bots = (await client.list_bots()).bots
     bot = next(
         (item for item in bots if item.config_entry_id == settings.selected_config_entry_id),
         None,
     )
-    if bot is None or not bot.supports("position_verified_photo_grid_repair"):
+    required = (
+        "illuminated_photo_grid_capture"
+        if require_lighting
+        else "position_verified_photo_grid_repair"
+    )
+    if bot is None or not bot.supports(required):
         version = bot.integration_version if bot is not None else None
         loaded = f" (loaded version {version})" if version else ""
         raise HomeAssistantError(
-            f"Photo-grid repair requires FarmBot integration V{MINIMUM_INTEGRATION_VERSION}"
+            f"Photo-grid capture requires FarmBot integration V{MINIMUM_INTEGRATION_VERSION}"
             f"{loaded}. Install/update it and restart Home Assistant."
         )
 
@@ -533,6 +549,170 @@ async def start_photo_grid_repair() -> dict[str, object]:
     }
 
 
+def _merge_photo_grid_frames(
+    record: PhotoGridRecord,
+    targets: list[PhotoGridTarget],
+    raw_frames: object,
+) -> list[PhotoGridFrame]:
+    """Validate and persist newly uploaded frames without duplicating targets."""
+    verified = match_verified_frames(targets, raw_frames)
+    by_target = {frame.target_index: frame for frame in record.frames}
+    for frame in verified:
+        by_target[frame.target_index] = frame
+    record.frames = [by_target[index] for index in sorted(by_target)]
+    photo_grid_store.save(record)
+    return verified
+
+
+async def _capture_photo_grid_targets(
+    record: PhotoGridRecord,
+    targets: list[PhotoGridTarget],
+) -> list[PhotoGridTarget]:
+    """Capture one integration-sized batch and return any unverified targets."""
+    payload = [{"x": target.x, "y": target.y, "z": target.z} for target in targets]
+    started = await client.start_grid_repair(record.config_entry_id, payload)
+    status = str(started.get("status") or "")
+    message = str(started.get("message") or status)
+    repair_id = str(started.get("repair_id") or "")
+    if status == "rejected" or not repair_id:
+        raise HomeAssistantError(message or "FarmBot rejected the photo-grid batch")
+
+    while True:
+        result = await client.grid_repair_status(record.config_entry_id, repair_id)
+        status = str(result.get("status") or "")
+        message = str(result.get("message") or status)
+        _merge_photo_grid_frames(record, targets, result.get("frames"))
+        complete_indexes = {frame.target_index for frame in record.frames}
+        record.status = "running"
+        record.message = (
+            f"{len(complete_indexes)} of {len(record.targets)} photos verified · {message}"
+        )
+        photo_grid_store.save(record)
+        if status in {"queued", "running", "waiting_images"}:
+            await asyncio.sleep(GRID_REPAIR_STATUS_POLL_SECONDS)
+            continue
+        return [target for target in targets if target.index not in complete_indexes]
+
+
+async def _photo_grid_worker(record: PhotoGridRecord) -> None:
+    """Capture the calibrated bed grid, retrying only coordinates not verified."""
+    try:
+        pending = list(record.targets)
+        # The integration verifies movement, upload processing, and returned
+        # coordinates before advancing within each batch. A second pass is
+        # limited to the exact targets whose verified frames were absent.
+        for attempt in range(2):
+            if not pending:
+                break
+            retry: list[PhotoGridTarget] = []
+            for start in range(0, len(pending), PHOTO_GRID_CHUNK_SIZE):
+                chunk = pending[start : start + PHOTO_GRID_CHUNK_SIZE]
+                try:
+                    retry.extend(await _capture_photo_grid_targets(record, chunk))
+                except HomeAssistantError as exc:
+                    LOGGER.warning(
+                        "Photo grid %s batch %d failed: %s",
+                        record.session_id,
+                        start // PHOTO_GRID_CHUNK_SIZE + 1,
+                        exc,
+                    )
+                    retry.extend(chunk)
+            pending = retry
+            if pending and attempt == 0:
+                record.status = "retrying"
+                record.message = (
+                    f"Retrying {len(pending)} coordinate"
+                    f"{'s' if len(pending) != 1 else ''} without a verified photo"
+                )
+                photo_grid_store.save(record)
+
+        record.completed_at = datetime.now(UTC)
+        if pending:
+            record.status = "failed"
+            record.message = (
+                f"Photo grid stopped safely: {len(pending)} of {len(record.targets)} "
+                "coordinates had no correctly positioned uploaded photo after two passes"
+            )
+        else:
+            record.status = "complete"
+            record.message = (
+                f"Photo grid complete: all {len(record.targets)} photos were uploaded "
+                "and coordinate-verified"
+            )
+        photo_grid_store.save(record)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # pylint: disable=broad-except
+        LOGGER.exception("Photo grid %s stopped", record.session_id)
+        record.completed_at = datetime.now(UTC)
+        record.status = "failed"
+        record.message = f"Photo grid stopped safely: {exc}"
+        photo_grid_store.save(record)
+
+
+async def start_calibrated_photo_grid() -> PhotoGridRecord:
+    """Plan and start a reliable whole-bed grid without the legacy sequence."""
+    global photo_grid_task
+    if photo_grid_task is not None and not photo_grid_task.done():
+        current = photo_grid_store.load()
+        if current is not None:
+            return current
+        raise HomeAssistantError("A photo grid is already running")
+    await _require_grid_repair_capability(require_lighting=True)
+    entry_id = settings.selected_config_entry_id
+    calibration = calibration_store.get(entry_id)
+    if calibration is None:
+        raise HomeAssistantError("Save FarmBot camera calibration before starting a photo grid")
+
+    soil = await client.soil_points(entry_id)
+    x_bounds = soil.motion.axis_bounds.get("x")
+    y_bounds = soil.motion.axis_bounds.get("y")
+    if x_bounds is None or y_bounds is None:
+        raise HomeAssistantError("FarmBot did not report usable X/Y axis bounds")
+    inventory = await client.inventory(
+        InventoryRequest(
+            config_entry_id=entry_id,
+            image_lookback_hours=min(720, max(72, settings.image_lookback_hours)),
+        )
+    )
+    z_bounds = soil.motion.axis_bounds.get("z")
+    if inventory.images:
+        ordered_z = sorted(float(image.meta.z) for image in inventory.images)
+        z = ordered_z[len(ordered_z) // 2]
+    elif z_bounds is not None:
+        z = min(z_bounds[1], max(z_bounds[0], 0.0))
+    else:
+        current_z = soil.motion.position.get("z")
+        if current_z is None:
+            raise HomeAssistantError("FarmBot did not report a safe photo Z coordinate")
+        z = float(current_z)
+    if z_bounds is not None:
+        z = min(z_bounds[1], max(z_bounds[0], z))
+
+    targets, footprint_width, footprint_height = plan_photo_grid(
+        calibration,
+        x_bounds=x_bounds,
+        y_bounds=y_bounds,
+        z=z,
+    )
+    record = PhotoGridRecord(
+        config_entry_id=entry_id,
+        started_at=datetime.now(UTC),
+        status="queued",
+        message=f"Queued {len(targets)} calibrated photo coordinates",
+        bed_bounds={"x": x_bounds, "y": y_bounds},
+        footprint_width_mm=footprint_width,
+        footprint_height_mm=footprint_height,
+        calibration=calibration,
+        targets=targets,
+    )
+    photo_grid_store.save(record)
+    photo_grid_task = asyncio.create_task(
+        _photo_grid_worker(record), name=f"photo-grid-{record.session_id}"
+    )
+    return record
+
+
 def _calibration_from_input(entry_id: str, values: FarmbotCalibrationInput) -> Calibration:
     """Build a processed-resolution calibration from stored FarmBot inputs."""
     resolution = settings.resolution
@@ -814,6 +994,83 @@ _DASHBOARD_JS = r"""
   const queueMessage=document.getElementById('queue-message');
   const gantryModal=document.getElementById('gantry-modal');
   const gantryOpen=document.getElementById('gantry-debug-open');
+  const photoGridModal=document.getElementById('photo-grid-modal');
+  const photoGridOpen=document.getElementById('photo-grid-open');
+  const photoGridCanvas=document.getElementById('photo-grid-canvas');
+  const photoGridStatus=document.getElementById('photo-grid-status');
+  function gridOriginSigns(origin){
+    return [(origin==='top_right'||origin==='bottom_right')?-1:1,
+            (origin==='bottom_left'||origin==='bottom_right')?-1:1];
+  }
+  function drawPhotoGrid(data){
+    const record=data.grid, bounds=record.bed_bounds, calibration=record.calibration;
+    const spanX=bounds.x[1]-bounds.x[0], spanY=bounds.y[1]-bounds.y[0];
+    const displayWidth=900;
+    photoGridCanvas.width=displayWidth;
+    photoGridCanvas.height=Math.max(240,Math.min(650,Math.round(displayWidth*spanY/spanX)));
+    const ctx=photoGridCanvas.getContext('2d');
+    const sx=photoGridCanvas.width/spanX, sy=photoGridCanvas.height/spanY;
+    const project=function(x,y){return [(x-bounds.x[0])*sx,(y-bounds.y[0])*sy];};
+    ctx.setTransform(1,0,0,1,0,0);
+    ctx.fillStyle='#283f30';ctx.fillRect(0,0,photoGridCanvas.width,photoGridCanvas.height);
+    const signs=gridOriginSigns(calibration.origin_location);
+    const rotation=calibration.rotation_degrees*Math.PI/180;
+    let loaded=0, failed=0;
+    const finish=function(){
+      if(loaded+failed!==record.frames.length) return;
+      ctx.setTransform(1,0,0,1,0,0);
+      (data.plants||[]).forEach(function(plant){
+        const c=project(plant.x,plant.y);
+        ctx.fillStyle='rgba(32,160,82,.18)';ctx.strokeStyle='#39d878';ctx.lineWidth=2;
+        ctx.beginPath();ctx.arc(c[0],c[1],Math.max(4,(plant.radius||0)*(sx+sy)/2),0,Math.PI*2);
+        ctx.fill();ctx.stroke();
+      });
+      (data.weeds||[]).forEach(function(weed){
+        const c=project(weed.x,weed.y);
+        ctx.fillStyle='#ef476f';ctx.beginPath();ctx.arc(c[0],c[1],4,0,Math.PI*2);ctx.fill();
+      });
+      photoGridStatus.textContent=record.message+' · '+loaded+' verified photos rendered'
+        +(failed?' · '+failed+' image(s) could not be loaded':'');
+    };
+    if(!record.frames.length){photoGridStatus.textContent='This grid has no verified photos yet';return;}
+    record.frames.forEach(function(frame){
+      const image=new Image();
+      image.onload=function(){
+        const iw=image.naturalWidth, ih=image.naturalHeight;
+        const ppmX=iw/(calibration.coordinate_scale*calibration.reference_width);
+        const ppmY=ih/(calibration.coordinate_scale*calibration.reference_height);
+        const garden=function(u,v){
+          const rx=u-iw/2, ry=v-ih/2;
+          const vx=Math.cos(rotation)*rx-Math.sin(rotation)*ry;
+          const vy=Math.sin(rotation)*rx+Math.cos(rotation)*ry;
+          return [frame.x+vx/(signs[0]*ppmX)-calibration.offset_x_mm,
+                  frame.y+vy/(signs[1]*ppmY)-calibration.offset_y_mm];
+        };
+        const p0=project.apply(null,garden(0,0));
+        const pu=project.apply(null,garden(iw,0));
+        const pv=project.apply(null,garden(0,ih));
+        ctx.save();
+        ctx.beginPath();ctx.rect(0,0,photoGridCanvas.width,photoGridCanvas.height);ctx.clip();
+        ctx.globalAlpha=.96;
+        ctx.setTransform((pu[0]-p0[0])/iw,(pu[1]-p0[1])/iw,
+                         (pv[0]-p0[0])/ih,(pv[1]-p0[1])/ih,p0[0],p0[1]);
+        ctx.drawImage(image,0,0);ctx.restore();
+        loaded++;finish();
+      };
+      image.onerror=function(){failed++;finish();};
+      image.src='api/vision/image/'+frame.image_id+'.jpg?entry_id='
+        +encodeURIComponent(record.config_entry_id);
+    });
+  }
+  async function loadPhotoGrid(){
+    photoGridStatus.textContent='Loading the verified grid…';
+    try{
+      const response=await fetch('api/photo-grid/latest');
+      const data=await response.json();
+      if(!response.ok) throw new Error(data.detail||('HTTP '+response.status));
+      drawPhotoGrid(data);
+    }catch(error){photoGridStatus.textContent='Could not load photo grid: '+error.message;}
+  }
   async function loadQueueImages(){
     const dateFrom=document.getElementById('queue-from').value;
     const dateTo=document.getElementById('queue-to').value;
@@ -1242,6 +1499,16 @@ _DASHBOARD_JS = r"""
   gantryModal.addEventListener('click',function(event){
     if(event.target===gantryModal) gantryModal.hidden=true;
   });
+  if(photoGridOpen) photoGridOpen.addEventListener('click',function(){
+    photoGridModal.hidden=false;loadPhotoGrid();
+    photoGridModal.querySelector('.modal-close').focus();
+  });
+  document.getElementById('photo-grid-close').addEventListener('click',function(){
+    photoGridModal.hidden=true;
+  });
+  photoGridModal.addEventListener('click',function(event){
+    if(event.target===photoGridModal) photoGridModal.hidden=true;
+  });
   document.getElementById('queue-refresh').addEventListener('click',loadQueueImages);
   document.getElementById('queue-select-all').addEventListener('change',function(){
     document.querySelectorAll('.queue-checkbox').forEach(box=>box.checked=this.checked);
@@ -1508,6 +1775,19 @@ async def lifespan(_: FastAPI):
             "the calibration page will not work until one is set in the add-on options"
         )
     seed_calibration_from_store()
+    interrupted_grid = photo_grid_store.load()
+    if interrupted_grid is not None and interrupted_grid.status in {
+        "queued",
+        "running",
+        "retrying",
+    }:
+        interrupted_grid.status = "failed"
+        interrupted_grid.completed_at = datetime.now(UTC)
+        interrupted_grid.message = (
+            "Photo grid was interrupted by an app restart; verified photos were preserved. "
+            "Start a fresh grid to replace it."
+        )
+        photo_grid_store.save(interrupted_grid)
     tasks = [
         asyncio.create_task(event_listener(), name="event_listener"),
         asyncio.create_task(heartbeat(), name="heartbeat"),
@@ -1535,6 +1815,9 @@ async def lifespan(_: FastAPI):
     if grid_repair_task is not None and not grid_repair_task.done():
         grid_repair_task.cancel()
         await asyncio.gather(grid_repair_task, return_exceptions=True)
+    if photo_grid_task is not None and not photo_grid_task.done():
+        photo_grid_task.cancel()
+        await asyncio.gather(photo_grid_task, return_exceptions=True)
     await asyncio.gather(*tasks, return_exceptions=True)
     await soil_jobs.close()
     await client.close()
@@ -1572,6 +1855,9 @@ button{{background:var(--green);border:0;border-radius:6px;padding:.65rem 1rem;c
 .gantry-gallery{{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:1rem;min-width:min(85vw,900px)}}
 .gantry-gallery figure{{margin:0;padding:0;overflow:hidden}}.gantry-gallery img{{width:100%;height:180px;object-fit:contain;background:#111}}
 .gantry-gallery figcaption{{padding:.5rem 0}}.gantry-target{{color:#a40000;font-weight:bold}}
+.photo-grid-dialog{{width:min(96vw,1000px)}}.photo-grid-dialog canvas{{display:block;width:100%;max-height:72vh;
+background:#243a2c;border:1px solid #bcc9c0;border-radius:6px}}
+.photo-grid-card form{{margin:0}}
 .modal-controls{{display:flex;gap:.5rem;align-items:center;justify-content:center;margin-top:.6rem}}.legend{{font-size:.9rem;color:var(--muted)}}
 .modal-controls[hidden]{{display:none}}
 .queue-dialog{{width:min(95vw,900px)}}.button-row{{display:flex;gap:.5rem;flex-wrap:wrap;align-items:center}}
@@ -1640,6 +1926,7 @@ async def health() -> JSONResponse:
 @app.get("/", response_class=HTMLResponse)
 async def dashboard(request: Request) -> HTMLResponse:
     grid_run = await inspect_photo_grid()
+    photo_grid_record = photo_grid_store.load()
     repair_values = grid_repair_settings_store.load()
     rows = database.pending_measurements()
     crop_slugs = sorted({row["crop_slug"] for row in rows})
@@ -1891,6 +2178,21 @@ async def dashboard(request: Request) -> HTMLResponse:
 
     weed_rows = "".join(_weed_row(w) for w in pending_weeds)
     resolution = settings.resolution
+    if photo_grid_record is None:
+        photo_grid_summary = "No calibrated grid has been captured yet"
+        photo_grid_details = "Save calibration, then start the first reliable whole-bed grid."
+        photo_grid_view_disabled = " disabled"
+    else:
+        photo_grid_summary = escape(photo_grid_record.message or photo_grid_record.status)
+        photo_grid_details = (
+            f"{len(photo_grid_record.frames)} of {len(photo_grid_record.targets)} verified photos"
+            f" · started "
+            f"{escape(photo_grid_record.started_at.astimezone().strftime('%d %b %Y %H:%M'))}"
+        )
+        photo_grid_view_disabled = "" if photo_grid_record.frames else " disabled"
+    photo_grid_running = photo_grid_task is not None and not photo_grid_task.done()
+    photo_grid_start_disabled = " disabled" if photo_grid_running else ""
+    photo_grid_message = escape(request.query_params.get("photo_grid", ""))
 
     if grid_run is None:
         repair_summary = escape(
@@ -1984,10 +2286,16 @@ async def dashboard(request: Request) -> HTMLResponse:
 <p>Mode: {settings.mode.value}</p></section>
 <section class=card><h2>Analysis resolution</h2><p><b>{escape(resolution.label)}</b></p>
 <p class=muted>{resolution.pixel_count:,} px · restart to change</p></section>
-<section class=card><h2>Automatic decision threshold</h2>
-<p><b>{settings.minimum_auto_confidence:.0%} confidence</b></p>
-<p class=muted>Set <code>minimum_auto_confidence</code> in the add-on configuration.
-It affects automatic changes only; every result remains manually reviewable.</p></section>
+<section class="card photo-grid-card"><h2>Photo grid</h2>
+<p><b>{photo_grid_summary}</b></p><p class=muted>{photo_grid_details}</p>
+<div class=button-row>
+<form method=post action="photo-grid/start"><button{photo_grid_start_disabled}>Start photo grid</button></form>
+<button id=photo-grid-open type=button{photo_grid_view_disabled}>View most recent grid</button>
+</div>
+<small class=action-message>{photo_grid_message}</small>
+<p class=muted><small>Uses the saved scale, reference image size, rotation and camera
+offsets with the FarmBot axis limits. Every uploaded photo is coordinate-checked before
+the bot advances.</small></p></section>
 <section class=card><h2>Repair photo grid</h2><p>{repair_summary}</p>
 <p class=muted>{repair_details}</p>
 <form method=post action="grid-repair/settings">
@@ -2099,8 +2407,61 @@ on to the next weed.</small></p>
 <h2>Gantry classifier debug</h2>
 <p class=muted>Every positive from the latest photo batch is shown. Perimeter positives are displayed for diagnosis but are not repair targets.</p>
 <div class=gantry-gallery>{gantry_cards}</div>
+</figure></div>
+<div id=photo-grid-modal class=overlay-modal hidden role=dialog aria-modal=true aria-label="Most recent photo grid">
+<figure class=photo-grid-dialog><button id=photo-grid-close class=modal-close type=button aria-label=Close>&times;</button>
+<h2>Most recent photo grid</h2>
+<canvas id=photo-grid-canvas width=900 height=420 aria-label="Birds-eye photo grid"></canvas>
+<p id=photo-grid-status class=muted>Loading the verified grid…</p>
+<p class=muted><small>The canvas uses the same calibrated garden-coordinate transform as
+analysis. Green circles are FarmBot plants and red dots are FarmBot weed points.</small></p>
 </figure></div><script>{_DASHBOARD_JS}</script>"""  # noqa: S608 - HTML template
     return layout(request, body)
+
+
+@app.post("/photo-grid/start")
+async def run_calibrated_photo_grid() -> RedirectResponse:
+    try:
+        record = await start_calibrated_photo_grid()
+        message = record.message
+    except (HomeAssistantError, ValueError) as exc:
+        message = f"Could not start photo grid: {exc}"
+    return RedirectResponse(f"../?photo_grid={quote(message)}", status_code=303)
+
+
+@app.get("/api/photo-grid/latest")
+async def latest_calibrated_photo_grid() -> JSONResponse:
+    record = photo_grid_store.load()
+    if record is None:
+        raise HTTPException(404, "No calibrated photo grid has been captured")
+    plants: list[dict[str, object]] = []
+    weeds: list[dict[str, object]] = []
+    try:
+        inventory = await client.inventory(
+            InventoryRequest(
+                config_entry_id=record.config_entry_id,
+                image_lookback_hours=min(720, max(72, settings.image_lookback_hours)),
+            )
+        )
+        plants = [
+            {
+                "id": plant.id,
+                "name": plant.name,
+                "x": plant.x,
+                "y": plant.y,
+                "radius": plant.radius,
+            }
+            for plant in inventory.plants
+        ]
+        weeds = [
+            {"id": weed.id, "name": weed.name, "x": weed.x, "y": weed.y, "radius": weed.radius}
+            for weed in inventory.weeds
+        ]
+    except HomeAssistantError:
+        # The verified mosaic remains viewable while FarmBot is temporarily
+        # offline; live plant/weed markers are supplementary.
+        pass
+    return JSONResponse({"grid": record.model_dump(mode="json"), "plants": plants, "weeds": weeds})
 
 
 @app.post("/grid-repair/settings")

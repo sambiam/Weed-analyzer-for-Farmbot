@@ -135,6 +135,29 @@ motion or apply results automatically.
 
 ## Image selection and analysis
 
+### Reliable photo grid
+
+The Analysis page's **Photo grid** card provides separate **Start photo grid**
+and **View most recent grid** actions. Starting a grid reads the selected bot's
+saved camera calibration and live motion limits. The app converts the native
+pixel scale and reference dimensions to the camera's garden footprint,
+includes camera rotation and X/Y optical offsets, and lays out an overlapping
+serpentine path over the complete X/Y bed bounds.
+
+Companion integration 2.2.0 or newer switches the standard lighting peripheral
+on while capturing and restores its previous state afterward. It acknowledges
+each safe movement, waits for live X/Y/Z position confirmation, takes the
+photo, and waits for the processed image inventory. The app also checks each
+returned frame against its requested X/Y/Z coordinate within 25 mm. Only
+verified frames count. Missing or mismatched targets are retried once; a grid
+with any remaining hole is marked failed rather than complete.
+
+The latest-grid view draws verified frames into one calibrated birds-eye
+garden mosaic and overlays current FarmBot plants and weeds. The plan and
+verified frame IDs are saved in `/data`, so completed progress survives an app
+restart. The existing **Repair photo grid** card remains available for
+externally created or older grids.
+
 The app asks the integration for inventory in the configured lookback window,
 then retrieves processed JPEGs one at a time at the configured resolution (at
 most 1280 × 960). It validates content type, checksum over the returned JPEG,

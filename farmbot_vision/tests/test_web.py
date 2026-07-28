@@ -51,7 +51,7 @@ async def test_grid_repair_requires_advertised_v2_capability(monkeypatch):
     try:
         with pytest.raises(
             web.HomeAssistantError,
-            match="requires FarmBot integration V2.0.2",
+            match="requires FarmBot integration V2.2.0",
         ):
             await web._require_grid_repair_capability()
     finally:
@@ -87,6 +87,81 @@ async def test_grid_repair_accepts_advertised_v2_capability(monkeypatch):
         await web._require_grid_repair_capability()
     finally:
         web.settings.selected_config_entry_id = previous
+
+
+@pytest.mark.asyncio
+async def test_whole_grid_requires_illuminated_capture_capability(monkeypatch):
+    previous = web.settings.selected_config_entry_id
+    web.settings.selected_config_entry_id = "entry-1"
+
+    async def list_bots():
+        return BotList.model_validate(
+            {
+                "bots": [
+                    {
+                        "config_entry_id": "entry-1",
+                        "device_id": "42",
+                        "name": "FarmBot",
+                        "integration_version": "2.1.0",
+                        "capabilities": ["position_verified_photo_grid_repair"],
+                    }
+                ]
+            }
+        )
+
+    monkeypatch.setattr(web.client, "list_bots", list_bots)
+    try:
+        with pytest.raises(web.HomeAssistantError, match="V2.2.0"):
+            await web._require_grid_repair_capability(require_lighting=True)
+    finally:
+        web.settings.selected_config_entry_id = previous
+
+
+@pytest.mark.asyncio
+async def test_whole_grid_keeps_only_coordinate_verified_frames(monkeypatch, tmp_path):
+    from farmbot_vision.calibration_store import FarmbotCalibrationInput
+    from farmbot_vision.photo_grid import PhotoGridRecord, PhotoGridStore, PhotoGridTarget
+
+    targets = [
+        PhotoGridTarget(index=0, row=0, column=0, x=100, y=200, z=0),
+        PhotoGridTarget(index=1, row=0, column=1, x=300, y=200, z=0),
+    ]
+    record = PhotoGridRecord(
+        config_entry_id="entry-1",
+        started_at=datetime.now(UTC),
+        bed_bounds={"x": (0, 500), "y": (0, 400)},
+        footprint_width_mm=250,
+        footprint_height_mm=200,
+        calibration=FarmbotCalibrationInput(
+            coordinate_scale=0.25,
+            reference_width=1000,
+            reference_height=800,
+        ),
+        targets=targets,
+    )
+
+    async def start(_entry_id, _targets):
+        return {"status": "queued", "repair_id": "grid-1", "message": "queued"}
+
+    async def status(_entry_id, _repair_id):
+        return {
+            "status": "complete",
+            "message": "capture complete",
+            "frames": [
+                {"image_id": 41, "x": 103, "y": 196, "z": 0},
+                # Outside the app's independent 25 mm tolerance.
+                {"image_id": 42, "x": 330, "y": 200, "z": 0},
+            ],
+        }
+
+    monkeypatch.setattr(web, "photo_grid_store", PhotoGridStore(tmp_path / "grid.json"))
+    monkeypatch.setattr(web.client, "start_grid_repair", start)
+    monkeypatch.setattr(web.client, "grid_repair_status", status)
+    missing = await web._capture_photo_grid_targets(record, targets)
+
+    assert [frame.image_id for frame in record.frames] == [41]
+    assert [target.index for target in missing] == [1]
+    assert [frame.image_id for frame in web.photo_grid_store.load().frames] == [41]
 
 
 @pytest.mark.asyncio

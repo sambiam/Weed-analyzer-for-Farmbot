@@ -1,9 +1,9 @@
 # Companion FarmBot integration contract
 
 Contract version: **farmbot-vision-v2**. Minimum compatible companion FarmBot
-integration release: **2.0.2** (the release that advertises and implements
+integration release: **2.2.0** (the release that advertises and implements
 photo-grid repair in addition to clear-site soil-height capture, the
-returned-JPEG contract and known-weed writes). Version 2.0.2 of the companion integration in the sibling
+returned-JPEG contract and known-weed writes). Version 2.2.0 of the companion integration in the sibling
 `Farmbot-for-Home-Assistant` repository implements this contract.
 
 All actions are in the `farmbot` domain. Response actions must support Home Assistant service response data. Unknown, invalid, or unauthorised fields must fail rather than be coerced. Timestamps are ISO-8601. The integration remains the only component that talks to FarmBot APIs.
@@ -13,7 +13,7 @@ All actions are in the `farmbot` domain. Response actions must support Home Assi
 No input. Response:
 
 ```json
-{"bots":[{"config_entry_id":"string","device_id":"string","name":"string","integration_version":"2.0.2","capabilities":["photo_grid_repair","verified_photo_grid_repair","position_verified_photo_grid_repair"]}]}
+{"bots":[{"config_entry_id":"string","device_id":"string","name":"string","integration_version":"2.2.0","capabilities":["photo_grid_repair","verified_photo_grid_repair","position_verified_photo_grid_repair","illuminated_photo_grid_capture"]}]}
 ```
 
 ## `farmbot.get_vision_inventory`
@@ -68,7 +68,11 @@ fully-processed image within 25 mm of its requested X/Y/Z coordinates.
 errors asynchronously. After six failed attempts the app records that cell as
 failed for the current session and continues repairing the remaining cells.
 It returns a `repair_id` immediately and restores the initial position when
-the command finishes or fails.
+the command finishes or fails. Integration 2.2.0 and the
+`illuminated_photo_grid_capture` capability additionally preserve the current
+state of the standard FarmBot lighting peripheral (pin 7), turn it on before
+the first movement/photo, and restore its prior state during cleanup. Failure
+to enable lighting stops the request before a photo is taken.
 
 `farmbot.get_vision_grid_repair` accepts `config_entry_id` and `repair_id`.
 It returns `queued|running|waiting_images|complete|failed`, a sanitized
@@ -205,4 +209,4 @@ processes only the named image. Manual requests retain the payload above.
 3. `resize_scale_x/y` equal to processed÷oriented in each axis.
 4. `processed_calibration` (basis `processed_image`) when calibration is known, plus reference dimensions on `camera_calibration`.
 
-The minimum compatible companion integration version is **2.0.2**.
+The minimum compatible companion integration version is **2.2.0**.

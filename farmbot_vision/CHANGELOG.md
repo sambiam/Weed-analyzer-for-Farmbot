@@ -1,5 +1,27 @@
 # Changelog
 
+## 2.3.0 - 2026-07-28
+
+- Replaced the **Automatic decision threshold** analysis card with a
+  calibration-aware **Photo grid** card containing separate **Start photo
+  grid** and **View most recent grid** actions.
+- Whole-bed grid coordinates are now calculated from the saved FarmBot camera
+  scale, reference resolution, rotation and optical offsets together with the
+  bot's live X/Y axis limits. Captures follow a serpentine path with calibrated
+  overlap.
+- Reliable capture uses the integration's acknowledged movement and processed
+  image checks in bounded batches. The app independently matches returned
+  X/Y/Z coordinates within 25 mm, persists every verified frame, retries only
+  missing/mismatched locations, and never reports completion with a hole.
+- Added a birds-eye canvas mosaic of the most recent verified grid, aligned in
+  garden coordinates and overlaid with current FarmBot plants and weed points.
+- The existing photo-grid repair controls remain available for older or
+  externally created grids.
+- Added root `AGENTS.md` instructions that require Codex to bump every app
+  version location and changelog for future non-documentation app changes.
+- Requires companion integration 2.2.0, which preserves the existing light
+  state, illuminates verified grid captures, and restores the light afterward.
+
 ## 2.2.0 - 2026-07-28
 
 - Weed leaf and stem fragments separated by small segmentation gaps are now
