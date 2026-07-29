@@ -15,7 +15,14 @@ from .calibration_store import FarmbotCalibrationInput
 
 PHOTO_GRID_OVERLAP = 0.15
 PHOTO_GRID_COORDINATE_TOLERANCE_MM = 25.0
-PHOTO_GRID_CHUNK_SIZE = 12
+# The integration verifies each target's movement, upload and returned
+# coordinates before advancing within a batch, so a failure inside one batch
+# can no longer strand the rest of the grid the way it could under the old
+# unverified capture path. A larger batch therefore only costs a bounded
+# blast radius if the integration crashes mid-batch, while cutting the number
+# of chunk boundaries -- each of which costs a return-to-origin move plus a
+# busy-race window against the previous batch's unwind.
+PHOTO_GRID_CHUNK_SIZE = 25
 
 
 class PhotoGridTarget(BaseModel):

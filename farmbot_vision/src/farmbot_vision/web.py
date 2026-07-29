@@ -123,6 +123,23 @@ grid_repair_task: asyncio.Task | None = None
 photo_grid_task: asyncio.Task | None = None
 GRID_REPAIR_STATUS_POLL_SECONDS = 5
 GRID_REPAIR_BUSY_RETRY_SECONDS = 30
+# A photo-grid batch start can be rejected as "busy" while the previous
+# batch's task is still unwinding (returning the bot to its original
+# position) or while FarmBot's own busy flag hasn't cleared yet. That is a
+# transient race, not a real failure, so retry with backoff instead of
+# discarding the whole batch's targets.
+PHOTO_GRID_BATCH_START_MAX_ATTEMPTS = 6
+PHOTO_GRID_BATCH_START_RETRY_BASE_SECONDS = 5
+PHOTO_GRID_BATCH_START_RETRY_MAX_SECONDS = 30
+# Bounded multi-pass retry for coordinates that came back unverified. A pass
+# that verifies zero new frames means another identical pass would just move
+# the bot pointlessly, so the worker stops early rather than always running
+# every pass.
+PHOTO_GRID_WORKER_MAX_PASSES = 3
+# Cap how many missing coordinates are ever written to the log or the
+# terminal status message so a large failure can't flood either.
+PHOTO_GRID_MISSING_LOG_LIMIT = 20
+PHOTO_GRID_MESSAGE_EXAMPLE_LIMIT = 5
 # A cell whose fresh photo still shows the gantry will photograph the gantry
 # again; give it one retry, then move on rather than loop on it forever.
 MAX_REPAIR_ATTEMPTS_PER_CELL = 2
@@ -564,18 +581,60 @@ def _merge_photo_grid_frames(
     return verified
 
 
+def _coordinate_label(target: PhotoGridTarget) -> str:
+    """Render a target's garden coordinates for logs and status messages."""
+    return f"{target.x:g},{target.y:g}"
+
+
+async def _start_photo_grid_batch(
+    record: PhotoGridRecord,
+    targets: list[PhotoGridTarget],
+) -> dict[str, object]:
+    """Start one batch, retrying only a transient busy rejection.
+
+    The integration can reject a new batch with a "busy" message while the
+    previous batch's task is still unwinding (returning the bot to its
+    original position) or while FarmBot's own busy flag hasn't cleared. That
+    is a transient race, not a real failure -- retrying with backoff avoids
+    losing an entire chunk's targets to it. Any other rejection reason (or a
+    response missing a repair ID) stays a hard, non-retried failure.
+    """
+    payload = [{"x": target.x, "y": target.y, "z": target.z} for target in targets]
+    attempt = 0
+    while True:
+        attempt += 1
+        started = await client.start_grid_repair(record.config_entry_id, payload)
+        status = str(started.get("status") or "")
+        message = str(started.get("message") or status)
+        repair_id = str(started.get("repair_id") or "")
+        if status != "rejected" and repair_id:
+            return started
+        is_busy = status == "rejected" and "busy" in message.casefold()
+        if is_busy and attempt < PHOTO_GRID_BATCH_START_MAX_ATTEMPTS:
+            delay = min(
+                PHOTO_GRID_BATCH_START_RETRY_BASE_SECONDS * attempt,
+                PHOTO_GRID_BATCH_START_RETRY_MAX_SECONDS,
+            )
+            LOGGER.info(
+                "Photo grid %s batch start busy (attempt %d/%d): %s; retrying in %ds",
+                record.session_id,
+                attempt,
+                PHOTO_GRID_BATCH_START_MAX_ATTEMPTS,
+                message,
+                delay,
+            )
+            await asyncio.sleep(delay)
+            continue
+        raise HomeAssistantError(message or "FarmBot rejected the photo-grid batch")
+
+
 async def _capture_photo_grid_targets(
     record: PhotoGridRecord,
     targets: list[PhotoGridTarget],
 ) -> list[PhotoGridTarget]:
     """Capture one integration-sized batch and return any unverified targets."""
-    payload = [{"x": target.x, "y": target.y, "z": target.z} for target in targets]
-    started = await client.start_grid_repair(record.config_entry_id, payload)
-    status = str(started.get("status") or "")
-    message = str(started.get("message") or status)
+    started = await _start_photo_grid_batch(record, targets)
     repair_id = str(started.get("repair_id") or "")
-    if status == "rejected" or not repair_id:
-        raise HomeAssistantError(message or "FarmBot rejected the photo-grid batch")
 
     while True:
         result = await client.grid_repair_status(record.config_entry_id, repair_id)
@@ -598,40 +657,91 @@ async def _photo_grid_worker(record: PhotoGridRecord) -> None:
     """Capture the calibrated bed grid, retrying only coordinates not verified."""
     try:
         pending = list(record.targets)
+        passes_run = 0
         # The integration verifies movement, upload processing, and returned
-        # coordinates before advancing within each batch. A second pass is
-        # limited to the exact targets whose verified frames were absent.
-        for attempt in range(2):
+        # coordinates before advancing within each batch. Each pass is
+        # limited to the exact targets whose verified frames were absent. A
+        # pass that verifies no new frames stops the worker early, since
+        # another identical pass would only move the bot pointlessly.
+        for attempt in range(PHOTO_GRID_WORKER_MAX_PASSES):
             if not pending:
                 break
+            passes_run += 1
+            verified_before_pass = len(record.frames)
             retry: list[PhotoGridTarget] = []
             for start in range(0, len(pending), PHOTO_GRID_CHUNK_SIZE):
                 chunk = pending[start : start + PHOTO_GRID_CHUNK_SIZE]
+                batch_number = start // PHOTO_GRID_CHUNK_SIZE + 1
                 try:
                     retry.extend(await _capture_photo_grid_targets(record, chunk))
                 except HomeAssistantError as exc:
                     LOGGER.warning(
                         "Photo grid %s batch %d failed: %s",
                         record.session_id,
-                        start // PHOTO_GRID_CHUNK_SIZE + 1,
+                        batch_number,
                         exc,
                     )
-                    retry.extend(chunk)
+                    # Only requeue targets whose frames were never verified --
+                    # a batch error must not discard photos already confirmed
+                    # and merged into record.frames during polling.
+                    verified_now = {frame.target_index for frame in record.frames}
+                    retry.extend(target for target in chunk if target.index not in verified_now)
+                verified_now = {frame.target_index for frame in record.frames}
+                batch_verified = sum(1 for target in chunk if target.index in verified_now)
+                LOGGER.info(
+                    "Photo grid %s pass %d batch %d: %d of %d targets verified this "
+                    "batch (%d of %d verified overall)",
+                    record.session_id,
+                    attempt + 1,
+                    batch_number,
+                    batch_verified,
+                    len(chunk),
+                    len(verified_now),
+                    len(record.targets),
+                )
             pending = retry
-            if pending and attempt == 0:
+            if not pending:
+                break
+            if len(record.frames) == verified_before_pass:
+                LOGGER.warning(
+                    "Photo grid %s pass %d verified no new frames; stopping early "
+                    "instead of running all %d passes",
+                    record.session_id,
+                    attempt + 1,
+                    PHOTO_GRID_WORKER_MAX_PASSES,
+                )
+                break
+            if attempt < PHOTO_GRID_WORKER_MAX_PASSES - 1:
                 record.status = "retrying"
                 record.message = (
                     f"Retrying {len(pending)} coordinate"
-                    f"{'s' if len(pending) != 1 else ''} without a verified photo"
+                    f"{'s' if len(pending) != 1 else ''} without a verified photo "
+                    f"(pass {attempt + 2} of {PHOTO_GRID_WORKER_MAX_PASSES})"
                 )
                 photo_grid_store.save(record)
 
         record.completed_at = datetime.now(UTC)
         if pending:
+            missing_all = ", ".join(
+                _coordinate_label(target) for target in pending[:PHOTO_GRID_MISSING_LOG_LIMIT]
+            )
+            if len(pending) > PHOTO_GRID_MISSING_LOG_LIMIT:
+                missing_all += f", … (+{len(pending) - PHOTO_GRID_MISSING_LOG_LIMIT} more)"
+            LOGGER.warning(
+                "Photo grid %s finished with %d of %d coordinates unverified: %s",
+                record.session_id,
+                len(pending),
+                len(record.targets),
+                missing_all,
+            )
+            examples = " · ".join(
+                _coordinate_label(target) for target in pending[:PHOTO_GRID_MESSAGE_EXAMPLE_LIMIT]
+            )
             record.status = "failed"
             record.message = (
                 f"Photo grid stopped safely: {len(pending)} of {len(record.targets)} "
-                "coordinates had no correctly positioned uploaded photo after two passes"
+                f"coordinates had no correctly positioned uploaded photo after "
+                f"{passes_run} pass{'es' if passes_run != 1 else ''} (e.g. {examples})"
             )
         else:
             record.status = "complete"

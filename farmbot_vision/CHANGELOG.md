@@ -1,5 +1,26 @@
 # Changelog
 
+## 2.3.1 - 2026-07-29
+
+- Fixed the photo grid worker requeuing an entire failed batch, including
+  targets whose frames had already been verified and merged during polling —
+  it now requeues only targets that still lack a verified frame.
+- Fixed a `rejected` batch-start response caused by a transient "busy"
+  condition (the previous batch's task still unwinding, or FarmBot's own busy
+  flag not yet clear) being treated as a hard failure. It is now retried with
+  backoff (up to 6 attempts, ~5s growing to ~30s); any other rejection reason
+  still fails immediately.
+- Increased the photo-grid batch size from 12 to 25 coordinates per batch,
+  now that the integration isolates per-target failures within a batch —
+  cutting a 77-cell grid from 7 batches to 4 and reducing exposure to the
+  busy-race window at each batch boundary.
+- The worker now runs up to 3 verification passes (previously 2) but stops
+  early if a pass verifies zero new frames, since a repeat pass would only
+  move the bot pointlessly.
+- Added per-batch and end-of-run diagnostic logging (verified counts per
+  batch/pass, and the coordinates of any cells left unverified) and extended
+  the terminal failure message to list example missing coordinates.
+
 ## 2.3.0 - 2026-07-28
 
 - Replaced the **Automatic decision threshold** analysis card with a

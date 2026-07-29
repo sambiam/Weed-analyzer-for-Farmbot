@@ -164,6 +164,144 @@ async def test_whole_grid_keeps_only_coordinate_verified_frames(monkeypatch, tmp
     assert [frame.image_id for frame in web.photo_grid_store.load().frames] == [41]
 
 
+def _photo_grid_record(targets, *, tmp_path):
+    from farmbot_vision.calibration_store import FarmbotCalibrationInput
+    from farmbot_vision.photo_grid import PhotoGridRecord
+
+    return PhotoGridRecord(
+        config_entry_id="entry-1",
+        started_at=datetime.now(UTC),
+        bed_bounds={"x": (0, 500), "y": (0, 400)},
+        footprint_width_mm=250,
+        footprint_height_mm=200,
+        calibration=FarmbotCalibrationInput(
+            coordinate_scale=0.25,
+            reference_width=1000,
+            reference_height=800,
+        ),
+        targets=targets,
+    )
+
+
+@pytest.mark.asyncio
+async def test_worker_requeues_only_unverified_targets_after_batch_error(monkeypatch, tmp_path):
+    """A batch error must not discard frames verified during that same batch's
+    polling -- only targets still missing a verified frame get requeued."""
+    from farmbot_vision.photo_grid import PhotoGridFrame, PhotoGridStore, PhotoGridTarget
+
+    targets = [
+        PhotoGridTarget(index=0, row=0, column=0, x=100, y=200, z=0),
+        PhotoGridTarget(index=1, row=0, column=1, x=300, y=200, z=0),
+    ]
+    record = _photo_grid_record(targets, tmp_path=tmp_path)
+    monkeypatch.setattr(web, "photo_grid_store", PhotoGridStore(tmp_path / "grid.json"))
+
+    chunks_seen: list[list[int]] = []
+
+    async def fake_capture(record_arg, chunk):
+        chunks_seen.append([target.index for target in chunk])
+        if len(chunks_seen) == 1:
+            # Simulate target 0's frame being verified and merged into
+            # record.frames during polling, moments before the batch as a
+            # whole errors out (e.g. a dropped connection on a later poll).
+            record_arg.frames = [PhotoGridFrame(target_index=0, image_id=41, x=103, y=196, z=0)]
+        raise web.HomeAssistantError("simulated batch failure")
+
+    monkeypatch.setattr(web, "_capture_photo_grid_targets", fake_capture)
+
+    await web._photo_grid_worker(record)
+
+    # The already-verified target must never be resent to the bot.
+    assert chunks_seen[0] == [0, 1]
+    assert all(0 not in chunk for chunk in chunks_seen[1:])
+    assert [frame.target_index for frame in record.frames] == [0]
+    assert record.status == "failed"
+
+
+@pytest.mark.asyncio
+async def test_batch_start_retries_busy_rejection_then_succeeds(monkeypatch, tmp_path):
+    from farmbot_vision.photo_grid import PhotoGridTarget
+
+    targets = [PhotoGridTarget(index=0, row=0, column=0, x=100, y=200, z=0)]
+    record = _photo_grid_record(targets, tmp_path=tmp_path)
+
+    attempts = {"count": 0}
+
+    async def start(_entry_id, _targets):
+        attempts["count"] += 1
+        if attempts["count"] < 3:
+            return {"status": "rejected", "message": "FarmBot is busy with another task"}
+        return {"status": "queued", "repair_id": "grid-1", "message": "queued"}
+
+    sleeps: list[float] = []
+
+    async def fake_sleep(seconds):
+        sleeps.append(seconds)
+
+    monkeypatch.setattr(web.client, "start_grid_repair", start)
+    monkeypatch.setattr(web.asyncio, "sleep", fake_sleep)
+
+    result = await web._start_photo_grid_batch(record, targets)
+
+    assert result["repair_id"] == "grid-1"
+    assert attempts["count"] == 3
+    # Backoff grows with each retry.
+    assert sleeps == [
+        web.PHOTO_GRID_BATCH_START_RETRY_BASE_SECONDS,
+        web.PHOTO_GRID_BATCH_START_RETRY_BASE_SECONDS * 2,
+    ]
+
+
+@pytest.mark.asyncio
+async def test_batch_start_does_not_retry_a_non_busy_rejection(monkeypatch, tmp_path):
+    from farmbot_vision.photo_grid import PhotoGridTarget
+
+    targets = [PhotoGridTarget(index=0, row=0, column=0, x=100, y=200, z=0)]
+    record = _photo_grid_record(targets, tmp_path=tmp_path)
+
+    async def start(_entry_id, _targets):
+        return {"status": "rejected", "message": "Calibration is missing"}
+
+    slept = False
+
+    async def fake_sleep(_seconds):
+        nonlocal slept
+        slept = True
+
+    monkeypatch.setattr(web.client, "start_grid_repair", start)
+    monkeypatch.setattr(web.asyncio, "sleep", fake_sleep)
+
+    with pytest.raises(web.HomeAssistantError, match="Calibration is missing"):
+        await web._start_photo_grid_batch(record, targets)
+    assert not slept
+
+
+@pytest.mark.asyncio
+async def test_worker_stops_early_when_a_pass_verifies_no_new_frames(monkeypatch, tmp_path):
+    from farmbot_vision.photo_grid import PhotoGridStore, PhotoGridTarget
+
+    targets = [PhotoGridTarget(index=0, row=0, column=0, x=100, y=200, z=0)]
+    record = _photo_grid_record(targets, tmp_path=tmp_path)
+    monkeypatch.setattr(web, "photo_grid_store", PhotoGridStore(tmp_path / "grid.json"))
+
+    calls = {"count": 0}
+
+    async def fake_capture(_record_arg, chunk):
+        calls["count"] += 1
+        # Never verifies anything, so every pass would be identical.
+        return list(chunk)
+
+    monkeypatch.setattr(web, "_capture_photo_grid_targets", fake_capture)
+
+    await web._photo_grid_worker(record)
+
+    # The stall guard must stop after the first pass instead of running all
+    # PHOTO_GRID_WORKER_MAX_PASSES passes against a target that can't verify.
+    assert calls["count"] == 1
+    assert record.status == "failed"
+    assert "after 1 pass" in record.message
+
+
 @pytest.mark.asyncio
 async def test_grid_repair_recheck_forces_a_fresh_inventory_lookup(monkeypatch):
     """The Recheck button must not be blocked by the 5-minute inspection cache
