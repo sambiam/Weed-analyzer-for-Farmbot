@@ -5,7 +5,7 @@ import pytest
 from farmbot_vision.calibration import from_farmbot_calibration
 from farmbot_vision.database import Database
 from farmbot_vision.models import Calibration, OriginLocation
-from farmbot_vision.vision import garden_to_pixel
+from farmbot_vision.vision import garden_to_pixel, pixel_to_garden
 
 
 def _cal(origin: OriginLocation, ppm: float = 2.0, rotation: float = 0.0) -> Calibration:
@@ -39,6 +39,10 @@ def test_farmbot_scale_is_rescaled_to_processed_resolution():
     reference_ppm = 1 / 0.242
     assert cal.pixels_per_mm_x == pytest.approx(reference_ppm * 960 / 2592)
     assert cal.pixels_per_mm_y == pytest.approx(reference_ppm * 720 / 1944)
+    # Resizing changes px/mm, never the physical footprint implied by the
+    # verbatim FarmBot mm/capture-pixel value.
+    assert 960 / cal.pixels_per_mm_x == pytest.approx(2592 * 0.242)
+    assert 720 / cal.pixels_per_mm_y == pytest.approx(1944 * 0.242)
     # 4:3 preserving resize -> isotropic scale.
     assert cal.pixels_per_mm_x == pytest.approx(cal.pixels_per_mm_y)
     assert cal.rotation_degrees == -31.9
@@ -122,9 +126,19 @@ def test_rotation_is_applied_about_the_image_centre():
     # (which never rotated the image) got wrong.
     cal = _cal(OriginLocation.TOP_LEFT, rotation=90.0)
     px, py = garden_to_pixel(1100, 1000, 1000, 1000, 960, 720, cal)
-    # 100 mm * 2 px/mm = 200 px, rotated by -90 deg about centre: +x -> -y.
+    # FarmBot displays the upload with rotate(-90deg), so the unrotated source
+    # pixel is below centre; the display rotation brings it back onto garden +X.
     assert px == pytest.approx(960 / 2)
-    assert py == pytest.approx(720 / 2 - 200)
+    assert py == pytest.approx(720 / 2 + 200)
+
+
+def test_farmbot_offsets_are_copied_without_sign_changes():
+    cal = _cal(OriginLocation.TOP_LEFT).model_copy(update={"offset_x_mm": 20, "offset_y_mm": 80})
+    # FarmBot Web App places the optical centre at photo coordinate + offset.
+    px, py = garden_to_pixel(1020, 1080, 1000, 1000, 960, 720, cal)
+    assert (px, py) == pytest.approx((480, 360))
+    gx, gy = pixel_to_garden(480, 360, 1000, 1000, 960, 720, cal)
+    assert (gx, gy) == pytest.approx((1020, 1080))
 
 
 def test_zero_rotation_matches_legacy_scale_map():

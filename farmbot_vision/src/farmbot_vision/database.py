@@ -269,6 +269,18 @@ MIGRATIONS = [
     ALTER TABLE measurements ADD COLUMN fusion_reliable INTEGER NOT NULL DEFAULT 0;
     ALTER TABLE measurements ADD COLUMN fusion_diagnostic_path TEXT;
     """,
+    # Migration 17: per-plant image unlinks. A rejected recommendation or kept
+    # removal marks the image(s) it was based on as no longer valid evidence
+    # for that specific plant, without touching the image file itself -- the
+    # same capture can still legitimately back other plants and the
+    # whole-garden photo-grid mosaic.
+    """
+    CREATE TABLE IF NOT EXISTS plant_image_unlinks(
+      config_entry_id TEXT NOT NULL, plant_id INTEGER NOT NULL, image_id INTEGER NOT NULL,
+      measurement_id TEXT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY(config_entry_id, plant_id, image_id)
+    );
+    """,
 ]
 
 
@@ -1405,6 +1417,38 @@ class Database:
                 "INSERT INTO decisions(measurement_id,action,details_json) VALUES(?,?,?)",
                 [(candidate[0], action, payload) for candidate in candidate_rows],
             )
+        # A rejected recommendation ("reject") or a kept plant that was
+        # flagged for removal ("keep") means the image(s) behind it are not
+        # valid evidence for this plant going forward -- unlink them from the
+        # plant without touching the image file itself (other plants, and the
+        # whole-garden photo-grid mosaic, may still legitimately reference it).
+        if action in ("reject", "keep") and image_ids:
+            self.unlink_plant_images(row[0], row[1], image_ids, measurement_id)
+
+    def unlink_plant_images(
+        self,
+        config_entry_id: str | None,
+        plant_id: int,
+        image_ids: Iterable[int],
+        measurement_id: str | None = None,
+    ) -> None:
+        """Record that ``image_ids`` must no longer be shown as this plant's evidence."""
+        with self.connection:
+            self.connection.executemany(
+                "INSERT OR IGNORE INTO plant_image_unlinks"
+                "(config_entry_id,plant_id,image_id,measurement_id) VALUES(?,?,?,?)",
+                [
+                    (config_entry_id, plant_id, int(image_id), measurement_id)
+                    for image_id in image_ids
+                ],
+            )
+
+    def unlinked_image_ids(self, config_entry_id: str | None, plant_id: int) -> set[int]:
+        rows = self.connection.execute(
+            "SELECT image_id FROM plant_image_unlinks WHERE config_entry_id IS ? AND plant_id=?",
+            (config_entry_id, plant_id),
+        ).fetchall()
+        return {int(row[0]) for row in rows}
 
     def set_composite_path(
         self,

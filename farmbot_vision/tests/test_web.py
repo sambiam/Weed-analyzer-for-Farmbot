@@ -1044,6 +1044,10 @@ async def test_duplicate_slashes_reach_health_and_settings():
     assert b"id=map_origin" in body
     assert b"id=date_from" in body
     assert b"newest photo at each FarmBot coordinate" in body
+    assert b"id=zoom-in" in body
+    assert b"id=zoom-out" in body
+    assert b"id=zoom-reset" in body
+    assert b"Copy both FarmBot camera offsets unchanged" in body
 
     status, _, body = await asgi_request("/health")
     assert status == 200
@@ -1128,6 +1132,72 @@ async def test_approval_json_records_applied_and_html_post_still_redirects(monke
     )
     assert status == 303
     assert b"location" in headers
+
+
+@pytest.mark.asyncio
+async def test_rejecting_a_recommendation_unlinks_its_image_from_the_plant():
+    # A photo taken at the wrong coordinate can end up analysed for a plant it
+    # never actually shows. Rejecting the bad recommendation must stop that
+    # image from being treated as evidence for this plant without deleting it
+    # (other plants, and the whole-garden mosaic, may still reference it).
+    measurement = _review_measurement(plant_id=4001, image_id=77)
+    web.database.save_measurements([measurement])
+    assert web.database.unlinked_image_ids("review-bot", 4001) == set()
+
+    status, _, body = await asgi_request(
+        f"/recommendations/{measurement.measurement_id}/reject",
+        method="POST",
+        headers=[(b"accept", b"application/json")],
+    )
+
+    assert status == 200
+    assert json.loads(body)["status"] == "rejected"
+    assert web.database.unlinked_image_ids("review-bot", 4001) == {77}
+    # A different plant that legitimately used the same image is unaffected.
+    assert web.database.unlinked_image_ids("review-bot", 4002) == set()
+
+
+@pytest.mark.asyncio
+async def test_keeping_a_flagged_removal_unlinks_its_image_from_the_plant(monkeypatch):
+    measurement = _review_measurement(
+        plant_id=4010,
+        image_id=88,
+        vegetation_absent=True,
+        absent_observations=2,
+        current_radius_mm=40,
+        recommended_protection_radius_mm=0,
+    )
+    web.database.save_measurements([measurement])
+
+    status, _, body = await asgi_request(
+        f"/removals/{measurement.measurement_id}/keep",
+        method="POST",
+        headers=[(b"accept", b"application/json")],
+    )
+
+    assert status == 200
+    assert json.loads(body)["status"] == "rejected"
+    assert web.database.unlinked_image_ids("review-bot", 4010) == {88}
+
+
+@pytest.mark.asyncio
+async def test_dashboard_recommendation_row_carries_plant_photo_attributes():
+    measurement = _review_measurement(
+        plant_id=4020,
+        image_id=99,
+        recorded_center_x=123.4,
+        recorded_center_y=567.8,
+    )
+    web.database.save_measurements([measurement])
+    web.database.unlink_plant_images("review-bot", 4020, [55])
+
+    status, _, body = await asgi_request("/")
+    assert status == 200
+    html = body.decode()
+    assert 'data-plant-id="4020"' in html
+    assert 'data-plant-x="123.4"' in html
+    assert 'data-plant-y="567.8"' in html
+    assert 'data-unlinked-images="[55]"' in html
 
 
 @pytest.mark.asyncio

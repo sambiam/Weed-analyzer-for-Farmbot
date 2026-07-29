@@ -154,7 +154,7 @@ def _capture_centres(
         # persisted, reloaded or resent.
         optical_centres = [first + step * index for index in range(count)]
     return [
-        round(min(upper, max(lower, centre + gantry_offset)), PHOTO_GRID_COORDINATE_DECIMALS)
+        round(min(upper, max(lower, centre - gantry_offset)), PHOTO_GRID_COORDINATE_DECIMALS)
         for centre in optical_centres
     ]
 

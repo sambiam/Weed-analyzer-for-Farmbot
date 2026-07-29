@@ -1022,16 +1022,11 @@ class ClassicalVisionEngine(ImageAnalysisEngine):
         )
 
 
-# Sign of the rotation applied when mapping garden coordinates into the
-# *unrotated* processed image. FarmBot calibrates a ``Camera rotation`` and
-# physically rotates each photo by it to align the frame with the garden axes
-# (see FarmBot's plant_detection/P2C.py, which rotates the image and only then
-# maps pixels<->coordinates linearly). We overlay on the unrotated image, so we
-# apply the inverse rotation about the image centre. This constant selects the
-# rotation direction; it is verified against real FarmBot images in the
-# composite calibration view (flip it if a rotated camera overlays the wrong
-# way).
-ROTATION_SIGN = 1.0
+# FarmBot Web App renders an unmodified upload with
+# ``rotate(-CAMERA_CALIBRATION_total_rotation_angle)``. Our pixel transforms
+# operate on that same unrotated upload, so copied rotation values use the
+# Web App's negative display direction.
+ROTATION_SIGN = -1.0
 
 
 def garden_to_pixel(
@@ -1053,14 +1048,17 @@ def garden_to_pixel(
     ``rotation_degrees == 0`` this reduces to the historical identity map, so
     every origin/offset behaviour is preserved.
     """
-    dx = plant_x - image_x + calibration.offset_x_mm
-    dy = plant_y - image_y + calibration.offset_y_mm
+    # FarmBot places the optical centre at the recorded gantry coordinate plus
+    # CAMERA_OFFSET_X/Y. Keep copied offset signs unchanged.
+    dx = plant_x - image_x - calibration.offset_x_mm
+    dy = plant_y - image_y - calibration.offset_y_mm
     origin = OriginLocation(calibration.origin_location)
     # Pixel-space offset from centre, with the origin reflection applied before
     # rotation (in the garden->pixel direction).
     vx = origin.sign_x * dx * calibration.pixels_per_mm_x
     vy = origin.sign_y * dy * calibration.pixels_per_mm_y
-    # Rotate by -rotation about the centre (inverse of the image-align rotation).
+    # The source upload is displayed by FarmBot at -rotation; mapping a garden
+    # delta back into that source image applies the inverse (+rotation).
     theta = math.radians(ROTATION_SIGN * calibration.rotation_degrees)
     cos_t, sin_t = math.cos(theta), math.sin(theta)
     rx = cos_t * vx + sin_t * vy
@@ -1087,8 +1085,8 @@ def pixel_to_garden(
     dx = vx / (origin.sign_x * calibration.pixels_per_mm_x)
     dy = vy / (origin.sign_y * calibration.pixels_per_mm_y)
     return (
-        image_x + dx - calibration.offset_x_mm,
-        image_y + dy - calibration.offset_y_mm,
+        image_x + dx + calibration.offset_x_mm,
+        image_y + dy + calibration.offset_y_mm,
     )
 
 

@@ -159,6 +159,45 @@ def test_fused_canopy_provenance_round_trips_and_overrides_consolidation(tmp_pat
     assert consolidated["fusion_diagnostic_path"].endswith("fusion.jpg")
 
 
+def test_plant_image_unlinks_round_trip_and_stay_scoped_per_plant(tmp_path):
+    database = Database(tmp_path / "db.sqlite")
+    assert database.unlinked_image_ids("bot-1", 1) == set()
+
+    database.unlink_plant_images("bot-1", 1, [5, 6], measurement_id="m1")
+    # Re-unlinking the same image (e.g. a fused reject spanning several
+    # pending rows for the same image) must not raise or duplicate.
+    database.unlink_plant_images("bot-1", 1, [6], measurement_id="m2")
+
+    assert database.unlinked_image_ids("bot-1", 1) == {5, 6}
+    # Scoped by plant and by bot: neither leaks into an unrelated plant or bot.
+    assert database.unlinked_image_ids("bot-1", 2) == set()
+    assert database.unlinked_image_ids("bot-2", 1) == set()
+
+
+def test_rejecting_a_recommendation_unlinks_every_pending_image_for_that_plant(tmp_path):
+    database = Database(tmp_path / "db.sqlite")
+    first = _measurement(config_entry_id="bot-1", plant_id=7, image_id=10)
+    second = _measurement(config_entry_id="bot-1", plant_id=7, image_id=11)
+    database.save_measurements([first, second])
+
+    database.record_group_decision(str(first.measurement_id), "reject", {})
+
+    assert database.unlinked_image_ids("bot-1", 7) == {10, 11}
+
+
+def test_keeping_a_removal_unlinks_its_image_but_approving_does_not(tmp_path):
+    database = Database(tmp_path / "db.sqlite")
+    kept = _measurement(config_entry_id="bot-1", plant_id=8, image_id=20)
+    applied = _measurement(config_entry_id="bot-1", plant_id=9, image_id=30)
+    database.save_measurements([kept, applied])
+
+    database.record_group_decision(str(kept.measurement_id), "keep", {})
+    database.record_group_decision(str(applied.measurement_id), "applied", {})
+
+    assert database.unlinked_image_ids("bot-1", 8) == {20}
+    assert database.unlinked_image_ids("bot-1", 9) == set()
+
+
 def test_derived_calibration_does_not_clobber_manual(tmp_path):
     database = Database(tmp_path / "db.sqlite")
     manual = database.save_calibration(

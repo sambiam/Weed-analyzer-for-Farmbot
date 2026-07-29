@@ -962,19 +962,29 @@ class NormalizeIngressPathMiddleware:
 # vision.ROTATION_SIGN and vision.garden_to_pixel.
 _CALIBRATION_JS = r"""
 (function(){
-  const ROT_SIGN=1;            // matches vision.ROTATION_SIGN
+  const ROT_SIGN=-1;           // FarmBot Web App uses rotate(-camera_rotation)
   const MAX_CANVAS=2400;       // cap composite dimensions to bound memory
   const canvas=document.getElementById('canvas');
   const ctx=canvas.getContext('2d');
+  const viewport=document.getElementById('calibration-grid-viewport');
   const status=document.getElementById('status');
   const ppmEl=document.getElementById('ppm');
   let scene={images:[],plants:[],weeds:[],bed_bounds:null}, current=null, pending=false;
+  let viewZoom=1;
 
   function entry(){return document.getElementById('entry_id').value.trim();}
   function num(id){return parseFloat(document.getElementById(id).value)||0;}
   function checked(id){return document.getElementById(id).checked;}
   function origin(){return document.getElementById('origin').value;}
   function mapOrigin(){return document.getElementById('map_origin').value;}
+  function applyZoom(next){
+    viewZoom=Math.max(1,Math.min(6,next));
+    canvas.style.width=(viewZoom*100)+'%';
+    canvas.style.height='auto';
+    document.getElementById('zoom-value').textContent=Math.round(viewZoom*100)+'%';
+    document.getElementById('zoom-out').disabled=viewZoom<=1;
+    document.getElementById('zoom-in').disabled=viewZoom>=6;
+  }
   function originSigns(o){
     return [(o==='top_right'||o==='bottom_right')?-1:1,
             (o==='bottom_left'||o==='bottom_right')?-1:1];
@@ -996,7 +1006,7 @@ _CALIBRATION_JS = r"""
     const rx=u-iw/2, ry=v-ih/2;
     const c=Math.cos(p.rot), s=Math.sin(p.rot);
     const vx=c*rx - s*ry, vy=s*rx + c*ry;
-    return [cx + vx/(p.sx*ppm[0])-p.ox, cy + vy/(p.sy*ppm[1])-p.oy];
+    return [cx + vx/(p.sx*ppm[0])+p.ox, cy + vy/(p.sy*ppm[1])+p.oy];
   }
   function loadGridImages(){
     const p=params();
@@ -1026,6 +1036,10 @@ _CALIBRATION_JS = r"""
   }
   function render(){
     const p=params();
+    ppmEl.textContent=p
+      ?('Using FarmBot scale verbatim: '+p.scale+' mm/capture pixel; '
+        +'preview resized from '+p.refw+'×'+p.refh)
+      :'Enter the FarmBot pixel coordinate scale and Camera settings resolution';
     document.getElementById('save').disabled=!(p&&checked('confirm'));
     if(!current){return;}
     const ready=current.images.filter(r=>r.loaded&&r.img.naturalWidth>0);
@@ -1131,6 +1145,15 @@ _CALIBRATION_JS = r"""
   ['showoverlay','showlabels','confirm'].forEach(function(id){
     document.getElementById(id).addEventListener('change',scheduleRender);
   });
+  document.getElementById('zoom-in').addEventListener('click',function(){
+    applyZoom(viewZoom+.5);
+  });
+  document.getElementById('zoom-out').addEventListener('click',function(){
+    applyZoom(viewZoom-.5);
+  });
+  document.getElementById('zoom-reset').addEventListener('click',function(){
+    applyZoom(1);viewport.scrollLeft=0;viewport.scrollTop=0;
+  });
   document.getElementById('save').addEventListener('click',function(){
     const p=params();
     if(!p){status.textContent='Enter the FarmBot calibration values first';return;}
@@ -1145,6 +1168,7 @@ _CALIBRATION_JS = r"""
     document.body.appendChild(f);f.submit();
   });
   clearCanvas('Loading the date-filtered photo grid…');
+  applyZoom(1);
   if(entry()) document.getElementById('load').click();
 })();
 """
@@ -1161,6 +1185,13 @@ _DASHBOARD_JS = r"""
   const plantWithOverlay=document.getElementById('plant-modal-with-overlay');
   const artifactControls=document.getElementById('artifact-controls');
   const overlayLegend=document.getElementById('overlay-modal-legend');
+  const plantPhotoMode=document.getElementById('plant-photo-mode');
+  const plantPhotoTab=document.getElementById('plant-photo-tab');
+  const plantDiagnosticTab=document.getElementById('plant-diagnostic-tab');
+  const plantPhotoPane=document.getElementById('plant-photo-pane');
+  const diagnosticPane=document.getElementById('diagnostic-pane');
+  const plantPhotoCanvas=document.getElementById('plant-photo-canvas');
+  const plantPhotoStatus=document.getElementById('plant-photo-status');
   let artifacts=[], index=0, returnFocus=null;
   let plantComposite=null;
   const queueModal=document.getElementById('queue-modal');
@@ -1176,6 +1207,62 @@ _DASHBOARD_JS = r"""
     return [(origin==='top_right'||origin==='bottom_right')?-1:1,
             (origin==='bottom_left'||origin==='bottom_right')?-1:1];
   }
+  /* Draws each frame's photo into ctx using the same calibrated, per-pixel
+     projective transform regardless of whether the caller wants the whole
+     bed (drawPhotoGrid) or a tight crop around one plant (openPlantView).
+     project(x,y) maps a garden-mm coordinate to canvas pixels; onDone(loaded,
+     failed) fires once every frame has resolved (loaded or failed). */
+  function drawFramesInto(ctx,canvasWidth,canvasHeight,frames,calibration,configEntryId,project,onDone){
+    if(!frames.length){onDone(0,0);return;}
+    const signs=gridOriginSigns(calibration.origin_location);
+    const rotation=-calibration.rotation_degrees*Math.PI/180;
+    let loaded=0, failed=0;
+    const finish=function(){if(loaded+failed===frames.length) onDone(loaded,failed);};
+    frames.forEach(function(frame){
+      const image=new Image();
+      image.onload=function(){
+        const iw=image.naturalWidth, ih=image.naturalHeight;
+        const ppmX=iw/(calibration.coordinate_scale*calibration.reference_width);
+        const ppmY=ih/(calibration.coordinate_scale*calibration.reference_height);
+        const garden=function(u,v){
+          const rx=u-iw/2, ry=v-ih/2;
+          const vx=Math.cos(rotation)*rx-Math.sin(rotation)*ry;
+          const vy=Math.sin(rotation)*rx+Math.cos(rotation)*ry;
+          return [frame.x+vx/(signs[0]*ppmX)+calibration.offset_x_mm,
+                  frame.y+vy/(signs[1]*ppmY)+calibration.offset_y_mm];
+        };
+        const p0=project.apply(null,garden(0,0));
+        const pu=project.apply(null,garden(iw,0));
+        const pv=project.apply(null,garden(0,ih));
+        ctx.save();
+        ctx.beginPath();ctx.rect(0,0,canvasWidth,canvasHeight);ctx.clip();
+        ctx.globalAlpha=.96;
+        ctx.setTransform((pu[0]-p0[0])/iw,(pu[1]-p0[1])/iw,
+                         (pv[0]-p0[0])/ih,(pv[1]-p0[1])/ih,p0[0],p0[1]);
+        ctx.drawImage(image,0,0);ctx.restore();
+        loaded++;finish();
+      };
+      image.onerror=function(){failed++;finish();};
+      image.src='api/vision/image/'+frame.image_id+'.jpg?entry_id='
+        +encodeURIComponent(configEntryId);
+    });
+  }
+  /* Whether garden point (px,py) falls inside frame's captured footprint.
+     Mirrors vision.garden_to_pixel's rotation/origin-sign convention but stays
+     in millimetre space throughout (no image needs to be loaded to test
+     membership -- the true image size in mm is coordinate_scale*reference
+     width/height, independent of whatever resolution is actually served). */
+  function frameOverlapsPoint(frame,calibration,px,py){
+    const signs=gridOriginSigns(calibration.origin_location);
+    const rotation=-calibration.rotation_degrees*Math.PI/180;
+    const cx=frame.x+calibration.offset_x_mm, cy=frame.y+calibration.offset_y_mm;
+    const dxm=(px-cx)*signs[0], dym=(py-cy)*signs[1];
+    const mx=Math.cos(rotation)*dxm+Math.sin(rotation)*dym;
+    const my=-Math.sin(rotation)*dxm+Math.cos(rotation)*dym;
+    const halfWidth=calibration.coordinate_scale*calibration.reference_width/2;
+    const halfHeight=calibration.coordinate_scale*calibration.reference_height/2;
+    return Math.abs(mx)<=halfWidth && Math.abs(my)<=halfHeight;
+  }
   function drawPhotoGrid(data){
     const record=data.grid, bounds=record.bed_bounds, calibration=record.calibration;
     const spanX=bounds.x[1]-bounds.x[0], spanY=bounds.y[1]-bounds.y[0];
@@ -1187,54 +1274,82 @@ _DASHBOARD_JS = r"""
     const project=function(x,y){return [(x-bounds.x[0])*sx,(y-bounds.y[0])*sy];};
     ctx.setTransform(1,0,0,1,0,0);
     ctx.fillStyle='#283f30';ctx.fillRect(0,0,photoGridCanvas.width,photoGridCanvas.height);
-    const signs=gridOriginSigns(calibration.origin_location);
-    const rotation=calibration.rotation_degrees*Math.PI/180;
-    let loaded=0, failed=0;
-    const finish=function(){
-      if(loaded+failed!==record.frames.length) return;
-      ctx.setTransform(1,0,0,1,0,0);
-      (data.plants||[]).forEach(function(plant){
-        const c=project(plant.x,plant.y);
-        ctx.fillStyle='rgba(32,160,82,.18)';ctx.strokeStyle='#39d878';ctx.lineWidth=2;
-        ctx.beginPath();ctx.arc(c[0],c[1],Math.max(4,(plant.radius||0)*(sx+sy)/2),0,Math.PI*2);
-        ctx.fill();ctx.stroke();
-      });
-      (data.weeds||[]).forEach(function(weed){
-        const c=project(weed.x,weed.y);
-        ctx.fillStyle='#ef476f';ctx.beginPath();ctx.arc(c[0],c[1],4,0,Math.PI*2);ctx.fill();
-      });
-      photoGridStatus.textContent=record.message+' · '+loaded+' verified photos rendered'
-        +(failed?' · '+failed+' image(s) could not be loaded':'');
-    };
     if(!record.frames.length){photoGridStatus.textContent='This grid has no verified photos yet';return;}
-    record.frames.forEach(function(frame){
-      const image=new Image();
-      image.onload=function(){
-        const iw=image.naturalWidth, ih=image.naturalHeight;
-        const ppmX=iw/(calibration.coordinate_scale*calibration.reference_width);
-        const ppmY=ih/(calibration.coordinate_scale*calibration.reference_height);
-        const garden=function(u,v){
-          const rx=u-iw/2, ry=v-ih/2;
-          const vx=Math.cos(rotation)*rx-Math.sin(rotation)*ry;
-          const vy=Math.sin(rotation)*rx+Math.cos(rotation)*ry;
-          return [frame.x+vx/(signs[0]*ppmX)-calibration.offset_x_mm,
-                  frame.y+vy/(signs[1]*ppmY)-calibration.offset_y_mm];
-        };
-        const p0=project.apply(null,garden(0,0));
-        const pu=project.apply(null,garden(iw,0));
-        const pv=project.apply(null,garden(0,ih));
-        ctx.save();
-        ctx.beginPath();ctx.rect(0,0,photoGridCanvas.width,photoGridCanvas.height);ctx.clip();
-        ctx.globalAlpha=.96;
-        ctx.setTransform((pu[0]-p0[0])/iw,(pu[1]-p0[1])/iw,
-                         (pv[0]-p0[0])/ih,(pv[1]-p0[1])/ih,p0[0],p0[1]);
-        ctx.drawImage(image,0,0);ctx.restore();
-        loaded++;finish();
+    drawFramesInto(ctx,photoGridCanvas.width,photoGridCanvas.height,record.frames,calibration,
+      record.config_entry_id,project,function(loaded,failed){
+        ctx.setTransform(1,0,0,1,0,0);
+        (data.plants||[]).forEach(function(plant){
+          const c=project(plant.x,plant.y);
+          ctx.fillStyle='rgba(32,160,82,.18)';ctx.strokeStyle='#39d878';ctx.lineWidth=2;
+          ctx.beginPath();ctx.arc(c[0],c[1],Math.max(4,(plant.radius||0)*(sx+sy)/2),0,Math.PI*2);
+          ctx.fill();ctx.stroke();
+        });
+        (data.weeds||[]).forEach(function(weed){
+          const c=project(weed.x,weed.y);
+          ctx.fillStyle='#ef476f';ctx.beginPath();ctx.arc(c[0],c[1],4,0,Math.PI*2);ctx.fill();
+        });
+        photoGridStatus.textContent=record.message+' · '+loaded+' verified photos rendered'
+          +(failed?' · '+failed+' image(s) could not be loaded':'');
+      });
+  }
+  function showPlantPhotoTab(showPhoto){
+    plantPhotoPane.hidden=!showPhoto;
+    diagnosticPane.hidden=showPhoto;
+    plantPhotoTab.setAttribute('aria-pressed',String(showPhoto));
+    plantDiagnosticTab.setAttribute('aria-pressed',String(!showPhoto));
+  }
+  async function openPlantView(trigger){
+    const plantX=parseFloat(trigger.dataset.plantX);
+    const plantY=parseFloat(trigger.dataset.plantY);
+    const plantRadius=parseFloat(trigger.dataset.plantRadius)||0;
+    let unlinked=[];
+    try{unlinked=JSON.parse(trigger.dataset.unlinkedImages||'[]');}catch(_){unlinked=[];}
+    const unlinkedIds=new Set(unlinked.map(String));
+    showPlantPhotoTab(true);
+    const ctx=plantPhotoCanvas.getContext('2d');
+    ctx.setTransform(1,0,0,1,0,0);
+    ctx.fillStyle='#111';ctx.fillRect(0,0,plantPhotoCanvas.width,plantPhotoCanvas.height);
+    plantPhotoStatus.textContent='Loading the latest whole-bed grid…';
+    if(!Number.isFinite(plantX)||!Number.isFinite(plantY)){
+      plantPhotoStatus.textContent='Plant position unavailable; showing the diagnostic image instead.';
+      showPlantPhotoTab(false);
+      return;
+    }
+    try{
+      const response=await fetch('api/photo-grid/latest');
+      const data=await response.json();
+      if(!response.ok) throw new Error(data.detail||('HTTP '+response.status));
+      const calibration=data.grid.calibration;
+      const frames=(data.grid.frames||[]).filter(function(frame){
+        return !unlinkedIds.has(String(frame.image_id))
+          && frameOverlapsPoint(frame,calibration,plantX,plantY);
+      });
+      if(!frames.length){
+        plantPhotoStatus.textContent='No verified whole-bed photo currently covers this plant; '
+          +'showing the diagnostic analysis image instead.';
+        showPlantPhotoTab(false);
+        return;
+      }
+      const halfSpan=Math.max(plantRadius*4,200);
+      const project=function(x,y){
+        return [(x-(plantX-halfSpan))*plantPhotoCanvas.width/(2*halfSpan),
+                (y-(plantY-halfSpan))*plantPhotoCanvas.height/(2*halfSpan)];
       };
-      image.onerror=function(){failed++;finish();};
-      image.src='api/vision/image/'+frame.image_id+'.jpg?entry_id='
-        +encodeURIComponent(record.config_entry_id);
-    });
+      drawFramesInto(ctx,plantPhotoCanvas.width,plantPhotoCanvas.height,frames,calibration,
+        data.grid.config_entry_id,project,function(loaded,failed){
+          const c=project(plantX,plantY);
+          ctx.setTransform(1,0,0,1,0,0);
+          ctx.strokeStyle='#39d878';ctx.lineWidth=2;
+          ctx.beginPath();ctx.arc(c[0],c[1],6,0,Math.PI*2);ctx.stroke();
+          plantPhotoStatus.textContent=frames.length+' image(s) from the latest whole-bed grid'
+            +(failed?' · '+failed+' could not be loaded':'')
+            +(frames.length>1?' (this plant spans a seam between captures)':'');
+        });
+    }catch(error){
+      plantPhotoStatus.textContent='Could not load the whole-bed grid ('+error.message+'); '
+        +'showing the diagnostic analysis image instead.';
+      showPlantPhotoTab(false);
+    }
   }
   async function loadPhotoGrid(){
     photoGridStatus.textContent='Loading the verified grid…';
@@ -1564,6 +1679,8 @@ _DASHBOARD_JS = r"""
   weedModal.addEventListener('click',function(event){if(event.target===weedModal) closeWeedModal();});
   plantWithoutOverlay.addEventListener('click',function(){showPlantComposite(false);});
   plantWithOverlay.addEventListener('click',function(){showPlantComposite(true);});
+  plantPhotoTab.addEventListener('click',function(){showPlantPhotoTab(true);});
+  plantDiagnosticTab.addEventListener('click',function(){showPlantPhotoTab(false);});
   document.addEventListener('click',async function(event){
     const weedViewer=event.target.closest('.weed-view');
     if(weedViewer){
@@ -1572,32 +1689,39 @@ _DASHBOARD_JS = r"""
       return;
     }
     const plantViewer=event.target.closest('[data-composite-clean]');
-    if(plantViewer){
-      plantComposite={
-        clean:plantViewer.dataset.compositeClean,
-        overlay:plantViewer.dataset.compositeOverlay||null
-      };
-      if(!plantComposite.clean) return;
-      returnFocus=plantViewer;
-      let details={}; try{details=JSON.parse(plantViewer.dataset.details||'{}');}catch(_){}
+    const artifactViewer=plantViewer?null:event.target.closest('[data-artifacts]');
+    const trigger=plantViewer||artifactViewer;
+    if(trigger){
+      if(plantViewer){
+        plantComposite={
+          clean:plantViewer.dataset.compositeClean,
+          overlay:plantViewer.dataset.compositeOverlay||null
+        };
+        plantToggle.hidden=false;
+        artifactControls.hidden=true;
+        plantWithOverlay.disabled=!plantComposite.overlay;
+        overlayLegend.textContent='Cyan circle = original radius; red circle = new radius; white dot = plant center.';
+        if(plantComposite.clean) showPlantComposite(false); else modalImg.removeAttribute('src');
+      } else {
+        try{artifacts=JSON.parse(artifactViewer.dataset.artifacts||'[]');}catch(_){artifacts=[];}
+        index=0;
+        plantToggle.hidden=true;
+        artifactControls.hidden=!artifacts.length;
+        overlayLegend.textContent='Cyan circle = original radius; red circle = planned radius.';
+        if(artifacts.length) showArtifact(); else modalImg.removeAttribute('src');
+      }
+      returnFocus=trigger;
+      let details={}; try{details=JSON.parse(trigger.dataset.details||'{}');}catch(_){}
       modalDetails.textContent=details.formula||'';
-      plantToggle.hidden=false;
-      artifactControls.hidden=true;
-      plantWithOverlay.disabled=!plantComposite.overlay;
-      overlayLegend.textContent='Cyan circle = original radius; red circle = new radius; white dot = plant center.';
-      modal.hidden=false; showPlantComposite(false); closeButton.focus(); return;
-    }
-    const viewer=event.target.closest('[data-artifacts]');
-    if(viewer){
-      try{artifacts=JSON.parse(viewer.dataset.artifacts||'[]');}catch(_){artifacts=[];}
-      if(!artifacts.length) return;
-      index=0; returnFocus=viewer;
-      let details={}; try{details=JSON.parse(viewer.dataset.details||'{}');}catch(_){}
-      modalDetails.textContent=details.formula||'';
-      plantToggle.hidden=true;
-      artifactControls.hidden=false;
-      overlayLegend.textContent='Cyan circle = original radius; red circle = planned radius.';
-      modal.hidden=false; showArtifact(); closeButton.focus(); return;
+      modal.hidden=false; closeButton.focus();
+      if(trigger.dataset.plantId){
+        plantPhotoMode.hidden=false;
+        openPlantView(trigger);
+      } else {
+        plantPhotoMode.hidden=true;
+        showPlantPhotoTab(false);
+      }
+      return;
     }
     const action=event.target.closest('.review-action');
     if(action){
@@ -2027,12 +2151,17 @@ button{{background:var(--green);border:0;border-radius:6px;padding:.65rem 1rem;c
 .overlay-modal{{position:fixed;inset:0;z-index:1000;background:#000b;display:flex;align-items:center;justify-content:center;padding:1rem}}
 .overlay-modal figure{{position:relative;background:white;border-radius:10px;margin:0;padding:1rem;max-width:min(95vw,1000px);max-height:95vh;overflow:auto}}
 .overlay-modal img{{display:block;max-height:70vh;margin:auto}}.modal-close{{position:absolute;right:.5rem;top:.5rem;font-size:1.5rem}}
+.overlay-modal canvas{{display:block;max-height:70vh;max-width:100%;margin:auto;background:#111;border-radius:6px}}
+#plant-photo-pane[hidden],#diagnostic-pane[hidden]{{display:none}}
 .gantry-gallery{{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:1rem;min-width:min(85vw,900px)}}
 .gantry-gallery figure{{margin:0;padding:0;overflow:hidden}}.gantry-gallery img{{width:100%;height:180px;object-fit:contain;background:#111}}
 .gantry-gallery figcaption{{padding:.5rem 0}}.gantry-target{{color:#a40000;font-weight:bold}}
 .photo-grid-dialog{{width:min(96vw,1000px)}}.photo-grid-dialog canvas{{display:block;width:100%;max-height:72vh;
 background:#243a2c;border:1px solid #bcc9c0;border-radius:6px}}
 .photo-grid-card form{{margin:0}}
+.calibration-grid-viewport{{width:100%;max-height:72vh;overflow:auto;background:#111;
+border:1px solid #ccc;border-radius:6px}}.calibration-grid-viewport canvas{{display:block;
+width:100%;height:auto;max-width:none}}
 .modal-controls{{display:flex;gap:.5rem;align-items:center;justify-content:center;margin-top:.6rem}}.legend{{font-size:.9rem;color:var(--muted)}}
 .modal-controls[hidden]{{display:none}}
 .queue-dialog{{width:min(95vw,900px)}}.button-row{{display:flex;gap:.5rem;flex-wrap:wrap;align-items:center}}
@@ -2136,6 +2265,17 @@ async def dashboard(request: Request) -> HTMLResponse:
             )
         }
         details_json = escape(json.dumps(details, separators=(",", ":")), quote=True)
+        plant_attrs = ""
+        if r.get("plant_id") is not None and center_x is not None and center_y is not None:
+            plant_entry_id = r.get("config_entry_id") or settings.selected_config_entry_id
+            unlinked = sorted(database.unlinked_image_ids(plant_entry_id, int(r["plant_id"])))
+            unlinked_json = escape(json.dumps(unlinked, separators=(",", ":")), quote=True)
+            plant_attrs = (
+                f' data-plant-id="{int(r["plant_id"])}" '
+                f'data-plant-x="{float(center_x)}" data-plant-y="{float(center_y)}" '
+                f'data-plant-radius="{float(r.get("current_radius_mm") or 0)}" '
+                f'data-unlinked-images="{unlinked_json}"'
+            )
         if r.get("composite_path"):
             clean_url = escape(
                 f"artifact/{Path(r['composite_path']).name}",
@@ -2152,7 +2292,7 @@ async def dashboard(request: Request) -> HTMLResponse:
             composite_button = (
                 f'<button type=button data-composite-clean="{clean_url}" '
                 f'data-composite-overlay="{overlay_url}" '
-                f'data-details="{details_json}">View</button>'
+                f'data-details="{details_json}"{plant_attrs}>View</button>'
             )
             if r.get("fusion_diagnostic_path"):
                 fusion_url = escape(
@@ -2174,11 +2314,16 @@ async def dashboard(request: Request) -> HTMLResponse:
             paths = [*paths, r["fusion_diagnostic_path"]]
         urls = [f"artifact/{Path(path).name}" for path in paths if path]
         if not urls:
-            return "<span class=muted>None</span>"
+            if not plant_attrs:
+                return "<span class=muted>None</span>"
+            return (
+                f'<button type=button data-artifacts="[]" '
+                f'data-details="{details_json}"{plant_attrs}>View</button>'
+            )
         artifacts_json = escape(json.dumps(urls, separators=(",", ":")), quote=True)
         return (
             f'<button type=button data-artifacts="{artifacts_json}" '
-            f'data-details="{details_json}">View</button>'
+            f'data-details="{details_json}"{plant_attrs}>View</button>'
         )
 
     def _format_center(
@@ -2517,6 +2662,16 @@ value="{repair_values.delay_minutes}" required> minutes after the photo grid com
 <section class=card><h2>Safety warning</h2><p class=warn>Early experimental vision results must not be the sole basis for destructive automatic weeding.</p></section>
 <div id=overlay-modal class=overlay-modal hidden role=dialog aria-modal=true aria-label="Analysis diagnostic"><figure>
 <button id=overlay-modal-close class=modal-close type=button aria-label=Close>&times;</button>
+<div id=plant-photo-mode class="modal-controls plant-view-toggle" role=group aria-label="View mode" hidden>
+<button id=plant-photo-tab type=button aria-pressed=true>Plant photo</button>
+<button id=plant-diagnostic-tab type=button aria-pressed=false>Diagnostic overlay</button>
+</div>
+<div id=plant-photo-pane hidden>
+<canvas id=plant-photo-canvas width=480 height=480
+ aria-label="Plant photo, cropped from the latest whole-bed grid"></canvas>
+<p id=plant-photo-status class=muted></p>
+</div>
+<div id=diagnostic-pane>
 <div id=plant-view-toggle class="modal-controls plant-view-toggle" role=group aria-label="Plant image view" hidden>
 <button id=plant-modal-without-overlay type=button aria-pressed=true>Original images</button>
 <button id=plant-modal-with-overlay type=button aria-pressed=false>Show mask overlay</button>
@@ -2524,6 +2679,7 @@ value="{repair_values.delay_minutes}" required> minutes after the photo grid com
 <img id=overlay-modal-img alt="Plant analysis diagnostic"><figcaption id=overlay-modal-details></figcaption>
 <p id=overlay-modal-legend class=legend>Cyan circle = original radius; red circle = planned radius.</p>
 <div id=artifact-controls class=modal-controls><button id=overlay-modal-prev type=button>Previous</button><span id=overlay-modal-counter></span><button id=overlay-modal-next type=button>Next</button></div>
+</div>
 </figure></div>
 <div id=weed-modal class=overlay-modal hidden role=dialog aria-modal=true aria-label="Weed review">
 <figure class=weed-dialog><button id=weed-modal-close class=modal-close type=button aria-label=Close>&times;</button>
@@ -4024,11 +4180,13 @@ tools needed.</p>
 <label>Photos to<br><input id=date_to type=datetime-local value="{grid_to_value}"></label></div>
 <p><button type=button id=load>Load photo grid</button></p>
 <hr>
-<p class=muted>In FarmBot open Photos → Camera calibration and copy each value below.</p>
+<p class=muted>Copy scale, rotation, origin, and offsets exactly as shown in FarmBot.
+Copy the selected resolution from Photos → Camera settings; it lets this app resize the
+preview without changing FarmBot's millimetres-per-pixel scale.</p>
 <label>Pixel coordinate scale (mm/pixel)<br><input id=fb_scale type=number min=0 step=any value="{v_scale}"></label>
-<label>Measured at width (px)<br><input id=fb_refw type=number min=1 step=1 value="{v_refw}"></label>
-<label>Measured at height (px)<br><input id=fb_refh type=number min=1 step=1 value="{v_refh}"></label>
-<p id=ppm class=muted>Enter the FarmBot pixel coordinate scale, and measured-at width/height</p>
+<label>FarmBot capture width (px)<br><input id=fb_refw type=number min=1 step=1 value="{v_refw}"></label>
+<label>FarmBot capture height (px)<br><input id=fb_refh type=number min=1 step=1 value="{v_refh}"></label>
+<p id=ppm class=muted>Enter the FarmBot pixel coordinate scale and Camera settings resolution</p>
 <label>Camera rotation (degrees)<br><input id=rotation type=number step=any value="{v_rot}"></label>
 <label>Origin location in image<br><select id=origin>{_origin_options(v_origin)}</select></label>
 <label>Map origin<br><select id=map_origin>{_origin_options(v_map_origin)}</select></label>
@@ -4036,8 +4194,8 @@ tools needed.</p>
 the orientation selected in the FarmBot web app. It does not change the camera transform.</p>
 <label>Offset X (mm)<br><input id=offx type=number step=any value="{v_ox}"></label>
 <label>Offset Y (mm)<br><input id=offy type=number step=any value="{v_oy}"></label>
-<p class=muted>Leave offsets at 0 unless the overlay is shifted. FarmBot's camera offset is
-already folded into the image-centre coordinate, so entering it again would double-count.</p>
+<p class=muted>Copy both FarmBot camera offsets unchanged. FarmBot places the optical
+centre at the photo's recorded gantry coordinate plus these offsets.</p>
 <label><input type=checkbox id=showoverlay checked> Overlay plant &amp; weed centres</label><br>
 <label><input type=checkbox id=showlabels checked> Show labels (name / weed)</label>
 <p><label><input type=checkbox id=confirm> Centres align across the full grid</label></p>
@@ -4045,11 +4203,18 @@ already folded into the image-centre coordinate, so entering it again would doub
 <p id=status class=muted></p>
 </div>
 <div>
+<div class=button-row aria-label="Calibration grid zoom controls">
+<button type=button id=zoom-out aria-label="Zoom out">−</button>
+<button type=button id=zoom-in aria-label="Zoom in">+</button>
+<button type=button id=zoom-reset>Reset zoom</button>
+<span id=zoom-value class=muted>100%</span></div>
+<div id=calibration-grid-viewport class=calibration-grid-viewport>
 <canvas id=canvas width=900 height=420 aria-label="Calibration birds-eye photo grid"
- style="display:block;width:100%;max-height:72vh;border:1px solid #ccc;background:#111"></canvas>
+ style="display:block;width:100%;background:#111"></canvas></div>
 <p class=muted>Green = known plants (name · crop). Red = FarmBot weeds. Adjust the
 values above and the complete grid updates live. Within the selected range, only the
-newest photo at each FarmBot coordinate is shown.</p>
+newest photo at each FarmBot coordinate is shown. Zoom in, then use the scrollbars
+to inspect individual seams and marker centres.</p>
 </div>
 </div>
 </section>

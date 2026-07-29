@@ -104,10 +104,12 @@ def test_bed_grid_generates_seventy_seven_unique_cells():
     calibration = _bed_calibration()
     footprint_x = calibration.coordinate_scale * calibration.reference_width
     footprint_y = calibration.coordinate_scale * calibration.reference_height
-    first_x = BED_X_BOUNDS[0] + footprint_x / 2 + calibration.offset_x_mm
-    last_x = BED_X_BOUNDS[1] - footprint_x / 2 + calibration.offset_x_mm
-    first_y = BED_Y_BOUNDS[0] + footprint_y / 2 + calibration.offset_y_mm
-    last_y = BED_Y_BOUNDS[1] - footprint_y / 2 + calibration.offset_y_mm
+    # FarmBot's optical centre is gantry + camera offset, so capture gantry
+    # coordinates subtract the copied offsets from the desired bed positions.
+    first_x = BED_X_BOUNDS[0] + footprint_x / 2 - calibration.offset_x_mm
+    last_x = BED_X_BOUNDS[1] - footprint_x / 2 - calibration.offset_x_mm
+    first_y = BED_Y_BOUNDS[0] + footprint_y / 2 - calibration.offset_y_mm
+    last_y = BED_Y_BOUNDS[1] - footprint_y / 2 - calibration.offset_y_mm
 
     first, last = targets[0], targets[-1]
     assert (first.row, first.column) == (0, 0)

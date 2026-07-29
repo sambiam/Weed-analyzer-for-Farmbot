@@ -1,5 +1,23 @@
 # Changelog
 
+## 3.0.0 - 2026-07-29
+
+- Corrected camera calibration to match the current FarmBot Web App source:
+  copied camera rotation values now use FarmBot's negative display direction,
+  and copied camera offsets place the optical centre at photo coordinate plus
+  offset without requiring users to invert either value.
+- Photo-grid planning now subtracts the FarmBot camera offset from desired
+  optical centres when calculating gantry capture coordinates.
+- Clarified that Pixel coordinate scale is copied verbatim in millimetres per
+  capture pixel, while the FarmBot Camera settings resolution is used only to
+  rescale analysis and preview copies.
+- Added calibration-grid zoom in, zoom out, and reset controls. The full-bed
+  canvas can be enlarged to 600% and scrolled to inspect individual seams and
+  overlay centres.
+- Existing installations that stored inverted workaround rotation or offset
+  values must replace them with the values shown verbatim in FarmBot after
+  upgrading.
+
 ## 2.6.0 - 2026-07-29
 
 - The whole-bed photo grid is now captured as one continuous serpentine route.
