@@ -40,6 +40,9 @@ class FarmbotCalibrationInput(BaseModel):
     reference_height: int = Field(ge=1)
     rotation_degrees: float = 0.0
     origin_location: OriginLocation = OriginLocation.TOP_LEFT
+    # Whole-map display orientation. This is separate from origin_location,
+    # which is part of the camera's garden-to-pixel transform.
+    map_origin: OriginLocation = OriginLocation.TOP_LEFT
     offset_x_mm: float = 0.0
     offset_y_mm: float = 0.0
 

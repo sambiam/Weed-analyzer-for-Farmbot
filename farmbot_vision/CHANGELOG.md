@@ -1,5 +1,37 @@
 # Changelog
 
+## 2.6.0 - 2026-07-29
+
+- The whole-bed photo grid is now captured as one continuous serpentine route.
+  With companion integration 2.5.0 the entire 77-cell plan is sent in a single
+  `start_vision_grid_repair` call, so the bot no longer drives back out to its
+  staging position and cycles the lighting every twelve cells, and rows are no
+  longer cut in half and resumed later.
+- Where the loaded integration still requires chunking, batches are strictly
+  consecutive slices of the same canonical route: the first cell of a batch is
+  the cell that follows the last cell of the one before it, with no renumbering,
+  no overlap and no regenerated coordinates. The app logs a warning naming the
+  capability to update for.
+- Uploaded frames are credited to a cell by the stable target index the
+  integration returns, instead of by 25 mm coordinate proximity. A verified cell
+  can no longer look unverified and get photographed a second time.
+- Grid coordinates are rounded to micrometres so a cell's planned position is
+  identical however often it is generated, stored or resent.
+
+## 2.5.0 - 2026-07-29
+
+- Replaced the calibration row composite with a date-filtered, full-bed photo
+  grid that matches the analysis page's birds-eye mosaic and updates live as
+  camera calibration values change.
+- The calibration grid keeps only the newest image at each FarmBot coordinate
+  in the selected range, preventing repeated captures from being painted over
+  one another.
+- Plant and weed circles remain overlaid across the complete bed. A persistent
+  Map origin setting now rotates the photos, markers, and labels together to
+  match the FarmBot web app's map orientation.
+- Corrected calibration-preview offset handling so its inverse image transform
+  matches the analysis pipeline's garden-coordinate transform.
+
 ## 2.4.1 - 2026-07-29
 
 - **Fixed:** The photo grid captured almost nothing (2 of 77 coordinates in

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from urllib.parse import unquote, urlencode, urljoin, urlsplit
 from uuid import uuid4
@@ -1041,6 +1041,9 @@ async def test_duplicate_slashes_reach_health_and_settings():
     status, _, body = await asgi_request("///settings")
     assert status == 200
     assert b"FarmBot calibration" in body
+    assert b"id=map_origin" in body
+    assert b"id=date_from" in body
+    assert b"newest photo at each FarmBot coordinate" in body
 
     status, _, body = await asgi_request("/health")
     assert status == 200
@@ -1662,6 +1665,7 @@ async def test_save_calibration_persists_to_data_store():
         offset_x=3,
         offset_y=-4,
         origin_location="bottom_left",
+        map_origin="top_right",
         coordinate_scale=0.3,
         reference_width=2592,
         reference_height=1944,
@@ -1672,6 +1676,58 @@ async def test_save_calibration_persists_to_data_store():
     assert stored.rotation_degrees == 12.0
     assert stored.offset_x_mm == 3
     assert str(stored.origin_location) == "bottom_left"
+    assert str(stored.map_origin) == "top_right"
+
+
+@pytest.mark.asyncio
+async def test_calibration_grid_filters_dates_and_keeps_newest_per_location(monkeypatch, tmp_path):
+    from farmbot_vision.photo_grid import PhotoGridStore
+
+    now = datetime.now(UTC)
+
+    async def inventory(_request):
+        def image(image_id, minutes_ago, x, y):
+            return {
+                "id": image_id,
+                "created_at": now - timedelta(minutes=minutes_ago),
+                "x": x,
+                "y": y,
+                "z": 0,
+            }
+
+        return Inventory.model_validate(
+            {
+                "device_id": "42",
+                "generated_at": now,
+                "plants": [],
+                "weeds": [],
+                "images": [
+                    image(1, 20, 100, 200),
+                    image(2, 10, 104, 203),
+                    image(3, 5, 400, 500),
+                    image(4, 120, 700, 800),
+                ],
+                "curves": [],
+                "camera_calibration": {"available": False},
+            }
+        )
+
+    async def soil_points(_entry_id):
+        raise web.HomeAssistantError("motion bounds unavailable")
+
+    monkeypatch.setattr(web.client, "inventory", inventory)
+    monkeypatch.setattr(web.client, "soil_points", soil_points)
+    monkeypatch.setattr(web, "photo_grid_store", PhotoGridStore(tmp_path / "grid.json"))
+
+    response = await web.vision_images(
+        entry_id="bot-grid",
+        date_from=now - timedelta(hours=1),
+        date_to=now,
+    )
+    payload = json.loads(response.body)
+
+    assert [image["id"] for image in payload["images"]] == [3, 2]
+    assert payload["bed_bounds"] is None
 
 
 @pytest.mark.asyncio

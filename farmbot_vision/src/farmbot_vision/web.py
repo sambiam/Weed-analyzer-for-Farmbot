@@ -56,6 +56,7 @@ from .models import (
     ApplyRadiusRequest,
     ApplyRemovalRequest,
     ApplySoilHeightRequest,
+    Bot,
     Calibration,
     CreateWeedRequest,
     InventoryRequest,
@@ -68,12 +69,13 @@ from .models import (
     WeedBulkAcceptRequest,
 )
 from .photo_grid import (
-    PHOTO_GRID_CHUNK_SIZE,
+    PHOTO_GRID_CONTINUOUS_CAPABILITY,
     PhotoGridFrame,
     PhotoGridRecord,
     PhotoGridStore,
     PhotoGridTarget,
     match_verified_frames,
+    photo_grid_chunk_size,
     plan_photo_grid,
 )
 from .settings import Settings
@@ -238,7 +240,7 @@ async def inspect_photo_grid(*, force: bool = False) -> GridRun | None:
         return None
 
 
-async def _require_grid_repair_capability(*, require_lighting: bool = False) -> None:
+async def _require_grid_repair_capability(*, require_lighting: bool = False) -> Bot:
     bots = (await client.list_bots()).bots
     bot = next(
         (item for item in bots if item.config_entry_id == settings.selected_config_entry_id),
@@ -256,6 +258,7 @@ async def _require_grid_repair_capability(*, require_lighting: bool = False) -> 
             f"Photo-grid capture requires FarmBot integration V{MINIMUM_INTEGRATION_VERSION}"
             f"{loaded}. Install/update it and restart Home Assistant."
         )
+    return bot
 
 
 def _ordered_repair_targets(run: GridRun):
@@ -600,7 +603,14 @@ async def _start_photo_grid_batch(
     losing an entire chunk's targets to it. Any other rejection reason (or a
     response missing a repair ID) stays a hard, non-retried failure.
     """
-    payload = [{"x": target.x, "y": target.y, "z": target.z} for target in targets]
+    # `index` is only sent to an integration that advertises it: older service
+    # schemas reject any unknown target key outright, which would turn every
+    # batch into an HTTP 400 that captures nothing.
+    payload = [
+        {"x": target.x, "y": target.y, "z": target.z}
+        | ({"index": target.index} if record.indexed_targets else {})
+        for target in targets
+    ]
     attempt = 0
     while True:
         attempt += 1
@@ -704,9 +714,14 @@ async def _photo_grid_worker(record: PhotoGridRecord) -> None:
             passes_run += 1
             verified_before_pass = len(record.frames)
             retry: list[PhotoGridTarget] = []
-            for start in range(0, len(pending), PHOTO_GRID_CHUNK_SIZE):
-                chunk = pending[start : start + PHOTO_GRID_CHUNK_SIZE]
-                batch_number = start // PHOTO_GRID_CHUNK_SIZE + 1
+            # Batches are consecutive slices of the canonical route, in route
+            # order: the first cell of batch N+1 is the cell that follows the
+            # last cell of batch N. Nothing is renumbered, repeated or
+            # regenerated at a boundary.
+            chunk_size = max(1, record.chunk_size)
+            for start in range(0, len(pending), chunk_size):
+                chunk = pending[start : start + chunk_size]
+                batch_number = start // chunk_size + 1
                 try:
                     retry.extend(await _capture_photo_grid_targets(record, chunk))
                 except HomeAssistantError as exc:
@@ -803,7 +818,7 @@ async def start_calibrated_photo_grid() -> PhotoGridRecord:
         if current is not None:
             return current
         raise HomeAssistantError("A photo grid is already running")
-    await _require_grid_repair_capability(require_lighting=True)
+    bot = await _require_grid_repair_capability(require_lighting=True)
     entry_id = settings.selected_config_entry_id
     calibration = calibration_store.get(entry_id)
     if calibration is None:
@@ -840,6 +855,7 @@ async def start_calibrated_photo_grid() -> PhotoGridRecord:
         y_bounds=y_bounds,
         z=z,
     )
+    chunk_size = photo_grid_chunk_size(bot.capabilities)
     record = PhotoGridRecord(
         config_entry_id=entry_id,
         started_at=datetime.now(UTC),
@@ -850,7 +866,20 @@ async def start_calibrated_photo_grid() -> PhotoGridRecord:
         footprint_height_mm=footprint_height,
         calibration=calibration,
         targets=targets,
+        chunk_size=chunk_size,
+        indexed_targets=bot.supports("indexed_photo_grid_targets"),
     )
+    if chunk_size < len(targets):
+        LOGGER.warning(
+            "Photo grid %s will be sent as %d separate calls: the loaded FarmBot "
+            "integration (%s) does not advertise %s, so it runs the lighting and a "
+            "return to the staging position once per call instead of once per grid. "
+            "Update the integration to capture the route continuously.",
+            record.session_id,
+            math.ceil(len(targets) / chunk_size),
+            bot.integration_version or "unknown version",
+            PHOTO_GRID_CONTINUOUS_CAPABILITY,
+        )
     photo_grid_store.save(record)
     photo_grid_task = asyncio.create_task(
         _photo_grid_worker(record), name=f"photo-grid-{record.session_id}"
@@ -928,7 +957,7 @@ class NormalizeIngressPathMiddleware:
 # FarmBot-style composite calibration view. One photo-row (images sharing an X
 # coordinate) is stitched in garden-coordinate space using the FarmBot camera
 # calibration, with plant and weed centres overlaid so alignment across the
-# whole row can be verified at once. Vanilla JS on a canvas -- no frontend build
+# whole bed can be verified at once. Vanilla JS on a canvas -- no frontend build
 # toolchain (Part 5). The rotation direction here MUST match
 # vision.ROTATION_SIGN and vision.garden_to_pixel.
 _CALIBRATION_JS = r"""
@@ -937,15 +966,15 @@ _CALIBRATION_JS = r"""
   const MAX_CANVAS=2400;       // cap composite dimensions to bound memory
   const canvas=document.getElementById('canvas');
   const ctx=canvas.getContext('2d');
-  const rowSel=document.getElementById('row');
   const status=document.getElementById('status');
   const ppmEl=document.getElementById('ppm');
-  let scene={images:[],plants:[],weeds:[]}, rows=[], current=null, pending=false;
+  let scene={images:[],plants:[],weeds:[],bed_bounds:null}, current=null, pending=false;
 
   function entry(){return document.getElementById('entry_id').value.trim();}
   function num(id){return parseFloat(document.getElementById(id).value)||0;}
   function checked(id){return document.getElementById(id).checked;}
   function origin(){return document.getElementById('origin').value;}
+  function mapOrigin(){return document.getElementById('map_origin').value;}
   function originSigns(o){
     return [(o==='top_right'||o==='bottom_right')?-1:1,
             (o==='bottom_left'||o==='bottom_right')?-1:1];
@@ -967,39 +996,16 @@ _CALIBRATION_JS = r"""
     const rx=u-iw/2, ry=v-ih/2;
     const c=Math.cos(p.rot), s=Math.sin(p.rot);
     const vx=c*rx - s*ry, vy=s*rx + c*ry;
-    return [cx + vx/(p.sx*ppm[0]), cy + vy/(p.sy*ppm[1])];
+    return [cx + vx/(p.sx*ppm[0])-p.ox, cy + vy/(p.sy*ppm[1])-p.oy];
   }
-  // Group images into rows by shared X (within tolerance, mm).
-  function buildRows(images,tol){
-    const imgs=images.filter(im=>isFinite(im.x)&&isFinite(im.y)).slice()
-                     .sort((a,b)=>a.x-b.x);
-    const out=[]; let cur=null;
-    imgs.forEach(im=>{
-      if(!cur||Math.abs(im.x-cur.x)>tol){cur={x:im.x,sum:im.x,images:[im]};out.push(cur);}
-      else{cur.images.push(im);cur.sum+=im.x;cur.x=cur.sum/cur.images.length;}
-    });
-    out.forEach(r=>r.images.sort((a,b)=>a.y-b.y));
-    return out;
-  }
-  function populateRows(){
-    rows=buildRows(scene.images,num('rowtol')||50);
-    rowSel.innerHTML='';
-    rows.forEach((r,i)=>{
-      const o=document.createElement('option');
-      o.value=i;
-      o.textContent='X≈'+Math.round(r.x)+' mm ('+r.images.length+' photos)';
-      rowSel.appendChild(o);
-    });
-  }
-  function selectRow(){
+  function loadGridImages(){
     const p=params();
     ppmEl.textContent=p?('Pixels per mm (at analysis res): scale '+p.scale+' mm/px'):
                         'Enter the FarmBot pixel coordinate scale, and measured-at width/height';
-    const row=rows[+rowSel.value];
-    if(!row){current=null;clearCanvas('Load a bot, then pick a photo row');return;}
+    if(!scene.images.length){current=null;clearCanvas('No photos in this date range');return;}
     current={images:[]};
-    status.textContent='Loading '+row.images.length+' photos…';
-    row.images.forEach(im=>{
+    status.textContent='Loading '+scene.images.length+' grid photos…';
+    scene.images.forEach(im=>{
       const image=new Image();
       const rec={info:im,img:image,loaded:false};
       current.images.push(rec);
@@ -1009,7 +1015,7 @@ _CALIBRATION_JS = r"""
     });
   }
   function clearCanvas(msg){
-    canvas.width=640;canvas.height=200;
+    canvas.width=900;canvas.height=420;
     ctx.setTransform(1,0,0,1,0,0);
     ctx.fillStyle='#111';ctx.fillRect(0,0,canvas.width,canvas.height);
     ctx.fillStyle='#888';ctx.font='14px sans-serif';ctx.fillText(msg||'',12,28);
@@ -1036,12 +1042,28 @@ _CALIBRATION_JS = r"""
         gymin=Math.min(gymin,g[1]);gymax=Math.max(gymax,g[1]);
       });
     });
+    // Use the FarmBot bed bounds when the latest grid or motion state supplied
+    // them. This makes the calibration canvas the same whole-bed view as the
+    // analysis grid instead of shrinking around whichever photos happened to load.
+    if(scene.bed_bounds&&scene.bed_bounds.x&&scene.bed_bounds.y){
+      gxmin=scene.bed_bounds.x[0];gxmax=scene.bed_bounds.x[1];
+      gymin=scene.bed_bounds.y[0];gymax=scene.bed_bounds.y[1];
+    }
     let P=ppmSum/ready.length;
     const rangeX=Math.max(1,gxmax-gxmin), rangeY=Math.max(1,gymax-gymin);
-    P=Math.min(P,MAX_CANVAS/rangeX,MAX_CANVAS/rangeY);
-    canvas.width=Math.max(1,Math.round(rangeX*P));
-    canvas.height=Math.max(1,Math.round(rangeY*P));
-    const toCanvas=function(gx,gy){return [(gx-gxmin)*P,(gy-gymin)*P];};
+    const quarterTurn=mapOrigin()==='top_right'||mapOrigin()==='bottom_left';
+    const displayRangeX=quarterTurn?rangeY:rangeX;
+    const displayRangeY=quarterTurn?rangeX:rangeY;
+    P=Math.min(P,MAX_CANVAS/displayRangeX,MAX_CANVAS/displayRangeY);
+    canvas.width=Math.max(1,Math.round(displayRangeX*P));
+    canvas.height=Math.max(1,Math.round(displayRangeY*P));
+    const toCanvas=function(gx,gy){
+      const x=gx-gxmin, y=gy-gymin;
+      if(mapOrigin()==='top_right') return [(rangeY-y)*P,x*P];
+      if(mapOrigin()==='bottom_right') return [(rangeX-x)*P,(rangeY-y)*P];
+      if(mapOrigin()==='bottom_left') return [y*P,(rangeX-x)*P];
+      return [x*P,y*P];
+    };
     ctx.setTransform(1,0,0,1,0,0);
     ctx.fillStyle='#111';ctx.fillRect(0,0,canvas.width,canvas.height);
     // Paint each image via the affine that maps its source pixels into the
@@ -1058,13 +1080,12 @@ _CALIBRATION_JS = r"""
     });
     ctx.setTransform(1,0,0,1,0,0);
     if(checked('showoverlay')) drawOverlay(p,toCanvas,P);
-    status.textContent='Row composite: '+ready.length+' photos, '
+    status.textContent='Full grid: '+ready.length+' photos, '
       +scene.plants.length+' plants, '+scene.weeds.length+' weeds. '
-      +'Confirm centres sit on their plants across the row.';
+      +'Confirm centres sit on their plants across the bed.';
   }
   function marker(p,toCanvas,P,pt,colour,label){
-    // Offset shifts a point's projected position exactly as garden_to_pixel does.
-    const c=toCanvas(pt.x+p.ox,pt.y+p.oy);
+    const c=toCanvas(pt.x,pt.y);
     if(c[0]<-40||c[1]<-40||c[0]>canvas.width+40||c[1]>canvas.height+40) return;
     ctx.strokeStyle=colour;ctx.fillStyle=colour;ctx.lineWidth=2;
     ctx.beginPath();ctx.arc(c[0],c[1],Math.max(4,(pt.radius||0)*P),0,7);ctx.stroke();
@@ -1081,23 +1102,29 @@ _CALIBRATION_JS = r"""
   }
 
   document.getElementById('load').addEventListener('click',async function(){
-    status.textContent='Loading inventory…';
+    const dateFrom=document.getElementById('date_from').value;
+    const dateTo=document.getElementById('date_to').value;
+    if(!dateFrom||!dateTo){status.textContent='Choose both a from and to date';return;}
+    if(new Date(dateFrom)>new Date(dateTo)){status.textContent='From must be before to';return;}
+    status.textContent='Loading date-filtered grid…';
     try{
-      const r=await fetch('api/vision/images?entry_id='+encodeURIComponent(entry()));
+      const query=new URLSearchParams({entry_id:entry(),
+        date_from:new Date(dateFrom).toISOString(),date_to:new Date(dateTo).toISOString()});
+      const r=await fetch('api/vision/images?'+query.toString());
       if(!r.ok) throw new Error('HTTP '+r.status);
       scene=await r.json();
       scene.images=scene.images||[];scene.plants=scene.plants||[];scene.weeds=scene.weeds||[];
-      populateRows();
-      status.textContent=scene.images.length+' images, '+rows.length+' rows, '
+      status.textContent=scene.images.length+' unique grid locations, '
         +scene.plants.length+' plants, '+scene.weeds.length+' weeds';
-      if(rows.length) selectRow(); else clearCanvas('No images with coordinates found');
+      if(scene.images.length) loadGridImages(); else clearCanvas('No images in this date range');
     }catch(err){status.textContent='Could not load inventory: '+err.message;}
   });
-  rowSel.addEventListener('change',selectRow);
-  document.getElementById('rowtol').addEventListener('input',function(){
-    populateRows();selectRow();
+  ['date_from','date_to'].forEach(function(id){
+    document.getElementById(id).addEventListener('change',function(){
+      document.getElementById('load').click();
+    });
   });
-  ['fb_scale','fb_refw','fb_refh','rotation','origin','offx','offy'].forEach(function(id){
+  ['fb_scale','fb_refw','fb_refh','rotation','origin','map_origin','offx','offy'].forEach(function(id){
     document.getElementById(id).addEventListener('input',scheduleRender);
     document.getElementById(id).addEventListener('change',scheduleRender);
   });
@@ -1111,12 +1138,14 @@ _CALIBRATION_JS = r"""
     const fields={entry_id:entry(),coordinate_scale:num('fb_scale'),
       reference_width:num('fb_refw'),reference_height:num('fb_refh'),
       rotation:num('rotation'),origin_location:origin(),
+      map_origin:mapOrigin(),
       offset_x:num('offx'),offset_y:num('offy')};
     for(const k in fields){const i=document.createElement('input');i.type='hidden';
       i.name=k;i.value=fields[k];f.appendChild(i);}
     document.body.appendChild(f);f.submit();
   });
-  clearCanvas('Load a bot, then pick a photo row');
+  clearCanvas('Loading the date-filtered photo grid…');
+  if(entry()) document.getElementById('load').click();
 })();
 """
 
@@ -1991,6 +2020,7 @@ def layout(request: Request, body: str, title: str = "FarmBot Vision") -> HTMLRe
 :root{{--green:#52b788;--dark:#17221b;--muted:#74817a}}*{{box-sizing:border-box}}
 body{{font:15px system-ui;margin:0;background:#f3f7f4;color:var(--dark)}}header{{background:#173f2c;color:white;padding:1rem 4vw}}
 main{{max-width:1100px;margin:auto;padding:1.2rem}}nav a{{color:white;margin-right:1rem}}.grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:1rem}}
+.calibration-grid{{grid-template-columns:minmax(240px,320px) minmax(0,1fr)}}@media(max-width:760px){{.calibration-grid{{grid-template-columns:1fr}}}}
 .card{{background:white;border-radius:10px;padding:1rem;box-shadow:0 1px 4px #0002;overflow:auto}}table{{width:100%;border-collapse:collapse}}td,th{{padding:.5rem;text-align:left;border-bottom:1px solid #ddd}}
 button{{background:var(--green);border:0;border-radius:6px;padding:.65rem 1rem;cursor:pointer}}.warn{{color:#9b4b00}}.muted{{color:var(--muted)}}input,select{{padding:.5rem;max-width:100%}}img{{max-width:100%}}
 .action-message{{display:block;color:#a40000;max-width:24rem}}.action-message.notice{{color:var(--muted)}}.overlay-modal[hidden]{{display:none}}
@@ -3937,6 +3967,16 @@ def _origin_options(selected: str) -> str:
     )
 
 
+def _calibration_grid_range(entry_id: str) -> tuple[datetime, datetime]:
+    """Default the preview to the latest captured grid's time window."""
+    record = photo_grid_store.load()
+    if record is not None and record.config_entry_id == entry_id and record.frames:
+        end = record.completed_at or record.started_at + timedelta(hours=1)
+        return record.started_at - timedelta(minutes=5), end + timedelta(minutes=5)
+    end = datetime.now(UTC)
+    return end - timedelta(hours=72), end
+
+
 @app.get("/settings", response_class=HTMLResponse)
 async def calibration_page(request: Request) -> HTMLResponse:
     entry_id = settings.selected_config_entry_id
@@ -3964,21 +4004,25 @@ async def calibration_page(request: Request) -> HTMLResponse:
     v_ox = 0 if stored is None else stored.offset_x_mm
     v_oy = 0 if stored is None else stored.offset_y_mm
     v_origin = "top_left" if stored is None else str(stored.origin_location)
+    v_map_origin = "top_left" if stored is None else str(stored.map_origin)
+    grid_from, grid_to = _calibration_grid_range(entry_id)
+    grid_from_value = grid_from.astimezone().strftime("%Y-%m-%dT%H:%M")
+    grid_to_value = grid_to.astimezone().strftime("%Y-%m-%dT%H:%M")
     body = f"""<section class=card><h2>FarmBot calibration</h2>
 <p>Copy the values from FarmBot's own camera calibration (Photos → Camera
-calibration), then verify alignment against a whole photo row. The app rescales
+calibration), then verify alignment against a date-filtered whole-bed grid. The app rescales
 FarmBot's mm/pixel scale (measured at its native frame) to the configured
 analysis resolution ({escape(resolution.label)}). Values are saved to the app's
 persistent storage and restored automatically after a restart — no external
 tools needed.</p>
 {warning_html}
 <p class=muted>Current active calibration: {escape(current)}</p>
-<div class=grid>
+<div class="grid calibration-grid">
 <div>
 <label>FarmBot config entry ID<br><input id=entry_id value="{escape(entry_id)}"></label>
-<p><button type=button id=load>Load bot inventory</button></p>
-<label>Photo row (same X)<br><select id=row></select></label>
-<label>Row X tolerance (mm)<br><input id=rowtol type=number min=1 step=any value=50></label>
+<div class=button-row><label>Photos from<br><input id=date_from type=datetime-local value="{grid_from_value}"></label>
+<label>Photos to<br><input id=date_to type=datetime-local value="{grid_to_value}"></label></div>
+<p><button type=button id=load>Load photo grid</button></p>
 <hr>
 <p class=muted>In FarmBot open Photos → Camera calibration and copy each value below.</p>
 <label>Pixel coordinate scale (mm/pixel)<br><input id=fb_scale type=number min=0 step=any value="{v_scale}"></label>
@@ -3987,21 +4031,25 @@ tools needed.</p>
 <p id=ppm class=muted>Enter the FarmBot pixel coordinate scale, and measured-at width/height</p>
 <label>Camera rotation (degrees)<br><input id=rotation type=number step=any value="{v_rot}"></label>
 <label>Origin location in image<br><select id=origin>{_origin_options(v_origin)}</select></label>
+<label>Map origin<br><select id=map_origin>{_origin_options(v_map_origin)}</select></label>
+<p class=muted>Map origin rotates the complete bed, including photos and markers, to match
+the orientation selected in the FarmBot web app. It does not change the camera transform.</p>
 <label>Offset X (mm)<br><input id=offx type=number step=any value="{v_ox}"></label>
 <label>Offset Y (mm)<br><input id=offy type=number step=any value="{v_oy}"></label>
 <p class=muted>Leave offsets at 0 unless the overlay is shifted. FarmBot's camera offset is
 already folded into the image-centre coordinate, so entering it again would double-count.</p>
 <label><input type=checkbox id=showoverlay checked> Overlay plant &amp; weed centres</label><br>
 <label><input type=checkbox id=showlabels checked> Show labels (name / weed)</label>
-<p><label><input type=checkbox id=confirm> Centres align across the row</label></p>
+<p><label><input type=checkbox id=confirm> Centres align across the full grid</label></p>
 <p><button type=button id=save disabled>Save calibration</button></p>
 <p id=status class=muted></p>
 </div>
 <div>
-<canvas id=canvas width=640 height=200
- style="width:100%;border:1px solid #ccc;background:#111"></canvas>
+<canvas id=canvas width=900 height=420 aria-label="Calibration birds-eye photo grid"
+ style="display:block;width:100%;max-height:72vh;border:1px solid #ccc;background:#111"></canvas>
 <p class=muted>Green = known plants (name · crop). Red = FarmBot weeds. Adjust the
-values above and the composite updates live.</p>
+values above and the complete grid updates live. Within the selected range, only the
+newest photo at each FarmBot coordinate is shown.</p>
 </div>
 </div>
 </section>
@@ -4009,13 +4057,42 @@ values above and the composite updates live.</p>
     return layout(request, body, "Calibration · FarmBot Vision")
 
 
+def _latest_images_by_location(images: list, tolerance_mm: float = 25.0) -> list:
+    """Keep the newest capture at each FarmBot grid coordinate."""
+    selected = []
+    for image in sorted(images, key=lambda item: item.created_at, reverse=True):
+        if any(
+            math.hypot(image.meta.x - other.meta.x, image.meta.y - other.meta.y) <= tolerance_mm
+            for other in selected
+        ):
+            continue
+        selected.append(image)
+    return selected
+
+
 @app.get("/api/vision/images")
-async def vision_images(entry_id: str) -> JSONResponse:
+async def vision_images(
+    entry_id: str,
+    date_from: datetime | None = None,
+    date_to: datetime | None = None,
+) -> JSONResponse:
+    now = datetime.now(UTC)
+    if date_from is None or date_to is None:
+        default_from, default_to = _calibration_grid_range(entry_id)
+        date_from = date_from or default_from
+        date_to = date_to or default_to
+    if date_from.tzinfo is None:
+        date_from = date_from.replace(tzinfo=UTC)
+    if date_to.tzinfo is None:
+        date_to = date_to.replace(tzinfo=UTC)
+    if date_from > date_to:
+        raise HTTPException(422, "From must be before to")
+    if date_from < now - timedelta(hours=720):
+        raise HTTPException(422, "Photo history is limited to the most recent 30 days")
+    lookback_hours = max(1, min(720, math.ceil((now - date_from).total_seconds() / 3600)))
     try:
         inventory = await client.inventory(
-            InventoryRequest(
-                config_entry_id=entry_id, image_lookback_hours=settings.image_lookback_hours
-            )
+            InventoryRequest(config_entry_id=entry_id, image_lookback_hours=lookback_hours)
         )
     except HomeAssistantError as exc:
         LOGGER.warning(
@@ -4025,10 +4102,14 @@ async def vision_images(entry_id: str) -> JSONResponse:
             exc,
         )
         raise HTTPException(502, "could not load images") from exc
+    filtered_images = [
+        image
+        for image in inventory.images
+        if image.processed and date_from <= image.created_at <= date_to
+    ]
     images = [
         {"id": i.id, "created_at": i.created_at.isoformat(), "x": i.meta.x, "y": i.meta.y}
-        for i in sorted(inventory.images, key=lambda item: item.created_at, reverse=True)
-        if i.processed
+        for i in _latest_images_by_location(filtered_images)
     ]
     plants = [
         {
@@ -4045,7 +4126,31 @@ async def vision_images(entry_id: str) -> JSONResponse:
         {"id": w.id, "name": w.name, "x": w.x, "y": w.y, "radius": w.radius}
         for w in inventory.weeds
     ]
-    return JSONResponse({"images": images, "plants": plants, "weeds": weeds})
+    bed_bounds = None
+    record = photo_grid_store.load()
+    if record is not None and record.config_entry_id == entry_id:
+        bed_bounds = record.bed_bounds
+    if bed_bounds is None:
+        try:
+            soil = await client.soil_points(entry_id)
+            x_bounds = soil.motion.axis_bounds.get("x")
+            y_bounds = soil.motion.axis_bounds.get("y")
+            if x_bounds is not None and y_bounds is not None:
+                bed_bounds = {"x": x_bounds, "y": y_bounds}
+        except HomeAssistantError:
+            # Image-corner bounds in the browser are still a complete, useful
+            # fallback when an older integration cannot report motion limits.
+            pass
+    return JSONResponse(
+        {
+            "images": images,
+            "plants": plants,
+            "weeds": weeds,
+            "bed_bounds": bed_bounds,
+            "date_from": date_from.isoformat(),
+            "date_to": date_to.isoformat(),
+        }
+    )
 
 
 @app.get("/api/vision/image/{image_id}.jpg")
@@ -4082,6 +4187,7 @@ async def save_calibration(
     offset_x: float = Form(0),
     offset_y: float = Form(0),
     origin_location: str = Form("top_left"),
+    map_origin: str = Form("top_left"),
 ) -> RedirectResponse:
     """Persist the FarmBot camera calibration for a bot.
 
@@ -4095,12 +4201,19 @@ async def save_calibration(
     except ValueError as exc:
         raise HTTPException(400, "invalid origin location") from exc
     try:
+        # Direct unit-level calls do not pass through FastAPI's form decoder,
+        # so an omitted Form default arrives as field metadata rather than text.
+        display_origin = OriginLocation(map_origin if isinstance(map_origin, str) else "top_left")
+    except ValueError as exc:
+        raise HTTPException(400, "invalid map origin") from exc
+    try:
         values = FarmbotCalibrationInput(
             coordinate_scale=coordinate_scale,
             reference_width=reference_width,
             reference_height=reference_height,
             rotation_degrees=rotation,
             origin_location=origin,
+            map_origin=display_origin,
             offset_x_mm=offset_x,
             offset_y_mm=offset_y,
         )

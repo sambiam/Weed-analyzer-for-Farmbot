@@ -56,8 +56,20 @@ The integration must resize before base64 encoding and must not return signed UR
 
 ## Photo-grid repair services
 
-`farmbot.start_vision_grid_repair` accepts `config_entry_id` and one to twelve
-`targets`, each containing finite `x`, `y`, and `z` coordinates. It validates
+`farmbot.start_vision_grid_repair` accepts `config_entry_id` and `targets`,
+each containing finite `x`, `y`, and `z` coordinates plus an optional
+caller-owned `index`. Integration 2.5.0 accepts up to 256 targets in one call
+and advertises this as the `continuous_photo_grid_capture` capability, so a
+whole bed grid is one run: the lighting, the drive in from the parked position
+and the drive back to it happen once around the entire route rather than once
+per call. Integrations before 2.5.0 cap a call at twelve targets and reject an
+oversized call during Home Assistant's schema validation, with no status record
+and no partial capture; the app falls back to twelve-target chunking whenever
+the capability is absent, and to sending no `index` unless
+`indexed_photo_grid_targets` is advertised (older schemas reject unknown target
+keys). Cell-to-cell moves inside the grid skip the `safe_z` retract only when
+every target shares one Z that is already within 25 mm of the top of the Z
+axis; the move into the grid and the move back out always retract. It validates
 connection, emergency-stop, busy state, and all axis bounds before queuing
 each acknowledged safe-Z move separately from its settle/photo request. A
 photo request must not be sent until a fresh FarmBot status report places all
@@ -77,7 +89,12 @@ to enable lighting stops the request before a photo is taken.
 `farmbot.get_vision_grid_repair` accepts `config_entry_id` and `repair_id`.
 It returns `queued|running|waiting_images|complete|failed`, a sanitized
 message, the validated target coordinates, verified frames, per-target
-completion/failure details, and the current photo-attempt number.
+completion/failure details, and the current photo-attempt number. From 2.5.0
+each frame carries the `target_index` it was captured for, `failures` carries
+`{index, reason, code}` with `code` one of `movement`, `camera`,
+`upload_timeout` or `error`, and an aborted run reports the cells it never
+attempted as `unattempted_targets`. An `upload_timeout` is an unknown
+completion state and never counts as a captured cell.
 
 `farmbot.delete_vision_image` accepts `config_entry_id` and `image_id`, and
 returns `deleted|rejected` with the image ID and a sanitized message. It

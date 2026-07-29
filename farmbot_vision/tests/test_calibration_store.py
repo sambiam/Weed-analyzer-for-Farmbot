@@ -13,6 +13,7 @@ def _input() -> FarmbotCalibrationInput:
         reference_height=1944,
         rotation_degrees=-31.9,
         origin_location=OriginLocation.TOP_RIGHT,
+        map_origin=OriginLocation.BOTTOM_LEFT,
         offset_x_mm=1.5,
         offset_y_mm=-2.0,
     )
@@ -25,6 +26,7 @@ def test_round_trips_per_entry(tmp_path):
     assert got is not None
     assert got.coordinate_scale == 0.242
     assert got.origin_location == OriginLocation.TOP_RIGHT
+    assert got.map_origin == OriginLocation.BOTTOM_LEFT
     assert got.offset_x_mm == 1.5
     assert store.get("botB") is None
 
@@ -53,3 +55,11 @@ def test_rejects_nonpositive_scale():
 
 def test_missing_file_returns_none(tmp_path):
     assert CalibrationStore(tmp_path / "absent.json").get("bot") is None
+
+
+def test_old_record_defaults_map_origin_to_top_left(tmp_path):
+    path = tmp_path / "cal.json"
+    path.write_text(
+        '{"bot":{"coordinate_scale":0.25,"reference_width":1000,"reference_height":800}}'
+    )
+    assert CalibrationStore(path).get("bot").map_origin == OriginLocation.TOP_LEFT
