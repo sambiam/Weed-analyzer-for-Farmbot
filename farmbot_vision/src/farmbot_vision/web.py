@@ -634,7 +634,41 @@ async def _capture_photo_grid_targets(
     targets: list[PhotoGridTarget],
 ) -> list[PhotoGridTarget]:
     """Capture one integration-sized batch and return any unverified targets."""
-    started = await _start_photo_grid_batch(record, targets)
+    try:
+        started = await _start_photo_grid_batch(record, targets)
+    except HomeAssistantError as exc:
+        if len(targets) <= 1:
+            raise
+        # Home Assistant rejects an over-long `targets` list during service
+        # schema validation, which surfaces here as a bare HTTP 400 with no
+        # per-target detail and no capture at all. Halving the batch lets a
+        # cap mismatch between add-on and integration versions degrade into
+        # smaller working calls instead of stranding every coordinate in the
+        # chunk -- the failure mode that cost a whole grid when the app's
+        # chunk size was raised past the integration's limit.
+        middle = len(targets) // 2
+        LOGGER.warning(
+            "Photo grid %s batch of %d targets was rejected (%s); retrying as %d + %d",
+            record.session_id,
+            len(targets),
+            exc,
+            middle,
+            len(targets) - middle,
+        )
+        unverified: list[PhotoGridTarget] = []
+        for half in (targets[:middle], targets[middle:]):
+            try:
+                unverified.extend(await _capture_photo_grid_targets(record, half))
+            except HomeAssistantError as half_exc:
+                LOGGER.warning(
+                    "Photo grid %s split batch of %d targets failed: %s",
+                    record.session_id,
+                    len(half),
+                    half_exc,
+                )
+                verified = {frame.target_index for frame in record.frames}
+                unverified.extend(item for item in half if item.index not in verified)
+        return unverified
     repair_id = str(started.get("repair_id") or "")
 
     while True:

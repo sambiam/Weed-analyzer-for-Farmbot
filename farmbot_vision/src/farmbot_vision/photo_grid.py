@@ -15,14 +15,17 @@ from .calibration_store import FarmbotCalibrationInput
 
 PHOTO_GRID_OVERLAP = 0.15
 PHOTO_GRID_COORDINATE_TOLERANCE_MM = 25.0
-# The integration verifies each target's movement, upload and returned
-# coordinates before advancing within a batch, so a failure inside one batch
-# can no longer strand the rest of the grid the way it could under the old
-# unverified capture path. A larger batch therefore only costs a bounded
-# blast radius if the integration crashes mid-batch, while cutting the number
-# of chunk boundaries -- each of which costs a return-to-origin move plus a
-# busy-race window against the previous batch's unwind.
-PHOTO_GRID_CHUNK_SIZE = 25
+# Hard contract limit, not a tuning knob: the integration's
+# `start_vision_grid_repair` service schema declares
+# `vol.Length(min=1, max=12)` on `targets`, so Home Assistant rejects an
+# oversized call with HTTP 400 during schema validation -- before the handler
+# runs, before any status is reported, and with no partial capture. Raising
+# this without first raising that schema (and gating on an advertised
+# capability, since the add-on and the integration are versioned and updated
+# independently) silently loses every coordinate in the batch. See
+# docs/integration-contract.md, "one to twelve targets".
+PHOTO_GRID_MAX_TARGETS_PER_CALL = 12
+PHOTO_GRID_CHUNK_SIZE = PHOTO_GRID_MAX_TARGETS_PER_CALL
 
 
 class PhotoGridTarget(BaseModel):

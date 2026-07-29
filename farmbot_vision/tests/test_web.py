@@ -276,6 +276,97 @@ async def test_batch_start_does_not_retry_a_non_busy_rejection(monkeypatch, tmp_
     assert not slept
 
 
+def test_chunk_size_never_exceeds_the_integration_target_cap():
+    """Regression guard for the 2.3.1 outage.
+
+    Home Assistant validates `start_vision_grid_repair`'s schema
+    (`vol.Length(min=1, max=12)` on `targets`) before the handler runs, so an
+    oversized batch is refused with a bare HTTP 400 and captures nothing at
+    all. Raising the chunk size past the cap silently lost 75 of 77
+    coordinates; only the short final remainder was small enough to pass.
+    """
+    from farmbot_vision.photo_grid import (
+        PHOTO_GRID_CHUNK_SIZE,
+        PHOTO_GRID_MAX_TARGETS_PER_CALL,
+    )
+
+    assert PHOTO_GRID_MAX_TARGETS_PER_CALL == 12
+    assert 1 <= PHOTO_GRID_CHUNK_SIZE <= PHOTO_GRID_MAX_TARGETS_PER_CALL
+
+
+@pytest.mark.asyncio
+async def test_rejected_batch_is_split_and_retried_in_smaller_calls(monkeypatch, tmp_path):
+    """A batch refused outright must degrade into smaller calls, not vanish.
+
+    Mirrors the real failure: the integration refuses any batch above a cap,
+    so the app must keep halving rather than stranding every coordinate.
+    """
+    from farmbot_vision.photo_grid import PhotoGridStore, PhotoGridTarget
+
+    targets = [
+        PhotoGridTarget(index=index, row=0, column=index, x=100 * index, y=200, z=0)
+        for index in range(4)
+    ]
+    record = _photo_grid_record(targets, tmp_path=tmp_path)
+    accepted: list[int] = []
+
+    async def start(_entry_id, payload):
+        if len(payload) > 2:
+            raise web.HomeAssistantError("non-retryable Home Assistant response 400")
+        accepted.append(len(payload))
+        return {"status": "queued", "repair_id": f"grid-{len(accepted)}", "message": "queued"}
+
+    async def status(_entry_id, repair_id):
+        first = repair_id == "grid-1"
+        return {
+            "status": "complete",
+            "message": "capture complete",
+            "frames": [
+                {"image_id": 10, "x": 0, "y": 200, "z": 0},
+                {"image_id": 11, "x": 100, "y": 200, "z": 0},
+            ]
+            if first
+            else [
+                {"image_id": 12, "x": 200, "y": 200, "z": 0},
+                {"image_id": 13, "x": 300, "y": 200, "z": 0},
+            ],
+        }
+
+    monkeypatch.setattr(web, "photo_grid_store", PhotoGridStore(tmp_path / "grid.json"))
+    monkeypatch.setattr(web.client, "start_grid_repair", start)
+    monkeypatch.setattr(web.client, "grid_repair_status", status)
+
+    missing = await web._capture_photo_grid_targets(record, targets)
+
+    assert accepted == [2, 2]
+    assert missing == []
+    assert sorted(frame.target_index for frame in record.frames) == [0, 1, 2, 3]
+
+
+@pytest.mark.asyncio
+async def test_split_batch_reports_unverified_targets_when_every_half_fails(monkeypatch, tmp_path):
+    """If splitting cannot help, the targets come back as unverified rather
+    than raising past the worker's per-batch accounting."""
+    from farmbot_vision.photo_grid import PhotoGridStore, PhotoGridTarget
+
+    targets = [
+        PhotoGridTarget(index=index, row=0, column=index, x=100 * index, y=200, z=0)
+        for index in range(2)
+    ]
+    record = _photo_grid_record(targets, tmp_path=tmp_path)
+
+    async def start(_entry_id, _payload):
+        raise web.HomeAssistantError("non-retryable Home Assistant response 400")
+
+    monkeypatch.setattr(web, "photo_grid_store", PhotoGridStore(tmp_path / "grid.json"))
+    monkeypatch.setattr(web.client, "start_grid_repair", start)
+
+    missing = await web._capture_photo_grid_targets(record, targets)
+
+    assert [target.index for target in missing] == [0, 1]
+    assert record.frames == []
+
+
 @pytest.mark.asyncio
 async def test_worker_stops_early_when_a_pass_verifies_no_new_frames(monkeypatch, tmp_path):
     from farmbot_vision.photo_grid import PhotoGridStore, PhotoGridTarget

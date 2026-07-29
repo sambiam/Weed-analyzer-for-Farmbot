@@ -1,5 +1,23 @@
 # Changelog
 
+## 2.4.1 - 2026-07-29
+
+- **Fixed:** The photo grid captured almost nothing (2 of 77 coordinates in
+  the observed run). `PHOTO_GRID_CHUNK_SIZE` had been raised to 25 in 2.3.1,
+  but the companion integration's `start_vision_grid_repair` service schema
+  caps `targets` at twelve. Home Assistant therefore rejected every full-size
+  batch with HTTP 400 during schema validation — before the handler ran, so
+  no coordinate in the batch was visited or photographed. Only the short
+  final remainder was small enough to be accepted. The chunk size is now
+  derived from `PHOTO_GRID_MAX_TARGETS_PER_CALL` (12), which documents the
+  cap as a contract limit rather than a tuning knob, and a test asserts the
+  relationship so it cannot regress silently.
+- **Added:** A batch rejected outright is now halved and retried in smaller
+  calls instead of stranding every coordinate in it. A per-call cap mismatch
+  between the add-on and the companion integration — which are versioned and
+  updated independently — now degrades into slower capture rather than a
+  near-empty grid.
+
 ## 2.4.0 - 2026-07-29
 
 - Added a **Fallen leaf** choice to the weed review modal for isolated leaves
