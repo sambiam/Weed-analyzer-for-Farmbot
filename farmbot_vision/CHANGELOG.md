@@ -1,5 +1,41 @@
 # Changelog
 
+## 3.2.0 - 2026-07-30
+
+- Selected complete single-image plant evidence exclusively and separated
+  candidate, useful, selected, and excluded images so irrelevant grid tiles no
+  longer lower confidence.
+- Added calibrated 72-sector outer-boundary coverage, bed-space mask radius
+  measurement, partial/large-plant fusion, noise removal, and structured
+  evidence diagnostics.
+- Rebuilt plant review imagery from one shared standard/target-mask renderer,
+  including tight calibrated crops, expanded tile windows, deterministic seams,
+  current/proposed radii, centre crosses, crop labels, and neighbouring plants.
+- Made the review modal responsive and geometry-stable between standard and
+  diagnostic modes, removing the independent live-grid canvas pipeline.
+- Added deduplicated centred follow-up photo scheduling through the existing
+  FarmBot grid-repair movement service when a fit-sized plant lacks 50% grid
+  coverage; plants too large for one frame remain composite-only.
+- Added regression coverage for single/partial/large/no-evidence selection,
+  3x4 expanded composites, calibrated transforms, mask isolation, targeted
+  capture deduplication, and the mobile review layout.
+
+## 3.1.0 - 2026-07-29
+
+- Matched FarmBot Web App photo sizing by rebuilding each processed preview
+  JPEG's physical footprint from its actual pre-resize dimensions instead of
+  assuming every capture has the resolution typed into the form.
+- Mixed-resolution photos in a selected date range are now hidden using the
+  same dimension check as FarmBot, with the actual dimensions and hidden count
+  reported below the grid.
+- Split Farm Designer orientation into its real independent controls: Map
+  origin reflects the selected axes, while Rotate map swaps X and Y. Existing
+  saved orientations are migrated to retain their previous on-screen layout.
+- The preview now prefers live FarmBot axis bounds over potentially stale
+  photo-grid metadata and reports both the bounds and their source.
+- Photos are painted oldest-to-newest like FarmBot so the newest neighbouring
+  tile remains visible where captures overlap.
+
 ## 3.0.0 - 2026-07-29
 
 - Corrected camera calibration to match the current FarmBot Web App source:

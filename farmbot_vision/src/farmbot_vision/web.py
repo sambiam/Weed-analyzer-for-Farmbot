@@ -77,6 +77,7 @@ from .photo_grid import (
     match_verified_frames,
     photo_grid_chunk_size,
     plan_photo_grid,
+    plan_targeted_plant_captures,
 )
 from .settings import Settings
 from .soil_jobs import SoilJobManager
@@ -698,6 +699,87 @@ async def _capture_photo_grid_targets(
         return [target for target in targets if target.index not in complete_indexes]
 
 
+async def _capture_targeted_plant_photos(record: PhotoGridRecord) -> None:
+    """Queue and complete deduplicated centred follow-ups through grid repair."""
+
+    inventory = await client.inventory(
+        InventoryRequest(
+            config_entry_id=record.config_entry_id,
+            image_lookback_hours=min(720, max(72, settings.image_lookback_hours)),
+        )
+    )
+    planned, diagnostics = plan_targeted_plant_captures(
+        record,
+        inventory.plants,
+        safety_margin_mm=settings.safety_margin_mm,
+    )
+    record.targeted_capture_diagnostics = diagnostics
+    if not planned:
+        photo_grid_store.save(record)
+        return
+    # Persist queued state before calling Home Assistant. A worker restart or a
+    # second completion callback therefore cannot enqueue an equivalent move.
+    record.targeted_captures.extend(planned)
+    photo_grid_store.save(record)
+    for capture in planned:
+        target = PhotoGridTarget(
+            index=len(record.targets) + record.targeted_captures.index(capture),
+            row=0,
+            column=0,
+            x=capture.x,
+            y=capture.y,
+            z=capture.z,
+        )
+        try:
+            started = await _start_photo_grid_batch(record, [target])
+            capture.repair_id = str(started.get("repair_id") or "")
+            capture.status = "running"
+            photo_grid_store.save(record)
+            while True:
+                result = await client.grid_repair_status(record.config_entry_id, capture.repair_id)
+                status = str(result.get("status") or "")
+                if status in {"queued", "running", "waiting_images"}:
+                    await asyncio.sleep(GRID_REPAIR_STATUS_POLL_SECONDS)
+                    continue
+                frames = result.get("frames")
+                image_id = None
+                if isinstance(frames, list):
+                    for frame in frames:
+                        if isinstance(frame, dict) and frame.get("image_id") is not None:
+                            image_id = int(frame["image_id"])
+                            break
+                capture.image_id = image_id
+                capture.completed_at = datetime.now(UTC)
+                capture.status = "complete" if image_id is not None else "failed"
+                capture.reason = str(result.get("message") or capture.reason)
+                photo_grid_store.save(record)
+                LOGGER.info(
+                    "Targeted plant capture: %s",
+                    json.dumps(
+                        {
+                            "grid_session_id": record.session_id,
+                            "plant_id": capture.plant_id,
+                            "crop_name": capture.crop_name,
+                            "status": capture.status,
+                            "image_id": capture.image_id,
+                            "reason": capture.reason,
+                        },
+                        separators=(",", ":"),
+                    ),
+                )
+                break
+        except HomeAssistantError as exc:
+            capture.completed_at = datetime.now(UTC)
+            capture.status = "failed"
+            capture.reason = str(exc)
+            photo_grid_store.save(record)
+            LOGGER.warning(
+                "Targeted capture for plant %s failed safely: %s",
+                capture.plant_id,
+                exc,
+            )
+
+
 async def _photo_grid_worker(record: PhotoGridRecord) -> None:
     """Capture the calibrated bed grid, retrying only coordinates not verified."""
     try:
@@ -800,6 +882,15 @@ async def _photo_grid_worker(record: PhotoGridRecord) -> None:
                 "and coordinate-verified"
             )
         photo_grid_store.save(record)
+        if record.status == "complete":
+            try:
+                await _capture_targeted_plant_photos(record)
+            except HomeAssistantError as exc:
+                LOGGER.warning(
+                    "Targeted plant capture planning failed after grid %s: %s",
+                    record.session_id,
+                    exc,
+                )
     except asyncio.CancelledError:
         raise
     except Exception as exc:  # pylint: disable=broad-except
@@ -954,12 +1045,12 @@ class NormalizeIngressPathMiddleware:
         await self.app(scope, receive, send)
 
 
-# FarmBot-style composite calibration view. One photo-row (images sharing an X
-# coordinate) is stitched in garden-coordinate space using the FarmBot camera
-# calibration, with plant and weed centres overlaid so alignment across the
-# whole bed can be verified at once. Vanilla JS on a canvas -- no frontend build
-# toolchain (Part 5). The rotation direction here MUST match
-# vision.ROTATION_SIGN and vision.garden_to_pixel.
+# FarmBot-style composite calibration view. The selected whole-bed photo set is
+# stitched in garden-coordinate space using FarmBot camera and Farm Designer
+# transforms, with plant and weed centres overlaid so alignment across the whole
+# bed can be verified at once. Vanilla JS on a canvas -- no frontend build
+# toolchain (Part 5). The rotation direction here MUST match vision.ROTATION_SIGN
+# and vision.garden_to_pixel.
 _CALIBRATION_JS = r"""
 (function(){
   const ROT_SIGN=-1;           // FarmBot Web App uses rotate(-camera_rotation)
@@ -977,6 +1068,7 @@ _CALIBRATION_JS = r"""
   function checked(id){return document.getElementById(id).checked;}
   function origin(){return document.getElementById('origin').value;}
   function mapOrigin(){return document.getElementById('map_origin').value;}
+  function rotateMap(){return checked('rotate_map');}
   function applyZoom(next){
     viewZoom=Math.max(1,Math.min(6,next));
     canvas.style.width=(viewZoom*100)+'%';
@@ -998,30 +1090,61 @@ _CALIBRATION_JS = r"""
             rot:num('rotation')*Math.PI/180*ROT_SIGN,ox:num('offx'),oy:num('offy')};
   }
   // Pixels-per-mm of one processed image (its own natural size) under p.
-  function imagePpm(p,iw,ih){return [(1/p.scale)*iw/p.refw,(1/p.scale)*ih/p.refh];}
+  // FarmBot sizes map photos from the loaded image's actual dimensions. The
+  // integration reports those pre-resize dimensions so the smaller JPEG can
+  // reproduce the same physical footprint exactly.
+  function imagePpm(p,iw,ih,captureW,captureH){
+    return [iw/(p.scale*(captureW||p.refw)),ih/(p.scale*(captureH||p.refh))];
+  }
   // Map a source pixel (u,v) of an image taken at (cx,cy) to a garden coord.
   // Inverse of vision.garden_to_pixel.
-  function pixelToCoord(p,cx,cy,iw,ih,u,v){
-    const ppm=imagePpm(p,iw,ih);
+  function pixelToCoord(p,cx,cy,iw,ih,u,v,captureW,captureH){
+    const ppm=imagePpm(p,iw,ih,captureW,captureH);
     const rx=u-iw/2, ry=v-ih/2;
     const c=Math.cos(p.rot), s=Math.sin(p.rot);
     const vx=c*rx - s*ry, vy=s*rx + c*ry;
     return [cx + vx/(p.sx*ppm[0])+p.ox, cy + vy/(p.sy*ppm[1])+p.oy];
   }
+  function releaseImages(batch){
+    if(!batch) return;
+    batch.images.forEach(function(rec){
+      if(rec.objectUrl) URL.revokeObjectURL(rec.objectUrl);
+    });
+  }
+  function positiveHeader(response,name){
+    const value=parseFloat(response.headers.get(name));
+    return value>0?value:null;
+  }
   function loadGridImages(){
     const p=params();
-    ppmEl.textContent=p?('Pixels per mm (at analysis res): scale '+p.scale+' mm/px'):
+    ppmEl.textContent=p?('FarmBot coordinate scale: '+p.scale+' mm/capture pixel'):
                         'Enter the FarmBot pixel coordinate scale, and measured-at width/height';
     if(!scene.images.length){current=null;clearCanvas('No photos in this date range');return;}
-    current={images:[]};
+    releaseImages(current);
+    const batch={images:[]};
+    current=batch;
     status.textContent='Loading '+scene.images.length+' grid photos…';
     scene.images.forEach(im=>{
       const image=new Image();
-      const rec={info:im,img:image,loaded:false};
-      current.images.push(rec);
-      image.onload=function(){rec.loaded=true;render();};
-      image.onerror=function(){status.textContent='Could not load image #'+im.id;};
-      image.src='api/vision/image/'+im.id+'.jpg?entry_id='+encodeURIComponent(entry());
+      const rec={info:im,img:image,loaded:false,captureW:null,captureH:null,objectUrl:null};
+      batch.images.push(rec);
+      const url='api/vision/image/'+im.id+'.jpg?entry_id='+encodeURIComponent(entry());
+      fetch(url).then(function(response){
+        if(!response.ok) throw new Error('HTTP '+response.status);
+        rec.captureW=positiveHeader(response,'X-FarmBot-Oriented-Width');
+        rec.captureH=positiveHeader(response,'X-FarmBot-Oriented-Height');
+        return response.blob();
+      }).then(function(blob){
+        if(current!==batch) return;
+        rec.objectUrl=URL.createObjectURL(blob);
+        image.onload=function(){rec.loaded=true;render();};
+        image.onerror=function(){status.textContent='Could not decode image #'+im.id;};
+        image.src=rec.objectUrl;
+      }).catch(function(error){
+        if(current===batch){
+          status.textContent='Could not load image #'+im.id+': '+error.message;
+        }
+      });
     });
   }
   function clearCanvas(msg){
@@ -1038,20 +1161,37 @@ _CALIBRATION_JS = r"""
     const p=params();
     ppmEl.textContent=p
       ?('Using FarmBot scale verbatim: '+p.scale+' mm/capture pixel; '
-        +'preview resized from '+p.refw+'×'+p.refh)
+        +'selected capture resolution '+p.refw+'×'+p.refh)
       :'Enter the FarmBot pixel coordinate scale and Camera settings resolution';
     document.getElementById('save').disabled=!(p&&checked('confirm'));
     if(!current){return;}
-    const ready=current.images.filter(r=>r.loaded&&r.img.naturalWidth>0);
+    const loaded=current.images.filter(r=>r.loaded&&r.img.naturalWidth>0);
     if(!p){clearCanvas('Enter FarmBot calibration values to build the composite');return;}
-    if(!ready.length){return;}
+    if(!loaded.length){return;}
+    // FarmBot only displays images whose actual dimensions agree with the
+    // calibration image. This prevents a mixed-resolution date range from
+    // stretching older captures with the current scale.
+    const matchesCalibration=function(r){
+      if(!(r.captureW&&r.captureH)) return true; // legacy integration fallback
+      const direct=Math.abs(r.captureW-p.refw)<5&&Math.abs(r.captureH-p.refh)<5;
+      const swapped=Math.abs(r.captureH-p.refw)<5&&Math.abs(r.captureW-p.refh)<5;
+      return direct||swapped;
+    };
+    const ready=loaded.filter(matchesCalibration);
+    if(!ready.length){
+      clearCanvas('No loaded photos match the selected FarmBot camera resolution');
+      status.textContent='Loaded '+loaded.length+' photos, but their actual dimensions do not '
+        +'match '+p.refw+'×'+p.refh+'. Select the Camera settings resolution used for this run.';
+      return;
+    }
     // Garden-space bounding box from every image's four corners.
     let gxmin=Infinity,gxmax=-Infinity,gymin=Infinity,gymax=-Infinity,ppmSum=0;
     ready.forEach(r=>{
       const iw=r.img.naturalWidth, ih=r.img.naturalHeight;
-      const pp=imagePpm(p,iw,ih); ppmSum+=(pp[0]+pp[1])/2;
+      const pp=imagePpm(p,iw,ih,r.captureW,r.captureH); ppmSum+=(pp[0]+pp[1])/2;
       [[0,0],[iw,0],[0,ih],[iw,ih]].forEach(c=>{
-        const g=pixelToCoord(p,r.info.x,r.info.y,iw,ih,c[0],c[1]);
+        const g=pixelToCoord(
+          p,r.info.x,r.info.y,iw,ih,c[0],c[1],r.captureW,r.captureH);
         gxmin=Math.min(gxmin,g[0]);gxmax=Math.max(gxmax,g[0]);
         gymin=Math.min(gymin,g[1]);gymax=Math.max(gymax,g[1]);
       });
@@ -1065,17 +1205,20 @@ _CALIBRATION_JS = r"""
     }
     let P=ppmSum/ready.length;
     const rangeX=Math.max(1,gxmax-gxmin), rangeY=Math.max(1,gymax-gymin);
-    const quarterTurn=mapOrigin()==='top_right'||mapOrigin()==='bottom_left';
-    const displayRangeX=quarterTurn?rangeY:rangeX;
-    const displayRangeY=quarterTurn?rangeX:rangeY;
+    const displayRangeX=rotateMap()?rangeY:rangeX;
+    const displayRangeY=rotateMap()?rangeX:rangeY;
     P=Math.min(P,MAX_CANVAS/displayRangeX,MAX_CANVAS/displayRangeY);
     canvas.width=Math.max(1,Math.round(displayRangeX*P));
     canvas.height=Math.max(1,Math.round(displayRangeY*P));
     const toCanvas=function(gx,gy){
-      const x=gx-gxmin, y=gy-gymin;
-      if(mapOrigin()==='top_right') return [(rangeY-y)*P,x*P];
-      if(mapOrigin()==='bottom_right') return [(rangeX-x)*P,(rangeY-y)*P];
-      if(mapOrigin()==='bottom_left') return [y*P,(rangeX-x)*P];
+      let x=gx-gxmin, y=gy-gymin;
+      if(rotateMap()){const oldX=x;x=y;y=oldX;}
+      if(mapOrigin()==='top_right'||mapOrigin()==='bottom_right'){
+        x=displayRangeX-x;
+      }
+      if(mapOrigin()==='bottom_left'||mapOrigin()==='bottom_right'){
+        y=displayRangeY-y;
+      }
       return [x*P,y*P];
     };
     ctx.setTransform(1,0,0,1,0,0);
@@ -1085,18 +1228,31 @@ _CALIBRATION_JS = r"""
     ctx.imageSmoothingEnabled=true;
     ready.forEach(r=>{
       const iw=r.img.naturalWidth, ih=r.img.naturalHeight;
-      const p0=toCanvas.apply(null,pixelToCoord(p,r.info.x,r.info.y,iw,ih,0,0));
-      const pu=toCanvas.apply(null,pixelToCoord(p,r.info.x,r.info.y,iw,ih,iw,0));
-      const pv=toCanvas.apply(null,pixelToCoord(p,r.info.x,r.info.y,iw,ih,0,ih));
+      const p0=toCanvas.apply(null,pixelToCoord(
+        p,r.info.x,r.info.y,iw,ih,0,0,r.captureW,r.captureH));
+      const pu=toCanvas.apply(null,pixelToCoord(
+        p,r.info.x,r.info.y,iw,ih,iw,0,r.captureW,r.captureH));
+      const pv=toCanvas.apply(null,pixelToCoord(
+        p,r.info.x,r.info.y,iw,ih,0,ih,r.captureW,r.captureH));
       ctx.setTransform((pu[0]-p0[0])/iw,(pu[1]-p0[1])/iw,
                        (pv[0]-p0[0])/ih,(pv[1]-p0[1])/ih,p0[0],p0[1]);
       ctx.drawImage(r.img,0,0);
     });
     ctx.setTransform(1,0,0,1,0,0);
     if(checked('showoverlay')) drawOverlay(p,toCanvas,P);
-    status.textContent='Full grid: '+ready.length+' photos, '
-      +scene.plants.length+' plants, '+scene.weeds.length+' weeds. '
-      +'Confirm centres sit on their plants across the bed.';
+    const skipped=loaded.length-ready.length;
+    const dimensions=[...new Set(ready.map(function(r){
+      return r.captureW&&r.captureH?(r.captureW+'×'+r.captureH):'legacy dimensions';
+    }))].join(', ');
+    const bounds=scene.bed_bounds
+      ?(' Bed: X '+gxmin+'–'+gxmax+' mm, Y '+gymin+'–'+gymax+' mm'
+        +(scene.bed_bounds_source?(' ('+scene.bed_bounds_source+')'):'')+'.')
+      :'';
+    status.textContent='Full grid: '+ready.length+' photos'
+      +(skipped?(', '+skipped+' different-resolution photos hidden'):'')
+      +'; actual capture '+dimensions+'. '+scene.plants.length+' plants, '
+      +scene.weeds.length+' weeds. '
+      +'Confirm centres sit on their plants across the bed.'+bounds;
   }
   function marker(p,toCanvas,P,pt,colour,label){
     const c=toCanvas(pt.x,pt.y);
@@ -1128,6 +1284,11 @@ _CALIBRATION_JS = r"""
       if(!r.ok) throw new Error('HTTP '+r.status);
       scene=await r.json();
       scene.images=scene.images||[];scene.plants=scene.plants||[];scene.weeds=scene.weeds||[];
+      // FarmBot reverses the API's newest-first collection before painting,
+      // leaving the newest neighbouring capture on top where tiles overlap.
+      scene.images.sort(function(a,b){
+        return new Date(a.created_at)-new Date(b.created_at);
+      });
       status.textContent=scene.images.length+' unique grid locations, '
         +scene.plants.length+' plants, '+scene.weeds.length+' weeds';
       if(scene.images.length) loadGridImages(); else clearCanvas('No images in this date range');
@@ -1142,7 +1303,7 @@ _CALIBRATION_JS = r"""
     document.getElementById(id).addEventListener('input',scheduleRender);
     document.getElementById(id).addEventListener('change',scheduleRender);
   });
-  ['showoverlay','showlabels','confirm'].forEach(function(id){
+  ['rotate_map','showoverlay','showlabels','confirm'].forEach(function(id){
     document.getElementById(id).addEventListener('change',scheduleRender);
   });
   document.getElementById('zoom-in').addEventListener('click',function(){
@@ -1161,7 +1322,7 @@ _CALIBRATION_JS = r"""
     const fields={entry_id:entry(),coordinate_scale:num('fb_scale'),
       reference_width:num('fb_refw'),reference_height:num('fb_refh'),
       rotation:num('rotation'),origin_location:origin(),
-      map_origin:mapOrigin(),
+      map_origin:mapOrigin(),rotate_map:rotateMap(),
       offset_x:num('offx'),offset_y:num('offy')};
     for(const k in fields){const i=document.createElement('input');i.type='hidden';
       i.name=k;i.value=fields[k];f.appendChild(i);}
@@ -1180,18 +1341,11 @@ _DASHBOARD_JS = r"""
   const modalDetails=document.getElementById('overlay-modal-details');
   const closeButton=document.getElementById('overlay-modal-close');
   const counter=document.getElementById('overlay-modal-counter');
-  const plantToggle=document.getElementById('plant-view-toggle');
-  const plantWithoutOverlay=document.getElementById('plant-modal-without-overlay');
-  const plantWithOverlay=document.getElementById('plant-modal-with-overlay');
   const artifactControls=document.getElementById('artifact-controls');
   const overlayLegend=document.getElementById('overlay-modal-legend');
   const plantPhotoMode=document.getElementById('plant-photo-mode');
   const plantPhotoTab=document.getElementById('plant-photo-tab');
   const plantDiagnosticTab=document.getElementById('plant-diagnostic-tab');
-  const plantPhotoPane=document.getElementById('plant-photo-pane');
-  const diagnosticPane=document.getElementById('diagnostic-pane');
-  const plantPhotoCanvas=document.getElementById('plant-photo-canvas');
-  const plantPhotoStatus=document.getElementById('plant-photo-status');
   let artifacts=[], index=0, returnFocus=null;
   let plantComposite=null;
   const queueModal=document.getElementById('queue-modal');
@@ -1209,7 +1363,7 @@ _DASHBOARD_JS = r"""
   }
   /* Draws each frame's photo into ctx using the same calibrated, per-pixel
      projective transform regardless of whether the caller wants the whole
-     bed (drawPhotoGrid) or a tight crop around one plant (openPlantView).
+     bed (drawPhotoGrid) or the stored, tightly cropped plant review artifact.
      project(x,y) maps a garden-mm coordinate to canvas pixels; onDone(loaded,
      failed) fires once every frame has resolved (loaded or failed). */
   function drawFramesInto(ctx,canvasWidth,canvasHeight,frames,calibration,configEntryId,project,onDone){
@@ -1247,22 +1401,6 @@ _DASHBOARD_JS = r"""
         +encodeURIComponent(configEntryId);
     });
   }
-  /* Whether garden point (px,py) falls inside frame's captured footprint.
-     Mirrors vision.garden_to_pixel's rotation/origin-sign convention but stays
-     in millimetre space throughout (no image needs to be loaded to test
-     membership -- the true image size in mm is coordinate_scale*reference
-     width/height, independent of whatever resolution is actually served). */
-  function frameOverlapsPoint(frame,calibration,px,py){
-    const signs=gridOriginSigns(calibration.origin_location);
-    const rotation=-calibration.rotation_degrees*Math.PI/180;
-    const cx=frame.x+calibration.offset_x_mm, cy=frame.y+calibration.offset_y_mm;
-    const dxm=(px-cx)*signs[0], dym=(py-cy)*signs[1];
-    const mx=Math.cos(rotation)*dxm+Math.sin(rotation)*dym;
-    const my=-Math.sin(rotation)*dxm+Math.cos(rotation)*dym;
-    const halfWidth=calibration.coordinate_scale*calibration.reference_width/2;
-    const halfHeight=calibration.coordinate_scale*calibration.reference_height/2;
-    return Math.abs(mx)<=halfWidth && Math.abs(my)<=halfHeight;
-  }
   function drawPhotoGrid(data){
     const record=data.grid, bounds=record.bed_bounds, calibration=record.calibration;
     const spanX=bounds.x[1]-bounds.x[0], spanY=bounds.y[1]-bounds.y[0];
@@ -1293,63 +1431,9 @@ _DASHBOARD_JS = r"""
       });
   }
   function showPlantPhotoTab(showPhoto){
-    plantPhotoPane.hidden=!showPhoto;
-    diagnosticPane.hidden=showPhoto;
+    if(plantComposite) showPlantComposite(!showPhoto);
     plantPhotoTab.setAttribute('aria-pressed',String(showPhoto));
     plantDiagnosticTab.setAttribute('aria-pressed',String(!showPhoto));
-  }
-  async function openPlantView(trigger){
-    const plantX=parseFloat(trigger.dataset.plantX);
-    const plantY=parseFloat(trigger.dataset.plantY);
-    const plantRadius=parseFloat(trigger.dataset.plantRadius)||0;
-    let unlinked=[];
-    try{unlinked=JSON.parse(trigger.dataset.unlinkedImages||'[]');}catch(_){unlinked=[];}
-    const unlinkedIds=new Set(unlinked.map(String));
-    showPlantPhotoTab(true);
-    const ctx=plantPhotoCanvas.getContext('2d');
-    ctx.setTransform(1,0,0,1,0,0);
-    ctx.fillStyle='#111';ctx.fillRect(0,0,plantPhotoCanvas.width,plantPhotoCanvas.height);
-    plantPhotoStatus.textContent='Loading the latest whole-bed grid…';
-    if(!Number.isFinite(plantX)||!Number.isFinite(plantY)){
-      plantPhotoStatus.textContent='Plant position unavailable; showing the diagnostic image instead.';
-      showPlantPhotoTab(false);
-      return;
-    }
-    try{
-      const response=await fetch('api/photo-grid/latest');
-      const data=await response.json();
-      if(!response.ok) throw new Error(data.detail||('HTTP '+response.status));
-      const calibration=data.grid.calibration;
-      const frames=(data.grid.frames||[]).filter(function(frame){
-        return !unlinkedIds.has(String(frame.image_id))
-          && frameOverlapsPoint(frame,calibration,plantX,plantY);
-      });
-      if(!frames.length){
-        plantPhotoStatus.textContent='No verified whole-bed photo currently covers this plant; '
-          +'showing the diagnostic analysis image instead.';
-        showPlantPhotoTab(false);
-        return;
-      }
-      const halfSpan=Math.max(plantRadius*4,200);
-      const project=function(x,y){
-        return [(x-(plantX-halfSpan))*plantPhotoCanvas.width/(2*halfSpan),
-                (y-(plantY-halfSpan))*plantPhotoCanvas.height/(2*halfSpan)];
-      };
-      drawFramesInto(ctx,plantPhotoCanvas.width,plantPhotoCanvas.height,frames,calibration,
-        data.grid.config_entry_id,project,function(loaded,failed){
-          const c=project(plantX,plantY);
-          ctx.setTransform(1,0,0,1,0,0);
-          ctx.strokeStyle='#39d878';ctx.lineWidth=2;
-          ctx.beginPath();ctx.arc(c[0],c[1],6,0,Math.PI*2);ctx.stroke();
-          plantPhotoStatus.textContent=frames.length+' image(s) from the latest whole-bed grid'
-            +(failed?' · '+failed+' could not be loaded':'')
-            +(frames.length>1?' (this plant spans a seam between captures)':'');
-        });
-    }catch(error){
-      plantPhotoStatus.textContent='Could not load the whole-bed grid ('+error.message+'); '
-        +'showing the diagnostic analysis image instead.';
-      showPlantPhotoTab(false);
-    }
   }
   async function loadPhotoGrid(){
     photoGridStatus.textContent='Loading the verified grid…';
@@ -1395,8 +1479,6 @@ _DASHBOARD_JS = r"""
     if(!plantComposite) return;
     const useOverlay=withOverlay&&plantComposite.overlay;
     modalImg.src=useOverlay?plantComposite.overlay:plantComposite.clean;
-    plantWithoutOverlay.setAttribute('aria-pressed',String(!useOverlay));
-    plantWithOverlay.setAttribute('aria-pressed',String(Boolean(useOverlay)));
   }
   const weedModal=document.getElementById('weed-modal');
   const weedImg=document.getElementById('weed-modal-img');
@@ -1677,8 +1759,6 @@ _DASHBOARD_JS = r"""
   weedZoom.addEventListener('input',function(){if(weedData&&weedViewMode==='closeup') applyCloseUp();});
   document.getElementById('weed-modal-close').addEventListener('click',closeWeedModal);
   weedModal.addEventListener('click',function(event){if(event.target===weedModal) closeWeedModal();});
-  plantWithoutOverlay.addEventListener('click',function(){showPlantComposite(false);});
-  plantWithOverlay.addEventListener('click',function(){showPlantComposite(true);});
   plantPhotoTab.addEventListener('click',function(){showPlantPhotoTab(true);});
   plantDiagnosticTab.addEventListener('click',function(){showPlantPhotoTab(false);});
   document.addEventListener('click',async function(event){
@@ -1697,15 +1777,12 @@ _DASHBOARD_JS = r"""
           clean:plantViewer.dataset.compositeClean,
           overlay:plantViewer.dataset.compositeOverlay||null
         };
-        plantToggle.hidden=false;
         artifactControls.hidden=true;
-        plantWithOverlay.disabled=!plantComposite.overlay;
-        overlayLegend.textContent='Cyan circle = original radius; red circle = new radius; white dot = plant center.';
+        overlayLegend.textContent='White cross = known center; cyan = current radius; red = proposed radius. Neighbour labels and circles stay fixed; diagnostic mode only adds the target mask.';
         if(plantComposite.clean) showPlantComposite(false); else modalImg.removeAttribute('src');
       } else {
         try{artifacts=JSON.parse(artifactViewer.dataset.artifacts||'[]');}catch(_){artifacts=[];}
         index=0;
-        plantToggle.hidden=true;
         artifactControls.hidden=!artifacts.length;
         overlayLegend.textContent='Cyan circle = original radius; red circle = planned radius.';
         if(artifacts.length) showArtifact(); else modalImg.removeAttribute('src');
@@ -1714,9 +1791,9 @@ _DASHBOARD_JS = r"""
       let details={}; try{details=JSON.parse(trigger.dataset.details||'{}');}catch(_){}
       modalDetails.textContent=details.formula||'';
       modal.hidden=false; closeButton.focus();
-      if(trigger.dataset.plantId){
+      if(plantViewer&&plantComposite){
         plantPhotoMode.hidden=false;
-        openPlantView(trigger);
+        showPlantPhotoTab(true);
       } else {
         plantPhotoMode.hidden=true;
         showPlantPhotoTab(false);
@@ -2149,10 +2226,9 @@ main{{max-width:1100px;margin:auto;padding:1.2rem}}nav a{{color:white;margin-rig
 button{{background:var(--green);border:0;border-radius:6px;padding:.65rem 1rem;cursor:pointer}}.warn{{color:#9b4b00}}.muted{{color:var(--muted)}}input,select{{padding:.5rem;max-width:100%}}img{{max-width:100%}}
 .action-message{{display:block;color:#a40000;max-width:24rem}}.action-message.notice{{color:var(--muted)}}.overlay-modal[hidden]{{display:none}}
 .overlay-modal{{position:fixed;inset:0;z-index:1000;background:#000b;display:flex;align-items:center;justify-content:center;padding:1rem}}
-.overlay-modal figure{{position:relative;background:white;border-radius:10px;margin:0;padding:1rem;max-width:min(95vw,1000px);max-height:95vh;overflow:auto}}
-.overlay-modal img{{display:block;max-height:70vh;margin:auto}}.modal-close{{position:absolute;right:.5rem;top:.5rem;font-size:1.5rem}}
+.overlay-modal figure{{position:relative;background:white;border-radius:10px;margin:0;padding:1rem;width:min(95vw,1000px);max-height:95vh;overflow:auto}}
+.overlay-modal img{{display:block;width:100%;height:auto;max-height:72vh;object-fit:contain;margin:auto;background:#111}}.modal-close{{position:absolute;right:.5rem;top:.5rem;font-size:1.5rem;z-index:2}}
 .overlay-modal canvas{{display:block;max-height:70vh;max-width:100%;margin:auto;background:#111;border-radius:6px}}
-#plant-photo-pane[hidden],#diagnostic-pane[hidden]{{display:none}}
 .gantry-gallery{{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:1rem;min-width:min(85vw,900px)}}
 .gantry-gallery figure{{margin:0;padding:0;overflow:hidden}}.gantry-gallery img{{width:100%;height:180px;object-fit:contain;background:#111}}
 .gantry-gallery figcaption{{padding:.5rem 0}}.gantry-target{{color:#a40000;font-weight:bold}}
@@ -2179,6 +2255,7 @@ button.unknown-button{{background:#e4ede7;color:var(--dark);box-shadow:inset 0 0
 border-radius:50%;border:3px solid #168cff;box-shadow:0 0 0 1px #001b3d}}
 .weed-view-toggle button[aria-pressed=true]{{background:#1672c4;color:white;box-shadow:inset 0 0 0 2px #0b4779}}
 .plant-view-toggle button[aria-pressed=true]{{background:#1672c4;color:white;box-shadow:inset 0 0 0 2px #0b4779}}
+@media (max-width:600px){{.overlay-modal{{padding:.35rem;align-items:flex-start}}.overlay-modal figure{{width:99vw;max-width:99vw;padding:.55rem;margin-top:.35rem}}.overlay-modal img{{max-height:68vh}}.modal-controls{{flex-wrap:wrap}}}}
 td.actions{{min-width:9rem}}.actions-group{{display:flex;flex-direction:column;align-items:stretch;gap:.4rem}}
 .actions-group form{{margin:0}}.actions-group button{{width:100%;padding:.45rem .8rem;font-size:.9rem}}
 .actions-group button[data-artifacts]{{background:#e4ede7;color:var(--dark)}}
@@ -2254,6 +2331,11 @@ async def dashboard(request: Request) -> HTMLResponse:
                 f"Current {r['current_radius_mm']:.1f} mm; Recommended = "
                 f"{r['recommended_protection_radius_mm']:.1f} mm. "
                 f"Plant center = {center}; crop: {r.get('crop_slug', 'unknown')}. "
+                f"Evidence: {int(r.get('used_measurement_count', 1))} used, "
+                f"{int(r.get('useful_measurement_count', 1))} useful, "
+                f"{int(r.get('measurement_count', 1))} candidates; "
+                f"visible outer boundary "
+                f"{float(r.get('visible_boundary_coverage', r.get('boundary_coverage', 0)) or 0):.0%}. "
                 + (
                     f"Fused from {r.get('fusion_view_count', 0)} calibrated views; "
                     f"angular coverage {float(r.get('fusion_angular_coverage') or 0):.0%}; "
@@ -2663,23 +2745,12 @@ value="{repair_values.delay_minutes}" required> minutes after the photo grid com
 <div id=overlay-modal class=overlay-modal hidden role=dialog aria-modal=true aria-label="Analysis diagnostic"><figure>
 <button id=overlay-modal-close class=modal-close type=button aria-label=Close>&times;</button>
 <div id=plant-photo-mode class="modal-controls plant-view-toggle" role=group aria-label="View mode" hidden>
-<button id=plant-photo-tab type=button aria-pressed=true>Plant photo</button>
-<button id=plant-diagnostic-tab type=button aria-pressed=false>Diagnostic overlay</button>
-</div>
-<div id=plant-photo-pane hidden>
-<canvas id=plant-photo-canvas width=480 height=480
- aria-label="Plant photo, cropped from the latest whole-bed grid"></canvas>
-<p id=plant-photo-status class=muted></p>
-</div>
-<div id=diagnostic-pane>
-<div id=plant-view-toggle class="modal-controls plant-view-toggle" role=group aria-label="Plant image view" hidden>
-<button id=plant-modal-without-overlay type=button aria-pressed=true>Original images</button>
-<button id=plant-modal-with-overlay type=button aria-pressed=false>Show mask overlay</button>
+<button id=plant-photo-tab type=button aria-pressed=true>Standard view</button>
+<button id=plant-diagnostic-tab type=button aria-pressed=false>Diagnostic mask</button>
 </div>
 <img id=overlay-modal-img alt="Plant analysis diagnostic"><figcaption id=overlay-modal-details></figcaption>
 <p id=overlay-modal-legend class=legend>Cyan circle = original radius; red circle = planned radius.</p>
 <div id=artifact-controls class=modal-controls><button id=overlay-modal-prev type=button>Previous</button><span id=overlay-modal-counter></span><button id=overlay-modal-next type=button>Next</button></div>
-</div>
 </figure></div>
 <div id=weed-modal class=overlay-modal hidden role=dialog aria-modal=true aria-label="Weed review">
 <figure class=weed-dialog><button id=weed-modal-close class=modal-close type=button aria-label=Close>&times;</button>
@@ -4161,6 +4232,7 @@ async def calibration_page(request: Request) -> HTMLResponse:
     v_oy = 0 if stored is None else stored.offset_y_mm
     v_origin = "top_left" if stored is None else str(stored.origin_location)
     v_map_origin = "top_left" if stored is None else str(stored.map_origin)
+    v_rotate_map = False if stored is None else stored.rotate_map
     grid_from, grid_to = _calibration_grid_range(entry_id)
     grid_from_value = grid_from.astimezone().strftime("%Y-%m-%dT%H:%M")
     grid_to_value = grid_to.astimezone().strftime("%Y-%m-%dT%H:%M")
@@ -4181,8 +4253,9 @@ tools needed.</p>
 <p><button type=button id=load>Load photo grid</button></p>
 <hr>
 <p class=muted>Copy scale, rotation, origin, and offsets exactly as shown in FarmBot.
-Copy the selected resolution from Photos → Camera settings; it lets this app resize the
-preview without changing FarmBot's millimetres-per-pixel scale.</p>
+Copy the selected resolution from Photos → Camera settings. The preview verifies that
+against each downloaded photo's actual dimensions and hides captures made at another
+resolution, matching FarmBot's own map filter.</p>
 <label>Pixel coordinate scale (mm/pixel)<br><input id=fb_scale type=number min=0 step=any value="{v_scale}"></label>
 <label>FarmBot capture width (px)<br><input id=fb_refw type=number min=1 step=1 value="{v_refw}"></label>
 <label>FarmBot capture height (px)<br><input id=fb_refh type=number min=1 step=1 value="{v_refh}"></label>
@@ -4190,8 +4263,11 @@ preview without changing FarmBot's millimetres-per-pixel scale.</p>
 <label>Camera rotation (degrees)<br><input id=rotation type=number step=any value="{v_rot}"></label>
 <label>Origin location in image<br><select id=origin>{_origin_options(v_origin)}</select></label>
 <label>Map origin<br><select id=map_origin>{_origin_options(v_map_origin)}</select></label>
-<p class=muted>Map origin rotates the complete bed, including photos and markers, to match
-the orientation selected in the FarmBot web app. It does not change the camera transform.</p>
+<label><input type=checkbox id=rotate_map{" checked" if v_rotate_map else ""}>
+ Rotate map (swap X and Y)</label>
+<p class=muted>Copy both Farm Designer controls independently. Map origin reflects the
+selected axes; Rotate map swaps X and Y. Together they orient the complete bed,
+including photos and markers, without changing the camera transform.</p>
 <label>Offset X (mm)<br><input id=offx type=number step=any value="{v_ox}"></label>
 <label>Offset Y (mm)<br><input id=offy type=number step=any value="{v_oy}"></label>
 <p class=muted>Copy both FarmBot camera offsets unchanged. FarmBot places the optical
@@ -4291,27 +4367,32 @@ async def vision_images(
         {"id": w.id, "name": w.name, "x": w.x, "y": w.y, "radius": w.radius}
         for w in inventory.weeds
     ]
+    # Farm Designer sizes the map from the bot's current axis lengths. Prefer
+    # those live limits over a saved photo-grid record, which may predate a
+    # firmware axis-length correction and would stretch the rendered mosaic.
     bed_bounds = None
-    record = photo_grid_store.load()
-    if record is not None and record.config_entry_id == entry_id:
-        bed_bounds = record.bed_bounds
+    bed_bounds_source = None
+    try:
+        soil = await client.soil_points(entry_id)
+        x_bounds = soil.motion.axis_bounds.get("x")
+        y_bounds = soil.motion.axis_bounds.get("y")
+        if x_bounds is not None and y_bounds is not None:
+            bed_bounds = {"x": x_bounds, "y": y_bounds}
+            bed_bounds_source = "live FarmBot axes"
+    except HomeAssistantError:
+        pass
     if bed_bounds is None:
-        try:
-            soil = await client.soil_points(entry_id)
-            x_bounds = soil.motion.axis_bounds.get("x")
-            y_bounds = soil.motion.axis_bounds.get("y")
-            if x_bounds is not None and y_bounds is not None:
-                bed_bounds = {"x": x_bounds, "y": y_bounds}
-        except HomeAssistantError:
-            # Image-corner bounds in the browser are still a complete, useful
-            # fallback when an older integration cannot report motion limits.
-            pass
+        record = photo_grid_store.load()
+        if record is not None and record.config_entry_id == entry_id:
+            bed_bounds = record.bed_bounds
+            bed_bounds_source = "saved grid fallback"
     return JSONResponse(
         {
             "images": images,
             "plants": plants,
             "weeds": weeds,
             "bed_bounds": bed_bounds,
+            "bed_bounds_source": bed_bounds_source,
             "date_from": date_from.isoformat(),
             "date_to": date_to.isoformat(),
         }
@@ -4339,7 +4420,18 @@ async def vision_image(entry_id: str, image_id: int) -> Response:
             exc,
         )
         raise HTTPException(502, "could not load image") from exc
-    return Response(base64.b64decode(response.image_base64), media_type="image/jpeg")
+    headers = {
+        "X-FarmBot-Processed-Width": str(response.width),
+        "X-FarmBot-Processed-Height": str(response.height),
+    }
+    if response.oriented_width is not None and response.oriented_height is not None:
+        headers["X-FarmBot-Oriented-Width"] = str(response.oriented_width)
+        headers["X-FarmBot-Oriented-Height"] = str(response.oriented_height)
+    return Response(
+        base64.b64decode(response.image_base64),
+        media_type="image/jpeg",
+        headers=headers,
+    )
 
 
 @app.post("/calibration")
@@ -4353,6 +4445,7 @@ async def save_calibration(
     offset_y: float = Form(0),
     origin_location: str = Form("top_left"),
     map_origin: str = Form("top_left"),
+    rotate_map: bool = Form(False),
 ) -> RedirectResponse:
     """Persist the FarmBot camera calibration for a bot.
 
@@ -4371,6 +4464,7 @@ async def save_calibration(
         display_origin = OriginLocation(map_origin if isinstance(map_origin, str) else "top_left")
     except ValueError as exc:
         raise HTTPException(400, "invalid map origin") from exc
+    display_rotate = rotate_map if isinstance(rotate_map, bool) else False
     try:
         values = FarmbotCalibrationInput(
             coordinate_scale=coordinate_scale,
@@ -4379,6 +4473,7 @@ async def save_calibration(
             rotation_degrees=rotation,
             origin_location=origin,
             map_origin=display_origin,
+            rotate_map=display_rotate,
             offset_x_mm=offset_x,
             offset_y_mm=offset_y,
         )

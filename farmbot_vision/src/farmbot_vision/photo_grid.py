@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 import os
 import tempfile
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid4
 
@@ -41,6 +41,7 @@ PHOTO_GRID_CHUNK_SIZE = PHOTO_GRID_MAX_TARGETS_PER_CALL
 # journeys to a 77-cell grid.
 PHOTO_GRID_CONTINUOUS_CAPABILITY = "continuous_photo_grid_capture"
 PHOTO_GRID_CONTINUOUS_MAX_TARGETS = 256
+TARGETED_CAPTURE_MINIMUM_PLANT_COVERAGE = 0.50
 
 
 def photo_grid_chunk_size(capabilities: object) -> int:
@@ -74,6 +75,22 @@ class PhotoGridFrame(BaseModel):
     z: float
 
 
+class TargetedPlantCapture(BaseModel):
+    plant_id: int = Field(gt=0)
+    crop_name: str
+    x: float
+    y: float
+    z: float
+    expected_diameter_mm: float = Field(ge=0)
+    best_grid_coverage: float = Field(ge=0, le=1)
+    status: str = "queued"
+    reason: str
+    repair_id: str | None = None
+    image_id: int | None = None
+    queued_at: datetime
+    completed_at: datetime | None = None
+
+
 class PhotoGridRecord(BaseModel):
     session_id: str = Field(default_factory=lambda: str(uuid4()))
     config_entry_id: str
@@ -95,6 +112,8 @@ class PhotoGridRecord(BaseModel):
     # index. Older schemas reject unknown target keys, so this stays off for
     # them and frames fall back to coordinate matching.
     indexed_targets: bool = False
+    targeted_captures: list[TargetedPlantCapture] = Field(default_factory=list)
+    targeted_capture_diagnostics: list[dict[str, object]] = Field(default_factory=list)
 
 
 class PhotoGridStore:
@@ -265,3 +284,131 @@ def match_verified_frames(
         )
         unmatched.pop(target.index)
     return matched
+
+
+def _plant_area_coverage(
+    plant_x: float,
+    plant_y: float,
+    radius_mm: float,
+    target: PhotoGridTarget,
+    calibration: FarmbotCalibrationInput,
+) -> float:
+    """Sample the expected bed-space canopy inside one calibrated frame."""
+
+    radius_mm = max(1.0, float(radius_mm))
+    axis = [(-1.0 + index / 20.0) for index in range(41)]
+    theta = math.radians(-calibration.rotation_degrees)
+    cos_t, sin_t = math.cos(theta), math.sin(theta)
+    sign_x = calibration.origin_location.sign_x
+    sign_y = calibration.origin_location.sign_y
+    optical_x = target.x + calibration.offset_x_mm
+    optical_y = target.y + calibration.offset_y_mm
+    half_width = calibration.coordinate_scale * calibration.reference_width / 2
+    half_height = calibration.coordinate_scale * calibration.reference_height / 2
+    inside_circle = 0
+    inside_frame = 0
+    for unit_y in axis:
+        for unit_x in axis:
+            if unit_x * unit_x + unit_y * unit_y > 1:
+                continue
+            inside_circle += 1
+            dx = (plant_x + unit_x * radius_mm - optical_x) * sign_x
+            dy = (plant_y + unit_y * radius_mm - optical_y) * sign_y
+            local_x = cos_t * dx + sin_t * dy
+            local_y = -sin_t * dx + cos_t * dy
+            if abs(local_x) <= half_width and abs(local_y) <= half_height:
+                inside_frame += 1
+    return inside_frame / max(1, inside_circle)
+
+
+def plan_targeted_plant_captures(
+    record: PhotoGridRecord,
+    plants: list,
+    *,
+    safety_margin_mm: float,
+) -> tuple[list[TargetedPlantCapture], list[dict[str, object]]]:
+    """Plan centred follow-up photos without issuing FarmBot movement."""
+
+    existing = {capture.plant_id for capture in record.targeted_captures}
+    targets_by_index = {target.index: target for target in record.targets}
+    captured_targets = [
+        targets_by_index[frame.target_index]
+        for frame in record.frames
+        if frame.target_index in targets_by_index
+    ]
+    x_bounds = record.bed_bounds["x"]
+    y_bounds = record.bed_bounds["y"]
+    native_width = record.calibration.coordinate_scale * record.calibration.reference_width
+    native_height = record.calibration.coordinate_scale * record.calibration.reference_height
+    usable_short_side = min(native_width, native_height) * (1 - PHOTO_GRID_OVERLAP)
+    fallback_z = record.targets[0].z
+    planned: list[TargetedPlantCapture] = []
+    diagnostics: list[dict[str, object]] = []
+    for plant in plants:
+        expected_radius = max(1.0, float(plant.radius) + safety_margin_mm)
+        expected_diameter = expected_radius * 2
+        best_coverage = max(
+            (
+                _plant_area_coverage(
+                    float(plant.x),
+                    float(plant.y),
+                    expected_radius,
+                    target,
+                    record.calibration,
+                )
+                for target in captured_targets
+            ),
+            default=0.0,
+        )
+        fits = expected_diameter <= usable_short_side
+        gantry_x = float(plant.x) - record.calibration.offset_x_mm
+        gantry_y = float(plant.y) - record.calibration.offset_y_mm
+        in_bounds = (
+            x_bounds[0] <= gantry_x <= x_bounds[1] and y_bounds[0] <= gantry_y <= y_bounds[1]
+        )
+        reason: str
+        should_schedule = False
+        if int(plant.id) in existing:
+            reason = "equivalent targeted capture already queued or completed for this grid run"
+        elif best_coverage >= TARGETED_CAPTURE_MINIMUM_PLANT_COVERAGE:
+            reason = "a grid image already shows at least 50% of the expected plant"
+        elif not fits:
+            reason = "expected plant diameter exceeds the usable single-photo footprint"
+        elif not in_bounds:
+            reason = "a centred gantry coordinate would be outside FarmBot axis bounds"
+        else:
+            reason = (
+                "no grid image shows 50% of the expected plant and the plant fits "
+                "inside one safety-margined camera frame"
+            )
+            should_schedule = True
+        diagnostic = {
+            "plant_id": int(plant.id),
+            "crop_name": str(
+                getattr(plant, "name", None) or getattr(plant, "openfarm_slug", "unknown")
+            ),
+            "expected_diameter_mm": expected_diameter,
+            "usable_camera_short_side_mm": usable_short_side,
+            "best_grid_coverage": best_coverage,
+            "targeted_photo_scheduled": should_schedule,
+            "reason": reason,
+        }
+        diagnostics.append(diagnostic)
+        if should_schedule:
+            planned.append(
+                TargetedPlantCapture(
+                    plant_id=int(plant.id),
+                    crop_name=str(
+                        getattr(plant, "name", None) or getattr(plant, "openfarm_slug", "unknown")
+                    ),
+                    x=gantry_x,
+                    y=gantry_y,
+                    z=fallback_z,
+                    expected_diameter_mm=expected_diameter,
+                    best_grid_coverage=best_coverage,
+                    status="queued",
+                    reason=reason,
+                    queued_at=datetime.now(UTC),
+                )
+            )
+    return planned, diagnostics

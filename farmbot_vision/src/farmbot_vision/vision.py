@@ -20,6 +20,7 @@ from .models import (
     PlantSeed,
     WeedDetection,
 )
+from .plant_measurement import BOUNDARY_SECTOR_COUNT
 from .resolution import MAX_PROCESSED_HEIGHT, MAX_PROCESSED_WIDTH
 from .weed_settings import WeedSettings
 from .weed_verifier import WeedVisualVerifier, encode_candidate_crop, extract_visual_features
@@ -215,6 +216,98 @@ def _circle_visible_fraction(
     return float(np.count_nonzero(visible) / max(1, np.count_nonzero(inside)))
 
 
+def _pixel_offsets_to_world_mm(
+    dx: np.ndarray | float,
+    dy: np.ndarray | float,
+    calibration: Calibration,
+) -> tuple[np.ndarray | float, np.ndarray | float]:
+    """Rotate and scale image offsets into calibrated bed-space millimetres."""
+
+    theta = math.radians(ROTATION_SIGN * calibration.rotation_degrees)
+    cos_t, sin_t = math.cos(theta), math.sin(theta)
+    vx = cos_t * dx - sin_t * dy
+    vy = sin_t * dx + cos_t * dy
+    origin = OriginLocation(calibration.origin_location)
+    return (
+        vx / (origin.sign_x * calibration.pixels_per_mm_x),
+        vy / (origin.sign_y * calibration.pixels_per_mm_y),
+    )
+
+
+def _world_offsets_to_pixel(
+    dx_mm: np.ndarray,
+    dy_mm: np.ndarray,
+    calibration: Calibration,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Inverse of :func:`_pixel_offsets_to_world_mm` for visibility sampling."""
+
+    origin = OriginLocation(calibration.origin_location)
+    vx = origin.sign_x * dx_mm * calibration.pixels_per_mm_x
+    vy = origin.sign_y * dy_mm * calibration.pixels_per_mm_y
+    theta = math.radians(ROTATION_SIGN * calibration.rotation_degrees)
+    cos_t, sin_t = math.cos(theta), math.sin(theta)
+    return cos_t * vx + sin_t * vy, -sin_t * vx + cos_t * vy
+
+
+def _canopy_visibility(
+    center: tuple[float, float],
+    radius_mm: float,
+    width: int,
+    height: int,
+    calibration: Calibration,
+) -> tuple[float, list[int]]:
+    """Return visible canopy area and visible outer-boundary sectors.
+
+    The boundary uses 72 equal angular sectors in bed space. A sector is visible
+    when its outer-canopy sample maps inside the calibrated source image.
+    """
+
+    radius_mm = max(1.0, float(radius_mm))
+    angles = np.arange(BOUNDARY_SECTOR_COUNT, dtype=np.float64) * (
+        2 * math.pi / BOUNDARY_SECTOR_COUNT
+    )
+    boundary_dx, boundary_dy = _world_offsets_to_pixel(
+        np.cos(angles) * radius_mm,
+        np.sin(angles) * radius_mm,
+        calibration,
+    )
+    boundary_x = center[0] + boundary_dx
+    boundary_y = center[1] + boundary_dy
+    sectors = (
+        np.flatnonzero(
+            (boundary_x >= 0) & (boundary_x < width) & (boundary_y >= 0) & (boundary_y < height)
+        )
+        .astype(int)
+        .tolist()
+    )
+
+    # A deterministic 41x41 disc sample measures visible canopy area in the
+    # same bed-space circle rather than in an uncalibrated display-pixel circle.
+    axis = np.linspace(-1.0, 1.0, 41)
+    xx, yy = np.meshgrid(axis, axis)
+    inside = (xx * xx + yy * yy) <= 1.0
+    area_dx, area_dy = _world_offsets_to_pixel(
+        xx * radius_mm,
+        yy * radius_mm,
+        calibration,
+    )
+    area_x = center[0] + area_dx
+    area_y = center[1] + area_dy
+    visible = inside & (area_x >= 0) & (area_x < width) & (area_y >= 0) & (area_y < height)
+    area_fraction = float(np.count_nonzero(visible) / max(1, np.count_nonzero(inside)))
+    return area_fraction, sectors
+
+
+def _image_quality(image: np.ndarray) -> float:
+    """Compact sharpness/exposure score used as one confidence factor."""
+
+    grey = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    sharpness = min(1.0, math.log1p(float(cv2.Laplacian(grey, cv2.CV_32F).var())) / math.log(101))
+    clipped = float(np.mean((grey <= 5) | (grey >= 250)))
+    exposure = max(0.0, 1.0 - clipped * 2.5)
+    return float(np.clip(0.6 * sharpness + 0.4 * exposure, 0.05, 1.0))
+
+
 _PLANT_COLORS: tuple[tuple[int, int, int], ...] = (
     (255, 180, 40),
     (180, 80, 255),
@@ -361,31 +454,32 @@ class ClassicalVisionEngine(ImageAnalysisEngine):
         labels_count, labels, stats, _ = cv2.connectedComponentsWithStats(ownership_input, 8)
         centers = np.array([seed.center_px for seed in seeds], dtype=np.float32)
         overlay = image.copy()
+        image_quality = _image_quality(image)
         weed_review = image.copy() if weed_settings and weed_settings.enabled else None
         ownership = np.zeros_like(labels, dtype=np.int16)
         ambiguous = np.zeros_like(mask, dtype=bool)
         uncertain_seeds: set[int] = set()
         edge_truncated: set[int] = set()
         out_of_frame: set[int] = set()
+        expected_visibility: dict[int, tuple[float, list[int]]] = {}
         skipped: dict[int, str] = {}
         ambiguity_gap = max(5.0, params.mean_ppm * 5)
 
         valid_indices: list[int] = []
         for index, seed in enumerate(seeds):
             x, y = seed.center_px
-            visible_radius = (
-                max(
-                    30.0,
-                    seed.current_radius_mm + self.safety_margin_mm,
-                )
-                * params.mean_ppm
+            expected_radius_mm = max(
+                30.0,
+                seed.current_radius_mm + self.safety_margin_mm,
             )
-            if (
-                x + visible_radius < 0
-                or y + visible_radius < 0
-                or x - visible_radius >= width
-                or y - visible_radius >= height
-            ):
+            expected_visibility[index] = _canopy_visibility(
+                seed.center_px,
+                expected_radius_mm,
+                width,
+                height,
+                calibration,
+            )
+            if expected_visibility[index][0] <= 0:
                 # Fully off-frame: there is no pixel evidence to analyse, so
                 # this plant never joins ownership/connected-components. It
                 # still gets a low-confidence Measurement below so it surfaces
@@ -396,8 +490,7 @@ class ClassicalVisionEngine(ImageAnalysisEngine):
             if x < 0 or y < 0 or x >= width or y >= height:
                 edge_truncated.add(index)
             else:
-                border = min(x, y, width - x, height - y)
-                if border < visible_radius:
+                if len(expected_visibility[index][1]) < BOUNDARY_SECTOR_COUNT:
                     edge_truncated.add(index)
 
         for label in range(1, labels_count):
@@ -434,10 +527,26 @@ class ClassicalVisionEngine(ImageAnalysisEngine):
                 candidate_farthest = float(
                     np.max(np.sqrt((xs[candidate] - cx) ** 2 + (ys[candidate] - cy) ** 2))
                 )
+                candidate_dx_mm, candidate_dy_mm = _pixel_offsets_to_world_mm(
+                    xs[candidate] - cx,
+                    ys[candidate] - cy,
+                    calibration,
+                )
+                candidate_nearest_mm = float(np.min(np.hypot(candidate_dx_mm, candidate_dy_mm)))
                 bounded_historical_leaf = historical_overlap and candidate_farthest <= (
                     max(seed.current_radius_mm * 1.5, seed.current_radius_mm + 30) * params.mean_ppm
                 )
-                if component_near_seed or bounded_historical_leaf:
+                intersects_expected_canopy = candidate_nearest_mm <= max(
+                    30.0,
+                    seed.current_radius_mm * 1.25,
+                    seed.current_radius_mm + self.safety_margin_mm,
+                )
+                center_outside = not (0 <= cx < width and 0 <= cy < height)
+                if (
+                    component_near_seed
+                    or bounded_historical_leaf
+                    or (center_outside and intersects_expected_canopy)
+                ):
                     ownership[ys[candidate], xs[candidate]] = index + 1
                     ambiguous[ys[candidate & is_ambiguous], xs[candidate & is_ambiguous]] = True
                 else:
@@ -496,6 +605,53 @@ class ClassicalVisionEngine(ImageAnalysisEngine):
             separators=(",", ":"),
         )
 
+        def evidence_metadata(
+            seed_index: int,
+            radius_mm: float,
+            *,
+            has_evidence: bool,
+            segmentation_quality: float,
+            canopy_truncated: bool = False,
+            exclusion_reason: str | None = None,
+        ) -> dict[str, object]:
+            seed = seeds[seed_index]
+            area_fraction, sectors = _canopy_visibility(
+                seed.center_px,
+                max(1.0, radius_mm),
+                width,
+                height,
+                calibration,
+            )
+            center_visible = 0 <= seed.center_px[0] < width and 0 <= seed.center_px[1] < height
+            expected_sectors = expected_visibility.get(seed_index, (0.0, []))[1]
+            boundary_coverage = len(sectors) / BOUNDARY_SECTOR_COUNT
+            details = {
+                "plant_id": seed.plant_id,
+                "plant_center_px": [float(seed.center_px[0]), float(seed.center_px[1])],
+                "center_visible": center_visible,
+                "visible_canopy_fraction": area_fraction,
+                "visible_boundary_coverage": boundary_coverage,
+                "visible_boundary_sectors": sectors,
+                "image_quality": image_quality,
+                "segmentation_quality": segmentation_quality,
+                "calibration_source": calibration.source,
+                "calibration_uncertainty_mm": calibration.uncertainty_mm,
+            }
+            return {
+                "visible_fraction": area_fraction,
+                "center_visible": center_visible,
+                "boundary_coverage": boundary_coverage,
+                "boundary_sectors": sectors,
+                "canopy_truncated": canopy_truncated,
+                "has_plant_evidence": has_evidence,
+                "plant_fits_single_frame": (len(expected_sectors) == BOUNDARY_SECTOR_COUNT),
+                "image_quality": image_quality,
+                "segmentation_quality": float(np.clip(segmentation_quality, 0.0, 1.0)),
+                "evidence_status": "useful" if has_evidence else "excluded",
+                "exclusion_reason": exclusion_reason,
+                "diagnostics_json": json.dumps(details, separators=(",", ":")),
+            }
+
         measurements: list[Measurement] = []
         for index in out_of_frame:
             seed = seeds[index]
@@ -535,7 +691,13 @@ class ClassicalVisionEngine(ImageAnalysisEngine):
                     calibrated=True,
                     contract_version=CONTRACT_VERSION,
                     plant_center_px=seed.center_px,
-                    visible_fraction=0.0,
+                    **evidence_metadata(
+                        index,
+                        max(1.0, seed.current_radius_mm),
+                        has_evidence=False,
+                        segmentation_quality=0.0,
+                        exclusion_reason="plant footprint is outside this image",
+                    ),
                 )
             )
         for index in valid_indices:
@@ -555,12 +717,6 @@ class ClassicalVisionEngine(ImageAnalysisEngine):
             core_vegetation = int(np.count_nonzero((mask > 0) & core))
             core_area = max(1, int(np.count_nonzero(core)))
             core_coverage = core_vegetation / core_area
-            visible_fraction = _circle_visible_fraction(
-                seed.center_px,
-                max(1.0, seed.current_radius_mm * params.mean_ppm),
-                width,
-                height,
-            )
             # A plant must have evidence at its recorded centre. Vegetation
             # merely touching the outer radius is not proof the plant remains.
             center_present = core_coverage >= 0.035 or (
@@ -605,7 +761,13 @@ class ClassicalVisionEngine(ImageAnalysisEngine):
                         calibrated=True,
                         contract_version=CONTRACT_VERSION,
                         plant_center_px=seed.center_px,
-                        visible_fraction=visible_fraction,
+                        **evidence_metadata(
+                            index,
+                            max(1.0, seed.current_radius_mm),
+                            has_evidence=False,
+                            segmentation_quality=0.0,
+                            exclusion_reason="no connected target canopy was found",
+                        ),
                     )
                 )
                 continue
@@ -658,7 +820,13 @@ class ClassicalVisionEngine(ImageAnalysisEngine):
                         calibrated=True,
                         contract_version=CONTRACT_VERSION,
                         plant_center_px=seed.center_px,
-                        visible_fraction=visible_fraction,
+                        **evidence_metadata(
+                            index,
+                            max(1.0, seed.current_radius_mm),
+                            has_evidence=False,
+                            segmentation_quality=core_coverage,
+                            exclusion_reason="no vegetation at the known plant centre",
+                        ),
                     )
                 )
                 center = (round(seed.center_px[0]), round(seed.center_px[1]))
@@ -676,16 +844,27 @@ class ClassicalVisionEngine(ImageAnalysisEngine):
                     cv2.LINE_AA,
                 )
                 continue
-            dx_mm = (xs - seed.center_px[0]) / calibration.pixels_per_mm_x
-            dy_mm = (ys - seed.center_px[1]) / calibration.pixels_per_mm_y
-            distances_mm = np.sqrt(dx_mm**2 + dy_mm**2)
+            dx_mm, dy_mm = _pixel_offsets_to_world_mm(
+                xs - seed.center_px[0],
+                ys - seed.center_px[1],
+                calibration,
+            )
+            distances_mm = np.hypot(dx_mm, dy_mm)
             typical = float(np.percentile(distances_mm, 90))
             maximum = float(distances_mm.max())
-            visible_fraction = _circle_visible_fraction(
+            _visible_fraction, visible_boundary_sectors = _canopy_visibility(
                 seed.center_px,
-                max(seed.current_radius_mm, maximum) * params.mean_ppm,
+                max(seed.current_radius_mm, maximum),
                 width,
                 height,
+                calibration,
+            )
+            boundary_coverage = len(visible_boundary_sectors) / BOUNDARY_SECTOR_COUNT
+            canopy_truncated = bool(
+                np.any(owned[:2, :])
+                or np.any(owned[-2:, :])
+                or np.any(owned[:, :2])
+                or np.any(owned[:, -2:])
             )
             ambiguous_pixels = int(np.count_nonzero(ambiguous & owned))
             ambiguous_fraction = ambiguous_pixels / max(1, len(xs))
@@ -694,25 +873,27 @@ class ClassicalVisionEngine(ImageAnalysisEngine):
             # unambiguous core and nearest-seed pixels for growth measurement.
             plant_ambiguous = ambiguous_fraction > 0.45 or index in uncertain_seeds
             component_coverage = min(1.0, len(xs) / (500.0 * params.mean_ppm**2))
-            border_distance = min(
-                seed.center_px[0],
-                seed.center_px[1],
-                width - seed.center_px[0],
-                height - seed.center_px[1],
-            )
-            edge_score = min(
-                1.0, border_distance / max(1, maximum * calibration.pixels_per_mm_x + 8)
+            segmentation_quality = float(
+                np.clip(
+                    0.5 * component_coverage
+                    + 0.3 * min(1.0, core_coverage / 0.18)
+                    + 0.2 * (1.0 - ambiguous_fraction),
+                    0.0,
+                    1.0,
+                )
             )
             confidence = max(
                 0.05,
                 min(
                     0.99,
-                    0.55
+                    0.34
                     + 0.25 * component_coverage
-                    + 0.2 * edge_score
+                    + 0.23 * boundary_coverage
+                    + 0.10 * image_quality
+                    + 0.08 * segmentation_quality
                     - min(0.28, ambiguous_fraction * 0.35)
                     - (0.18 if index in uncertain_seeds else 0)
-                    - (0.22 if index in edge_truncated else 0),
+                    - (0.08 if canopy_truncated else 0),
                 ),
             )
             recommendation = (
@@ -721,10 +902,12 @@ class ClassicalVisionEngine(ImageAnalysisEngine):
                 + max(self.calibration_uncertainty_mm, calibration.uncertainty_mm)
             )
             canopy_center = (float(np.median(xs)), float(np.median(ys)))
-            center_offset_mm = math.hypot(
-                (canopy_center[0] - seed.center_px[0]) / calibration.pixels_per_mm_x,
-                (canopy_center[1] - seed.center_px[1]) / calibration.pixels_per_mm_y,
+            center_offset_x_mm, center_offset_y_mm = _pixel_offsets_to_world_mm(
+                canopy_center[0] - seed.center_px[0],
+                canopy_center[1] - seed.center_px[1],
+                calibration,
             )
+            center_offset_mm = math.hypot(center_offset_x_mm, center_offset_y_mm)
             center_misaligned = center_offset_mm > max(
                 20.0, min(60.0, seed.current_radius_mm * 0.3)
             )
@@ -770,7 +953,13 @@ class ClassicalVisionEngine(ImageAnalysisEngine):
                     calibrated=True,
                     contract_version=CONTRACT_VERSION,
                     plant_center_px=seed.center_px,
-                    visible_fraction=visible_fraction,
+                    **evidence_metadata(
+                        index,
+                        max(seed.current_radius_mm, maximum),
+                        has_evidence=True,
+                        segmentation_quality=segmentation_quality,
+                        canopy_truncated=canopy_truncated,
+                    ),
                 )
             )
             color = (0, 165, 255) if plant_ambiguous else _PLANT_COLORS[index % len(_PLANT_COLORS)]

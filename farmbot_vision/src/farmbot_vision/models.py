@@ -692,6 +692,20 @@ class Measurement(StrictModel):
     plant_center_px: tuple[float, float] | None = None
     absent_observations: int = Field(default=0, ge=0)
     visible_fraction: float = Field(default=1, ge=0, le=1)
+    # Evidence geometry and quality are kept separate from the final
+    # consolidation so excluded photos can be explained without lowering the
+    # selected estimate's confidence.
+    center_visible: bool = True
+    boundary_coverage: float = Field(default=0, ge=0, le=1)
+    boundary_sectors: list[int] = Field(default_factory=list)
+    canopy_truncated: bool = False
+    has_plant_evidence: bool = True
+    plant_fits_single_frame: bool = True
+    image_quality: float = Field(default=1, ge=0, le=1)
+    segmentation_quality: float = Field(default=1, ge=0, le=1)
+    evidence_status: Literal["candidate", "useful", "used", "excluded"] = "candidate"
+    exclusion_reason: str | None = None
+    diagnostics_json: str = "{}"
     safety_margin_mm: float = Field(default=0, ge=0)
     calibration_uncertainty_mm: float = Field(default=0, ge=0)
     source_image_path: str | None = None

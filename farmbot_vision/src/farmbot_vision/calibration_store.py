@@ -20,7 +20,7 @@ import os
 import tempfile
 from pathlib import Path
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from .models import OriginLocation
 
@@ -43,8 +43,22 @@ class FarmbotCalibrationInput(BaseModel):
     # Whole-map display orientation. This is separate from origin_location,
     # which is part of the camera's garden-to-pixel transform.
     map_origin: OriginLocation = OriginLocation.TOP_LEFT
+    rotate_map: bool = False
     offset_x_mm: float = 0.0
     offset_y_mm: float = 0.0
+
+    @model_validator(mode="before")
+    @classmethod
+    def migrate_combined_map_orientation(cls, data: object) -> object:
+        """Preserve the pre-3.1 display while separating FarmBot's controls."""
+        if not isinstance(data, dict) or "rotate_map" in data:
+            return data
+        migrated = dict(data)
+        migrated["rotate_map"] = migrated.get("map_origin", "top_left") in {
+            "top_right",
+            "bottom_left",
+        }
+        return migrated
 
 
 class CalibrationStore:

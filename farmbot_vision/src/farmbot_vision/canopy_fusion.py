@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import math
 from dataclasses import dataclass
 
@@ -8,6 +7,11 @@ import cv2
 import numpy as np
 
 from .canopy_settings import CanopyFusionSettings
+from .plant_measurement import (
+    MINIMUM_PARTIAL_BOUNDARY_COVERAGE,
+    relative_pixel_to_plant_mm_transform,
+    select_measurement_evidence,
+)
 
 
 @dataclass(frozen=True)
@@ -24,54 +28,30 @@ class FusedCanopyResult:
     diagnostic_jpeg: bytes | None
 
 
-def _relative_transform(item) -> tuple[np.ndarray, float] | None:
-    try:
-        transform = json.loads(item.transform_json or "{}")
-    except (TypeError, json.JSONDecodeError):
-        return None
-    ppm_x = float(transform.get("pixels_per_mm_x") or 0)
-    ppm_y = float(transform.get("pixels_per_mm_y") or 0)
-    if ppm_x <= 0 or ppm_y <= 0 or not item.plant_center_px:
-        return None
-    rotation = math.radians(float(transform.get("rotation_degrees") or 0))
-    cos_t, sin_t = math.cos(rotation), math.sin(rotation)
-    origin = str(transform.get("origin_location") or "top_left")
-    sign_x = -1 if origin in {"top_right", "bottom_right"} else 1
-    sign_y = -1 if origin in {"bottom_left", "bottom_right"} else 1
-    cx, cy = item.plant_center_px
-    matrix = np.float64(
-        [
-            [
-                sign_x * cos_t / ppm_x,
-                -sign_x * sin_t / ppm_x,
-                sign_x * (-cos_t * cx + sin_t * cy) / ppm_x,
-            ],
-            [
-                sign_y * sin_t / ppm_y,
-                sign_y * cos_t / ppm_y,
-                sign_y * (-sin_t * cx - cos_t * cy) / ppm_y,
-            ],
-        ]
-    )
-    return matrix, math.sqrt(ppm_x * ppm_y)
-
-
 def fuse_canopy_masks(
     measurements: list,
     settings: CanopyFusionSettings,
 ) -> FusedCanopyResult | None:
     """Fuse per-image plant ownership masks on a plant-centred metric canvas."""
-    if not settings.enabled or len(measurements) < settings.minimum_views:
+    if not settings.enabled:
         return None
-    newest = max(item.image_timestamp for item in measurements)
-    activated_by_partial = any(
-        item.visible_fraction < settings.activation_visible_fraction for item in measurements
-    )
+    selection = select_measurement_evidence(measurements)
+    if selection.mode in {"single_complete", "no_evidence", "no_center"}:
+        return None
+    selected = list(selection.used)
+    if not selected:
+        return None
+    newest = max(item.image_timestamp for item in selected)
+    activated_by_partial = selection.mode in {
+        "partial_composite",
+        "insufficient_partial",
+        "large_composite",
+    }
     if not settings.always_fuse_when_available and not activated_by_partial:
         return None
 
     frames: list[dict] = []
-    for item in measurements:
+    for item in selected:
         if (
             item.vegetation_absent
             or not item.mask_path
@@ -81,7 +61,7 @@ def fuse_canopy_masks(
         ):
             continue
         mask = cv2.imread(item.mask_path, cv2.IMREAD_GRAYSCALE)
-        relative = _relative_transform(item)
+        relative = relative_pixel_to_plant_mm_transform(item)
         if mask is None or relative is None or not np.any(mask > 0):
             continue
         transform, scale = relative
@@ -103,7 +83,8 @@ def fuse_canopy_masks(
                 ),
             }
         )
-    if len(frames) < settings.minimum_views:
+    minimum_frames = 1 if activated_by_partial else settings.minimum_views
+    if len(frames) < minimum_frames:
         return None
 
     min_x = min(frame["bounds"][0] for frame in frames)
@@ -165,18 +146,33 @@ def fuse_canopy_masks(
         visible_count += (warped_visible > 0).astype(np.uint16)
         strongest_evidence = np.maximum(strongest_evidence, warped_evidence)
 
+    single_threshold = (
+        settings.minimum_view_confidence
+        if len(frames) == 1
+        else settings.single_view_acceptance_confidence
+    )
     accepted = (support_count >= settings.minimum_supporting_views) | (
-        (support_count >= 1) & (strongest_evidence >= settings.single_view_acceptance_confidence)
+        (support_count >= 1) & (strongest_evidence >= single_threshold)
     )
     if not np.any(accepted):
         return None
-    # Remove interpolation specks without joining separate leaves.
+    # Remove interpolation specks without joining separate leaves, then drop
+    # disconnected fragments smaller than the existing 12 mm² physical noise
+    # floor. Legitimate separated leaves remain available to the radial sectors.
     accepted_u8 = accepted.astype(np.uint8) * 255
     accepted_u8 = cv2.morphologyEx(
         accepted_u8,
         cv2.MORPH_OPEN,
         cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
     )
+    component_count, component_labels, component_stats, _ = cv2.connectedComponentsWithStats(
+        accepted_u8, 8
+    )
+    minimum_component_area = max(3, round(12.0 * ppm * ppm))
+    accepted_u8 = np.zeros_like(accepted_u8)
+    for label in range(1, component_count):
+        if int(component_stats[label, cv2.CC_STAT_AREA]) >= minimum_component_area:
+            accepted_u8[component_labels == label] = 255
     accepted = accepted_u8 > 0
     ys, xs = np.where(accepted)
     if not len(xs):
@@ -213,7 +209,10 @@ def fuse_canopy_masks(
         .astype(int)
         .tolist()
     )
-    coverage = len(observed_sectors) / settings.angular_sectors
+    coverage = max(
+        len(observed_sectors) / settings.angular_sectors,
+        selection.boundary_coverage,
+    )
     corroborated = float(np.mean(support_count[accepted] >= 2))
     source_radii = sorted(
         float(frame["item"].maximum_accepted_canopy_radius_mm) for frame in frames
@@ -226,13 +225,16 @@ def fuse_canopy_masks(
     mean_confidence = float(np.mean([frame["item"].confidence for frame in frames]))
     confidence = float(
         np.clip(
-            mean_confidence * (0.55 + 0.45 * coverage)
+            mean_confidence * 0.75
+            + 0.20 * coverage
             + min(0.08, 0.02 * (len(frames) - 1))
             + min(0.05, corroborated * 0.1),
             0.05,
             0.99,
         )
     )
+    if coverage < MINIMUM_PARTIAL_BOUNDARY_COVERAGE:
+        confidence = min(confidence, 0.45)
 
     ok_mask, encoded_mask = cv2.imencode(".png", accepted_u8)
     diagnostic = np.zeros((canvas_height, canvas_width, 3), dtype=np.uint8)

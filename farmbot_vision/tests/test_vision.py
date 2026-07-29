@@ -4,9 +4,9 @@ from datetime import UTC, datetime
 
 import cv2
 import numpy as np
-from conftest import jpeg
+from conftest import encode_jpeg, jpeg
 
-from farmbot_vision.models import Decision, PlantSeed
+from farmbot_vision.models import Calibration, Decision, PlantSeed
 from farmbot_vision.vision import ClassicalVisionEngine, decode_jpeg, register_translation
 
 NOW = datetime(2026, 2, 1, tzinfo=UTC)
@@ -24,6 +24,31 @@ def test_circular_plant_without_weeds(seed, calibration):
     assert 33 <= measurement.maximum_accepted_canopy_radius_mm <= 37
     assert measurement.recommended_protection_radius_mm >= 63
     assert measurement.confidence > 0.7
+
+
+def test_radius_is_measured_in_bed_mm_after_anisotropic_rotation():
+    image = np.zeros((180, 180, 3), np.uint8)
+    cv2.ellipse(image, (90, 90), (30, 60), 0, 0, 360, (20, 210, 30), -1)
+    calibration = Calibration(
+        source="manual",
+        pixels_per_mm_x=2,
+        pixels_per_mm_y=1,
+        rotation_degrees=90,
+        uncertainty_mm=0,
+    )
+    seed = PlantSeed(
+        plant_id=1,
+        crop_slug="lettuce",
+        center_px=(90, 90),
+        current_radius_mm=25,
+    )
+
+    result = ClassicalVisionEngine(
+        safety_margin_mm=0,
+        calibration_uncertainty_mm=0,
+    ).analyse(encode_jpeg(image), 9, NOW, [seed], calibration)
+
+    assert 27 <= result.measurements[0].maximum_accepted_canopy_radius_mm <= 33
 
 
 def test_largest_genuine_leaf_is_not_excluded(seed, calibration):

@@ -14,6 +14,7 @@ from .models import (
     SoilMeasurement,
     SoilStereoCalibration,
 )
+from .plant_measurement import select_measurement_evidence, selection_diagnostics
 
 MIGRATIONS = [
     """
@@ -281,6 +282,23 @@ MIGRATIONS = [
       PRIMARY KEY(config_entry_id, plant_id, image_id)
     );
     """,
+    # Migration 18: keep candidate/useful/selected evidence separate and retain
+    # measurable boundary coverage plus confidence factors for diagnostics.
+    # Legacy rows default to useful/full-view semantics so existing pending
+    # recommendations remain reviewable.
+    """
+    ALTER TABLE measurements ADD COLUMN center_visible INTEGER NOT NULL DEFAULT 1;
+    ALTER TABLE measurements ADD COLUMN boundary_coverage REAL NOT NULL DEFAULT 1;
+    ALTER TABLE measurements ADD COLUMN boundary_sectors_json TEXT NOT NULL DEFAULT '[]';
+    ALTER TABLE measurements ADD COLUMN canopy_truncated INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE measurements ADD COLUMN has_plant_evidence INTEGER NOT NULL DEFAULT 1;
+    ALTER TABLE measurements ADD COLUMN plant_fits_single_frame INTEGER NOT NULL DEFAULT 1;
+    ALTER TABLE measurements ADD COLUMN image_quality REAL NOT NULL DEFAULT 1;
+    ALTER TABLE measurements ADD COLUMN segmentation_quality REAL NOT NULL DEFAULT 1;
+    ALTER TABLE measurements ADD COLUMN evidence_status TEXT NOT NULL DEFAULT 'candidate';
+    ALTER TABLE measurements ADD COLUMN exclusion_reason TEXT;
+    ALTER TABLE measurements ADD COLUMN diagnostics_json TEXT NOT NULL DEFAULT '{}';
+    """,
 ]
 
 
@@ -511,6 +529,17 @@ class Database:
                     m.fusion_disagreement_mm,
                     int(m.fusion_reliable),
                     m.fusion_diagnostic_path,
+                    int(m.center_visible),
+                    m.boundary_coverage,
+                    json.dumps(m.boundary_sectors, separators=(",", ":")),
+                    int(m.canopy_truncated),
+                    int(m.has_plant_evidence),
+                    int(m.plant_fits_single_frame),
+                    m.image_quality,
+                    m.segmentation_quality,
+                    m.evidence_status,
+                    m.exclusion_reason,
+                    m.diagnostics_json,
                 )
             )
         with self.connection:
@@ -548,8 +577,11 @@ class Database:
                 fused_canopy,fused_typical_radius_mm,fused_maximum_radius_mm,
                 fused_recommended_radius_mm,fused_confidence,fusion_view_count,
                 fusion_angular_coverage,fusion_corroborated_fraction,fusion_disagreement_mm,
-                fusion_reliable,fusion_diagnostic_path)
-                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                fusion_reliable,fusion_diagnostic_path,center_visible,boundary_coverage,
+                boundary_sectors_json,canopy_truncated,has_plant_evidence,
+                plant_fits_single_frame,image_quality,segmentation_quality,evidence_status,
+                exclusion_reason,diagnostics_json)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 values,
             )
 
@@ -1131,6 +1163,10 @@ class Database:
                 row["artifact_paths"] = json.loads(row.get("artifact_paths_json") or "[]")
             except (TypeError, json.JSONDecodeError):
                 row["artifact_paths"] = []
+            try:
+                row["boundary_sectors"] = json.loads(row.get("boundary_sectors_json") or "[]")
+            except (TypeError, json.JSONDecodeError):
+                row["boundary_sectors"] = []
         return result
 
     @staticmethod
@@ -1155,12 +1191,87 @@ class Database:
         recency all contribute to the weight. A weighted median prevents one
         distant false-positive leaf from dominating the recommended radius.
         """
-        if len(rows) == 1:
-            row = dict(rows[0])
-            row["source_measurement_ids"] = [row["measurement_id"]]
-            row["measurement_count"] = 1
+        evidence = select_measurement_evidence(rows)
+        candidate_rows = sorted(rows, key=lambda row: str(row["image_timestamp"]), reverse=True)
+        diagnostics = selection_diagnostics(evidence)
+        if evidence.used:
+            ordered = [dict(row) for row in evidence.used]
+        else:
+            absence_rows = [
+                dict(row)
+                for row in candidate_rows
+                if row.get("vegetation_absent") and row.get("center_visible", 1)
+            ]
+            if absence_rows:
+                ordered = absence_rows
+            else:
+                representative = dict(candidate_rows[0])
+                representative.update(diagnostics)
+                representative["confidence"] = min(
+                    0.2, float(representative.get("confidence") or 0.05)
+                )
+                representative["decision"] = "uncertain"
+                representative["vegetation_absent"] = 0
+                representative["reason"] = (
+                    f"No usable target-plant evidence in {len(candidate_rows)} candidate image"
+                    f"{'s' if len(candidate_rows) != 1 else ''}; "
+                    "excluded images do not contribute to confidence"
+                )
+                representative["source_measurement_ids"] = [
+                    str(row["measurement_id"]) for row in candidate_rows
+                ]
+                representative["measurement_count"] = len(candidate_rows)
+                representative["useful_measurement_count"] = len(evidence.useful)
+                representative["used_measurement_count"] = 0
+                return representative
+        if len(ordered) == 1:
+            row = dict(ordered[0])
+            legacy_fused = next(
+                (
+                    candidate
+                    for candidate in candidate_rows
+                    if candidate.get("fused_canopy")
+                    and candidate.get("fusion_reliable")
+                    and candidate.get("fused_recommended_radius_mm") is not None
+                ),
+                None,
+            )
+            if legacy_fused is not None:
+                row["typical_canopy_radius_mm"] = float(legacy_fused["fused_typical_radius_mm"])
+                row["maximum_accepted_canopy_radius_mm"] = float(
+                    legacy_fused["fused_maximum_radius_mm"]
+                )
+                row["recommended_protection_radius_mm"] = float(
+                    legacy_fused["fused_recommended_radius_mm"]
+                )
+                row["confidence"] = float(legacy_fused["fused_confidence"])
+                for field in (
+                    "fused_canopy",
+                    "fused_typical_radius_mm",
+                    "fused_maximum_radius_mm",
+                    "fused_recommended_radius_mm",
+                    "fused_confidence",
+                    "fusion_view_count",
+                    "fusion_angular_coverage",
+                    "fusion_corroborated_fraction",
+                    "fusion_disagreement_mm",
+                    "fusion_reliable",
+                    "fusion_diagnostic_path",
+                ):
+                    row[field] = legacy_fused.get(field)
+            row.update(diagnostics)
+            row["source_measurement_ids"] = [
+                str(candidate["measurement_id"]) for candidate in candidate_rows
+            ]
+            row["measurement_count"] = len(candidate_rows)
+            row["useful_measurement_count"] = len(evidence.useful)
+            row["used_measurement_count"] = 1
+            if evidence.mode == "single_complete" and len(candidate_rows) > 1:
+                row["reason"] = (
+                    f"Selected complete image #{row['image_id']} alone from "
+                    f"{len(candidate_rows)} candidates; excluded images do not reduce confidence"
+                )
             return row
-        ordered = sorted(rows, key=lambda row: str(row["image_timestamp"]), reverse=True)
         newest = datetime.fromisoformat(str(ordered[0]["image_timestamp"]))
         weights: list[float] = []
         for row in ordered:
@@ -1268,11 +1379,13 @@ class Database:
                 if path and path not in paths:
                     paths.append(path)
         representative["artifact_paths"] = paths
-        representative["source_measurement_ids"] = [str(row["measurement_id"]) for row in ordered]
-        representative["measurement_count"] = len(ordered)
-        # Images that never contained the plant are recorded so it surfaces for
-        # review, but counting them as evidence overstated how much was seen.
-        contributing = sum(1 for row in ordered if float(row.get("visible_fraction") or 0) > 0)
+        representative.update(diagnostics)
+        representative["source_measurement_ids"] = [
+            str(row["measurement_id"]) for row in candidate_rows
+        ]
+        representative["measurement_count"] = len(candidate_rows)
+        representative["useful_measurement_count"] = len(evidence.useful)
+        representative["used_measurement_count"] = len(evidence.used)
         representative["reason"] = (
             (
                 f"Fused plant ownership masks from {representative['fusion_view_count']} "
@@ -1282,12 +1395,11 @@ class Database:
             )
             if representative.get("fused_canopy")
             else (
-                f"Consolidated from {contributing} of {len(ordered)} images "
-                f"({len(ordered) - contributing} did not show the plant) using confidence, "
-                "visible canopy percentage and recency"
-                if contributing < len(ordered)
-                else f"Consolidated from {len(ordered)} images using confidence, visible canopy "
-                "percentage and recency"
+                f"Estimated from {len(evidence.used)} selected image"
+                f"{'s' if len(evidence.used) != 1 else ''} out of "
+                f"{len(candidate_rows)} candidates ({len(evidence.useful)} contained useful "
+                f"target evidence); visible outer-boundary coverage "
+                f"{evidence.boundary_coverage:.0%}"
             )
         )
         return representative
@@ -1309,6 +1421,10 @@ class Database:
                 row["artifact_paths"] = json.loads(row.get("artifact_paths_json") or "[]")
             except (TypeError, json.JSONDecodeError):
                 row["artifact_paths"] = []
+            try:
+                row["boundary_sectors"] = json.loads(row.get("boundary_sectors_json") or "[]")
+            except (TypeError, json.JSONDecodeError):
+                row["boundary_sectors"] = []
         groups: dict[tuple[object, object], list[dict]] = {}
         for row in result:
             groups.setdefault((row.get("config_entry_id"), row["plant_id"]), []).append(row)
@@ -1377,6 +1493,12 @@ class Database:
                 )
             except (TypeError, json.JSONDecodeError):
                 candidate["artifact_paths"] = []
+            try:
+                candidate["boundary_sectors"] = json.loads(
+                    candidate.get("boundary_sectors_json") or "[]"
+                )
+            except (TypeError, json.JSONDecodeError):
+                candidate["boundary_sectors"] = []
         return self._consolidate_measurement_rows(result) if result else item
 
     def record_group_decision(self, measurement_id: str, action: str, details: dict) -> None:
@@ -1462,6 +1584,33 @@ class Database:
                 "WHERE measurement_id=?",
                 [(path, overlay_path, measurement_id) for measurement_id in measurement_ids],
             )
+
+    def set_evidence_selection(self, measurements: list[object]) -> dict[str, object]:
+        """Persist candidate/useful/used state and return structured diagnostics."""
+
+        selection = select_measurement_evidence(measurements)
+        used = {str(item.measurement_id) for item in selection.used}
+        useful = {str(item.measurement_id) for item in selection.useful}
+        excluded = {str(item.measurement_id): reason for item, reason in selection.excluded}
+        updates = []
+        for item in selection.candidates:
+            item_id = str(item.measurement_id)
+            if item_id in used:
+                status, reason = "used", None
+            elif item_id in useful:
+                status = "excluded"
+                reason = excluded.get(item_id, "useful evidence was not needed")
+            else:
+                status = "excluded"
+                reason = excluded.get(item_id, item.exclusion_reason)
+            updates.append((status, reason, item_id))
+        with self.connection:
+            self.connection.executemany(
+                "UPDATE measurements SET evidence_status=?,exclusion_reason=? "
+                "WHERE measurement_id=?",
+                updates,
+            )
+        return selection_diagnostics(selection)
 
     def set_fused_canopy(self, measurement_ids: list[str], values: dict) -> None:
         with self.connection:

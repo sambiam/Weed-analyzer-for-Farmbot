@@ -1,11 +1,19 @@
+import json
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 from uuid import uuid4
 
 import cv2
 import numpy as np
 
+from farmbot_vision.calibration_store import FarmbotCalibrationInput
 from farmbot_vision.jobs import build_plant_composite
 from farmbot_vision.models import Decision, Measurement
+from farmbot_vision.photo_grid import (
+    PhotoGridFrame,
+    PhotoGridRecord,
+    PhotoGridTarget,
+)
 
 
 def _measurement(
@@ -14,16 +22,21 @@ def _measurement(
     center_x: float,
     timestamp: datetime,
     *,
+    center_y: float | None = None,
     transform_json: str = '{"pixels_per_mm_x":1,"pixels_per_mm_y":1}',
     visible_fraction: float = 1.0,
+    boundary_sectors: list[int] | None = None,
+    center_visible: bool = True,
+    has_plant_evidence: bool = True,
     size: tuple[int, int] = (100, 200),
 ) -> Measurement:
     photo = tmp_path / f"{image_id}.jpg"
     mask = tmp_path / f"{image_id}.png"
     height, width = size
+    center_y = height // 2 if center_y is None else center_y
     image = np.full((height, width, 3), (55 + image_id, 90, 110), np.uint8)
     ownership = np.zeros((height, width), np.uint8)
-    cv2.circle(ownership, (round(center_x), height // 2), 18, 255, -1)
+    cv2.circle(ownership, (round(center_x), round(center_y)), 18, 255, -1)
     cv2.imwrite(str(photo), image)
     cv2.imwrite(str(mask), ownership)
     return Measurement(
@@ -42,10 +55,14 @@ def _measurement(
         reason="test",
         transform_json=transform_json,
         algorithm_version="test",
-        plant_center_px=(center_x, height // 2),
+        plant_center_px=(center_x, center_y),
         source_image_path=str(photo),
         mask_path=str(mask),
         visible_fraction=visible_fraction,
+        boundary_coverage=len(boundary_sectors or []) / 72,
+        boundary_sectors=boundary_sectors or [],
+        center_visible=center_visible,
+        has_plant_evidence=has_plant_evidence,
     )
 
 
@@ -54,8 +71,14 @@ def test_composite_stitches_overlapping_frames_and_draws_bold_radii(tmp_path):
     output = tmp_path / "composite.jpg"
     overlay_output = tmp_path / "composite-overlay.jpg"
     measurements = [
-        _measurement(tmp_path, 1, 150, now),
-        _measurement(tmp_path, 2, 50, now + timedelta(minutes=1)),
+        _measurement(tmp_path, 1, 150, now, boundary_sectors=list(range(18))),
+        _measurement(
+            tmp_path,
+            2,
+            50,
+            now + timedelta(minutes=1),
+            boundary_sectors=list(range(18, 36)),
+        ),
     ]
 
     assert build_plant_composite(measurements, output, overlay_output)
@@ -85,7 +108,14 @@ def test_composite_ignores_views_that_never_contained_the_plant(tmp_path):
     # vision.py records a zero-visibility measurement for plants whose whole
     # protection circle sits outside the frame. Stitching those photos widened
     # the canvas to the entire photo grid and buried the plant.
-    elsewhere = _measurement(tmp_path, 5, 4000, now + timedelta(minutes=1), visible_fraction=0)
+    elsewhere = _measurement(
+        tmp_path,
+        5,
+        4000,
+        now + timedelta(minutes=1),
+        visible_fraction=0,
+        has_plant_evidence=False,
+    )
 
     assert build_plant_composite([visible], output)
     alone = cv2.imread(str(output))
@@ -139,3 +169,127 @@ def test_composite_applies_calibrated_rotation_and_origin(tmp_path):
         )
         > 20
     )
+
+
+def test_one_by_two_evidence_region_builds_three_by_four_grid_crop(tmp_path):
+    now = datetime(2026, 7, 26, tzinfo=UTC)
+    output = tmp_path / "grid-composite.jpg"
+    overlay = tmp_path / "grid-composite-mask.jpg"
+    calibration = FarmbotCalibrationInput(
+        coordinate_scale=1,
+        reference_width=100,
+        reference_height=100,
+    )
+    targets = [
+        PhotoGridTarget(
+            index=row * 6 + column, row=row, column=column, x=column * 80, y=row * 80, z=0
+        )
+        for row in range(5)
+        for column in range(6)
+    ]
+    frames = [
+        PhotoGridFrame(
+            target_index=target.index,
+            image_id=1000 + target.index,
+            x=target.x,
+            y=target.y,
+            z=0,
+        )
+        for target in targets
+    ]
+    record = PhotoGridRecord(
+        config_entry_id="bot",
+        started_at=now,
+        status="complete",
+        bed_bounds={"x": (0, 500), "y": (0, 400)},
+        footprint_width_mm=100,
+        footprint_height_mm=100,
+        calibration=calibration,
+        targets=targets,
+        frames=frames,
+    )
+    plant_x, plant_y = 200.0, 200.0
+    measurements = []
+    useful_cells = {(2, 2): list(range(18)), (2, 3): list(range(18, 36))}
+    for target, frame in zip(targets, frames, strict=True):
+        center_x = 50 + plant_x - target.x
+        center_y = 50 + plant_y - target.y
+        sectors = useful_cells.get((target.row, target.column), [])
+        item = _measurement(
+            tmp_path,
+            frame.image_id,
+            center_x,
+            now + timedelta(seconds=target.index),
+            center_y=center_y,
+            size=(100, 100),
+            boundary_sectors=sectors,
+            center_visible=(target.row, target.column) == (2, 2),
+            has_plant_evidence=bool(sectors),
+            visible_fraction=0.25 if sectors else 0,
+            transform_json=json.dumps(
+                {
+                    "pixels_per_mm_x": 1,
+                    "pixels_per_mm_y": 1,
+                    "rotation_degrees": 0,
+                    "origin_location": "top_left",
+                    "image_x": target.x,
+                    "image_y": target.y,
+                }
+            ),
+        )
+        item = item.model_copy(
+            update={
+                "recorded_center_x": plant_x,
+                "recorded_center_y": plant_y,
+            }
+        )
+        measurements.append(item)
+
+    assert build_plant_composite(
+        measurements,
+        output,
+        overlay,
+        grid_record=record,
+        plants=[
+            SimpleNamespace(
+                id=7,
+                name="Broccoli",
+                openfarm_slug="broccoli",
+                x=plant_x,
+                y=plant_y,
+                radius=30,
+            ),
+            SimpleNamespace(
+                id=8,
+                name="Lettuce",
+                openfarm_slug="lettuce",
+                x=plant_x + 100,
+                y=plant_y,
+                radius=24,
+            ),
+        ],
+        proposed_radii={8: 32},
+    )
+
+    metadata = json.loads(output.with_suffix(".json").read_text())
+    clean = cv2.imread(str(output))
+    diagnostic = cv2.imread(str(overlay))
+    assert metadata["tile_window"]["rows"] == 3
+    assert metadata["tile_window"]["columns"] == 4
+    assert clean.shape == diagnostic.shape
+    assert metadata["standard_and_diagnostic_geometry_identical"] is True
+    difference = cv2.absdiff(clean, diagnostic)
+    ppm = metadata["pixels_per_mm"]
+    min_x, min_y, _, _ = metadata["crop_mm"]
+    target_px = (round(-min_x * ppm), round(-min_y * ppm))
+    neighbour_px = (round((100 - min_x) * ppm), round(-min_y * ppm))
+    target_patch = difference[
+        target_px[1] - 12 : target_px[1] + 13,
+        target_px[0] - 12 : target_px[0] + 13,
+    ]
+    neighbour_patch = difference[
+        neighbour_px[1] - 10 : neighbour_px[1] + 11,
+        neighbour_px[0] - 10 : neighbour_px[0] + 11,
+    ]
+    assert float(np.mean(target_patch)) > 3
+    assert float(np.mean(neighbour_patch)) < 3

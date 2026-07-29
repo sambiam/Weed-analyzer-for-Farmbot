@@ -21,7 +21,9 @@ class CanopyFusionSettings(BaseModel):
     source_edge_margin_mm: float = Field(default=20, ge=0, le=250)
     radial_percentile: float = Field(default=97, ge=80, le=100)
     angular_sectors: int = Field(default=72, ge=12, le=360)
-    minimum_angular_coverage: float = Field(default=0.70, ge=0, le=1)
+    # 50% means at least 36 of the 72 bed-space outer-boundary sectors are
+    # visible across the selected evidence images.
+    minimum_angular_coverage: float = Field(default=0.50, ge=0, le=1)
     minimum_corroborated_fraction: float = Field(default=0.05, ge=0, le=1)
     maximum_automatic_disagreement_mm: float = Field(default=35, ge=0, le=500)
     automatic_requires_reliable_fusion: bool = True

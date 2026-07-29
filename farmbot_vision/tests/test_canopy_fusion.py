@@ -12,7 +12,15 @@ from farmbot_vision.canopy_settings import CanopyFusionSettings, CanopyFusionSet
 from farmbot_vision.models import Decision, Measurement
 
 
-def _measurement(mask_path: str, *, image_id: int, timestamp: datetime) -> Measurement:
+def _measurement(
+    mask_path: str,
+    *,
+    image_id: int,
+    timestamp: datetime,
+    sectors: list[int] | None = None,
+    center_visible: bool = True,
+) -> Measurement:
+    sectors = list(range(36)) if sectors is None else sectors
     return Measurement(
         measurement_id=uuid4(),
         plant_id=17,
@@ -29,6 +37,10 @@ def _measurement(mask_path: str, *, image_id: int, timestamp: datetime) -> Measu
         algorithm_version="test",
         calibrated=True,
         visible_fraction=0.6,
+        boundary_coverage=len(sectors) / 72,
+        boundary_sectors=sectors,
+        center_visible=center_visible,
+        has_plant_evidence=True,
         plant_center_px=(80, 80),
         mask_path=mask_path,
         transform_json=json.dumps(
@@ -53,8 +65,19 @@ def test_fuses_plant_masks_before_measuring_radius(tmp_path):
 
     result = fuse_canopy_masks(
         [
-            _measurement(str(first), image_id=1, timestamp=now),
-            _measurement(str(second), image_id=2, timestamp=now + timedelta(minutes=2)),
+            _measurement(
+                str(first),
+                image_id=1,
+                timestamp=now,
+                sectors=list(range(18)),
+            ),
+            _measurement(
+                str(second),
+                image_id=2,
+                timestamp=now + timedelta(minutes=2),
+                sectors=list(range(18, 36)),
+                center_visible=False,
+            ),
         ],
         CanopyFusionSettings(always_fuse_when_available=True),
     )
@@ -67,7 +90,7 @@ def test_fuses_plant_masks_before_measuring_radius(tmp_path):
     assert result.diagnostic_jpeg
 
 
-def test_fusion_rejects_views_outside_time_window(tmp_path):
+def test_fusion_excludes_stale_view_without_lowering_current_partial_estimate(tmp_path):
     mask = np.zeros((160, 160), dtype=np.uint8)
     cv2.circle(mask, (80, 80), 50, 255, -1)
     path = tmp_path / "mask.png"
@@ -85,7 +108,9 @@ def test_fusion_rejects_views_outside_time_window(tmp_path):
         ),
     )
 
-    assert result is None
+    assert result is not None
+    assert result.view_count == 1
+    assert result.angular_coverage >= 0.5
 
 
 def test_canopy_settings_round_trip(tmp_path):

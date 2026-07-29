@@ -164,6 +164,87 @@ async def test_whole_grid_keeps_only_coordinate_verified_frames(monkeypatch, tmp
     assert [frame.image_id for frame in web.photo_grid_store.load().frames] == [41]
 
 
+@pytest.mark.asyncio
+async def test_targeted_followup_uses_existing_capture_service_once(monkeypatch, tmp_path):
+    from farmbot_vision.calibration_store import FarmbotCalibrationInput
+    from farmbot_vision.photo_grid import (
+        PhotoGridFrame,
+        PhotoGridRecord,
+        PhotoGridStore,
+        PhotoGridTarget,
+    )
+
+    now = datetime.now(UTC)
+    record = PhotoGridRecord(
+        config_entry_id="entry-1",
+        started_at=now,
+        completed_at=now,
+        status="complete",
+        bed_bounds={"x": (0, 500), "y": (0, 400)},
+        footprint_width_mm=100,
+        footprint_height_mm=100,
+        calibration=FarmbotCalibrationInput(
+            coordinate_scale=1,
+            reference_width=100,
+            reference_height=100,
+        ),
+        targets=[PhotoGridTarget(index=0, row=0, column=0, x=50, y=50, z=0)],
+        frames=[PhotoGridFrame(target_index=0, image_id=41, x=50, y=50, z=0)],
+        indexed_targets=True,
+    )
+    inventory = Inventory.model_validate(
+        {
+            "device_id": "42",
+            "generated_at": now,
+            "plants": [
+                {
+                    "id": 7,
+                    "name": "Lettuce",
+                    "openfarm_slug": "lettuce",
+                    "x": 250,
+                    "y": 200,
+                    "z": 0,
+                    "radius": 20,
+                    "plant_stage": "planted",
+                }
+            ],
+            "weeds": [],
+            "images": [],
+            "curves": [],
+            "camera_calibration": {"available": False},
+        }
+    )
+    calls = []
+
+    async def get_inventory(_request):
+        return inventory
+
+    async def start(_entry_id, targets):
+        calls.append(targets)
+        return {"status": "queued", "repair_id": "targeted-1", "message": "queued"}
+
+    async def status(_entry_id, _repair_id):
+        return {
+            "status": "complete",
+            "message": "targeted capture complete",
+            "frames": [{"image_id": 99, "target_index": 1, "x": 250, "y": 200, "z": 0}],
+        }
+
+    monkeypatch.setattr(web, "photo_grid_store", PhotoGridStore(tmp_path / "grid.json"))
+    monkeypatch.setattr(web.client, "inventory", get_inventory)
+    monkeypatch.setattr(web.client, "start_grid_repair", start)
+    monkeypatch.setattr(web.client, "grid_repair_status", status)
+
+    await web._capture_targeted_plant_photos(record)
+    await web._capture_targeted_plant_photos(record)
+
+    assert len(calls) == 1
+    assert calls[0] == [{"x": 250.0, "y": 200.0, "z": 0.0, "index": 1}]
+    assert len(record.targeted_captures) == 1
+    assert record.targeted_captures[0].status == "complete"
+    assert record.targeted_captures[0].image_id == 99
+
+
 def _photo_grid_record(targets, *, tmp_path):
     from farmbot_vision.calibration_store import FarmbotCalibrationInput
     from farmbot_vision.photo_grid import PhotoGridRecord
@@ -1042,6 +1123,8 @@ async def test_duplicate_slashes_reach_health_and_settings():
     assert status == 200
     assert b"FarmBot calibration" in body
     assert b"id=map_origin" in body
+    assert b"id=rotate_map" in body
+    assert b"Rotate map (swap X and Y)" in body
     assert b"id=date_from" in body
     assert b"newest photo at each FarmBot coordinate" in body
     assert b"id=zoom-in" in body
@@ -1518,8 +1601,8 @@ async def test_dashboard_plant_view_uses_only_clean_and_mask_composites(tmp_path
     assert status == 200
     assert 'data-composite-clean="artifact/plant-composite.jpg"' in html
     assert 'data-composite-overlay="artifact/plant-composite-overlay.jpg"' in html
-    assert "Original images" in html
-    assert "Show mask overlay" in html
+    assert "Standard view" in html
+    assert "Diagnostic mask" in html
     assert "artifact/frame-overlay.jpg" not in html
     assert "artifact/frame-mask.png" not in html
 
@@ -1667,9 +1750,26 @@ async def test_ingress_html_uses_relative_links_without_logging_session(
     )
     settings_html = settings_body.decode()
     assert "fetch('api/vision/images" in settings_html
-    assert "image.src='api/vision/image/" in settings_html
+    assert "fetch(url).then" in settings_html
+    assert "X-FarmBot-Oriented-Width" in settings_html
     assert "f.action='calibration'" in settings_html
     assert 'href="/settings"' not in settings_html
+
+
+@pytest.mark.asyncio
+async def test_mobile_review_uses_one_responsive_geometry_for_standard_and_mask_views():
+    status, _, body = await asgi_request("/")
+    html = body.decode()
+
+    assert status == 200
+    assert ">Standard view</button>" in html
+    assert ">Diagnostic mask</button>" in html
+    assert "id=plant-photo-canvas" not in html
+    assert "id=plant-modal-without-overlay" not in html
+    assert "id=plant-modal-with-overlay" not in html
+    assert ".overlay-modal img{display:block;width:100%;height:auto" in html
+    assert "@media (max-width:600px)" in html
+    assert "if(plantComposite) showPlantComposite(!showPhoto);" in html
 
 
 def test_direct_asgi_middleware_normalizes_scope_without_touching_query():
@@ -1736,6 +1836,7 @@ async def test_save_calibration_persists_to_data_store():
         offset_y=-4,
         origin_location="bottom_left",
         map_origin="top_right",
+        rotate_map=True,
         coordinate_scale=0.3,
         reference_width=2592,
         reference_height=1944,
@@ -1747,6 +1848,7 @@ async def test_save_calibration_persists_to_data_store():
     assert stored.offset_x_mm == 3
     assert str(stored.origin_location) == "bottom_left"
     assert str(stored.map_origin) == "top_right"
+    assert stored.rotate_map is True
 
 
 @pytest.mark.asyncio
@@ -1798,6 +1900,91 @@ async def test_calibration_grid_filters_dates_and_keeps_newest_per_location(monk
 
     assert [image["id"] for image in payload["images"]] == [3, 2]
     assert payload["bed_bounds"] is None
+
+
+@pytest.mark.asyncio
+async def test_calibration_grid_prefers_live_axis_bounds(monkeypatch):
+    from types import SimpleNamespace
+
+    now = datetime.now(UTC)
+
+    async def inventory(_request):
+        return Inventory.model_validate(
+            {
+                "device_id": "42",
+                "generated_at": now,
+                "plants": [],
+                "weeds": [],
+                "images": [
+                    {
+                        "id": 1,
+                        "created_at": now,
+                        "x": 100,
+                        "y": 200,
+                        "z": 0,
+                    }
+                ],
+                "curves": [],
+                "camera_calibration": {"available": False},
+            }
+        )
+
+    async def soil_points(_entry_id):
+        return SoilPointInventory(
+            device_id="42",
+            generated_at=now,
+            points=[],
+            motion=SoilMotionState(
+                connected=True,
+                busy=False,
+                locked=False,
+                position={"x": 0, "y": 0, "z": 0},
+                z_direction=-1,
+                axis_bounds={"x": (0, 4180), "y": (0, 2164), "z": (-400, 0)},
+            ),
+        )
+
+    stale_record = SimpleNamespace(
+        config_entry_id="bot-grid",
+        bed_bounds={"x": (0, 1000), "y": (0, 800)},
+    )
+    monkeypatch.setattr(web.client, "inventory", inventory)
+    monkeypatch.setattr(web.client, "soil_points", soil_points)
+    monkeypatch.setattr(web.photo_grid_store, "load", lambda: stale_record)
+
+    response = await web.vision_images(
+        entry_id="bot-grid",
+        date_from=now - timedelta(hours=1),
+        date_to=now,
+    )
+    payload = json.loads(response.body)
+
+    assert payload["bed_bounds"] == {"x": [0.0, 4180.0], "y": [0.0, 2164.0]}
+    assert payload["bed_bounds_source"] == "live FarmBot axes"
+
+
+@pytest.mark.asyncio
+async def test_calibration_image_reports_actual_dimensions(monkeypatch):
+    import base64
+    from types import SimpleNamespace
+
+    async def image(_request, _max_bytes):
+        return SimpleNamespace(
+            image_base64=base64.b64encode(b"jpeg bytes").decode(),
+            width=960,
+            height=720,
+            oriented_width=1280,
+            oriented_height=960,
+        )
+
+    monkeypatch.setattr(web.client, "image", image)
+    response = await web.vision_image(entry_id="bot-grid", image_id=123)
+
+    assert response.headers["x-farmbot-processed-width"] == "960"
+    assert response.headers["x-farmbot-processed-height"] == "720"
+    assert response.headers["x-farmbot-oriented-width"] == "1280"
+    assert response.headers["x-farmbot-oriented-height"] == "960"
+    assert response.body == b"jpeg bytes"
 
 
 @pytest.mark.asyncio

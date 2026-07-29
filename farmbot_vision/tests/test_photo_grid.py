@@ -1,13 +1,19 @@
 import math
+from datetime import UTC, datetime
+from types import SimpleNamespace
 
 from farmbot_vision.calibration_store import FarmbotCalibrationInput
 from farmbot_vision.photo_grid import (
     PHOTO_GRID_CHUNK_SIZE,
     PHOTO_GRID_CONTINUOUS_CAPABILITY,
     PHOTO_GRID_CONTINUOUS_MAX_TARGETS,
+    PhotoGridFrame,
+    PhotoGridRecord,
+    PhotoGridTarget,
     match_verified_frames,
     photo_grid_chunk_size,
     plan_photo_grid,
+    plan_targeted_plant_captures,
 )
 
 # Geometry chosen to produce the real bed's 11 x 7 grid: an 1800 x 1600 native
@@ -241,3 +247,63 @@ def test_planned_coordinates_are_stable_across_repeated_planning():
         (item.x, item.y, item.z) for item in _bed_grid()
     ]
     assert all(item.x == round(item.x, 3) and item.y == round(item.y, 3) for item in _bed_grid())
+
+
+def _targeted_record() -> PhotoGridRecord:
+    calibration = FarmbotCalibrationInput(
+        coordinate_scale=1,
+        reference_width=100,
+        reference_height=100,
+    )
+    target = PhotoGridTarget(index=0, row=0, column=0, x=50, y=50, z=0)
+    return PhotoGridRecord(
+        config_entry_id="bot",
+        started_at=datetime(2026, 7, 30, tzinfo=UTC),
+        completed_at=datetime(2026, 7, 30, 0, 5, tzinfo=UTC),
+        status="complete",
+        bed_bounds={"x": (0, 500), "y": (0, 400)},
+        footprint_width_mm=100,
+        footprint_height_mm=100,
+        calibration=calibration,
+        targets=[target],
+        frames=[PhotoGridFrame(target_index=0, image_id=101, x=50, y=50, z=0)],
+    )
+
+
+def test_fit_sized_plant_without_half_coverage_queues_exactly_one_targeted_capture():
+    record = _targeted_record()
+    plant = SimpleNamespace(id=7, name="Lettuce", openfarm_slug="lettuce", x=250, y=200, radius=20)
+
+    planned, diagnostics = plan_targeted_plant_captures(
+        record,
+        [plant],
+        safety_margin_mm=10,
+    )
+    record.targeted_captures.extend(planned)
+    duplicate, second_diagnostics = plan_targeted_plant_captures(
+        record,
+        [plant],
+        safety_margin_mm=10,
+    )
+
+    assert len(planned) == 1
+    assert (planned[0].x, planned[0].y) == (250, 200)
+    assert diagnostics[0]["targeted_photo_scheduled"] is True
+    assert duplicate == []
+    assert second_diagnostics[0]["targeted_photo_scheduled"] is False
+    assert "already queued or completed" in second_diagnostics[0]["reason"]
+
+
+def test_plant_too_large_for_one_photo_uses_grid_without_targeted_capture():
+    record = _targeted_record()
+    plant = SimpleNamespace(id=8, name="Pumpkin", openfarm_slug="pumpkin", x=250, y=200, radius=100)
+
+    planned, diagnostics = plan_targeted_plant_captures(
+        record,
+        [plant],
+        safety_margin_mm=10,
+    )
+
+    assert planned == []
+    assert diagnostics[0]["targeted_photo_scheduled"] is False
+    assert "exceeds the usable single-photo footprint" in diagnostics[0]["reason"]

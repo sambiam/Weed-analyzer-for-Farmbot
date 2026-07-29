@@ -41,6 +41,9 @@ from .models import (
     VisionImageRequest,
     VisionStatus,
 )
+from .photo_grid import PhotoGridStore
+from .plant_measurement import select_measurement_evidence, selection_diagnostics
+from .review_composite import build_plant_review
 from .safety import decide
 from .settings import Settings
 from .vision import ClassicalVisionEngine, garden_to_pixel, pixel_to_garden
@@ -55,6 +58,10 @@ def build_plant_composite(
     measurements: list,
     output_path: Path,
     overlay_output_path: Path | None = None,
+    *,
+    plants: list | None = None,
+    proposed_radii: dict[int, float] | None = None,
+    grid_record=None,
 ) -> bool:
     """Stitch all views of one plant using their calibrated garden transforms.
 
@@ -63,187 +70,14 @@ def build_plant_composite(
     tinted over the same stitched pixels. Radius and centre annotations are
     drawn on both copies.
     """
-    frames = []
-    for item in measurements:
-        if not item.source_image_path or not item.plant_center_px:
-            continue
-        # Photos where the protection circle never entered the frame hold no
-        # pixels of this plant (vision.py records them only so the plant
-        # surfaces for review). Stitching them anyway stretched the canvas
-        # across the whole photo grid, so every plant's composite came out as
-        # the same garden-wide mosaic with the plant an invisible speck.
-        if item.visible_fraction <= 0:
-            continue
-        image = cv2.imread(item.source_image_path, cv2.IMREAD_COLOR)
-        if image is None:
-            continue
-        try:
-            transform = json.loads(item.transform_json or "{}")
-        except (TypeError, json.JSONDecodeError):
-            transform = {}
-        ppm_x = float(transform.get("pixels_per_mm_x") or 0)
-        ppm_y = float(transform.get("pixels_per_mm_y") or 0)
-        if ppm_x <= 0 or ppm_y <= 0:
-            continue
-        rotation = math.radians(float(transform.get("rotation_degrees") or 0))
-        cos_t, sin_t = math.cos(rotation), math.sin(rotation)
-        origin = str(transform.get("origin_location") or "top_left")
-        sign_x = -1 if origin in {"top_right", "bottom_right"} else 1
-        sign_y = -1 if origin in {"bottom_left", "bottom_right"} else 1
-        cx, cy = item.plant_center_px
-        height, width = image.shape[:2]
-        # Source pixel -> millimetres relative to this plant. This is the
-        # relative form of vision.pixel_to_garden: anchoring each photo at the
-        # same plant cancels camera position and calibration offsets while
-        # retaining rotation, scale and origin reflection.
-        relative_transform = np.float64(
-            [
-                [
-                    sign_x * cos_t / ppm_x,
-                    -sign_x * sin_t / ppm_x,
-                    sign_x * (-cos_t * cx + sin_t * cy) / ppm_x,
-                ],
-                [
-                    sign_y * sin_t / ppm_y,
-                    sign_y * cos_t / ppm_y,
-                    sign_y * (-sin_t * cx - cos_t * cy) / ppm_y,
-                ],
-            ]
-        )
-        corners = cv2.transform(
-            np.float64([[[0, 0], [width, 0], [0, height], [width, height]]]),
-            relative_transform,
-        )[0]
-        frames.append(
-            {
-                "item": item,
-                "image": image,
-                "transform": relative_transform,
-                "bounds": (
-                    float(corners[:, 0].min()),
-                    float(corners[:, 0].max()),
-                    float(corners[:, 1].min()),
-                    float(corners[:, 1].max()),
-                ),
-                "scale": math.sqrt(ppm_x * ppm_y),
-            }
-        )
-    if not frames:
-        return False
-    representative = Database._consolidate_measurement_rows(
-        [item.model_dump(mode="json") for item in measurements]
+    return build_plant_review(
+        measurements,
+        output_path,
+        overlay_output_path,
+        plants=plants,
+        proposed_radii=proposed_radii,
+        grid_record=grid_record,
     )
-    current = float(representative["current_radius_mm"])
-    planned = float(representative["recommended_protection_radius_mm"])
-    min_x = min(frame["bounds"][0] for frame in frames)
-    max_x = max(frame["bounds"][1] for frame in frames)
-    min_y = min(frame["bounds"][2] for frame in frames)
-    max_y = max(frame["bounds"][3] for frame in frames)
-    # The stitched frames cover far more garden than this plant. Crop to the
-    # plant's own neighbourhood so it fills the composite and each plant gets a
-    # visibly different picture, keeping enough surroundings to judge the
-    # annotated radii against neighbouring vegetation.
-    focus_mm = max(60.0, max(current, planned) * 2.5)
-    focused = (
-        max(min_x, -focus_mm),
-        min(max_x, focus_mm),
-        max(min_y, -focus_mm),
-        min(max_y, focus_mm),
-    )
-    if focused[1] - focused[0] > 1 and focused[3] - focused[2] > 1:
-        min_x, max_x, min_y, max_y = focused
-    ppm = float(np.median([frame["scale"] for frame in frames]))
-    ppm = min(ppm, 2400 / max(1.0, max(max_x - min_x, max_y - min_y)))
-    canvas_width = max(1, round((max_x - min_x) * ppm))
-    canvas_height = max(1, round((max_y - min_y) * ppm))
-    accumulated = np.zeros((canvas_height, canvas_width, 3), dtype=np.float32)
-    weights = np.zeros((canvas_height, canvas_width), dtype=np.float32)
-    ownership = np.zeros((canvas_height, canvas_width), dtype=np.uint8)
-    for frame in sorted(frames, key=lambda frame: frame["item"].image_timestamp):
-        affine = frame["transform"].copy()
-        affine[0] = affine[0] * ppm
-        affine[1] = affine[1] * ppm
-        affine[0, 2] -= min_x * ppm
-        affine[1, 2] -= min_y * ppm
-        size = (canvas_width, canvas_height)
-        warped = cv2.warpAffine(
-            frame["image"], affine, size, flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT
-        )
-        valid = cv2.warpAffine(
-            np.full(frame["image"].shape[:2], 255, dtype=np.uint8),
-            affine,
-            size,
-            flags=cv2.INTER_NEAREST,
-            borderMode=cv2.BORDER_CONSTANT,
-        )
-        selected = valid > 0
-        accumulated[selected] += warped[selected]
-        weights[selected] += 1
-        mask_path = frame["item"].mask_path
-        if mask_path:
-            mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
-            if mask is not None:
-                warped_mask = cv2.warpAffine(
-                    mask,
-                    affine,
-                    size,
-                    flags=cv2.INTER_NEAREST,
-                    borderMode=cv2.BORDER_CONSTANT,
-                )
-                ownership = cv2.max(ownership, warped_mask)
-    canvas = np.zeros_like(accumulated, dtype=np.uint8)
-    present = weights > 0
-    canvas[present] = np.clip(accumulated[present] / weights[present, np.newaxis], 0, 255).astype(
-        np.uint8
-    )
-    overlay_canvas = canvas.copy()
-    selected = ownership > 0
-    overlay_canvas[selected] = (
-        overlay_canvas[selected].astype(np.float32) * 0.58
-        + np.asarray((255, 190, 20), dtype=np.float32) * 0.42
-    ).astype(np.uint8)
-    center = (round(-min_x * ppm), round(-min_y * ppm))
-    thickness = max(4, round(min(canvas_width, canvas_height) / 300))
-    label = f"original {current:.1f} mm | new {planned:.1f} mm"
-
-    def annotate(target: np.ndarray) -> None:
-        cv2.circle(target, center, max(1, round(current * ppm)), (255, 255, 0), thickness)
-        cv2.circle(target, center, max(1, round(planned * ppm)), (0, 0, 255), thickness + 1)
-        dot_radius = max(5, thickness + 2)
-        cv2.circle(target, center, dot_radius + 2, (25, 25, 25), -1, cv2.LINE_AA)
-        cv2.circle(target, center, dot_radius, (255, 255, 255), -1, cv2.LINE_AA)
-        text_origin = (12, max(28, round(canvas_height * 0.04)))
-        font_scale = max(0.6, min(1.1, canvas_width / 1400))
-        cv2.putText(
-            target,
-            label,
-            text_origin,
-            cv2.FONT_HERSHEY_SIMPLEX,
-            font_scale,
-            (20, 20, 20),
-            max(4, thickness),
-            cv2.LINE_AA,
-        )
-        cv2.putText(
-            target,
-            label,
-            text_origin,
-            cv2.FONT_HERSHEY_SIMPLEX,
-            font_scale,
-            (255, 255, 255),
-            max(1, thickness // 2),
-            cv2.LINE_AA,
-        )
-
-    annotate(canvas)
-    clean_written = bool(cv2.imwrite(str(output_path), canvas, [cv2.IMWRITE_JPEG_QUALITY, 88]))
-    if overlay_output_path is None:
-        return clean_written
-    annotate(overlay_canvas)
-    overlay_written = bool(
-        cv2.imwrite(str(overlay_output_path), overlay_canvas, [cv2.IMWRITE_JPEG_QUALITY, 88])
-    )
-    return clean_written and overlay_written
 
 
 class JobManager:
@@ -378,23 +212,30 @@ class JobManager:
         """Apply at most one robust automatic judgement for repeated views."""
         if len(measurements) < 2:
             return
+        evidence = select_measurement_evidence(measurements)
+        if not evidence.used:
+            return
         aggregate = Database._consolidate_measurement_rows(
             [item.model_dump(mode="json") for item in measurements]
         )
         partial_views_require_fusion = (
             fusion_settings.enabled
             and fusion_settings.automatic_requires_reliable_fusion
-            and any(
-                item.visible_fraction < fusion_settings.activation_visible_fraction
-                for item in measurements
-            )
+            and evidence.mode != "single_complete"
         )
         if partial_views_require_fusion and not bool(aggregate.get("fusion_reliable")):
             return
         if aggregate.get("fused_canopy") and not bool(aggregate.get("fusion_reliable")):
             return
-        latest = max(measurements, key=lambda item: item.image_timestamp)
-        candidate = latest.model_copy(
+        representative = next(
+            (
+                item
+                for item in evidence.used
+                if str(item.measurement_id) == str(aggregate["measurement_id"])
+            ),
+            max(evidence.used, key=lambda item: item.image_timestamp),
+        )
+        candidate = representative.model_copy(
             update={
                 "typical_canopy_radius_mm": aggregate["typical_canopy_radius_mm"],
                 "maximum_accepted_canopy_radius_mm": aggregate["maximum_accepted_canopy_radius_mm"],
@@ -528,6 +369,19 @@ class JobManager:
                     config_entry_id=entry_id,
                     image_lookback_hours=self.settings.image_lookback_hours,
                 )
+            )
+            grid_record = PhotoGridStore(self.settings.data_dir / "photo_grid_latest.json").load()
+            if grid_record is not None and grid_record.config_entry_id != entry_id:
+                grid_record = None
+            grid_frames_by_image = (
+                {int(frame.image_id): frame for frame in grid_record.frames}
+                if grid_record is not None
+                else {}
+            )
+            grid_targets_by_index = (
+                {int(target.index): target for target in grid_record.targets}
+                if grid_record is not None
+                else {}
             )
             self.current["progress"] = "Inventory loaded"
             resolution = self.settings.resolution
@@ -687,10 +541,41 @@ class JobManager:
                     if item.plant_id not in plants_by_id:
                         continue
                     plant = plants_by_id[item.plant_id]
+                    try:
+                        transform_details = json.loads(item.transform_json or "{}")
+                    except (TypeError, json.JSONDecodeError):
+                        transform_details = {}
+                    transform_details.update(
+                        {
+                            "image_x": response.meta.x,
+                            "image_y": response.meta.y,
+                            "image_z": response.meta.z,
+                            "plant_x": plant.x,
+                            "plant_y": plant.y,
+                        }
+                    )
+                    grid_frame = grid_frames_by_image.get(int(item.image_id))
+                    grid_target = (
+                        grid_targets_by_index.get(int(grid_frame.target_index))
+                        if grid_frame is not None
+                        else None
+                    )
+                    if grid_target is not None:
+                        transform_details.update(
+                            {
+                                "grid_session_id": grid_record.session_id,
+                                "grid_target_index": grid_target.index,
+                                "grid_row": grid_target.row,
+                                "grid_column": grid_target.column,
+                                "tile_footprint_width_mm": grid_record.footprint_width_mm,
+                                "tile_footprint_height_mm": grid_record.footprint_height_mm,
+                            }
+                        )
                     item = item.model_copy(
                         update={
                             "recorded_center_x": plant.x,
                             "recorded_center_y": plant.y,
+                            "transform_json": json.dumps(transform_details, separators=(",", ":")),
                         }
                     )
                     suggested_center = item.recommended_center_px
@@ -1200,7 +1085,43 @@ class JobManager:
             measurements_by_plant: dict[int, list] = {}
             for measurement in all_measurements:
                 measurements_by_plant.setdefault(measurement.plant_id, []).append(measurement)
+            proposed_radii = {
+                candidate_plant_id: float(
+                    Database._consolidate_measurement_rows(
+                        [item.model_dump(mode="json") for item in candidate_measurements]
+                    )["recommended_protection_radius_mm"]
+                )
+                for candidate_plant_id, candidate_measurements in measurements_by_plant.items()
+            }
             for plant_id, plant_measurements in measurements_by_plant.items():
+                evidence = select_measurement_evidence(plant_measurements)
+                evidence_diagnostics = selection_diagnostics(evidence)
+                self.db.set_evidence_selection(plant_measurements)
+                LOGGER.info(
+                    "Plant measurement evidence: %s",
+                    json.dumps(
+                        {
+                            "plant_id": plant_id,
+                            "crop_name": plant_measurements[0].crop_slug,
+                            "plant_center_bed_mm": [
+                                plant_measurements[0].recorded_center_x,
+                                plant_measurements[0].recorded_center_y,
+                            ],
+                            **evidence_diagnostics,
+                            "candidate_footprints": [
+                                {
+                                    "image_id": item.image_id,
+                                    "transform": json.loads(item.transform_json or "{}"),
+                                    "boundary_coverage": item.boundary_coverage,
+                                    "image_quality": item.image_quality,
+                                    "segmentation_quality": item.segmentation_quality,
+                                }
+                                for item in plant_measurements
+                            ],
+                        },
+                        separators=(",", ":"),
+                    ),
+                )
                 fused = fuse_canopy_masks(plant_measurements, fusion_settings)
                 if fused is not None:
                     individual = Database._consolidate_measurement_rows(
@@ -1212,8 +1133,11 @@ class JobManager:
                     )
                     reliable = (
                         fused.angular_coverage >= fusion_settings.minimum_angular_coverage
-                        and fused.corroborated_fraction
-                        >= fusion_settings.minimum_corroborated_fraction
+                        and (
+                            fused.view_count == 1
+                            or fused.corroborated_fraction
+                            >= fusion_settings.minimum_corroborated_fraction
+                        )
                         and disagreement <= fusion_settings.maximum_automatic_disagreement_mm
                     )
                     safety_margin = max(item.safety_margin_mm for item in plant_measurements)
@@ -1240,6 +1164,7 @@ class JobManager:
                         "fusion_reliable": reliable,
                         "fusion_diagnostic_path": stored_diagnostic,
                     }
+                    proposed_radii[plant_id] = float(fused_values["fused_recommended_radius_mm"])
                     self.db.set_fused_canopy(
                         [str(item.measurement_id) for item in plant_measurements],
                         fused_values,
@@ -1263,6 +1188,9 @@ class JobManager:
                     plant_measurements,
                     composite_path,
                     composite_overlay_path,
+                    plants=inventory.plants,
+                    proposed_radii=proposed_radii,
+                    grid_record=grid_record,
                 ):
                     self.db.set_composite_path(
                         [str(item.measurement_id) for item in plant_measurements],
