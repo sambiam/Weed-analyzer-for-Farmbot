@@ -1,5 +1,15 @@
 # Changelog
 
+## 2.4.0 - 2026-07-29
+
+- Added a **Fallen leaf** choice to the weed review modal for isolated leaves
+  that have detached from a plant. Selecting it rejects the FarmBot weed
+  recommendation, suppresses the position, and records a dedicated hard
+  negative so the local verifier can learn not to classify similar fallen
+  leaves as weeds.
+- Fallen-leaf samples now appear as a separate count and editable tag on the
+  verifier training page.
+
 ## 2.3.1 - 2026-07-29
 
 - Fixed the photo grid worker requeuing an entire failed batch, including

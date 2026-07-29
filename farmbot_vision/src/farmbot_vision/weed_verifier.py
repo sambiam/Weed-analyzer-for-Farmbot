@@ -35,6 +35,7 @@ POSITIVE_LABEL = "weed"
 # review UI now offers the more useful individual hard-negative categories.
 NEGATIVE_LABELS = {
     "crop",
+    "fallen_leaf",
     "mushroom",
     "moss",
     "soil",

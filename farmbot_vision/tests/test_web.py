@@ -1137,7 +1137,7 @@ async def test_dashboard_modal_uses_artifact_manifest_and_pending_rows(tmp_path,
     assert "Previous weed" in html and "Next weed" in html
     assert "Previous image" in html and "Next image" in html
     assert "Reject as" in html
-    for label in ("Crop", "Mushroom", "Moss", "Soil", "Hardware"):
+    for label in ("Crop", "Fallen leaf", "Mushroom", "Moss", "Soil", "Hardware"):
         assert label in html
     assert "Review / training label" not in html
     assert '<button class=review-action data-url="weeds/' not in html
@@ -1182,6 +1182,41 @@ async def test_dashboard_weed_modal_offers_unknown_and_close_up_controls(tmp_pat
     assert "id=weed-modal-unknown" in html
     assert "id=weed-modal-closeup" in html
     assert "id=weed-modal-zoom-level" in html
+    assert "data-weed-label=fallen_leaf" in html
+    assert "teaches the verifier that it is not a weed" in html
+
+
+@pytest.mark.asyncio
+async def test_fallen_leaf_label_rejects_detection_and_records_hard_negative():
+    detection_id = str(uuid4())
+    web.database.save_weed_detection(
+        detection_id=detection_id,
+        config_entry_id="fallen-leaf-bot",
+        image_id=8,
+        image_timestamp=datetime.now(UTC),
+        x=40,
+        y=70,
+        z=0,
+        area_mm2=55,
+        radius_mm=12,
+        confidence=0.85,
+        features={"strong_green_fraction": 0.9},
+        overlay_path=None,
+    )
+
+    status, _, body = await asgi_request(f"/weeds/{detection_id}/label/fallen_leaf", method="POST")
+
+    assert status == 200
+    assert json.loads(body)["status"] == "applied"
+    assert web.database.weed_detection(detection_id)["status"] == "rejected"
+    sample = next(
+        row for row in web.database.weed_training_samples() if row["detection_id"] == detection_id
+    )
+    assert sample["label"] == "fallen_leaf"
+    with web.database.connection:
+        web.database.connection.execute(
+            "DELETE FROM weed_training_samples WHERE detection_id=?", (detection_id,)
+        )
 
 
 @pytest.mark.asyncio

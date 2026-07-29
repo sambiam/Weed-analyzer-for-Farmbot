@@ -146,6 +146,7 @@ MAX_REPAIR_ATTEMPTS_PER_CELL = 2
 TRAINING_LABELS = (
     "weed",
     "crop",
+    "fallen_leaf",
     "mushroom",
     "moss",
     "soil",
@@ -2491,14 +2492,16 @@ value="{repair_values.delay_minutes}" required> minutes after the photo grid com
 <button id=weed-modal-unknown type=button class=unknown-button>Unknown</button></div>
 <fieldset><legend>Reject as</legend><div class=button-row>
 <button type=button data-weed-label=crop>Crop</button>
+<button type=button data-weed-label=fallen_leaf>Fallen leaf</button>
 <button type=button data-weed-label=mushroom>Mushroom</button>
 <button type=button data-weed-label=moss>Moss</button>
 <button type=button data-weed-label=soil>Soil</button>
 <button type=button data-weed-label=hardware>Hardware</button>
 </div></fieldset>
-<p class=muted><small>Unknown discards an unclear detection without accepting, rejecting,
-or adding it to the verifier's training data. Reviewing keeps the dialog open and moves
-on to the next weed.</small></p>
+<p class=muted><small>Fallen leaf identifies an isolated leaf that has detached from a plant
+and teaches the verifier that it is not a weed. Unknown discards an unclear detection without
+accepting, rejecting, or adding it to the verifier's training data. Reviewing keeps the dialog
+open and moves on to the next weed.</small></p>
 </div>
 <small id=weed-modal-message class=action-message></small>
 </figure></div>
@@ -3300,7 +3303,8 @@ Automatically remove known weeds that disappear</label><br>
 </fieldset>
 <button>Save all weed settings</button></form></section>
 <section class=card><h2>Verifier training</h2>{training_notice_html}<p>{model_status}</p>
-<p>Labels: {labels["weed"]} weeds · {labels["crop"]} crops · {labels["mushroom"]} mushrooms ·
+<p>Labels: {labels["weed"]} weeds · {labels["crop"]} crops ·
+{labels["fallen_leaf"]} fallen leaves · {labels["mushroom"]} mushrooms ·
 {labels["moss"]} moss · {labels["soil"]} soil · {labels["hardware"]} hardware.</p>
 <div class=button-row><form method=post action="weed-model/train"><button>Train verifier now</button></form>
 <form method=post action="weed-model/clear" onsubmit="return confirm('Clear all labeled training images and the trained verifier?');">

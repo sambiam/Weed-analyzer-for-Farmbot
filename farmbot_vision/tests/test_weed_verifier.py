@@ -7,7 +7,9 @@ import numpy as np
 import pytest
 
 from farmbot_vision.weed_verifier import (
+    ALL_LABELS,
     FEATURE_NAMES,
+    NEGATIVE_LABELS,
     WeedVisualVerifier,
     encode_candidate_crop,
     extract_visual_features,
@@ -21,6 +23,11 @@ def _features(green: float, texture: float) -> dict[str, float]:
     values["mean_saturation"] = green
     values["texture"] = texture
     return values
+
+
+def test_fallen_leaf_is_a_supported_hard_negative_label():
+    assert "fallen_leaf" in ALL_LABELS
+    assert "fallen_leaf" in NEGATIVE_LABELS
 
 
 def test_visual_features_and_candidate_crop_are_extracted():

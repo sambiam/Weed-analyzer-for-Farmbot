@@ -779,6 +779,7 @@ class Database:
         summary = {
             "weed": 0,
             "crop": 0,
+            "fallen_leaf": 0,
             "mushroom": 0,
             "moss": 0,
             "soil": 0,
