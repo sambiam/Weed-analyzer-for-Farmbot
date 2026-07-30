@@ -184,6 +184,20 @@ fallen leaves and crop foliage exactly as it does for a weed, so it is a
 candidate generator, not a classifier — tightening its thresholds mostly
 removes small weeds rather than false positives.
 
+Because of that, the size, colour and shape settings are treated as *recall
+floors* rather than as decisions. A candidate rejected at this stage is never
+scored, stored, reviewed or labelled, so the mistake is invisible and
+self-reinforcing: you cannot notice or correct a weed the app never mentioned.
+Every one of those thresholds is therefore clamped to an absolute ceiling, and
+while a trained verifier is scoring the padding around known crops is capped
+too — the verifier is given each candidate's distance to the nearest crop and
+judges that far better than a fixed circle can. The confidence thresholds are
+what actually decide whether something is a weed. Tune those first.
+
+Each analysed image logs how many candidates were found and why any were
+dropped (`crop-supported`, `size`, `colour/shape`, `low score`), so a starved
+verifier shows up in the add-on log rather than only as missing weeds.
+
 The **learned verifier** is a small logistic model trained on your own labels.
 It sees sixteen visual features the heuristic ignores (hue, saturation,
 texture, edge density, and what surrounds the candidate: mulch orange, bare
@@ -204,9 +218,10 @@ The intended path:
    with a 90% lower confidence bound so a small label set is not flattered.
 4. Apply the **suggested threshold**, which is the highest-recall operating
    point whose precision is confidently at or above 95%.
-5. Turn shadow mode off. The **candidate recall boost** then relaxes the
-   colour/shape gates so borderline weeds reach the verifier rather than being
-   dropped by rules that cannot classify them.
+5. Turn shadow mode off so the verifier's own threshold decides. The
+   **candidate recall boost** relaxes the colour/shape gates by its factor
+   from the moment a trained verifier starts scoring — shadow mode included,
+   since that is exactly the stage meant to be gathering examples to label.
 6. Only then consider automatic creation, which can additionally require
    verifier approval and several independent looks.
 

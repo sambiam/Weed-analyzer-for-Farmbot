@@ -739,6 +739,10 @@ class AnalysisResult(StrictModel):
     weed_review_jpeg: bytes | None = None
     skipped: dict[int, str] = Field(default_factory=dict)
     weeds: list[WeedDetection] = Field(default_factory=list)
+    # Candidate blobs found and why each was dropped before becoming a
+    # detection. Empty when weed detection is off. Logged per image so a
+    # starved verifier is visible instead of only showing up as missing weeds.
+    weed_candidate_stats: dict[str, int] = Field(default_factory=dict)
 
 
 class WeedDetection(StrictModel):

@@ -310,6 +310,29 @@ MIGRATIONS = [
     CREATE INDEX IF NOT EXISTS idx_decisions_measurement_action
       ON decisions(measurement_id,action);
     """,
+    # Migration 20: one normalized audit stream for changes that were actually
+    # applied to FarmBot.  Review decisions remain useful for queue state, but
+    # this table is intentionally limited to the user-facing change log.
+    """
+    CREATE TABLE IF NOT EXISTS change_log(
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      entity_type TEXT NOT NULL,
+      entity_id TEXT NOT NULL,
+      crop_type TEXT NOT NULL,
+      x REAL,
+      y REAL,
+      z REAL,
+      change_type TEXT NOT NULL,
+      original_radius_mm REAL NOT NULL,
+      current_radius_mm REAL NOT NULL,
+      decision_method TEXT NOT NULL,
+      confidence REAL NOT NULL,
+      details_json TEXT NOT NULL DEFAULT '{}',
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE INDEX IF NOT EXISTS idx_change_log_created
+      ON change_log(created_at DESC,id DESC);
+    """,
 ]
 
 
@@ -1899,6 +1922,55 @@ class Database:
             dict(row)
             for row in self.connection.execute(
                 "SELECT * FROM decisions ORDER BY created_at DESC LIMIT ?", (limit,)
+            )
+        ]
+
+    def record_change(
+        self,
+        *,
+        entity_type: str,
+        entity_id: object,
+        crop_type: str,
+        x: float | None,
+        y: float | None,
+        z: float | None,
+        change_type: str,
+        original_radius_mm: float,
+        current_radius_mm: float,
+        decision_method: str,
+        confidence: float,
+        details: dict | None = None,
+    ) -> None:
+        """Record an applied plant/weed mutation for the dashboard change log."""
+        with self.connection:
+            self.connection.execute(
+                """INSERT INTO change_log(
+                entity_type,entity_id,crop_type,x,y,z,change_type,
+                original_radius_mm,current_radius_mm,decision_method,confidence,
+                details_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    entity_type,
+                    str(entity_id),
+                    crop_type,
+                    x,
+                    y,
+                    z,
+                    change_type,
+                    float(original_radius_mm),
+                    float(current_radius_mm),
+                    decision_method,
+                    float(confidence),
+                    json.dumps(details or {}, separators=(",", ":")),
+                ),
+            )
+
+    def recent_changes(self, limit: int = 100) -> list[dict]:
+        """Return applied changes newest first for the dashboard log."""
+        return [
+            dict(row)
+            for row in self.connection.execute(
+                "SELECT * FROM change_log ORDER BY created_at DESC,id DESC LIMIT ?",
+                (limit,),
             )
         ]
 

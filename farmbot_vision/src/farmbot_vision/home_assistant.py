@@ -89,6 +89,17 @@ class HomeAssistantError(RuntimeError):
     pass
 
 
+class HomeAssistantUnavailableError(HomeAssistantError):
+    """Home Assistant could not service a request temporarily.
+
+    The distinction matters for long-running photo-grid captures: a request
+    can be accepted by the companion integration and then lose its status
+    response while Home Assistant is restarting. Callers must keep the
+    existing capture session together instead of splitting it into new
+    captures.
+    """
+
+
 class HomeAssistantConnectionError(HomeAssistantError):
     """The event WebSocket could not be established or remained open."""
 
@@ -172,6 +183,24 @@ class HomeAssistantClient:
                     raise StaleRadiusError("FarmBot radius changed; inventory refresh required")
                 if response.status_code in {400, 401, 403, 422}:
                     snippet = _snippet(response.text)
+                    if response.status_code == 400 and "system is not ready with state:" in (
+                        response.text.casefold()
+                    ):
+                        last_error = HomeAssistantUnavailableError(
+                            "Home Assistant is still starting"
+                        )
+                        last_body = snippet
+                        LOGGER.warning(
+                            "Home Assistant service %s is waiting for Home Assistant to finish "
+                            "starting (attempt %d/3)%s",
+                            action,
+                            attempt + 1,
+                            f": {snippet}" if snippet else "",
+                        )
+                        if attempt < 2:
+                            await asyncio.sleep(2**attempt)
+                            continue
+                        break
                     LOGGER.error(
                         "Home Assistant service %s rejected the request with a non-retryable "
                         "HTTP %d: %s",
@@ -232,7 +261,9 @@ class HomeAssistantClient:
             last_error,
             f"; integration response: {last_body}" if last_body else "",
         )
-        raise HomeAssistantError("Home Assistant temporarily unavailable") from last_error
+        raise HomeAssistantUnavailableError(
+            "Home Assistant temporarily unavailable"
+        ) from last_error
 
     async def list_bots(self) -> BotList:
         return await self._service("list_vision_bots", {}, BotList)  # type: ignore[return-value]

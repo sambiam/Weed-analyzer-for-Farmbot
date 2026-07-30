@@ -17,7 +17,10 @@ class WeedSettings(BaseModel):
     automatic_removal: bool = False
     removal_confidence: float = Field(default=0.6, ge=0, le=1)
     removal_min_consecutive_absent: int = Field(default=1, ge=1, le=10)
-    minimum_area_mm2: float = Field(default=75, ge=5, le=10_000)
+    # A first-true-leaf seedling covers roughly 30 mm2, so the old 75 mm2 floor
+    # silently discarded every weed worth catching early. Pixel noise is already
+    # rejected by the vegetation mask's own area floor.
+    minimum_area_mm2: float = Field(default=20, ge=5, le=10_000)
     maximum_area_mm2: float = Field(default=2_500, ge=10, le=100_000)
     plant_exclusion_margin_mm: float = Field(default=35, ge=0, le=500)
     crop_protection_enabled: bool = True
@@ -28,11 +31,17 @@ class WeedSettings(BaseModel):
     green_hue_max: int = Field(default=100, ge=0, le=179)
     strong_green_minimum_saturation: int = Field(default=45, ge=0, le=255)
     strong_green_minimum_excess_green: int = Field(default=20, ge=-255, le=510)
-    minimum_green_purity: float = Field(default=0.45, ge=0, le=1)
-    minimum_solidity: float = Field(default=0.25, ge=0, le=1)
-    minimum_circularity: float = Field(default=0.03, ge=0, le=1)
-    maximum_aspect_ratio: float = Field(default=7, ge=1, le=50)
-    minimum_confidence: float = Field(default=0.70, ge=0, le=1)
+    # Measured against real photographs rather than synthetic discs: a genuine
+    # weed leaf reaches only ~0.1-0.45 strong-green purity and ~0.2-0.6 solidity
+    # once shadow, glare and soil show through the gaps between its leaves. The
+    # previous defaults sat above that range and rejected almost every weed
+    # before the verifier ever scored it.
+    minimum_green_purity: float = Field(default=0.10, ge=0, le=1)
+    minimum_solidity: float = Field(default=0.08, ge=0, le=1)
+    minimum_circularity: float = Field(default=0.01, ge=0, le=1)
+    # Grass and other narrow-leaved weeds are legitimately long and thin.
+    maximum_aspect_ratio: float = Field(default=12, ge=1, le=50)
+    minimum_confidence: float = Field(default=0.45, ge=0, le=1)
     automatic_creation_confidence: float = Field(default=0.90, ge=0, le=1)
     temporal_confirmation_enabled: bool = True
     recommendation_min_observations: int = Field(default=1, ge=1, le=20)

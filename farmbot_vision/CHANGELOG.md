@@ -1,5 +1,69 @@
 # Changelog
 
+## 3.10.0 - 2026-07-30
+
+- Fixed weed candidate generation starving the learned verifier. Weeds plainly
+  visible in a photo were being discarded before the verifier ever scored them,
+  and because a discarded candidate is never stored, reviewed or labelled, the
+  loss was invisible. Four independent causes, each measured on a reference
+  scene:
+  - Crop protection grouped vegetation islands transitively. One weed near a
+    crop protected every weed reachable from it through a chain of
+    within-12 mm hops — about 70% of all vegetation in a weedy bed. Protection
+    is now bounded to 30 mm from the crop itself, which still covers a leaf
+    straddling the exclusion boundary.
+  - The heuristic confidence terms were summed unnormalised, so a genuine weed
+    could not score above roughly 0.70 while the default review threshold was
+    also 0.70. Terms are now normalised against what real foliage scores.
+  - The colour, shape and size thresholds could veto a candidate outright.
+    They are now clamped to absolute recall floors, so no saved value —
+    including one inherited from an earlier build whose defaults real foliage
+    could not meet — can stop a candidate from being scored.
+  - Crop padding blanked a 120 mm radius around a 60 mm plant. While a trained
+    verifier is scoring, padding beyond the canopy is capped at 12 mm; the
+    verifier receives each candidate's distance to the nearest crop and judges
+    it better than a fixed circle can.
+- Applied the candidate recall boost whenever a trained verifier is scoring,
+  including shadow mode, which is the stage meant to be gathering examples to
+  label.
+- Retuned the candidate defaults to values real photographs can meet: minimum
+  area 75 → 20 mm², strong-green fraction 0.45 → 0.10, solidity 0.25 → 0.08,
+  circularity 0.03 → 0.01, maximum aspect ratio 7 → 12, review confidence
+  0.70 → 0.45.
+- Logged per-image candidate counts and the reason each was dropped, so a
+  starved verifier is visible in the add-on log.
+- Rebuilt the weed settings page. Every setting now has a paired slider and
+  number box, and a `?` tooltip saying what it does, what high and low values
+  mean, and how to calibrate it. Added visual aids: a hue band marking the
+  accepted colour range, a colour sampler that centres the range on a colour
+  picked from your own photo, area limits shown as the physical width of a
+  blob, and shape diagrams for solidity and circularity. Grouped the settings
+  under plain-language headings.
+
+## 3.9.0 - 2026-07-30
+
+- Replaced the dashboard's approval and rollback history with a normalized
+  change log showing applied plant and weed changes, locations, radius before
+  and after, decision method, and confidence.
+
+## 3.8.3 - 2026-07-30
+
+- Reconciled photo-grid batches with FarmBot's durable processed-image
+  inventory when Home Assistant loses or delays a repair-status response, so
+  already-captured rows are not re-requested or marked missing.
+- Treated Home Assistant startup responses as temporary during a grid capture
+  and retained the existing batch while the service recovers.
+- Suppressed routine successful `/api/photo-grid/status` access-log entries
+  while retaining access logs for errors and other routes.
+
+## 3.8.2 - 2026-07-30
+
+- Recovered pale, washed-out leaf sections when they are anchored to detected
+  vegetation, while keeping isolated pale material out of the vegetation mask.
+- Allowed elongated crop-leaf components that reach a known plant centre while
+  continuing to reject isolated irrigation-line and weed-shaped components.
+- Added regression coverage for a pale outer leaf and an isolated weed.
+
 ## 3.8.1 - 2026-07-30
 
 - Fixed add-on startup under AppArmor by allowing the `nice` process-priority

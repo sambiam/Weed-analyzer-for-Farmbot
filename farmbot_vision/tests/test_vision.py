@@ -60,6 +60,23 @@ def test_largest_genuine_leaf_is_not_excluded(seed, calibration):
     assert measurement.maximum_accepted_canopy_radius_mm > measurement.typical_canopy_radius_mm
 
 
+def test_washed_out_leaf_is_recovered_without_claiming_an_isolated_weed(seed, calibration):
+    image = np.zeros((240, 320, 3), np.uint8)
+    cv2.circle(image, (160, 120), 25, (20, 210, 30), -1)
+    # This pale, low-saturation leaf fails the established strong-green
+    # classifier but remains green-tinted and attached to the crop canopy.
+    cv2.line(image, (160, 120), (260, 120), (190, 205, 195), 8)
+    cv2.circle(image, (285, 40), 12, (20, 210, 30), -1)
+
+    result = ClassicalVisionEngine().analyse(encode_jpeg(image), 9, NOW, [seed], calibration, {})
+    measurement = result.measurements[0]
+    assert measurement.maximum_accepted_canopy_radius_mm > 90
+
+    ownership = cv2.imdecode(np.frombuffer(result.ownership_mask, np.uint8), cv2.IMREAD_UNCHANGED)
+    assert ownership[120, 250] == 1
+    assert ownership[40, 285] == 0
+
+
 def test_isolated_weed_does_not_inflate_radius(seed, calibration):
     result = analyse([("circle", ((160, 120), 30)), ("circle", ((285, 40), 10))], seed, calibration)
     assert result.measurements[0].maximum_accepted_canopy_radius_mm < 35
@@ -495,27 +512,127 @@ def test_distance_to_the_nearest_plant_reaches_the_verifier():
     assert 0.3 < features["distance_to_plant"] < 0.8
 
 
-def test_recall_boost_only_relaxes_the_gates_while_the_verifier_enforces():
-    # A circularity floor the candidate cannot quite meet on its own terms.
-    strict = _weed_scene(
-        _StubVerifier(0.9),
-        minimum_circularity=1.0,
-        candidate_recall_boost=1.0,
-    )
-    assert strict.weeds == []
+def test_no_shape_setting_can_veto_a_candidate_before_the_verifier_scores_it():
+    """Rejecting a candidate here is invisible, so it must not be possible.
 
-    relaxed = _weed_scene(
-        _StubVerifier(0.9),
-        minimum_circularity=1.0,
-        candidate_recall_boost=0.5,
-    )
-    assert len(relaxed.weeds) == 1
+    A candidate dropped by the colour/shape gates is never scored, stored,
+    reviewed or labelled, so the mistake cannot be noticed or corrected. Every
+    gate is clamped to a recall ceiling; the verifier makes the decision.
+    """
+    impossible = {
+        "minimum_circularity": 1.0,
+        "minimum_solidity": 1.0,
+        "minimum_green_purity": 1.0,
+        "maximum_aspect_ratio": 1.0,
+        "minimum_area_mm2": 9_000,
+        "candidate_recall_boost": 1.0,
+    }
+    verifier = _StubVerifier(0.9)
 
-    # Shadow mode is not enforcement, so the gates stay where the user set them.
-    shadowed = _weed_scene(
-        _StubVerifier(0.9),
+    result = _weed_scene(verifier, **impossible)
+
+    assert len(result.weeds) == 1
+    assert verifier.seen, "the verifier must still be asked about the candidate"
+
+
+def test_shadow_mode_also_hands_every_candidate_to_the_verifier():
+    """Shadow mode exists to collect candidates worth labelling.
+
+    Holding the gates at the user's values there starved the very stage that is
+    meant to be gathering training examples.
+    """
+    verifier = _StubVerifier(0.9)
+
+    result = _weed_scene(
+        verifier,
         minimum_circularity=1.0,
-        candidate_recall_boost=0.5,
+        minimum_solidity=1.0,
         visual_verifier_shadow_mode=True,
     )
-    assert shadowed.weeds == []
+
+    assert len(verifier.seen) == 1
+    # Shadow mode still lets the heuristic own the accept/reject decision.
+    assert len(result.weeds) == 1
+    assert result.weeds[0].confidence == result.weeds[0].heuristic_confidence
+
+
+def test_a_strict_maximum_area_is_still_honoured():
+    """The one size judgement a verifier cannot make from a cropped image."""
+    result = _weed_scene(_StubVerifier(0.9), maximum_area_mm2=10)
+
+    assert result.weeds == []
+
+
+def test_crop_support_does_not_chain_across_the_frame(calibration):
+    """A weed near a crop must not protect every weed reachable from it.
+
+    Grouping joins vegetation islands up to WEED_GROUP_MAX_GAP_MM apart. Without
+    a distance limit those joins chained, so one leaf touching the crop's
+    exclusion zone protected a whole connected network of weeds.
+    """
+    from farmbot_vision.weed_settings import WeedSettings
+
+    seed = PlantSeed(plant_id=1, crop_slug="lettuce", center_px=(40, 120), current_radius_mm=20)
+    # A chain of blobs stepping away from the crop, each within the joining gap
+    # of the last, ending far enough away to be an unmistakable interrow weed.
+    chain = [("circle", ((40, 120), 18))] + [("circle", ((x, 120), 5)) for x in range(70, 290, 14)]
+
+    result = ClassicalVisionEngine().analyse(
+        jpeg(chain),
+        9,
+        NOW,
+        [seed],
+        calibration,
+        {},
+        WeedSettings(enabled=True, plant_exclusion_margin_mm=10),
+    )
+
+    assert result.weeds, "the far end of the chain must still be reported"
+    assert max(weed.center_px[0] for weed in result.weeds) > 200
+
+
+def test_candidate_stats_explain_why_candidates_were_dropped(seed, calibration):
+    """Starvation has to be observable, not inferred from absent weeds."""
+    from farmbot_vision.weed_settings import WeedSettings
+
+    result = ClassicalVisionEngine().analyse(
+        jpeg([("circle", ((160, 120), 25)), ("circle", ((285, 40), 10))]),
+        9,
+        NOW,
+        [seed],
+        calibration,
+        {},
+        WeedSettings(enabled=True, plant_exclusion_margin_mm=10, maximum_area_mm2=11),
+    )
+
+    assert result.weeds == []
+    assert result.weed_candidate_stats["blobs"] >= 1
+    assert result.weed_candidate_stats["size"] >= 1
+
+
+def test_candidate_stats_are_empty_when_weed_detection_is_off(seed, calibration):
+    assert analyse([("circle", ((160, 120), 25))], seed, calibration).weed_candidate_stats == {}
+
+
+def test_a_realistic_weed_clears_the_default_review_threshold(seed, calibration):
+    """The heuristic has to be able to reach its own default threshold.
+
+    Its terms used to be summed unnormalised, so a real weed topped out near
+    0.70 -- which was also the default review threshold, leaving effectively
+    nothing able to pass it.
+    """
+    from farmbot_vision.weed_settings import WeedSettings
+
+    defaults = WeedSettings(enabled=True)
+    result = ClassicalVisionEngine().analyse(
+        jpeg([("circle", ((160, 120), 25)), ("circle", ((285, 40), 9))]),
+        9,
+        NOW,
+        [seed],
+        calibration,
+        {},
+        defaults,
+    )
+
+    assert len(result.weeds) == 1
+    assert result.weeds[0].heuristic_confidence > defaults.minimum_confidence

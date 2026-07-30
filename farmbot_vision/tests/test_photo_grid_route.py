@@ -7,6 +7,7 @@ recorded failure.
 """
 
 from datetime import UTC, datetime
+from types import SimpleNamespace
 
 import pytest
 
@@ -73,6 +74,14 @@ def _frames(targets):
         }
         for target in targets
     ]
+
+
+@pytest.fixture(autouse=True)
+def _stub_inventory_for_route_tests(monkeypatch):
+    async def inventory(_request):
+        return SimpleNamespace(plants=[], images=[])
+
+    monkeypatch.setattr(web.client, "inventory", inventory)
 
 
 @pytest.mark.asyncio
@@ -227,6 +236,51 @@ async def test_a_failed_cell_is_retried_without_recapturing_successful_cells(mon
     assert sent == [[0, 1, 2, 3, 4, 5], [3]]
     assert len(record.targets) == 6
     assert sorted(frame.target_index for frame in record.frames) == [0, 1, 2, 3, 4, 5]
+    assert record.status == "complete"
+
+
+@pytest.mark.asyncio
+async def test_status_outage_recovers_persisted_inventory_without_restarting_batch(
+    monkeypatch, tmp_path
+):
+    """A lost repair response must not turn already-uploaded images into misses."""
+    targets = _route(count=3, columns=3)
+    record = _record(targets, tmp_path=tmp_path)
+    store = PhotoGridStore(tmp_path / "grid.json")
+    monkeypatch.setattr(web, "photo_grid_store", store)
+
+    starts = []
+
+    async def start(_entry_id, payload):
+        starts.append(payload)
+        return {"status": "queued", "repair_id": "grid-1", "message": "queued"}
+
+    async def status(_entry_id, _repair_id):
+        raise web.HomeAssistantUnavailableError("Home Assistant temporarily unavailable")
+
+    async def inventory(_request):
+        created_at = datetime.now(UTC)
+        return SimpleNamespace(
+            plants=[],
+            images=[
+                SimpleNamespace(
+                    id=100 + target.index,
+                    created_at=created_at,
+                    processed=True,
+                    meta=SimpleNamespace(x=target.x, y=target.y, z=target.z),
+                )
+                for target in targets
+            ],
+        )
+
+    monkeypatch.setattr(web.client, "start_grid_repair", start)
+    monkeypatch.setattr(web.client, "grid_repair_status", status)
+    monkeypatch.setattr(web.client, "inventory", inventory)
+
+    await web._photo_grid_worker(record)
+
+    assert len(starts) == 1
+    assert sorted(frame.target_index for frame in record.frames) == [0, 1, 2]
     assert record.status == "complete"
 
 

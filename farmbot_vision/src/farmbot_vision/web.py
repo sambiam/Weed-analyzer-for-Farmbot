@@ -48,7 +48,12 @@ from .grid_repair import (
     same_grid_run,
     target_payload,
 )
-from .home_assistant import HomeAssistantClient, HomeAssistantError, StaleRadiusError
+from .home_assistant import (
+    HomeAssistantClient,
+    HomeAssistantError,
+    HomeAssistantUnavailableError,
+    StaleRadiusError,
+)
 from .image_cache import CachedImage, ImageFileCache
 from .jobs import JobManager
 from .models import (
@@ -88,7 +93,12 @@ from .photo_quality import (
 )
 from .settings import Settings
 from .soil_jobs import SoilJobManager
-from .vision import garden_to_pixel
+from .vision import (
+    CANDIDATE_EXCLUSION_REACH_CEILING_MM,
+    CANDIDATE_MIN_AREA_CEILING_MM2,
+    CROP_SUPPORT_REACH_MM,
+    garden_to_pixel,
+)
 from .weed_settings import WeedSettings, WeedSettingsStore
 from .weed_verifier import (
     ALL_LABELS,
@@ -108,6 +118,20 @@ from .zones import (
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 LOGGER = logging.getLogger(__name__)
+
+
+class _RoutinePhotoGridStatusAccessFilter(logging.Filter):
+    """Keep the dashboard's successful five-second status polls out of logs."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        message = record.getMessage()
+        return not ('"GET /api/photo-grid/status ' in message and '" 200 OK' in message)
+
+
+# Uvicorn configures its access logger before importing this module, so adding
+# the filter here affects the running server while retaining access records for
+# errors and for every other route.
+logging.getLogger("uvicorn.access").addFilter(_RoutinePhotoGridStatusAccessFilter())
 settings = Settings.load()
 # OpenCV may otherwise create a worker per CPU core inside the analysis thread.
 # One worker preserves identical algorithms/results while leaving CPU time for
@@ -161,6 +185,14 @@ GRID_REPAIR_BUSY_RETRY_SECONDS = 30
 PHOTO_GRID_BATCH_START_MAX_ATTEMPTS = 6
 PHOTO_GRID_BATCH_START_RETRY_BASE_SECONDS = 5
 PHOTO_GRID_BATCH_START_RETRY_MAX_SECONDS = 30
+# A status request can disappear while Home Assistant restarts even though
+# FarmBot has already captured the images. Keep the existing repair session
+# alive long enough to query it again and reconcile the durable image list.
+PHOTO_GRID_STATUS_RECOVERY_MAX_ATTEMPTS = 6
+PHOTO_GRID_STATUS_RECOVERY_BASE_SECONDS = 5
+PHOTO_GRID_STATUS_RECOVERY_MAX_SECONDS = 30
+PHOTO_GRID_HA_RETRY_SECONDS = 15
+PHOTO_GRID_INVENTORY_CLOCK_SKEW_SECONDS = 30
 # Bounded multi-pass retry for coordinates that came back unverified. A pass
 # that verifies zero new frames means another identical pass would just move
 # the bot pointlessly, so the worker stops early rather than always running
@@ -629,6 +661,69 @@ def _merge_photo_grid_frames(
     return verified
 
 
+async def _recover_photo_grid_frames_from_inventory(
+    record: PhotoGridRecord,
+    targets: list[PhotoGridTarget],
+    *,
+    not_before: datetime,
+) -> list[PhotoGridFrame]:
+    """Recover processed captures when the repair status is stale or lost.
+
+    Repair status is held in the companion integration's live state, while
+    FarmBot image metadata is durable and is what the FarmBot web app displays.
+    During an HA restart the former can be unavailable after the latter already
+    contains the completed photos. Only images from this grid run are eligible
+    so an older photo at the same coordinate cannot fill a new cell.
+    """
+    existing_ids = {frame.image_id for frame in record.frames}
+    verified_indexes = {frame.target_index for frame in record.frames}
+    missing = [target for target in targets if target.index not in verified_indexes]
+    if not missing:
+        return []
+    try:
+        inventory = await client.inventory(
+            InventoryRequest(
+                config_entry_id=record.config_entry_id,
+                image_lookback_hours=min(720, max(72, settings.image_lookback_hours)),
+            )
+        )
+    except HomeAssistantError as exc:
+        LOGGER.debug(
+            "Could not reconcile photo-grid %s from FarmBot inventory: %s",
+            record.session_id,
+            exc,
+        )
+        return []
+
+    cutoff = not_before - timedelta(seconds=PHOTO_GRID_INVENTORY_CLOCK_SKEW_SECONDS)
+    raw_frames: list[dict[str, float | int]] = []
+    for image in sorted(inventory.images, key=lambda item: item.created_at, reverse=True):
+        if not image.processed or image.id in existing_ids or image.id in record.excluded_image_ids:
+            continue
+        created_at = image.created_at
+        if created_at.tzinfo is None:
+            created_at = created_at.replace(tzinfo=UTC)
+        if created_at < cutoff:
+            continue
+        raw_frames.append(
+            {
+                "image_id": image.id,
+                "x": image.meta.x,
+                "y": image.meta.y,
+                "z": image.meta.z,
+            }
+        )
+    recovered = _merge_photo_grid_frames(record, missing, raw_frames)
+    if recovered:
+        LOGGER.warning(
+            "Photo grid %s recovered %d processed frame(s) from FarmBot inventory after "
+            "repair status was unavailable or incomplete",
+            record.session_id,
+            len(recovered),
+        )
+    return recovered
+
+
 def _coordinate_label(target: PhotoGridTarget) -> str:
     """Render a target's garden coordinates for logs and status messages."""
     return f"{target.x:g},{target.y:g}"
@@ -660,7 +755,7 @@ def _photo_grid_status(record: PhotoGridRecord | None) -> dict[str, object]:
         for repair in record.quality_repairs
         if repair.status in {"attempting", "failed"}
     }
-    if record.status in {"retrying", "failed"}:
+    if record.status in {"retrying", "failed", "waiting_home_assistant"}:
         blue.update(missing)
     elif record.status in {"queued", "running"} and missing:
         # The integration reports verified frames as it advances. The first
@@ -754,8 +849,21 @@ async def _capture_photo_grid_targets(
     targets: list[PhotoGridTarget],
 ) -> list[PhotoGridTarget]:
     """Capture one integration-sized batch and return any unverified targets."""
+    if record.status == "waiting_home_assistant":
+        recovered = await _recover_photo_grid_frames_from_inventory(
+            record,
+            targets,
+            not_before=record.started_at,
+        )
+        if recovered and all(
+            any(frame.target_index == target.index for frame in record.frames) for target in targets
+        ):
+            return []
+    batch_started_at = datetime.now(UTC)
     try:
         started = await _start_photo_grid_batch(record, targets)
+    except HomeAssistantUnavailableError:
+        raise
     except HomeAssistantError as exc:
         if len(targets) <= 1:
             raise
@@ -790,13 +898,74 @@ async def _capture_photo_grid_targets(
                 unverified.extend(item for item in half if item.index not in verified)
         return unverified
     repair_id = str(started.get("repair_id") or "")
+    status_recovery_attempt = 0
 
     while True:
-        result = await client.grid_repair_status(record.config_entry_id, repair_id)
+        try:
+            result = await client.grid_repair_status(record.config_entry_id, repair_id)
+        except HomeAssistantUnavailableError as exc:
+            recovered = await _recover_photo_grid_frames_from_inventory(
+                record,
+                targets,
+                not_before=batch_started_at,
+            )
+            if all(
+                any(frame.target_index == target.index for frame in record.frames)
+                for target in targets
+            ):
+                return []
+            status_recovery_attempt += 1
+            if status_recovery_attempt > PHOTO_GRID_STATUS_RECOVERY_MAX_ATTEMPTS:
+                raise
+            delay = min(
+                PHOTO_GRID_STATUS_RECOVERY_BASE_SECONDS * status_recovery_attempt,
+                PHOTO_GRID_STATUS_RECOVERY_MAX_SECONDS,
+            )
+            record.status = "waiting_home_assistant"
+            record.message = (
+                "Home Assistant is temporarily unavailable; retaining this photo-grid batch "
+                f"and checking again in {delay}s"
+            )
+            photo_grid_store.save(record)
+            if status_recovery_attempt == 1:
+                LOGGER.warning(
+                    "Photo grid %s could not read repair status (%s); retaining the existing "
+                    "batch while Home Assistant recovers",
+                    record.session_id,
+                    exc,
+                )
+            await asyncio.sleep(delay)
+            continue
+        except HomeAssistantError:
+            # A non-transient rejection still gets one durable-inventory check:
+            # the service may have completed the capture just before returning
+            # its error response.
+            recovered = await _recover_photo_grid_frames_from_inventory(
+                record,
+                targets,
+                not_before=batch_started_at,
+            )
+            complete_indexes = {frame.target_index for frame in record.frames}
+            if recovered and all(target.index in complete_indexes for target in targets):
+                return []
+            raise
+        status_recovery_attempt = 0
         status = str(result.get("status") or "")
         message = str(result.get("message") or status)
         _merge_photo_grid_frames(record, targets, result.get("frames"))
         complete_indexes = {frame.target_index for frame in record.frames}
+        if status not in {"queued", "running", "waiting_images"} and any(
+            target.index not in complete_indexes for target in targets
+        ):
+            # The companion may time out just before FarmBot finishes image
+            # processing. A final inventory read credits those late images
+            # without moving the bot a second time.
+            await _recover_photo_grid_frames_from_inventory(
+                record,
+                targets,
+                not_before=batch_started_at,
+            )
+            complete_indexes = {frame.target_index for frame in record.frames}
         record.status = "running"
         record.message = (
             f"{len(complete_indexes)} of {len(record.targets)} photos verified · {message}"
@@ -1227,6 +1396,7 @@ async def _photo_grid_worker(record: PhotoGridRecord) -> None:
             passes_run += 1
             verified_before_pass = len(record.frames)
             retry: list[PhotoGridTarget] = []
+            home_assistant_unavailable = False
             # Batches are consecutive slices of the canonical route, in route
             # order: the first cell of batch N+1 is the cell that follows the
             # last cell of batch N. Nothing is renumbered, repeated or
@@ -1237,6 +1407,21 @@ async def _photo_grid_worker(record: PhotoGridRecord) -> None:
                 batch_number = start // chunk_size + 1
                 try:
                     retry.extend(await _capture_photo_grid_targets(record, chunk))
+                except HomeAssistantUnavailableError as exc:
+                    home_assistant_unavailable = True
+                    LOGGER.warning(
+                        "Photo grid %s batch %d is waiting for Home Assistant: %s",
+                        record.session_id,
+                        batch_number,
+                        exc,
+                    )
+                    # Keep the whole still-unverified chunk together. The
+                    # status request may have been lost after the companion
+                    # accepted the capture, so splitting it would create
+                    # duplicate moves and can turn one outage into a failed
+                    # row of otherwise durable FarmBot images.
+                    verified_now = {frame.target_index for frame in record.frames}
+                    retry.extend(target for target in chunk if target.index not in verified_now)
                 except HomeAssistantError as exc:
                     LOGGER.warning(
                         "Photo grid %s batch %d failed: %s",
@@ -1265,6 +1450,16 @@ async def _photo_grid_worker(record: PhotoGridRecord) -> None:
             pending = retry
             if not pending:
                 break
+            if home_assistant_unavailable and attempt < PHOTO_GRID_WORKER_MAX_PASSES - 1:
+                record.status = "waiting_home_assistant"
+                record.message = (
+                    "Home Assistant is temporarily unavailable; retaining the unverified "
+                    f"photo-grid batch for another attempt (pass {attempt + 2} of "
+                    f"{PHOTO_GRID_WORKER_MAX_PASSES})"
+                )
+                photo_grid_store.save(record)
+                await asyncio.sleep(PHOTO_GRID_HA_RETRY_SECONDS)
+                continue
             if len(record.frames) == verified_before_pass:
                 LOGGER.warning(
                     "Photo grid %s pass %d verified no new frames; stopping early "
@@ -1800,12 +1995,27 @@ _CALIBRATION_JS = r"""
     const c=toCanvas(pt.x,pt.y);
     if(c[0]<-40||c[1]<-40||c[0]>canvas.width+40||c[1]>canvas.height+40) return;
     ctx.strokeStyle=colour;ctx.fillStyle=colour;ctx.lineWidth=2;
-    ctx.beginPath();ctx.arc(c[0],c[1],Math.max(4,(pt.radius||0)*P),0,7);ctx.stroke();
+    const radius=Math.max(4,(pt.radius||0)*P);
+    ctx.globalAlpha=.18;ctx.beginPath();ctx.arc(c[0],c[1],radius,0,7);ctx.fill();
+    ctx.globalAlpha=1;ctx.beginPath();ctx.arc(c[0],c[1],radius,0,7);ctx.stroke();
     ctx.beginPath();ctx.arc(c[0],c[1],2.5,0,7);ctx.fill();
     if(label&&checked('showlabels')){
-      ctx.font='12px sans-serif';
-      ctx.fillText(label,c[0]+5,c[1]-5);
+      drawMarkerLabel(ctx,label,c[0]+9,c[1]-9,canvas.width,canvas.height);
     }
+  }
+  function drawMarkerLabel(ctx,label,x,y,width,height){
+    ctx.font='700 16px system-ui, sans-serif';
+    const paddingX=6,paddingY=4,metrics=ctx.measureText(label);
+    const textWidth=metrics.width, textHeight=16;
+    const left=Math.max(2,Math.min(x,width-textWidth-paddingX*2-2));
+    const top=Math.max(textHeight+paddingY*2+2,Math.min(y,height-2));
+    ctx.fillStyle='rgba(13,30,22,.9)';
+    ctx.fillRect(left,top-textHeight-paddingY*2,textWidth+paddingX*2,textHeight+paddingY*2);
+    ctx.strokeStyle='rgba(255,255,255,.8)';ctx.lineWidth=1;
+    ctx.strokeRect(left+.5,top-textHeight-paddingY*2+.5,
+      textWidth+paddingX*2-1,textHeight+paddingY*2-1);
+    ctx.fillStyle='#fff';ctx.textBaseline='alphabetic';
+    ctx.fillText(label,left+paddingX,top-paddingY);
   }
   function drawOverlay(p,toCanvas,P){
     scene.plants.forEach(pl=>marker(p,toCanvas,P,pl,'#2ecc40',
@@ -1996,6 +2206,20 @@ _DASHBOARD_JS = r"""
     ctx.strokeStyle='#245b38';ctx.lineWidth=4;
     ctx.strokeRect(2,2,canvasWidth-4,canvasHeight-4);ctx.restore();
   }
+  function drawMarkerLabel(ctx,label,x,y,width,height){
+    ctx.font='700 16px system-ui, sans-serif';
+    const paddingX=6,paddingY=4,metrics=ctx.measureText(label);
+    const textWidth=metrics.width, textHeight=16;
+    const left=Math.max(2,Math.min(x,width-textWidth-paddingX*2-2));
+    const top=Math.max(textHeight+paddingY*2+2,Math.min(y,height-2));
+    ctx.fillStyle='rgba(13,30,22,.9)';
+    ctx.fillRect(left,top-textHeight-paddingY*2,textWidth+paddingX*2,textHeight+paddingY*2);
+    ctx.strokeStyle='rgba(255,255,255,.8)';ctx.lineWidth=1;
+    ctx.strokeRect(left+.5,top-textHeight-paddingY*2+.5,
+      textWidth+paddingX*2-1,textHeight+paddingY*2-1);
+    ctx.fillStyle='#fff';ctx.textBaseline='alphabetic';
+    ctx.fillText(label,left+paddingX,top-paddingY);
+  }
   /* Draws each frame's photo into ctx using the same calibrated, per-pixel
      projective transform regardless of whether the caller wants the whole
      bed (drawPhotoGrid) or the stored, tightly cropped plant review artifact.
@@ -2108,15 +2332,27 @@ _DASHBOARD_JS = r"""
         ctx.setTransform(1,0,0,1,0,0);
         strokeGridTiles(
           ctx,tileBounds,project,photoGridCanvas.width,photoGridCanvas.height);
+        const markerRadius=function(point){
+          return Math.max(4,(point.radius||0)*(sx+sy)/2);
+        };
+        const markerLabel=function(point,fallback){
+          return point.name||fallback||('#'+point.id);
+        };
+        const drawPhotoGridMarker=function(point,stroke,fill,label){
+          const c=project(point.x,point.y),radius=markerRadius(point);
+          ctx.fillStyle=fill;ctx.strokeStyle=stroke;ctx.lineWidth=3;
+          ctx.beginPath();ctx.arc(c[0],c[1],radius,0,Math.PI*2);ctx.fill();ctx.stroke();
+          ctx.fillStyle=stroke;ctx.beginPath();ctx.arc(c[0],c[1],3,0,Math.PI*2);ctx.fill();
+          drawMarkerLabel(ctx,label,c[0]+radius+7,c[1]-radius-7,
+            photoGridCanvas.width,photoGridCanvas.height);
+        };
         (data.plants||[]).forEach(function(plant){
-          const c=project(plant.x,plant.y);
-          ctx.fillStyle='rgba(32,160,82,.18)';ctx.strokeStyle='#39d878';ctx.lineWidth=2;
-          ctx.beginPath();ctx.arc(c[0],c[1],Math.max(4,(plant.radius||0)*(sx+sy)/2),0,Math.PI*2);
-          ctx.fill();ctx.stroke();
+          drawPhotoGridMarker(plant,'#39d878','rgba(32,160,82,.18)',
+            markerLabel(plant,'Plant'));
         });
         (data.weeds||[]).forEach(function(weed){
-          const c=project(weed.x,weed.y);
-          ctx.fillStyle='#ef476f';ctx.beginPath();ctx.arc(c[0],c[1],4,0,Math.PI*2);ctx.fill();
+          drawPhotoGridMarker(weed,'#ff354d','rgba(255,53,77,.18)',
+            markerLabel(weed,'Weed'));
         });
         const planned=gridCroppedFootprint(
           calibration,calibration.reference_width,calibration.reference_height);
@@ -3042,6 +3278,37 @@ td.actions{{min-width:9rem}}.actions-group{{display:flex;flex-direction:column;a
 .hint{{display:inline-flex;align-items:center;justify-content:center;width:1.1em;height:1.1em;
 border-radius:50%;background:var(--muted);color:white;font-size:.72em;font-weight:bold;
 margin-left:.3em;cursor:help;vertical-align:middle;line-height:1}}
+.setting{{padding:.6rem 0;border-bottom:1px solid #eef2ef}}.setting:last-child{{border-bottom:0}}
+.setting-group{{padding:.6rem 0;border-bottom:1px solid #eef2ef}}
+.setting-group>.setting{{padding:.35rem 0;border-bottom:0}}
+.setting-head{{display:flex;align-items:center;gap:.1rem;font-weight:600;margin-bottom:.35rem}}
+.setting-control{{display:flex;align-items:center;gap:.6rem;flex-wrap:wrap}}
+.setting-control input[type=range]{{flex:1 1 11rem;min-width:8rem;max-width:20rem;padding:0}}
+.setting-control input[type=number]{{width:6.5rem}}
+.setting-control .unit{{color:var(--muted);font-size:.85rem}}
+.setting-note{{margin:.35rem 0 0;font-size:.82rem;color:var(--muted)}}
+.setting-note b{{color:var(--dark);font-weight:600}}
+.setting-note.clamped{{color:#9b4b00}}
+.setting-toggle{{display:inline-flex;align-items:center;gap:.4rem;font-weight:600;
+vertical-align:middle}}.setting-toggle input{{width:auto}}
+fieldset{{border:1px solid #d5ded8;border-radius:8px;margin-bottom:1rem;padding:.4rem 1rem 1rem}}
+legend{{font-weight:600;padding:0 .35rem}}
+.hue-band{{position:relative;height:13px;border-radius:7px;margin:.15rem 0 .45rem;
+border:1px solid #0002;
+background:linear-gradient(to right,#f00 0%,#ff0 17%,#0f0 33%,#0ff 50%,#00f 67%,#f0f 83%,#f00 100%)}}
+.hue-selected{{position:absolute;top:-4px;bottom:-4px;border:2px solid var(--dark);
+border-radius:6px;box-shadow:0 0 0 1px #fff9}}
+.swatch{{display:inline-block;width:2.4rem;height:1.5rem;border-radius:4px;
+border:1px solid #0004;vertical-align:middle}}
+.colour-row{{display:flex;align-items:center;gap:.5rem;flex-wrap:wrap;margin-top:.45rem}}
+.colour-row input[type=color]{{width:3rem;height:2rem;padding:.1rem}}
+.size-preview{{display:flex;align-items:flex-end;gap:1.1rem;margin-top:.5rem;
+background:#f3f7f4;border-radius:6px;padding:.6rem}}
+.size-preview figure{{margin:0;text-align:center;font-size:.72rem;color:var(--muted)}}
+.size-blob{{background:#3f9d58;border-radius:50%;margin:0 auto .25rem}}
+.shape-figs{{display:flex;gap:.9rem;flex-wrap:wrap;margin-top:.45rem}}
+.shape-figs figure{{margin:0;text-align:center;font-size:.71rem;color:var(--muted);max-width:5.5rem}}
+.shape-figs svg{{display:block;background:#f3f7f4;border-radius:6px;margin-bottom:.2rem}}
 </style></head><body><header><h1>🌱 FarmBot Vision</h1><nav><a href="./">Analysis</a><a href="soil-height">Soil height</a><a href="settings">Calibration</a><a href="weed-settings">Weed settings</a><a href="canopy-settings">Canopy fusion</a><a href="zones">Boundaries &amp; zones</a><a href="api/health">Health JSON</a></nav></header>
 <main>{body}</main></body></html>"""
     )
@@ -3050,6 +3317,63 @@ margin-left:.3em;cursor:help;vertical-align:middle;line-height:1}}
 def hint(text: str) -> str:
     """A small hover-tooltip badge ("?") explaining a nearby form field."""
     return f'<span class=hint tabindex=0 title="{escape(text, quote=True)}">?</span>'
+
+
+def slider_field(
+    name: str,
+    label: str,
+    value: float,
+    *,
+    tip: str,
+    minimum: float,
+    maximum: float,
+    step: float,
+    unit: str = "",
+    note: str = "",
+    extra: str = "",
+    slider_maximum: float | None = None,
+) -> str:
+    """A number setting shown as a slider and a box that track each other.
+
+    The slider makes the usable range and the direction of travel obvious; the
+    box keeps the exact value visible and typeable. ``tip`` is required because
+    a threshold whose meaning is not written down cannot be calibrated by
+    anyone who did not write the code.
+
+    ``minimum``/``maximum`` must match the corresponding ``WeedSettings`` field
+    bounds, or the browser rejects a stored value the model considers valid.
+    ``slider_maximum`` narrows the *slider* alone to the range worth dragging
+    through when the model permits an implausibly large value; the box still
+    accepts anything the model does.
+    """
+    handle_max = maximum if slider_maximum is None else slider_maximum
+    return (
+        f"<div class=setting><div class=setting-head>"
+        f'<label for="f-{name}">{escape(label)}</label>{hint(tip)}</div>'
+        f"<div class=setting-control>"
+        f'<input type=range aria-hidden=true tabindex=-1 data-sync="{name}" '
+        f'min={minimum:g} max={handle_max:g} step={step:g} value="{value:g}">'
+        f'<input type=number id="f-{name}" name="{name}" data-sync="{name}" '
+        f'min={minimum:g} max={maximum:g} step={step:g} value="{value:g}">'
+        f"{f'<span class=unit>{escape(unit)}</span>' if unit else ''}</div>"
+        f"{f'<p class=setting-note>{note}</p>' if note else ''}"
+        f"{extra}</div>"
+    )
+
+
+def toggle_field(name: str, label: str, value: bool, *, tip: str, note: str = "") -> str:
+    """A checkbox setting with the same heading, tooltip and note treatment."""
+    return (
+        f"<div class=setting><label class=setting-toggle>"
+        f'<input type=checkbox name="{name}" value=true{" checked" if value else ""}>'
+        f"{escape(label)}</label>{hint(tip)}"
+        f"{f'<p class=setting-note>{note}</p>' if note else ''}</div>"
+    )
+
+
+def _diameter_mm(area_mm2: float) -> float:
+    """The width of a round blob of this area -- the intuitive way to read mm²."""
+    return 2 * math.sqrt(max(0.0, area_mm2) / math.pi)
 
 
 @app.get("/health")
@@ -3301,10 +3625,24 @@ async def dashboard(request: Request) -> HTMLResponse:
             "<small class=action-message></small></td></tr>"
         )
     flagged_curve_rows = "".join(proposal_rows)
-    decision_rows = "".join(
-        f"<tr><td>{escape(row['created_at'])}</td><td>{escape(row['measurement_id'])}</td>"
-        f"<td>{escape(row['action'])}</td></tr>"
-        for row in database.recent_decisions()
+
+    def _change_location(change: dict) -> str:
+        coordinates = [change.get("x"), change.get("y"), change.get("z")]
+        if coordinates[0] is None or coordinates[1] is None:
+            return "Unavailable"
+        z_text = f", Z {float(coordinates[2]):.1f}" if coordinates[2] is not None else ""
+        return f"X {float(coordinates[0]):.1f}, Y {float(coordinates[1]):.1f}{z_text}"
+
+    change_rows = "".join(
+        f"<tr><td>{escape(str(change['created_at']))}</td>"
+        f"<td>{escape(str(change['crop_type']))}</td>"
+        f"<td>{escape(_change_location(change))}</td>"
+        f"<td>{escape(str(change['change_type']))}</td>"
+        f"<td>{float(change['original_radius_mm']):.1f} mm</td>"
+        f"<td>{float(change['current_radius_mm']):.1f} mm</td>"
+        f"<td>{escape(str(change['decision_method']))}</td>"
+        f"<td>{float(change['confidence']):.2f}</td></tr>"
+        for change in database.recent_changes()
     )
     pending_weeds = database.pending_weed_detections()
     weeds_by_image: dict[int, list[dict]] = {}
@@ -3538,7 +3876,10 @@ aria-label="Photo grid status" style="--grid-columns:{grid_columns}">{grid_cells
 <tbody>{weed_rows or "<tr><td colspan=7>No weed recommendations</td></tr>"}</tbody></table></section>
 <section class=card><h2>Growth-curve updates</h2><p class=muted>Flagged per-plant diameter points require review.</p><table><tbody>{flagged_curve_rows or "<tr><td>No flagged curve updates</td></tr>"}</tbody></table></section>
 <section class=card><h2>Crop protection spread proposals</h2><p class=muted>Monotonic and limited to 10 points. FarmBot values are diameters; assignment requires approval.</p><table><tbody>{curve_rows or "<tr><td>No curve is ready</td></tr>"}</tbody></table></section>
-<section class=card><h2>Approval and rollback history</h2><table><tbody>{decision_rows or "<tr><td>No decisions yet</td></tr>"}</tbody></table></section>
+<section class=card><h2>Change log</h2><p class=muted>Applied changes to plants and weeds, newest first.</p>
+<table><thead><tr><th>Time</th><th>Crop / type</th><th>Location</th><th>Change</th>
+<th>Original radius</th><th>Current radius</th><th>Decision method</th><th>Confidence</th></tr></thead>
+<tbody>{change_rows or "<tr><td colspan=8>No changes yet</td></tr>"}</tbody></table></section>
 <section class=card><h2>Safety warning</h2><p class=warn>Early experimental vision results must not be the sole basis for destructive automatic weeding.</p></section>
 <div id=overlay-modal class=overlay-modal hidden role=dialog aria-modal=true aria-label="Analysis diagnostic"><figure>
 <button id=overlay-modal-close class=modal-close type=button aria-label=Close>&times;</button>
@@ -3611,7 +3952,8 @@ open and moves on to the next weed.</small></p>
 <canvas id=photo-grid-canvas width=900 height=420 aria-label="Birds-eye photo grid"></canvas>
 <p id=photo-grid-status class=muted>Loading the verified grid…</p>
 <p class=muted><small>The canvas uses the same calibrated garden-coordinate transform as
-analysis. Green circles are FarmBot plants and red dots are FarmBot weed points.</small></p>
+analysis. Green circles are FarmBot plants, red circles show each FarmBot weed's radius,
+and the dark labels identify the points.</small></p>
 </figure></div><script>{_DASHBOARD_JS}</script>"""  # noqa: S608 - HTML template
     return layout(request, body)
 
@@ -4270,9 +4612,6 @@ async def weed_settings_page(request: Request) -> HTMLResponse:
     weed_verifier.reload()
     model = weed_verifier.model
 
-    def checked(value: bool) -> str:
-        return " checked" if value else ""
-
     if not model:
         model_status = "No trained verifier model yet."
         threshold_html = ""
@@ -4405,70 +4744,778 @@ async def weed_settings_page(request: Request) -> HTMLResponse:
         "</tbody></table>"
     )
 
+    operation_fields = "".join(
+        (
+            toggle_field(
+                "enabled",
+                "Enable weed detection",
+                values.enabled,
+                tip=(
+                    "Master switch. When off no photo is searched for weeds at all and "
+                    "nothing on this page has any effect."
+                ),
+            ),
+            toggle_field(
+                "automatic_creation",
+                "Automatically create detected weeds in FarmBot",
+                values.automatic_creation,
+                tip=(
+                    "When off, detections are only recommendations you approve on the "
+                    "Analysis page. When on, a detection that clears every automatic "
+                    "threshold below is written into FarmBot without asking. Leave this "
+                    "off until you have watched the recommendations for a few days and "
+                    "agree with them."
+                ),
+            ),
+            slider_field(
+                "minimum_confidence",
+                "Review/recommendation confidence",
+                values.minimum_confidence,
+                tip=(
+                    "How sure the app must be before a candidate is shown to you as a "
+                    "suspected weed. LOW (0.3) surfaces almost everything green that is "
+                    "not a known crop, so you see every weed but also more mulch and "
+                    "moss. HIGH (0.8) shows only obvious weeds and will silently miss "
+                    "small seedlings. To calibrate: start low, look at what appears on "
+                    "the Analysis page, and raise it only if the list is too noisy to "
+                    "work through. Once the learned verifier is enforcing, its own "
+                    "threshold replaces this one."
+                ),
+                minimum=0,
+                maximum=1,
+                step=0.01,
+                note=(
+                    "Lower = more weeds found and more false alarms. Higher = a cleaner "
+                    "list that misses small weeds."
+                ),
+            ),
+            slider_field(
+                "automatic_creation_confidence",
+                "Automatic creation confidence",
+                values.automatic_creation_confidence,
+                tip=(
+                    "The much stricter bar a detection must clear before it is written "
+                    "into FarmBot on its own. Keep it well above the review confidence "
+                    "above — creating a weed on top of a crop is a real cost, whereas a "
+                    "missed weed is caught on the next pass."
+                ),
+                minimum=0,
+                maximum=1,
+                step=0.01,
+            ),
+            slider_field(
+                "weed_radius_mm",
+                "Created weed radius",
+                values.weed_radius_mm,
+                tip=(
+                    "The radius given to a weed created in FarmBot, used as a floor: a "
+                    "weed measured larger than this keeps its measured size. FarmBot "
+                    "avoids this circle when watering and seeding, so a larger value is "
+                    "safer for neighbours but blocks more bed area."
+                ),
+                minimum=1,
+                maximum=250,
+                step=1,
+                unit="mm",
+            ),
+        )
+    )
+
+    min_diameter = _diameter_mm(values.minimum_area_mm2)
+    max_diameter = _diameter_mm(values.maximum_area_mm2)
+    size_preview = f"""<div class=size-preview>
+<figure><div class=size-blob id=size-blob-min style="width:{min(120, max(3, min_diameter * 1.6)):.0f}px;height:{min(120, max(3, min_diameter * 1.6)):.0f}px"></div>
+<figcaption>smallest kept<br><b id=size-min-mm>{min_diameter:.0f}</b> mm across</figcaption></figure>
+<figure><div class=size-blob id=size-blob-max style="width:{min(150, max(4, max_diameter * 1.6)):.0f}px;height:{min(150, max(4, max_diameter * 1.6)):.0f}px"></div>
+<figcaption>largest kept<br><b id=size-max-mm>{max_diameter:.0f}</b> mm across</figcaption></figure>
+<figcaption>Blobs are drawn to relative scale. A first-true-leaf seedling is roughly
+5&nbsp;mm across; a mature dandelion rosette 60&nbsp;mm.</figcaption></div>"""
+
+    size_fields = "".join(
+        (
+            slider_field(
+                "minimum_area_mm2",
+                "Minimum weed area",
+                values.minimum_area_mm2,
+                tip=(
+                    "Green patches smaller than this are ignored. Think of it as 'how "
+                    "small a weed do I want to catch'. LOW (20 mm², about 5 mm across) "
+                    "catches seedlings while they are still easy to remove. HIGH "
+                    "(200 mm²) only catches established weeds and will miss everything "
+                    "young. To calibrate: measure the smallest weed you actually want "
+                    "the bot to act on, square its width and use roughly that. Note "
+                    f"that candidate generation never applies a floor above "
+                    f"{CANDIDATE_MIN_AREA_CEILING_MM2:g} mm² while a trained verifier is "
+                    "scoring, because the verifier judges size far better than a fixed "
+                    "cut-off does."
+                ),
+                minimum=5,
+                maximum=10_000,
+                slider_maximum=500,
+                step=1,
+                unit="mm²",
+            ),
+            slider_field(
+                "maximum_area_mm2",
+                "Maximum weed area",
+                values.maximum_area_mm2,
+                tip=(
+                    "Green patches larger than this are assumed to be a crop, not a "
+                    "weed, and are ignored. This is the one size judgement the verifier "
+                    "cannot make for you, so it is always honoured. Set it comfortably "
+                    "above the biggest weed you expect but below your smallest mature "
+                    "crop, so an unrecorded crop plant is never proposed for removal."
+                ),
+                minimum=10,
+                maximum=100_000,
+                slider_maximum=10_000,
+                step=10,
+                unit="mm²",
+                extra=size_preview,
+            ),
+        )
+    )
+
+    hue_low_deg = values.green_hue_min * 2
+    hue_high_deg = values.green_hue_max * 2
+    hue_mid_deg = (hue_low_deg + hue_high_deg) // 2
+    colour_preview = f"""<div class=colour-row>
+<span>Accepted colours:</span>
+<span class=swatch id=hue-swatch-min style="background:hsl({hue_low_deg},70%,38%)"></span>
+<span class=swatch id=hue-swatch-mid style="background:hsl({hue_mid_deg},70%,38%)"></span>
+<span class=swatch id=hue-swatch-max style="background:hsl({hue_high_deg},70%,38%)"></span>
+<span class=unit><b id=hue-range-text>{hue_low_deg}&deg;&ndash;{hue_high_deg}&deg;</b></span>
+</div>
+<div class=colour-row>
+<label for=hue-picker>Or sample a leaf colour{
+        hint(
+            "Pick a colour from one of your own photos and the hue range and saturation "
+            "below are set to accept colours like it, plus a tolerance. Use it when your "
+            "camera renders foliage bluish or yellowish and the defaults miss real leaves."
+        )
+    }</label>
+<input type=color id=hue-picker value="#4a8f3c">
+<button type=button id=hue-apply class=unknown-button>Centre the range on this colour</button>
+</div>"""
+
+    colour_fields = "".join(
+        (
+            toggle_field(
+                "shape_filter_enabled",
+                "Enable colour/shape filter",
+                values.shape_filter_enabled,
+                tip=(
+                    "Turns the colour and shape rules below on or off. With it off, "
+                    "every green patch that passes the size filter is scored on "
+                    "confidence alone. Turning it off is a safe way to find out whether "
+                    "these rules are the reason a weed you can see is not being "
+                    "reported."
+                ),
+            ),
+            f"<div class=setting-group><div class=setting-head><span>Strong-green hue range</span>{
+                hint(
+                    'Which hues count as green foliage, on the 0-179 scale OpenCV uses (so '
+                    'the numbers are half of ordinary degrees). The band from about 25 to '
+                    '100 covers yellow-green through to blue-green. WIDER accepts more '
+                    'colours, including yellowing or reddish leaves, at the cost of also '
+                    'accepting green-painted hardware. NARROWER is stricter. To calibrate: '
+                    'use the colour sampler below on a leaf in one of your own photos.'
+                )
+            }</div><div class=hue-band><span class=hue-selected id=hue-selected "
+            f'style="left:{values.green_hue_min / 179 * 100:.1f}%;'
+            f'width:{max(1, values.green_hue_max - values.green_hue_min) / 179 * 100:.1f}%">'
+            "</span></div>"
+            + slider_field(
+                "green_hue_min",
+                "Hue range starts at",
+                values.green_hue_min,
+                tip=(
+                    "The yellow-green end of the accepted band. Lower it if yellowing "
+                    "or sun-bleached leaves are being missed."
+                ),
+                minimum=0,
+                maximum=179,
+                step=1,
+            )
+            + slider_field(
+                "green_hue_max",
+                "Hue range ends at",
+                values.green_hue_max,
+                tip=(
+                    "The blue-green end of the accepted band. Raise it if dark or "
+                    "shaded blue-green foliage is being missed."
+                ),
+                minimum=0,
+                maximum=179,
+                step=1,
+                extra=colour_preview,
+            )
+            + "</div>",
+            slider_field(
+                "strong_green_minimum_saturation",
+                "Strong-green minimum saturation",
+                values.strong_green_minimum_saturation,
+                tip=(
+                    "How vivid a pixel's colour must be to count as confident foliage, "
+                    "from 0 (grey) to 255 (pure colour). LOW (20) includes pale, "
+                    "sun-bleached and shaded leaves along with washed-out grey mulch. "
+                    "HIGH (100) only counts vividly green pixels and will miss weeds in "
+                    "shade or glare. To calibrate: if weeds in the shadow of a crop are "
+                    "being missed, lower it."
+                ),
+                minimum=0,
+                maximum=255,
+                step=1,
+                note=(
+                    "Lower = pale and shaded leaves still count. Higher = only vivid green counts."
+                ),
+            ),
+            slider_field(
+                "strong_green_minimum_excess_green",
+                "Strong-green minimum excess green",
+                values.strong_green_minimum_excess_green,
+                tip=(
+                    "How much greener than red and blue a pixel must be, measured as "
+                    "2×green − red − blue. This is the single most reliable way to "
+                    "separate leaves from brown soil and grey stone, because it ignores "
+                    "brightness. LOW (5) accepts barely-green pixels such as damp mulch. "
+                    "HIGH (60) accepts only strongly green ones and misses dark or "
+                    "reddish weed leaves. Around 20 suits most cameras."
+                ),
+                minimum=-255,
+                maximum=510,
+                step=1,
+                note="Negative values accept brown and grey pixels — rarely what you want.",
+            ),
+            slider_field(
+                "minimum_green_purity",
+                "Minimum strong-green fraction",
+                values.minimum_green_purity,
+                tip=(
+                    "What proportion of a candidate's pixels must pass the colour tests "
+                    "above. Real weeds score surprisingly low here — around 0.1 to 0.45 "
+                    "— because soil shows between their leaves, so a value above about "
+                    "0.5 rejects almost every genuine weed. LOW (0.05) keeps anything "
+                    "with a trace of green. HIGH (0.6) keeps only dense solid foliage."
+                ),
+                minimum=0,
+                maximum=1,
+                step=0.01,
+                note=(
+                    "A real weed usually scores <b>0.1&ndash;0.45</b>. Values above 0.5 "
+                    "reject nearly everything genuine."
+                ),
+            ),
+        )
+    )
+
+    shape_figures = """<div class=shape-figs>
+<figure><svg width=74 height=52 viewBox="0 0 74 52" role=img aria-label="Low solidity: a
+ragged star shape with large gaps inside its outline">
+<path d="M37 4 46 21 66 24 52 37 56 49 37 40 18 49 22 37 8 24 28 21Z" fill=#3f9d58></path>
+</svg><figcaption>Low solidity ~0.4<br>gappy rosette</figcaption></figure>
+<figure><svg width=74 height=52 viewBox="0 0 74 52" role=img aria-label="High solidity: a
+solid filled blob">
+<ellipse cx=37 cy=26 rx=24 ry=19 fill=#3f9d58></ellipse></svg>
+<figcaption>High solidity ~0.95<br>solid blob</figcaption></figure>
+<figure><svg width=74 height=52 viewBox="0 0 74 52" role=img aria-label="Low circularity: a
+long thin blade">
+<path d="M6 30 Q37 12 68 26 Q37 22 6 33Z" fill=#3f9d58></path></svg>
+<figcaption>Low circularity ~0.05<br>grass blade</figcaption></figure>
+<figure><svg width=74 height=52 viewBox="0 0 74 52" role=img aria-label="High circularity: a
+round disc">
+<circle cx=37 cy=26 r=19 fill=#3f9d58></circle></svg>
+<figcaption>High circularity ~0.9<br>round leaf</figcaption></figure>
+</div>"""
+
+    shape_fields = "".join(
+        (
+            slider_field(
+                "minimum_solidity",
+                "Minimum solidity",
+                values.minimum_solidity,
+                tip=(
+                    "How completely a candidate fills the smallest rubber band you could "
+                    "stretch around it. A solid disc scores 1.0; a five-leaf rosette "
+                    "with soil showing between its leaves scores about 0.3. LOW (0.05) "
+                    "accepts sparse, spidery seedlings — which is what most young weeds "
+                    "look like. HIGH (0.6) accepts only dense blobs and rejects almost "
+                    "every real weed. Raise it only if fragments of mulch are being "
+                    "reported."
+                ),
+                minimum=0,
+                maximum=1,
+                step=0.01,
+                note="A real rosette scores <b>0.2&ndash;0.6</b>, not 1.0.",
+            ),
+            slider_field(
+                "minimum_circularity",
+                "Minimum circularity",
+                values.minimum_circularity,
+                tip=(
+                    "How round the outline is: a perfect circle is 1.0, a long thin "
+                    "grass blade is near 0.02, and anything with a frilly edge scores "
+                    "low because its perimeter is long. Keep this very low — most weeds "
+                    "are not round. It is only useful for excluding long, smooth objects "
+                    "such as irrigation tubing, and even then the aspect-ratio limit "
+                    "below does that job better."
+                ),
+                minimum=0,
+                maximum=1,
+                step=0.005,
+                note="Keep below <b>0.05</b>; frilly weed leaves score very low here.",
+            ),
+            slider_field(
+                "maximum_aspect_ratio",
+                "Maximum aspect ratio",
+                values.maximum_aspect_ratio,
+                tip=(
+                    "How many times longer than wide a candidate may be. Its purpose is "
+                    "to reject drip line, wiring and bed edges. LOW (3) rejects long "
+                    "thin things aggressively and will also reject grass and other "
+                    "narrow-leaved weeds. HIGH (12) accepts almost any shape. Since "
+                    "grasses are among the weeds most worth catching, prefer a high "
+                    "value and let the verifier learn what tubing looks like."
+                ),
+                minimum=1,
+                maximum=50,
+                step=0.5,
+                unit=": 1",
+                note="Grass weeds are legitimately long and thin — 10 or more is sensible.",
+                extra=shape_figures,
+            ),
+        )
+    )
+
+    crop_canopy_example = max(
+        60 * values.crop_support_radius_multiplier, 60 + values.crop_support_extra_mm
+    )
+    crop_zone_example = crop_canopy_example + values.plant_exclusion_margin_mm
+    crop_fields = "".join(
+        (
+            toggle_field(
+                "crop_protection_enabled",
+                "Protect all known and previously observed crops",
+                values.crop_protection_enabled,
+                tip=(
+                    "Keeps a no-weeding zone around every plant FarmBot knows about, and "
+                    "around anything that was measured as crop foliage in earlier "
+                    "photos, so your crops are never proposed for removal. Turning this "
+                    "off finds more weeds close to crops but risks the bot removing a "
+                    "crop. Leave it on."
+                ),
+            ),
+            slider_field(
+                "crop_support_radius_multiplier",
+                "Canopy radius multiplier",
+                values.crop_support_radius_multiplier,
+                tip=(
+                    "Assume each crop's leaves reach this many times its recorded "
+                    "radius. It exists because a plant usually keeps growing between "
+                    "photos. 1.0 trusts the recorded radius exactly; 2.0 assumes the "
+                    "plant is twice as wide as recorded, which blanks a large area "
+                    "around it where weeds then cannot be seen."
+                ),
+                minimum=0.5,
+                maximum=5,
+                step=0.05,
+                unit="×",
+            ),
+            slider_field(
+                "crop_support_extra_mm",
+                "Minimum extra canopy support",
+                values.crop_support_extra_mm,
+                tip=(
+                    "A flat allowance added to each crop's radius, used instead of the "
+                    "multiplier whenever it is the larger of the two. It matters most "
+                    "for seedlings, where a multiplier of a tiny radius is still tiny."
+                ),
+                minimum=0,
+                maximum=500,
+                step=1,
+                unit="mm",
+            ),
+            slider_field(
+                "plant_exclusion_margin_mm",
+                "Extra exclusion around plants",
+                values.plant_exclusion_margin_mm,
+                tip=(
+                    "A final safety ring outside the assumed canopy in which nothing is "
+                    "ever treated as a weed. This is the setting most likely to hide "
+                    "real weeds, because it compounds with the two above: the blanked "
+                    "radius is (radius × multiplier, or radius + extra, whichever is "
+                    "larger) + this margin. HIGH values create a large blind ring where "
+                    "interrow weeds grow. While a trained verifier is scoring, the app "
+                    f"caps the padding beyond the canopy at "
+                    f"{CANDIDATE_EXCLUSION_REACH_CEILING_MM:g} mm, because the verifier "
+                    "is given each candidate's distance to the nearest crop and judges "
+                    "it better than a fixed circle can."
+                ),
+                minimum=0,
+                maximum=500,
+                step=1,
+                unit="mm",
+                note=(
+                    f"With these values, a 60&nbsp;mm crop blanks a "
+                    f"<b>{crop_zone_example:.0f}&nbsp;mm</b> radius "
+                    f"(canopy {crop_canopy_example:.0f}&nbsp;mm + margin "
+                    f"{values.plant_exclusion_margin_mm:.0f}&nbsp;mm). Weeds inside that "
+                    f"circle are never reported. Foliage physically joined to a crop is "
+                    f"protected for a further {CROP_SUPPORT_REACH_MM:g}&nbsp;mm "
+                    f"regardless."
+                ),
+            ),
+        )
+    )
+
+    temporal_fields = "".join(
+        (
+            toggle_field(
+                "temporal_confirmation_enabled",
+                "Enable temporal confirmation",
+                values.temporal_confirmation_enabled,
+                tip=(
+                    "Require the same weed to be seen in more than one photo before "
+                    "acting on it. This filters out one-off artefacts such as a shadow "
+                    "or a blown leaf, at the cost of a delay before a real weed is "
+                    "acted on."
+                ),
+            ),
+            slider_field(
+                "recommendation_min_observations",
+                "Looks before recommendation",
+                values.recommendation_min_observations,
+                tip=(
+                    "How many separate photos must show a weed at the same spot before "
+                    "it is offered to you for review. 1 shows it immediately."
+                ),
+                minimum=1,
+                maximum=20,
+                step=1,
+            ),
+            slider_field(
+                "automatic_min_observations",
+                "Looks before automatic creation",
+                values.automatic_min_observations,
+                tip=(
+                    "How many sightings are needed before a weed may be created in "
+                    "FarmBot automatically. Must be at least the review count above. "
+                    "Three is a reasonable balance."
+                ),
+                minimum=1,
+                maximum=20,
+                step=1,
+            ),
+            slider_field(
+                "temporal_match_distance_mm",
+                "Position matching distance",
+                values.temporal_match_distance_mm,
+                tip=(
+                    "How far apart two sightings may be and still count as the same "
+                    "weed. TOO SMALL and a weed drifting between photos is counted as a "
+                    "new one every time, so it never accumulates sightings. TOO LARGE "
+                    "and two neighbouring weeds are merged into one. Set it a little "
+                    "above your calibration accuracy."
+                ),
+                minimum=1,
+                maximum=250,
+                step=1,
+                unit="mm",
+            ),
+            slider_field(
+                "temporal_max_gap_hours",
+                "Maximum gap between looks",
+                values.temporal_max_gap_hours,
+                tip=(
+                    "After this long without being seen again, a weed's sighting count "
+                    "restarts. It stops a weed pulled weeks ago from still counting "
+                    "towards confirmation. 168 hours is one week."
+                ),
+                minimum=1,
+                maximum=8_760,
+                step=1,
+                unit="hours",
+            ),
+        )
+    )
+
+    verifier_fields = "".join(
+        (
+            toggle_field(
+                "visual_verifier_enabled",
+                "Enable learned verifier",
+                values.visual_verifier_enabled,
+                tip=(
+                    "Use the model trained from your own labels to score candidates. "
+                    "It is far better than the built-in rules at telling a weed from "
+                    "moss, a fallen leaf or crop foliage, because it learned from your "
+                    "bed, your camera and your light."
+                ),
+            ),
+            toggle_field(
+                "visual_verifier_shadow_mode",
+                "Shadow mode (score but do not reject)",
+                values.visual_verifier_shadow_mode,
+                tip=(
+                    "While on, the verifier's score is recorded next to each detection "
+                    "but the simple rules still decide. Use it to check the model agrees "
+                    "with you before letting it act. Turn it off to let the verifier's "
+                    "own confidence threshold make the decision."
+                ),
+            ),
+            toggle_field(
+                "visual_verifier_required_for_automatic",
+                "Require verifier approval for automatic creation",
+                values.visual_verifier_required_for_automatic,
+                tip=(
+                    "Blocks automatic creation of any weed the trained verifier has not "
+                    "approved. Keep this on: the simple rules measure how plant-like "
+                    "something is, not whether it is a weed, so they should never "
+                    "authorise a change to your garden on their own."
+                ),
+            ),
+            slider_field(
+                "visual_verifier_minimum_confidence",
+                "Verifier confidence threshold",
+                values.visual_verifier_minimum_confidence,
+                tip=(
+                    "The score the verifier must give a candidate for it to be treated "
+                    "as a weed, once shadow mode is off. This is the setting that "
+                    "actually decides what counts as a weed. LOW (0.5) catches nearly "
+                    "everything with more false alarms; HIGH (0.95) only the clearest "
+                    "cases. The training panel below suggests a threshold measured from "
+                    "your own labels — prefer that number to guessing."
+                ),
+                minimum=0,
+                maximum=1,
+                step=0.01,
+            ),
+            slider_field(
+                "candidate_recall_boost",
+                "Candidate recall boost while the verifier scores",
+                values.candidate_recall_boost,
+                tip=(
+                    "Relaxes the colour and shape rules by this factor whenever a "
+                    "trained verifier is scoring, so borderline weeds reach the verifier "
+                    "instead of being dropped by rules that cannot tell a weed from "
+                    "moss. 0.5 halves every threshold; 1 leaves them unchanged. Lower is "
+                    "better here — a candidate the rules reject is never scored, stored "
+                    "or shown, so you can never find out they were wrong."
+                ),
+                minimum=0.1,
+                maximum=1,
+                step=0.05,
+                note=(
+                    "Candidate generation is a recall stage. Regardless of this value "
+                    "the app also enforces absolute floors, so no size or shape setting "
+                    "can stop a candidate from being scored."
+                ),
+            ),
+            slider_field(
+                "training_minimum_per_class",
+                "Minimum weed and non-weed labels for training",
+                values.training_minimum_per_class,
+                tip=(
+                    "How many examples of each class must exist before training will "
+                    "run. Too few and the model memorises them instead of generalising. "
+                    "Ten of each is a workable minimum; several dozen is much better."
+                ),
+                minimum=2,
+                maximum=10_000,
+                slider_maximum=200,
+                step=1,
+            ),
+            toggle_field(
+                "automatic_retraining",
+                "Retrain automatically once enough labels exist",
+                values.automatic_retraining,
+                tip=(
+                    "Retrain the verifier in the background as you add labels, so it "
+                    "improves without you remembering to press the button."
+                ),
+            ),
+            slider_field(
+                "retrain_after_label_count",
+                "Retrain after this many new labels",
+                values.retrain_after_label_count,
+                tip=(
+                    "How many new labels to collect before automatic retraining runs. "
+                    "1 retrains after every label, which is fine — training takes well "
+                    "under a second."
+                ),
+                minimum=1,
+                maximum=500,
+                step=1,
+                note=(
+                    f"<b>{database.weed_labels_since_last_model_run()}</b> new label(s) "
+                    f"since the last trained run."
+                ),
+            ),
+            toggle_field(
+                "candidate_crop_storage_enabled",
+                "Store candidate crops for review/training",
+                values.candidate_crop_storage_enabled,
+                tip=(
+                    "Save a small cut-out image of every candidate. These are what you "
+                    "look at when labelling, so training is impractical without them. "
+                    "They are tiny (a few kB each) — leave this on."
+                ),
+            ),
+        )
+    )
+
+    maintenance_fields = "".join(
+        (
+            toggle_field(
+                "automatic_radius_adjustment",
+                "Automatically increase the radius of a matching known weed",
+                values.automatic_radius_adjustment,
+                tip=(
+                    "When a weed already in FarmBot is seen to have grown, widen its "
+                    "recorded radius without asking. Only ever increases it."
+                ),
+            ),
+            slider_field(
+                "radius_adjustment_confidence",
+                "Radius adjustment confidence",
+                values.radius_adjustment_confidence,
+                tip=(
+                    "Confidence needed to widen an existing weed automatically. This "
+                    "can be lower than the creation threshold because growing a weed "
+                    "you already agreed about is a small, reversible change."
+                ),
+                minimum=0,
+                maximum=1,
+                step=0.01,
+            ),
+            toggle_field(
+                "automatic_removal",
+                "Automatically remove known weeds that disappear",
+                values.automatic_removal,
+                tip=(
+                    "Delete a weed from FarmBot once photos show it is no longer there, "
+                    "for example after you pulled it. Keeps the map honest."
+                ),
+            ),
+            slider_field(
+                "removal_confidence",
+                "Removal confidence",
+                values.removal_confidence,
+                tip=(
+                    "How sure the app must be that a weed is genuinely gone, rather than "
+                    "hidden by a shadow or out of frame, before deleting it."
+                ),
+                minimum=0,
+                maximum=1,
+                step=0.01,
+            ),
+            slider_field(
+                "removal_min_consecutive_absent",
+                "Absent images before removal",
+                values.removal_min_consecutive_absent,
+                tip=(
+                    "How many photos in a row must show the spot empty before the weed "
+                    "is deleted. Raise it if weeds are being deleted and then found "
+                    "again."
+                ),
+                minimum=1,
+                maximum=10,
+                step=1,
+            ),
+        )
+    )
+
+    settings_script = """<script>
+(function(){
+  // Keep each slider and its number box showing the same value.
+  document.querySelectorAll('[data-sync]').forEach(function(input){
+    input.addEventListener('input', function(){
+      document.querySelectorAll('[data-sync="' + input.dataset.sync + '"]').forEach(
+        function(peer){ if (peer !== input) peer.value = input.value; }
+      );
+      refresh();
+    });
+  });
+  function field(name){ return document.querySelector('input[type=number][data-sync="' + name + '"]'); }
+  function diameter(area){ return 2 * Math.sqrt(Math.max(0, area) / Math.PI); }
+  function refresh(){
+    var minArea = parseFloat(field('minimum_area_mm2').value) || 0;
+    var maxArea = parseFloat(field('maximum_area_mm2').value) || 0;
+    var dmin = diameter(minArea), dmax = diameter(maxArea);
+    document.getElementById('size-min-mm').textContent = dmin.toFixed(0);
+    document.getElementById('size-max-mm').textContent = dmax.toFixed(0);
+    var blobMin = document.getElementById('size-blob-min');
+    var blobMax = document.getElementById('size-blob-max');
+    var pxMin = Math.min(120, Math.max(3, dmin * 1.6));
+    var pxMax = Math.min(150, Math.max(4, dmax * 1.6));
+    blobMin.style.width = blobMin.style.height = pxMin.toFixed(0) + 'px';
+    blobMax.style.width = blobMax.style.height = pxMax.toFixed(0) + 'px';
+    // OpenCV hue runs 0-179 over the full colour wheel, so double it for CSS.
+    var lo = (parseInt(field('green_hue_min').value, 10) || 0) * 2;
+    var hi = (parseInt(field('green_hue_max').value, 10) || 0) * 2;
+    var mid = Math.round((lo + hi) / 2);
+    document.getElementById('hue-swatch-min').style.background = 'hsl(' + lo + ',70%,38%)';
+    document.getElementById('hue-swatch-mid').style.background = 'hsl(' + mid + ',70%,38%)';
+    document.getElementById('hue-swatch-max').style.background = 'hsl(' + hi + ',70%,38%)';
+    document.getElementById('hue-range-text').textContent = lo + '\\u00b0\\u2013' + hi + '\\u00b0';
+    // Mark the accepted slice of the hue wheel on the band itself.
+    var band = document.getElementById('hue-selected');
+    band.style.left = (lo / 358 * 100).toFixed(1) + '%';
+    band.style.width = (Math.max(2, hi - lo) / 358 * 100).toFixed(1) + '%';
+  }
+  function setPair(name, value){
+    document.querySelectorAll('[data-sync="' + name + '"]').forEach(function(input){
+      input.value = value;
+    });
+  }
+  var apply = document.getElementById('hue-apply');
+  if (apply) apply.addEventListener('click', function(){
+    var hex = document.getElementById('hue-picker').value;
+    var r = parseInt(hex.substr(1, 2), 16) / 255;
+    var g = parseInt(hex.substr(3, 2), 16) / 255;
+    var b = parseInt(hex.substr(5, 2), 16) / 255;
+    var max = Math.max(r, g, b), min = Math.min(r, g, b), d = max - min;
+    var h = 0;
+    if (d > 0) {
+      if (max === r) h = ((g - b) / d) % 6;
+      else if (max === g) h = (b - r) / d + 2;
+      else h = (r - g) / d + 4;
+      h = (h * 60 + 360) % 360;
+    }
+    // A generous tolerance: real foliage in one bed still spans a wide hue band
+    // once shadow and glare are included, and a narrow band loses weeds.
+    var centre = Math.round(h / 2);
+    setPair('green_hue_min', Math.max(0, centre - 22));
+    setPair('green_hue_max', Math.min(179, centre + 22));
+    var saturation = max === 0 ? 0 : d / max;
+    setPair('strong_green_minimum_saturation',
+            Math.max(10, Math.round(saturation * 255 * 0.55)));
+    refresh();
+  });
+  refresh();
+})();
+</script>"""
+
     body = f"""<section class=card><h2>Weed detection and automation</h2>
-<p>Every stage is configurable. Start in review/shadow mode, label real examples, train the
-local verifier, then enable enforcement or automatic FarmBot creation when its validation
-results and field behaviour are satisfactory.</p>
+<p>Every stage is configurable, and every setting has a <span class=hint tabindex=0
+title="Hover or focus a question mark like this one to read what the setting does, what high
+and low values mean, and how to calibrate it.">?</span> explaining what it does. Start in
+review/shadow mode, label real examples, train the local verifier, then enable enforcement or
+automatic FarmBot creation when its validation results and field behaviour are satisfactory.</p>
+<p class=setting-note>Finding candidates and deciding which are weeds are separate stages. The
+size, colour and shape rules only decide <em>what gets looked at</em>, and are deliberately
+generous — a candidate rejected there is never scored, stored or shown, so a mistake made there
+is invisible. The confidence thresholds decide <em>what counts as a weed</em>. Tune those first.</p>
 <form method=post action="weed-settings">
-<fieldset><legend>Operation</legend>
-<label><input type=checkbox name=enabled value=true{checked(values.enabled)}> Enable weed detection</label><br>
-<label><input type=checkbox name=automatic_creation value=true{checked(values.automatic_creation)}>
-Automatically create detected weeds in FarmBot</label><br>
-<label>Review/recommendation confidence <input type=number name=minimum_confidence min=0 max=1 step=.01 value="{values.minimum_confidence:g}"></label><br>
-<label>Automatic creation confidence <input type=number name=automatic_creation_confidence min=0 max=1 step=.01 value="{values.automatic_creation_confidence:g}"></label><br>
-<label>Created weed radius (mm) <input type=number name=weed_radius_mm min=1 step=1 value="{values.weed_radius_mm:g}"></label>
-</fieldset>
-<fieldset><legend>Candidate size, colour and shape</legend>
-<label>Minimum weed area (mm²) <input type=number name=minimum_area_mm2 min=5 step=1 value="{values.minimum_area_mm2:g}"></label><br>
-<label>Maximum weed area (mm²) <input type=number name=maximum_area_mm2 min=10 step=1 value="{values.maximum_area_mm2:g}"></label><br>
-<label><input type=checkbox name=shape_filter_enabled value=true{checked(values.shape_filter_enabled)}> Enable colour/shape filter</label><br>
-<label>Strong-green hue range <input type=number name=green_hue_min min=0 max=179 step=1 value="{values.green_hue_min}"> to
-<input type=number name=green_hue_max min=0 max=179 step=1 value="{values.green_hue_max}"></label><br>
-<label>Strong-green minimum saturation <input type=number name=strong_green_minimum_saturation min=0 max=255 step=1 value="{values.strong_green_minimum_saturation}"></label><br>
-<label>Strong-green minimum Excess Green <input type=number name=strong_green_minimum_excess_green min=-255 max=510 step=1 value="{values.strong_green_minimum_excess_green}"></label><br>
-<label>Minimum strong-green fraction <input type=number name=minimum_green_purity min=0 max=1 step=.01 value="{values.minimum_green_purity:g}"></label><br>
-<label>Minimum solidity <input type=number name=minimum_solidity min=0 max=1 step=.01 value="{values.minimum_solidity:g}"></label><br>
-<label>Minimum circularity <input type=number name=minimum_circularity min=0 max=1 step=.01 value="{values.minimum_circularity:g}"></label><br>
-<label>Maximum aspect ratio <input type=number name=maximum_aspect_ratio min=1 max=50 step=.1 value="{values.maximum_aspect_ratio:g}"></label>
-</fieldset>
-<fieldset><legend>Known crop protection</legend>
-<label><input type=checkbox name=crop_protection_enabled value=true{checked(values.crop_protection_enabled)}> Protect all known and previously observed crops</label><br>
-<label>Canopy radius multiplier <input type=number name=crop_support_radius_multiplier min=.5 max=5 step=.05 value="{values.crop_support_radius_multiplier:g}"></label><br>
-<label>Minimum extra canopy support (mm) <input type=number name=crop_support_extra_mm min=0 max=500 step=1 value="{values.crop_support_extra_mm:g}"></label><br>
-<label>Extra exclusion around plants (mm) <input type=number name=plant_exclusion_margin_mm min=0 step=1 value="{values.plant_exclusion_margin_mm:g}"></label>
-</fieldset>
-<fieldset><legend>Multi-image confirmation</legend>
-<label><input type=checkbox name=temporal_confirmation_enabled value=true{checked(values.temporal_confirmation_enabled)}> Enable temporal confirmation</label><br>
-<label>Looks before recommendation <input type=number name=recommendation_min_observations min=1 max=20 step=1 value="{values.recommendation_min_observations}"></label><br>
-<label>Looks before automatic creation <input type=number name=automatic_min_observations min=1 max=20 step=1 value="{values.automatic_min_observations}"></label><br>
-<label>Position matching distance (mm) <input type=number name=temporal_match_distance_mm min=1 max=250 step=1 value="{values.temporal_match_distance_mm:g}"></label><br>
-<label>Maximum gap between looks (hours) <input type=number name=temporal_max_gap_hours min=1 max=8760 step=1 value="{values.temporal_max_gap_hours}"></label>
-</fieldset>
-<fieldset><legend>Learned visual verifier</legend>
-<label><input type=checkbox name=visual_verifier_enabled value=true{checked(values.visual_verifier_enabled)}> Enable learned verifier</label><br>
-<label><input type=checkbox name=visual_verifier_shadow_mode value=true{checked(values.visual_verifier_shadow_mode)}> Shadow mode (score but do not reject)</label><br>
-<label><input type=checkbox name=visual_verifier_required_for_automatic value=true{checked(values.visual_verifier_required_for_automatic)}> Require verifier approval for automatic creation</label><br>
-<label>Verifier confidence threshold <input type=number name=visual_verifier_minimum_confidence min=0 max=1 step=.01 value="{values.visual_verifier_minimum_confidence:g}"></label><br>
-<label>Candidate recall boost while the verifier scores <input type=number name=candidate_recall_boost min=.1 max=1 step=.05 value="{values.candidate_recall_boost:g}"></label><br>
-<span class=muted>Relaxes the colour/shape gates above by this factor once a trained verifier is
-enforcing, so borderline weeds reach the verifier instead of being dropped by rules that cannot
-tell a weed from moss. 1 keeps the gates unchanged.</span><br>
-<label>Minimum weed and non-weed labels for training <input type=number name=training_minimum_per_class min=2 step=1 value="{values.training_minimum_per_class}"></label><br>
-<label><input type=checkbox name=automatic_retraining value=true{checked(values.automatic_retraining)}> Retrain automatically once enough labels exist</label><br>
-<label>Retrain after every <input type=number name=retrain_after_label_count min=1 max=500 step=1 value="{values.retrain_after_label_count}"> new label(s)</label><br>
-<span class=muted>{database.weed_labels_since_last_model_run()} new label(s) since the last trained run.</span><br>
-<label><input type=checkbox name=candidate_crop_storage_enabled value=true{checked(values.candidate_crop_storage_enabled)}> Store candidate crops for review/training</label>
-</fieldset>
-<fieldset><legend>Existing weed maintenance</legend>
-<label><input type=checkbox name=automatic_radius_adjustment value=true{checked(values.automatic_radius_adjustment)}>
-Automatically increase the radius of a matching known weed</label><br>
-<label>Radius adjustment confidence <input type=number name=radius_adjustment_confidence min=0 max=1 step=.01 value="{values.radius_adjustment_confidence:g}"></label><br>
-<label><input type=checkbox name=automatic_removal value=true{checked(values.automatic_removal)}>
-Automatically remove known weeds that disappear</label><br>
-<label>Removal confidence <input type=number name=removal_confidence min=0 max=1 step=.01 value="{values.removal_confidence:g}"></label><br>
-<label>Absent images before removal <input type=number name=removal_min_consecutive_absent min=1 max=10 step=1 value="{values.removal_min_consecutive_absent}"></label>
-</fieldset>
-<button>Save all weed settings</button></form></section>
+<fieldset><legend>Operation</legend>{operation_fields}</fieldset>
+<fieldset><legend>How big a weed to look for</legend>{size_fields}</fieldset>
+<fieldset><legend>What counts as green foliage</legend>{colour_fields}</fieldset>
+<fieldset><legend>What shape a weed may be</legend>{shape_fields}</fieldset>
+<fieldset><legend>Known crop protection</legend>{crop_fields}</fieldset>
+<fieldset><legend>Multi-image confirmation</legend>{temporal_fields}</fieldset>
+<fieldset><legend>Learned visual verifier</legend>{verifier_fields}</fieldset>
+<fieldset><legend>Existing weed maintenance</legend>{maintenance_fields}</fieldset>
+<button>Save all weed settings</button></form>{settings_script}</section>
 <section class=card><h2>Verifier training</h2>{training_notice_html}<p>{model_status}</p>
 {threshold_html}
 <p>Labels: {labels["weed"]} weeds · {labels["crop"]} crops ·
@@ -4509,7 +5556,7 @@ async def save_weed_settings(
     automatic_removal: bool = Form(False),
     removal_confidence: float = Form(0.6),
     removal_min_consecutive_absent: int = Form(1),
-    minimum_area_mm2: float = Form(75),
+    minimum_area_mm2: float = Form(20),
     maximum_area_mm2: float = Form(2500),
     plant_exclusion_margin_mm: float = Form(35),
     crop_protection_enabled: bool = Form(False),
@@ -4520,11 +5567,11 @@ async def save_weed_settings(
     green_hue_max: int = Form(100),
     strong_green_minimum_saturation: int = Form(45),
     strong_green_minimum_excess_green: int = Form(20),
-    minimum_green_purity: float = Form(0.45),
-    minimum_solidity: float = Form(0.25),
-    minimum_circularity: float = Form(0.03),
-    maximum_aspect_ratio: float = Form(7),
-    minimum_confidence: float = Form(0.70),
+    minimum_green_purity: float = Form(0.10),
+    minimum_solidity: float = Form(0.08),
+    minimum_circularity: float = Form(0.01),
+    maximum_aspect_ratio: float = Form(12),
+    minimum_confidence: float = Form(0.45),
     automatic_creation_confidence: float = Form(0.90),
     temporal_confirmation_enabled: bool = Form(False),
     recommendation_min_observations: int = Form(1),
@@ -4840,6 +5887,20 @@ async def _approve_weed_detection(
     if result.get("status") == "applied":
         database.update_weed_detection(str(detection_id), "created")
         await _record_weed_label(detection_id, "weed")
+        database.record_change(
+            entity_type="weed",
+            entity_id=result.get("weed_id") or detection_id,
+            crop_type="weed",
+            x=detection["x"],
+            y=detection["y"],
+            z=detection["z"],
+            change_type="weed added",
+            original_radius_mm=0,
+            current_radius_mm=detection["radius_mm"],
+            decision_method="user",
+            confidence=detection["confidence"],
+            details=result,
+        )
     return result, 200
 
 
@@ -5298,7 +6359,8 @@ centre at the photo's recorded gantry coordinate plus these offsets.</p>
 <div id=calibration-grid-viewport class=calibration-grid-viewport>
 <canvas id=canvas width=900 height=420 aria-label="Calibration birds-eye photo grid"
  style="display:block;width:100%;background:#111"></canvas></div>
-<p class=muted>Green = known plants (name · crop). Red = FarmBot weeds. Adjust the
+<p class=muted>Green = known plants (name · crop). Red circles = FarmBot weeds with their
+stored radius. Dark labels use large white text for contrast. Adjust the
 values above and the complete grid updates live. Within the selected range, only the
 newest photo at each FarmBot coordinate is shown. Photos are cropped at shared
 camera-centre midpoints into gap-free rectangular cells, with the outside cells clipped
@@ -5636,6 +6698,20 @@ async def recommendation(request: Request, measurement_id: str, action: str) -> 
         status = str(result.get("status", "error"))
         if status == "applied":
             database.record_decision(measurement_id, "center_moved", result)
+            database.record_change(
+                entity_type="plant",
+                entity_id=row["plant_id"],
+                crop_type=row["crop_slug"],
+                x=float(result.get("x", row["recommended_center_x"])),
+                y=float(result.get("y", row["recommended_center_y"])),
+                z=None,
+                change_type="location changed",
+                original_radius_mm=row["current_radius_mm"],
+                current_radius_mm=row["current_radius_mm"],
+                decision_method="user",
+                confidence=row["confidence"],
+                details=result,
+            )
             return _action_response(
                 request,
                 "updated",
@@ -5713,6 +6789,28 @@ async def recommendation(request: Request, measurement_id: str, action: str) -> 
             )
         database.update_measurement_outcome(measurement_id, decision="applied", applied=True)
         database.record_group_decision(measurement_id, "applied", result)
+        new_radius = float(
+            result.get(
+                "new_radius_mm",
+                result.get("radius_mm", row["recommended_protection_radius_mm"]),
+            )
+        )
+        database.record_change(
+            entity_type="plant",
+            entity_id=row["plant_id"],
+            crop_type=row["crop_slug"],
+            x=row.get("recorded_center_x"),
+            y=row.get("recorded_center_y"),
+            z=None,
+            change_type=(
+                "radius increased" if new_radius > row["current_radius_mm"] else "radius decreased"
+            ),
+            original_radius_mm=row["current_radius_mm"],
+            current_radius_mm=new_radius,
+            decision_method="user",
+            confidence=row["confidence"],
+            details=result,
+        )
         approved_measurement = _measurement_from_row(row)
         if approved_measurement.plant_age_days is None:
             curve_message = "skipped because plant age is unavailable"
@@ -5797,6 +6895,20 @@ async def removal(request: Request, measurement_id: str, action: str) -> Respons
         status = str(result.get("status", "error"))
         if status == "applied":
             database.record_group_decision(measurement_id, "keep", result)
+            database.record_change(
+                entity_type="plant",
+                entity_id=row["plant_id"],
+                crop_type=row["crop_slug"],
+                x=float(result.get("x", row["recommended_center_x"])),
+                y=float(result.get("y", row["recommended_center_y"])),
+                z=None,
+                change_type="location changed",
+                original_radius_mm=row["current_radius_mm"],
+                current_radius_mm=row["current_radius_mm"],
+                decision_method="user",
+                confidence=row["confidence"],
+                details=result,
+            )
         return _action_response(
             request,
             status,
@@ -5838,6 +6950,20 @@ async def removal(request: Request, measurement_id: str, action: str) -> Respons
         return _action_response(request, status, message, error_status=409)
     database.update_measurement_outcome(measurement_id, decision="removed", applied=True)
     database.record_group_decision(measurement_id, "removed", result)
+    database.record_change(
+        entity_type="plant",
+        entity_id=row["plant_id"],
+        crop_type=row["crop_slug"],
+        x=row.get("recorded_center_x"),
+        y=row.get("recorded_center_y"),
+        z=None,
+        change_type="plant removed",
+        original_radius_mm=float(result.get("old_radius_mm") or plant.radius),
+        current_radius_mm=0,
+        decision_method="user",
+        confidence=row["confidence"],
+        details=result,
+    )
     return _action_response(request, "applied", message)
 
 

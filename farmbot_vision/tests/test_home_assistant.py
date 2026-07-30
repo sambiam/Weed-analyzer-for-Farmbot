@@ -10,6 +10,7 @@ from pydantic import ValidationError
 from farmbot_vision.home_assistant import (
     HomeAssistantClient,
     HomeAssistantError,
+    HomeAssistantUnavailableError,
     StaleRadiusError,
 )
 from farmbot_vision.models import (
@@ -116,6 +117,32 @@ async def test_grid_repair_400_surfaces_the_integration_response():
         match=r"extra keys not allowed",
     ):
         await client.start_grid_repair("entry", [{"x": 100.0, "y": 200.0, "z": 0.0}])
+    await client.close()
+
+
+@pytest.mark.asyncio
+async def test_home_assistant_setup_response_is_retried_as_temporary_unavailability(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    calls = 0
+    sleeps = []
+
+    async def handler(_request):
+        nonlocal calls
+        calls += 1
+        return httpx.Response(400, text='{"message":"System is not ready with state: setup"}')
+
+    async def fake_sleep(delay):
+        sleeps.append(delay)
+
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+    client = HomeAssistantClient(token="test", base_url="http://test")
+    await client._http.aclose()
+    client._http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    with pytest.raises(HomeAssistantUnavailableError):
+        await client.start_grid_repair("entry", [{"x": 100.0, "y": 200.0, "z": 0.0}])
+    assert calls == 3
+    assert sleeps == [1, 2]
     await client.close()
 
 

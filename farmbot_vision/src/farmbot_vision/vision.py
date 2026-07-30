@@ -41,6 +41,51 @@ MORPH_CLOSE_MM = 5.0
 # though they belong to one plant. Group nearby vegetation over this physical
 # gap while retaining only the original vegetation pixels for area/features.
 WEED_GROUP_MAX_GAP_MM = 12.0
+# Pale leaves are often separated from the darker canopy by glare or a
+# colour-temperature shift. Only recover such pixels when they are close to
+# an already detected vegetation island; this prevents pale mulch from becoming
+# global vegetation evidence.
+PALE_LEAF_MIN_SATURATION = 5
+PALE_LEAF_MIN_VALUE = 35
+PALE_LEAF_MIN_EXCESS_GREEN = 2
+PALE_LEAF_SUPPORT_GAP_MM = 10.0
+# A vegetation island that touches a crop's exclusion zone is protected only
+# this far beyond it. The grouping pass joins islands up to
+# WEED_GROUP_MAX_GAP_MM apart, and without a reach limit those joins chain
+# transitively: one weed near a crop protected an entire connected network of
+# weeds right across the frame, which measured at ~70% of all vegetation in a
+# weedy bed. The reach is comfortably wider than one grouping hop, so a crop
+# leaf straddling the exclusion boundary is still protected whole.
+CROP_SUPPORT_REACH_MM = 30.0
+
+# Candidate generation is a recall stage: its job is to hand the verifier every
+# blob that could be a weed, never to decide. A missed weed is invisible --
+# it is never scored, stored, reviewed or labelled, so the mistake cannot be
+# noticed or corrected -- while a false candidate costs one verifier call and
+# one rejection. These ceilings therefore clamp the saved configuration so no
+# size/shape value, including one inherited from an earlier build whose defaults
+# could not be met by real foliage, can veto a candidate before it is scored.
+# The confidence thresholds remain the real accept/reject stage.
+#
+# The area floor matches MIN_COMPONENT_AREA_MM2: nothing smaller survives the
+# vegetation mask anyway, so a higher candidate floor only discards real weeds.
+CANDIDATE_MIN_AREA_CEILING_MM2 = MIN_COMPONENT_AREA_MM2
+CANDIDATE_GREEN_PURITY_CEILING = 0.05
+CANDIDATE_SOLIDITY_CEILING = 0.05
+CANDIDATE_CIRCULARITY_CEILING = 0.005
+# ``aspect_ratio`` saturates at 12:1, so this floor disables the gate outright.
+CANDIDATE_ASPECT_RATIO_FLOOR = 12.0
+# How far past a crop's own canopy the no-candidate zone may reach while the
+# verifier is scoring. The verifier receives ``distance_to_plant`` as a feature,
+# so it can judge "too close to the crop to be a weed" far better than a fixed
+# circle can -- and unlike the circle it cannot hide a weed it got wrong. The
+# compounded default (1.2x radius + 25 mm + 35 mm) blanked 120 mm around a
+# 60 mm plant, which is where interrow weeds actually grow.
+CANDIDATE_EXCLUSION_REACH_CEILING_MM = 12.0
+CANDIDATE_CANOPY_MULTIPLIER_CEILING = 1.05
+# Reference size for the heuristic's area term. Scaling it by the configured
+# minimum area instead made every score move when the size filter was retuned.
+CANDIDATE_REFERENCE_AREA_MM2 = 150.0
 
 
 class InvalidImageError(ValueError):
@@ -85,6 +130,84 @@ class ScaleParams:
 
 def _odd(value: int) -> int:
     return value if value % 2 == 1 else value + 1
+
+
+@dataclass(frozen=True)
+class CandidateGates:
+    """The size/shape/colour thresholds actually used to admit a candidate.
+
+    These are deliberately *not* the user's settings applied verbatim. Rejecting
+    a blob here means the verifier never scores it, it is never stored, and it
+    can never be reviewed or labelled -- so a gate set too tightly is invisible
+    and self-reinforcing. Every gate is therefore clamped to an absolute recall
+    ceiling, leaving the confidence thresholds as the real accept/reject stage.
+    """
+
+    min_area_mm2: float
+    max_area_mm2: float
+    green_purity: float
+    solidity: float
+    circularity: float
+    aspect_ratio: float
+    shape_filter_enabled: bool
+    canopy_multiplier: float
+    canopy_extra_mm: float
+    exclusion_margin_mm: float
+
+    @classmethod
+    def build(cls, settings: WeedSettings, verifier_scoring: bool) -> CandidateGates:
+        # A trained verifier turns the shape rules into pure recall aids, so the
+        # recall boost applies whenever it is scoring -- shadow mode included,
+        # where the entire point is to collect candidates worth labelling.
+        boost = settings.candidate_recall_boost if verifier_scoring else 1.0
+        return cls(
+            min_area_mm2=min(settings.minimum_area_mm2, CANDIDATE_MIN_AREA_CEILING_MM2),
+            # No ceiling on the maximum: "this blob is too big to be a weed" is a
+            # judgement about the bed that no verifier can make from a crop.
+            max_area_mm2=settings.maximum_area_mm2,
+            green_purity=min(settings.minimum_green_purity * boost, CANDIDATE_GREEN_PURITY_CEILING),
+            solidity=min(settings.minimum_solidity * boost, CANDIDATE_SOLIDITY_CEILING),
+            circularity=min(settings.minimum_circularity * boost, CANDIDATE_CIRCULARITY_CEILING),
+            aspect_ratio=max(settings.maximum_aspect_ratio / boost, CANDIDATE_ASPECT_RATIO_FLOOR),
+            shape_filter_enabled=settings.shape_filter_enabled,
+            # The crop's own footprint is never clamped -- a 60 mm plant really
+            # does occupy 60 mm. Only the padding *beyond* it is, and only while
+            # the verifier can weigh distance-to-crop for itself. Grown-out
+            # foliage is still protected by ownership and by the contiguous
+            # crop-support pass, neither of which depends on this padding.
+            canopy_multiplier=(
+                min(settings.crop_support_radius_multiplier, CANDIDATE_CANOPY_MULTIPLIER_CEILING)
+                if verifier_scoring
+                else settings.crop_support_radius_multiplier
+            ),
+            canopy_extra_mm=(
+                min(settings.crop_support_extra_mm, CANDIDATE_EXCLUSION_REACH_CEILING_MM)
+                if verifier_scoring
+                else settings.crop_support_extra_mm
+            ),
+            exclusion_margin_mm=(
+                min(settings.plant_exclusion_margin_mm, CANDIDATE_EXCLUSION_REACH_CEILING_MM)
+                if verifier_scoring
+                else settings.plant_exclusion_margin_mm
+            ),
+        )
+
+    def crop_canopy_mm(self, radius_mm: float) -> float:
+        """The radius treated as the crop's own canopy for protection purposes."""
+        return max(radius_mm * self.canopy_multiplier, radius_mm + self.canopy_extra_mm)
+
+    def rejects(self, features: dict[str, float]) -> bool:
+        """Whether the colour/shape gates veto this candidate."""
+        if not self.shape_filter_enabled:
+            return False
+        return (
+            features["strong_green_fraction"] < self.green_purity
+            or features["solidity"] < self.solidity
+            or features["circularity"] < self.circularity
+            # ``aspect_ratio`` is stored normalised against the 12:1 saturation
+            # point, so undo that before comparing with the configured ratio.
+            or features["aspect_ratio"] * 12 > self.aspect_ratio
+        )
 
 
 class ImageAnalysisEngine(ABC):
@@ -151,7 +274,18 @@ def register_translation(previous: np.ndarray, current: np.ndarray) -> tuple[flo
     return float(shift[0]), float(shift[1]), float(response)
 
 
-def vegetation_mask(image: np.ndarray, params: ScaleParams) -> np.ndarray:
+def _vegetation_layers(
+    image: np.ndarray, params: ScaleParams
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return strong vegetation, recovered pale vegetation, and their union.
+
+    The strong layer intentionally retains the established colour classifier.
+    The second layer handles leaves washed towards white by the camera, but is
+    only retained when its connected component is close to strong vegetation.
+    Keeping the layers separate lets ownership use the same conservative
+    attachment rule while still exposing the recovered pixels in diagnostics.
+    """
+
     hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
     b, g, r = cv2.split(image.astype(np.int16))
     excess_green = 2 * g - r - b
@@ -171,11 +305,59 @@ def vegetation_mask(image: np.ndarray, params: ScaleParams) -> np.ndarray:
         & (saturation > 22)
         & (value > 20)
     )
-    binary = mask.astype(np.uint8) * 255
+
+    # Glare can reduce saturation and excess-green on genuine leaves without
+    # changing their green hue. Require a small green colour bias as well as a
+    # green hue/value range, so neutral grey and brown mulch do not qualify.
+    pale_hue = (hsv[:, :, 0] >= 20) & (hsv[:, :, 0] <= 105)
+    pale_colour_bias = (g >= r - 6) & (g >= b - 6)
+    pale = (
+        pale_hue
+        & (saturation >= PALE_LEAF_MIN_SATURATION)
+        & (value >= PALE_LEAF_MIN_VALUE)
+        & (excess_green >= PALE_LEAF_MIN_EXCESS_GREEN)
+        & pale_colour_bias
+    )
+    pale_only = pale & ~mask
+
+    # Recover a complete pale leaf only when it is anchored to the strong
+    # vegetation layer. The support is a proximity check, not a dilation of
+    # the returned mask, so it cannot paint the gap or surrounding soil.
+    support_radius = max(1, round(PALE_LEAF_SUPPORT_GAP_MM * params.mean_ppm))
+    support_kernel = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE,
+        (support_radius * 2 + 1, support_radius * 2 + 1),
+    )
+    strong_u8 = mask.astype(np.uint8)
+    supported_strong = cv2.dilate(strong_u8, support_kernel) > 0
+    pale_labels_count, pale_labels = cv2.connectedComponents(pale_only.astype(np.uint8), 8)
+    recovered_pale = np.zeros_like(mask, dtype=bool)
+    for label in range(1, pale_labels_count):
+        component = pale_labels == label
+        if np.any(component & supported_strong):
+            recovered_pale[component] = True
+
+    combined = mask | recovered_pale
+    binary = combined.astype(np.uint8) * 255
     open_k = np.ones((params.open_kernel, params.open_kernel), np.uint8)
     close_k = np.ones((params.close_kernel, params.close_kernel), np.uint8)
     binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, open_k)
-    return cv2.morphologyEx(binary, cv2.MORPH_CLOSE, close_k)
+    combined = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, close_k) > 0
+    return mask, recovered_pale, combined
+
+
+def vegetation_mask(image: np.ndarray, params: ScaleParams) -> np.ndarray:
+    """Return vegetation, including pale leaf sections anchored to foliage."""
+
+    _strong, _pale, combined = _vegetation_layers(image, params)
+    return combined.astype(np.uint8) * 255
+
+
+def _core_radius_px(seed: PlantSeed, params: ScaleParams) -> float:
+    return max(
+        6.0,
+        min(35.0, max(12.0, seed.current_radius_mm * 0.28)) * params.mean_ppm,
+    )
 
 
 def _valid_component(stats: np.ndarray, label: int, params: ScaleParams) -> bool:
@@ -423,7 +605,8 @@ class ClassicalVisionEngine(ImageAnalysisEngine):
     ) -> AnalysisResult:
         image = decode_jpeg(image_bytes)
         params = ScaleParams.build(image.shape[1], image.shape[0], calibration)
-        mask = vegetation_mask(image, params)
+        _strong_mask, _recovered_pale, mask = _vegetation_layers(image, params)
+        mask = mask.astype(np.uint8) * 255
         # Normalize any historical masks to this resolution (Part 8); reject
         # those from an incompatible aspect ratio.
         normalized: dict[int, np.ndarray] = {}
@@ -494,12 +677,27 @@ class ClassicalVisionEngine(ImageAnalysisEngine):
                     edge_truncated.add(index)
 
         for label in range(1, labels_count):
-            if not _valid_component(stats, label, params):
-                continue
             component = labels == label
             ys, xs = np.where(component)
             if not len(xs) or not valid_indices:
                 continue
+            if not _valid_component(stats, label, params):
+                # Long, narrow crop leaves (especially chives) resemble
+                # irrigation lines by geometry. Admit one only when it
+                # reaches a known plant's centre; an isolated line/weed keeps
+                # the existing rejection path.
+                component_area = int(stats[label, cv2.CC_STAT_AREA])
+                in_area_range = params.min_area <= component_area <= params.max_area
+                touches_plant_core = any(
+                    np.any(
+                        (xs - seeds[index].center_px[0]) ** 2
+                        + (ys - seeds[index].center_px[1]) ** 2
+                        <= _core_radius_px(seeds[index], params) ** 2
+                    )
+                    for index in valid_indices
+                )
+                if not in_area_range or not touches_plant_core:
+                    continue
             distances = np.stack(
                 [(xs - centers[i, 0]) ** 2 + (ys - centers[i, 1]) ** 2 for i in valid_indices]
             )
@@ -515,10 +713,7 @@ class ClassicalVisionEngine(ImageAnalysisEngine):
                 candidate = nearest == index
                 seed = seeds[index]
                 cx, cy = seed.center_px
-                core_radius_px = max(
-                    6.0,
-                    min(35.0, max(12.0, seed.current_radius_mm * 0.28)) * params.mean_ppm,
-                )
+                core_radius_px = _core_radius_px(seed, params)
                 component_near_seed = np.any((xs - cx) ** 2 + (ys - cy) ** 2 <= core_radius_px**2)
                 prior = previous_masks.get(seed.plant_id)
                 historical_overlap = (
@@ -708,10 +903,7 @@ class ClassicalVisionEngine(ImageAnalysisEngine):
             if seed.planted_at:
                 age = max(0, (image_timestamp.date() - seed.planted_at.date()).days)
             cx, cy = seed.center_px
-            core_radius_px = max(
-                6.0,
-                min(35.0, max(12.0, seed.current_radius_mm * 0.28)) * params.mean_ppm,
-            )
+            core_radius_px = _core_radius_px(seed, params)
             yy, xx = np.ogrid[:height, :width]
             core = (xx - cx) ** 2 + (yy - cy) ** 2 <= core_radius_px**2
             core_vegetation = int(np.count_nonzero((mask > 0) & core))
@@ -991,60 +1183,8 @@ class ClassicalVisionEngine(ImageAnalysisEngine):
                 cv2.LINE_AA,
             )
         weed_detections: list[WeedDetection] = []
+        candidate_stats: dict[str, int] = {}
         if weed_settings and weed_settings.enabled:
-            claimed = ownership > 0
-            exclusion = np.zeros_like(mask)
-            for seed in seeds:
-                if weed_settings.crop_protection_enabled:
-                    known_canopy = max(
-                        seed.current_radius_mm * weed_settings.crop_support_radius_multiplier,
-                        seed.current_radius_mm + weed_settings.crop_support_extra_mm,
-                    )
-                else:
-                    known_canopy = min(60.0, max(20.0, seed.current_radius_mm * 0.3))
-                exclusion_radius = (
-                    known_canopy + weed_settings.plant_exclusion_margin_mm
-                ) * params.mean_ppm
-                cv2.circle(
-                    exclusion,
-                    (round(seed.center_px[0]), round(seed.center_px[1])),
-                    max(1, round(exclusion_radius)),
-                    255,
-                    -1,
-                )
-            if weed_settings.crop_protection_enabled:
-                prior_margin_px = max(
-                    1, round(weed_settings.plant_exclusion_margin_mm * params.mean_ppm)
-                )
-                for prior in previous_masks.values():
-                    distance_from_prior = cv2.distanceTransform(
-                        (prior == 0).astype(np.uint8), cv2.DIST_L2, 5
-                    )
-                    exclusion[distance_from_prior <= prior_margin_px] = 255
-            group_gap_px = WEED_GROUP_MAX_GAP_MM * params.mean_ppm
-
-            # Protect a complete vegetation cluster when any part of it belongs
-            # to a crop or crosses a known crop's exclusion area. Previously
-            # the circular exclusion cut through outer leaves and the remaining
-            # leaf tips were emitted as separate weeds.
-            vegetation = (mask > 0).astype(np.uint8) * 255
-            _, vegetation_groups = _nearby_component_labels(vegetation, group_gap_px)
-            crop_anchor = (mask > 0) & (claimed | (exclusion > 0))
-            crop_group_ids = np.unique(vegetation_groups[crop_anchor])
-            crop_group_ids = crop_group_ids[crop_group_ids > 0]
-            crop_supported = (
-                np.isin(vegetation_groups, crop_group_ids)
-                if len(crop_group_ids)
-                else np.zeros_like(claimed)
-            )
-            candidate_mask = ((mask > 0) & ~claimed & (exclusion == 0) & ~crop_supported).astype(
-                np.uint8
-            ) * 255
-
-            # Label on a proximity-expanded support mask so the leaves and
-            # stem fragments of one continuous weed produce one detection.
-            count, candidate_labels = _nearby_component_labels(candidate_mask, group_gap_px)
-            area_scale = calibration.pixels_per_mm_x * calibration.pixels_per_mm_y
             # When the learned verifier is doing the accepting and rejecting,
             # the heuristic's remaining job is recall: hand it every candidate
             # worth judging rather than pre-filtering with rules that cannot
@@ -1055,7 +1195,68 @@ class ClassicalVisionEngine(ImageAnalysisEngine):
                 and weed_settings.visual_verifier_enabled
                 and not weed_settings.visual_verifier_shadow_mode
             )
-            gate_scale = weed_settings.candidate_recall_boost if verifier_authoritative else 1.0
+            gates = CandidateGates.build(weed_settings, verifier_scoring)
+            claimed = ownership > 0
+            exclusion = np.zeros_like(mask)
+            for seed in seeds:
+                if weed_settings.crop_protection_enabled:
+                    known_canopy = gates.crop_canopy_mm(seed.current_radius_mm)
+                else:
+                    known_canopy = min(60.0, max(20.0, seed.current_radius_mm * 0.3))
+                exclusion_radius = (known_canopy + gates.exclusion_margin_mm) * params.mean_ppm
+                cv2.circle(
+                    exclusion,
+                    (round(seed.center_px[0]), round(seed.center_px[1])),
+                    max(1, round(exclusion_radius)),
+                    255,
+                    -1,
+                )
+            if weed_settings.crop_protection_enabled:
+                prior_margin_px = max(1, round(gates.exclusion_margin_mm * params.mean_ppm))
+                for prior in previous_masks.values():
+                    distance_from_prior = cv2.distanceTransform(
+                        (prior == 0).astype(np.uint8), cv2.DIST_L2, 5
+                    )
+                    exclusion[distance_from_prior <= prior_margin_px] = 255
+            group_gap_px = WEED_GROUP_MAX_GAP_MM * params.mean_ppm
+
+            # Protect a complete vegetation cluster when any part of it belongs
+            # to a crop or crosses a known crop's exclusion area, so the
+            # circular exclusion cannot cut through an outer leaf and leave its
+            # tip behind as a spurious weed.
+            #
+            # The protection is bounded by distance from the crop itself. Group
+            # membership alone chains: island A joins B because they are within
+            # the grouping gap, B joins C, and a single weed touching the crop
+            # zone used to protect every weed transitively reachable from it.
+            vegetation = (mask > 0).astype(np.uint8) * 255
+            _, vegetation_groups = _nearby_component_labels(vegetation, group_gap_px)
+            crop_anchor = (mask > 0) & (claimed | (exclusion > 0))
+            crop_group_ids = np.unique(vegetation_groups[crop_anchor])
+            crop_group_ids = crop_group_ids[crop_group_ids > 0]
+            if len(crop_group_ids):
+                distance_from_crop = cv2.distanceTransform(
+                    (~crop_anchor).astype(np.uint8), cv2.DIST_L2, 5
+                )
+                reach_px = max(1.0, CROP_SUPPORT_REACH_MM * params.mean_ppm)
+                crop_supported = np.isin(vegetation_groups, crop_group_ids) & (
+                    distance_from_crop <= reach_px
+                )
+            else:
+                crop_supported = np.zeros_like(claimed)
+            candidate_mask = ((mask > 0) & ~claimed & (exclusion == 0) & ~crop_supported).astype(
+                np.uint8
+            ) * 255
+
+            # Label on a proximity-expanded support mask so the leaves and
+            # stem fragments of one continuous weed produce one detection.
+            count, candidate_labels = _nearby_component_labels(candidate_mask, group_gap_px)
+            area_scale = calibration.pixels_per_mm_x * calibration.pixels_per_mm_y
+            # Counted so an operator can see whether the heuristic is starving
+            # the verifier rather than having to infer it from missing weeds.
+            candidate_stats.update(
+                {"blobs": 0, "crop_supported": 0, "size": 0, "shape": 0, "score": 0}
+            )
             owned_seed_indices = [
                 index for index in range(len(seeds)) if np.any(ownership == index + 1)
             ]
@@ -1064,6 +1265,7 @@ class ClassicalVisionEngine(ImageAnalysisEngine):
                 ys, xs = np.where(component)
                 if not len(xs):
                     continue
+                candidate_stats["blobs"] += 1
                 area_mm2 = float(len(xs) / area_scale)
                 points = np.column_stack((xs, ys)).astype(np.float32).reshape(-1, 1, 2)
                 (wx, wy), _ = cv2.minEnclosingCircle(points)
@@ -1075,10 +1277,7 @@ class ClassicalVisionEngine(ImageAnalysisEngine):
                         (wx - seed.center_px[0]) / calibration.pixels_per_mm_x,
                         (wy - seed.center_px[1]) / calibration.pixels_per_mm_y,
                     )
-                    support_radius_mm = max(
-                        seed.current_radius_mm * weed_settings.crop_support_radius_multiplier,
-                        seed.current_radius_mm + weed_settings.crop_support_extra_mm,
-                    )
+                    support_radius_mm = gates.crop_canopy_mm(seed.current_radius_mm)
                     if distance_mm <= support_radius_mm and distance_mm < supported_distance:
                         supported_seed = seed_index
                         supported_distance = distance_mm
@@ -1088,6 +1287,7 @@ class ClassicalVisionEngine(ImageAnalysisEngine):
                     # not a FarmBot weed.
                     component = candidate_labels == label
                     ownership[component] = supported_seed + 1
+                    candidate_stats["crop_supported"] += 1
                     _tint_pixels(
                         overlay,
                         component,
@@ -1095,9 +1295,8 @@ class ClassicalVisionEngine(ImageAnalysisEngine):
                         0.35,
                     )
                     continue
-                if not (
-                    weed_settings.minimum_area_mm2 <= area_mm2 <= weed_settings.maximum_area_mm2
-                ):
+                if not (gates.min_area_mm2 <= area_mm2 <= gates.max_area_mm2):
+                    candidate_stats["size"] += 1
                     continue
                 # Distance to the nearest known crop separates an interrow weed
                 # from a crop leaf that escaped the exclusion mask, and it is
@@ -1124,33 +1323,28 @@ class ClassicalVisionEngine(ImageAnalysisEngine):
                     ),
                     distance_to_plant_mm=distance_to_plant_mm,
                 )
-                if weed_settings.shape_filter_enabled and (
-                    features["strong_green_fraction"]
-                    < weed_settings.minimum_green_purity * gate_scale
-                    or features["solidity"] < weed_settings.minimum_solidity * gate_scale
-                    or features["circularity"] < weed_settings.minimum_circularity * gate_scale
-                    or features["aspect_ratio"] * 12
-                    > weed_settings.maximum_aspect_ratio / gate_scale
-                ):
+                if gates.rejects(features):
+                    candidate_stats["shape"] += 1
                     continue
-                area_score = min(
-                    1.0,
-                    math.sqrt(
-                        max(0.0, area_mm2 - weed_settings.minimum_area_mm2)
-                        / max(1.0, weed_settings.minimum_area_mm2 * 2)
-                    ),
-                )
                 # The heuristic score measures plant-ness, not weed-ness: every
                 # term rises for moss, fallen leaves and crop foliage just as it
                 # does for a weed. It is a usable fallback ordering before the
                 # verifier is trained, never a substitute for it.
+                #
+                # Each term is normalised against what real foliage actually
+                # scores rather than against a perfect synthetic blob. Measured
+                # against photographs, the raw feature values for a genuine weed
+                # sit around a third of their nominal range, so the previous
+                # unnormalised sum could not exceed ~0.70 -- which was also the
+                # default review threshold, leaving nothing able to pass it.
+                area_score = min(1.0, math.sqrt(area_mm2 / CANDIDATE_REFERENCE_AREA_MM2))
                 heuristic_confidence = min(
                     0.98,
-                    0.25
+                    0.30
                     + area_score * 0.25
-                    + features["strong_green_fraction"] * 0.25
-                    + features["solidity"] * 0.15
-                    + features["circularity"] * 0.10,
+                    + min(1.0, features["strong_green_fraction"] / 0.5) * 0.25
+                    + min(1.0, features["solidity"] / 0.5) * 0.12
+                    + min(1.0, features["circularity"] / 0.25) * 0.08,
                 )
                 verifier_confidence = (
                     self.weed_verifier.predict(features) if verifier_scoring else None
@@ -1163,10 +1357,12 @@ class ClassicalVisionEngine(ImageAnalysisEngine):
                     # while the reported confidence said otherwise.
                     confidence = verifier_confidence
                     if verifier_confidence < weed_settings.visual_verifier_minimum_confidence:
+                        candidate_stats["score"] += 1
                         continue
                 else:
                     confidence = heuristic_confidence
                     if confidence < weed_settings.minimum_confidence:
+                        candidate_stats["score"] += 1
                         continue
                 component_radius_mm = float(
                     np.max(
@@ -1234,6 +1430,7 @@ class ClassicalVisionEngine(ImageAnalysisEngine):
             weed_review_jpeg=encoded_weed_review.tobytes() if ok_weed_review else None,
             skipped=skipped,
             weeds=weed_detections,
+            weed_candidate_stats=candidate_stats,
         )
 
 

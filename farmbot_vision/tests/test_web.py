@@ -1599,18 +1599,60 @@ async def test_weed_settings_page_exposes_pipeline_training_and_automation_contr
     html = body.decode()
 
     assert status == 200
-    assert "Candidate size, colour and shape" in html
+    assert "How big a weed to look for" in html
+    assert "What counts as green foliage" in html
+    assert "What shape a weed may be" in html
     assert "Known crop protection" in html
     assert "Multi-image confirmation" in html
     assert "Learned visual verifier" in html
-    assert "name=automatic_creation_confidence" in html
+    assert 'name="automatic_creation_confidence"' in html
     assert 'action="weed-model/train"' in html
     assert 'action="weed-model/clear"' in html
     assert 'action="weed-model/export"' in html
     assert 'action="weed-model/import"' in html
     assert "Clear all training images" in html
     assert "Most informative to label next" in html
-    assert "name=candidate_recall_boost" in html
+    assert 'name="candidate_recall_boost"' in html
+
+
+@pytest.mark.asyncio
+async def test_every_weed_setting_is_explained_and_has_a_slider_or_toggle():
+    """A threshold nobody can interpret cannot be calibrated, so none may ship bare."""
+    from farmbot_vision.weed_settings import WeedSettings
+
+    status, _, body = await asgi_request("/weed-settings")
+    html = body.decode()
+
+    assert status == 200
+    for name, field in WeedSettings.model_fields.items():
+        assert f'name="{name}"' in html, f"{name} is missing from the settings form"
+        if field.annotation is bool:
+            assert f'<input type=checkbox name="{name}"' in html, f"{name} needs a checkbox"
+        else:
+            assert f'type=range aria-hidden=true tabindex=-1 data-sync="{name}"' in html, (
+                f"{name} needs a slider paired with its number box"
+            )
+    # One tooltip per setting, plus the one introducing the convention.
+    assert html.count("class=hint") >= len(WeedSettings.model_fields)
+
+
+@pytest.mark.asyncio
+async def test_weed_settings_offer_visual_pickers_for_colour_shape_and_size():
+    status, _, body = await asgi_request("/weed-settings")
+    html = body.decode()
+
+    assert status == 200
+    # Hue is chosen against a colour band and can be sampled from a real leaf.
+    assert "class=hue-band" in html
+    assert "type=color id=hue-picker" in html
+    assert "Centre the range on this colour" in html
+    # Area limits are shown as the physical width of a blob, not bare mm².
+    assert "id=size-blob-min" in html
+    assert "mm across" in html
+    # Solidity and circularity are shown as shapes.
+    assert "class=shape-figs" in html
+    assert "Low solidity" in html
+    assert "High circularity" in html
 
 
 @pytest.mark.asyncio

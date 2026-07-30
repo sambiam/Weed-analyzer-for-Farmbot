@@ -290,6 +290,22 @@ class JobManager:
                     str(candidate.measurement_id), decision="removed", applied=True
                 )
                 self.db.record_group_decision(str(candidate.measurement_id), "removed", result)
+                self.db.record_change(
+                    entity_type="plant",
+                    entity_id=candidate.plant_id,
+                    crop_type=candidate.crop_slug,
+                    x=candidate.recorded_center_x,
+                    y=candidate.recorded_center_y,
+                    z=None,
+                    change_type="plant removed",
+                    original_radius_mm=float(
+                        result.get("old_radius_mm") or candidate.current_radius_mm
+                    ),
+                    current_radius_mm=0,
+                    decision_method="auto",
+                    confidence=candidate.confidence,
+                    details=result,
+                )
             return
         if candidate.decision != Decision.APPLIED or not candidate.calibrated:
             return
@@ -324,6 +340,30 @@ class JobManager:
                 str(candidate.measurement_id), decision="applied", applied=True
             )
             self.db.record_group_decision(str(candidate.measurement_id), "applied", result)
+            new_radius = float(
+                result.get(
+                    "new_radius_mm",
+                    result.get("radius_mm", candidate.recommended_protection_radius_mm),
+                )
+            )
+            self.db.record_change(
+                entity_type="plant",
+                entity_id=candidate.plant_id,
+                crop_type=candidate.crop_slug,
+                x=candidate.recorded_center_x,
+                y=candidate.recorded_center_y,
+                z=None,
+                change_type=(
+                    "radius increased"
+                    if new_radius > candidate.current_radius_mm
+                    else "radius decreased"
+                ),
+                original_radius_mm=candidate.current_radius_mm,
+                current_radius_mm=new_radius,
+                decision_method="auto",
+                confidence=candidate.confidence,
+                details=result,
+            )
             await self._update_curve_after_radius(
                 entry_id, inventory, candidate, human_approved=False
             )
@@ -650,6 +690,19 @@ class JobManager:
                     overlay_path.write_bytes(result.overlay_jpeg)
                 if result.weed_review_jpeg:
                     weed_review_path.write_bytes(result.weed_review_jpeg)
+                if result.weed_candidate_stats:
+                    stats = result.weed_candidate_stats
+                    LOGGER.info(
+                        "Image %s weed candidates: %s found, %s detected "
+                        "(dropped: %s crop-supported, %s size, %s colour/shape, %s low score)",
+                        response.image_id,
+                        stats.get("blobs", 0),
+                        len(result.weeds),
+                        stats.get("crop_supported", 0),
+                        stats.get("size", 0),
+                        stats.get("shape", 0),
+                        stats.get("score", 0),
+                    )
                 matched_known_weed_ids: set[int] = set()
                 for weed in result.weeds:
                     crop_path = artifacts / (
@@ -701,6 +754,22 @@ class JobManager:
                                 )
                                 if update_result.get("status") == "applied":
                                     status = "radius_adjusted"
+                                    self.db.record_change(
+                                        entity_type="weed",
+                                        entity_id=known_weed.id,
+                                        crop_type="weed",
+                                        x=known_weed.x,
+                                        y=known_weed.y,
+                                        z=known_weed.z,
+                                        change_type="radius increased",
+                                        original_radius_mm=known_weed.radius,
+                                        current_radius_mm=float(
+                                            update_result.get("radius_mm", target_radius)
+                                        ),
+                                        decision_method="auto",
+                                        confidence=weed.confidence,
+                                        details=update_result,
+                                    )
                             except HomeAssistantError as exc:
                                 LOGGER.warning("Automatic weed radius adjustment failed: %s", exc)
                         self.db.upsert_weed_track(
@@ -815,6 +884,20 @@ class JobManager:
                             )
                             if create_result.get("status") == "applied":
                                 weed_status = "created"
+                                self.db.record_change(
+                                    entity_type="weed",
+                                    entity_id=create_result.get("weed_id") or weed.detection_id,
+                                    crop_type="weed",
+                                    x=weed_x,
+                                    y=weed_y,
+                                    z=response.meta.z,
+                                    change_type="weed added",
+                                    original_radius_mm=0,
+                                    current_radius_mm=weed.radius_mm,
+                                    decision_method="auto",
+                                    confidence=weed.confidence,
+                                    details=create_result,
+                                )
                         except HomeAssistantError as exc:
                             LOGGER.warning(
                                 "Automatic weed creation failed; keeping recommendation: %s", exc
@@ -891,6 +974,20 @@ class JobManager:
                                 )
                                 if removal_result.get("status") == "applied":
                                     track_status = "removed"
+                                    self.db.record_change(
+                                        entity_type="weed",
+                                        entity_id=known_weed.id,
+                                        crop_type="weed",
+                                        x=known_weed.x,
+                                        y=known_weed.y,
+                                        z=known_weed.z,
+                                        change_type="weed removed",
+                                        original_radius_mm=known_weed.radius,
+                                        current_radius_mm=0,
+                                        decision_method="auto",
+                                        confidence=absence_confidence,
+                                        details=removal_result,
+                                    )
                             except HomeAssistantError as exc:
                                 LOGGER.warning("Automatic weed removal failed: %s", exc)
                         self.db.upsert_weed_track(
@@ -983,6 +1080,25 @@ class JobManager:
                                     else "removal_rejected",
                                     removal_result,
                                 )
+                                if removal_applied:
+                                    self.db.record_change(
+                                        entity_type="plant",
+                                        entity_id=item.plant_id,
+                                        crop_type=item.crop_slug,
+                                        x=item.recorded_center_x,
+                                        y=item.recorded_center_y,
+                                        z=None,
+                                        change_type="plant removed",
+                                        original_radius_mm=float(
+                                            removal_result.get(
+                                                "old_radius_mm", item.current_radius_mm
+                                            )
+                                        ),
+                                        current_radius_mm=0,
+                                        decision_method="auto",
+                                        confidence=item.confidence,
+                                        details=removal_result,
+                                    )
                             except StaleRadiusError:
                                 decided[item_index] = item.model_copy(
                                     update={"decision": Decision.REMOVAL_RECOMMENDED}
@@ -1082,6 +1198,33 @@ class JobManager:
                                 "applied" if apply_status == "applied" else "apply_rejected",
                                 apply_result,
                             )
+                            if radius_applied:
+                                new_radius = float(
+                                    apply_result.get(
+                                        "new_radius_mm",
+                                        apply_result.get(
+                                            "radius_mm", item.recommended_protection_radius_mm
+                                        ),
+                                    )
+                                )
+                                self.db.record_change(
+                                    entity_type="plant",
+                                    entity_id=item.plant_id,
+                                    crop_type=item.crop_slug,
+                                    x=item.recorded_center_x,
+                                    y=item.recorded_center_y,
+                                    z=None,
+                                    change_type=(
+                                        "radius increased"
+                                        if new_radius > item.current_radius_mm
+                                        else "radius decreased"
+                                    ),
+                                    original_radius_mm=item.current_radius_mm,
+                                    current_radius_mm=new_radius,
+                                    decision_method="auto",
+                                    confidence=item.confidence,
+                                    details=apply_result,
+                                )
                             if radius_applied:
                                 await self._update_curve_after_radius(
                                     entry_id, inventory, updated, human_approved=False
