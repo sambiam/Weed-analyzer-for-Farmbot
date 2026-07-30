@@ -1,5 +1,10 @@
 # Changelog
 
+## 3.8.1 - 2026-07-30
+
+- Fixed add-on startup under AppArmor by allowing the `nice` process-priority
+  wrapper used by the application launch script.
+
 ## 3.8.0 - 2026-07-30
 
 - The weed verifier's automatic retraining now retrains after every N new
