@@ -1,5 +1,14 @@
 # Changelog
 
+## 3.6.1 - 2026-07-30
+
+- Replaced the approximate FarmBot display crop with the exact maximum-area
+  axis-aligned rectangle contained inside each rotated camera image. Mosaic
+  cells can no longer request pixels beyond a rotated source edge.
+- Photo-grid planning now spaces captures from that blank-free footprint, so
+  increasing camera rotation automatically adds the rows and columns needed
+  to keep calibration, full-grid, and plant-measurement mosaics gap-free.
+
 ## 3.6.0 - 2026-07-30
 
 - The trained visual verifier is now the weed score outright rather than being

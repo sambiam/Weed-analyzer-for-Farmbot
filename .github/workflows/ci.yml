@@ -54,7 +54,7 @@ jobs:
           load: ${{ matrix.arch == 'amd64' }}
           tags: farmbot-vision:test-${{ matrix.arch }}
           build-args: |
-            BUILD_VERSION=3.6.0
+            BUILD_VERSION=3.6.1
             BUILD_ARCH=${{ matrix.arch }}
       - name: Smoke-test container health endpoint (amd64)
         if: matrix.arch == 'amd64'

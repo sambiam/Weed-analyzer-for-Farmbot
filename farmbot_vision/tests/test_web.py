@@ -1117,6 +1117,7 @@ async def test_root_and_duplicate_leading_slash_routes():
     assert b"gridCroppedFootprint" in body
     assert b"gridTileBounds" in body
     assert b"strokeGridTiles" in body
+    assert b"tile(s) need a new grid run at this rotation" in body
     assert b"X-FarmBot-Oriented-Width" in body
 
     for path in ("//", "///"):
@@ -1144,6 +1145,7 @@ async def test_duplicate_slashes_reach_health_and_settings():
     assert b"id=zoom-reset" in body
     assert b"calibrationTileBounds" in body
     assert b"strokeCalibrationTiles" in body
+    assert b"existing tile(s) were captured too far apart" in body
     assert b"Copy both FarmBot camera offsets unchanged" in body
     assert b"All photos are still shown at their reported size" in body
     assert b"No loaded photos match the selected FarmBot camera resolution" not in body

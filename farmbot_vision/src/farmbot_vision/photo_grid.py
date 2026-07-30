@@ -62,38 +62,45 @@ def photo_grid_chunk_size(capabilities: object) -> int:
 def farmbot_cropped_footprint(
     calibration: FarmbotCalibrationInput,
 ) -> tuple[float, float]:
-    """Return the usable map-photo rectangle after FarmBot's rotation crop.
+    """Return the largest blank-free rectangle inside the rotated photo.
 
-    FarmBot first scales the native image into millimetres, rotates it for the
-    map, and then clips small rotations to an axis-aligned rectangle. Its
-    ``cropAmount`` function removes the same rounded amount from both
-    dimensions. Near a quarter turn the displayed axes swap; rotations near
-    45 degrees use FarmBot's circular crop and therefore have a square usable
-    footprint.
+    FarmBot's map uses an approximate visual clip after rotating the full
+    image. That clip can still cross a rotated image edge when it is reused as
+    a rectangular mosaic footprint. This calculation instead finds the
+    maximum-area axis-aligned rectangle wholly contained by the rotated source
+    image. Planning against this stricter footprint makes higher rotations
+    produce more capture positions and guarantees that tessellated cells never
+    request pixels outside their source photo.
     """
     width = round(calibration.coordinate_scale * calibration.reference_width, 3)
     height = round(calibration.coordinate_scale * calibration.reference_height, 3)
-    angle = float(calibration.rotation_degrees)
-    closest = abs(angle) % 90
-    if closest > 45:
-        closest = 90 - closest
-    rotated_90 = (abs(angle) + 45) % 180 > 90
+    angle = math.radians(abs(float(calibration.rotation_degrees)) % 180)
+    if angle > math.pi / 2:
+        angle = math.pi - angle
+    sin_angle = abs(math.sin(angle))
+    cos_angle = abs(math.cos(angle))
+    if sin_angle < 1e-12:
+        return width, height
 
-    if closest > 40:
-        # FarmBot switches to a circle at steep angles. Plan against the
-        # largest axis-aligned square wholly inside that circle, otherwise the
-        # nominal rectangular cells would still leave uncovered corner gaps.
-        side = min(width, height) / math.sqrt(2)
-        return side, side
-
-    crop = 0
-    if closest > 0:
-        factor = (5.61 - 0.095 * closest**2 + 9.06 * closest) / 640
-        # Lodash round(), used by FarmBot, rounds positive .5 values upward.
-        crop = math.floor(max(width, height) * factor + 0.5)
-    usable_width = max(1.0, width - crop)
-    usable_height = max(1.0, height - crop)
-    return (usable_height, usable_width) if rotated_90 else (usable_width, usable_height)
+    width_is_longer = width >= height
+    long_side = max(width, height)
+    short_side = min(width, height)
+    half_constrained = (
+        short_side <= 2 * sin_angle * cos_angle * long_side or abs(sin_angle - cos_angle) < 1e-12
+    )
+    if half_constrained:
+        half_short = short_side / 2
+        if width_is_longer:
+            usable_width = half_short / sin_angle
+            usable_height = half_short / cos_angle
+        else:
+            usable_width = half_short / cos_angle
+            usable_height = half_short / sin_angle
+    else:
+        cos_double = cos_angle**2 - sin_angle**2
+        usable_width = (width * cos_angle - height * sin_angle) / cos_double
+        usable_height = (height * cos_angle - width * sin_angle) / cos_double
+    return round(max(1.0, usable_width), 3), round(max(1.0, usable_height), 3)
 
 
 class PhotoGridTarget(BaseModel):
@@ -313,10 +320,12 @@ def plan_photo_grid(
     """Create a serpentine grid from FarmBot calibration and motion bounds.
 
     FarmBot's scale is millimetres per native pixel. Capture spacing uses the
-    usable rectangle left by FarmBot's post-rotation map crop, rather than the
-    larger rotated bounding box, so cropped photos retain the configured
-    overlap without leaving regular gaps. Calibration offsets translate the
-    optical centre relative to the gantry coordinate stored with each photo.
+    largest blank-free rectangle inside the rotated source photo, rather than
+    the rotated bounding box or FarmBot's approximate display clip. Cropped
+    photos therefore retain the configured overlap without empty seams, and
+    high rotation angles automatically produce more captures. Calibration
+    offsets translate the optical centre relative to the gantry coordinate
+    stored with each photo.
     """
     if not math.isfinite(z):
         raise ValueError("photo-grid Z coordinate must be finite")

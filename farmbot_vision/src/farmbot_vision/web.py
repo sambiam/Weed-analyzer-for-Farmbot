@@ -1399,21 +1399,25 @@ _CALIBRATION_JS = r"""
     return [iw/(p.scale*(captureW||p.refw)),ih/(p.scale*(captureH||p.refh))];
   }
   function croppedFootprint(p,captureW,captureH){
-    let width=p.scale*(captureW||p.refw), height=p.scale*(captureH||p.refh);
-    const angle=Math.abs(num('rotation'));
-    let closest=angle%90;if(closest>45) closest=90-closest;
-    const rotated90=(angle+45)%180>90;
-    if(closest>40){
-      const side=Math.min(width,height)/Math.sqrt(2);
-      return [side,side];
+    const width=p.scale*(captureW||p.refw), height=p.scale*(captureH||p.refh);
+    let angle=Math.abs(num('rotation'))%180*Math.PI/180;
+    if(angle>Math.PI/2) angle=Math.PI-angle;
+    const sinAngle=Math.abs(Math.sin(angle)),cosAngle=Math.abs(Math.cos(angle));
+    if(sinAngle<1e-12) return [width,height];
+    const widthIsLonger=width>=height;
+    const longSide=Math.max(width,height),shortSide=Math.min(width,height);
+    let usableWidth,usableHeight;
+    if(shortSide<=2*sinAngle*cosAngle*longSide
+        ||Math.abs(sinAngle-cosAngle)<1e-12){
+      const halfShort=shortSide/2;
+      usableWidth=halfShort/(widthIsLonger?sinAngle:cosAngle);
+      usableHeight=halfShort/(widthIsLonger?cosAngle:sinAngle);
+    }else{
+      const cosDouble=cosAngle*cosAngle-sinAngle*sinAngle;
+      usableWidth=(width*cosAngle-height*sinAngle)/cosDouble;
+      usableHeight=(height*cosAngle-width*sinAngle)/cosDouble;
     }
-    let crop=0;
-    if(closest>0){
-      const factor=(5.61-.095*closest*closest+9.06*closest)/640;
-      crop=Math.round(Math.max(width,height)*factor);
-    }
-    width=Math.max(1,width-crop);height=Math.max(1,height-crop);
-    return rotated90?[height,width]:[width,height];
+    return [Math.max(1,usableWidth),Math.max(1,usableHeight)];
   }
   function calibrationTileBounds(records,p,xmin,xmax,ymin,ymax){
     const axis=function(values,lower,upper){
@@ -1584,6 +1588,7 @@ _CALIBRATION_JS = r"""
     // Paint each image via the affine that maps its source pixels into the
     // composite (three mapped points fully determine the affine).
     ctx.imageSmoothingEnabled=true;
+    let uncoveredTiles=0;
     ready.forEach(r=>{
       const iw=r.img.naturalWidth, ih=r.img.naturalHeight;
       const p0=toCanvas.apply(null,pixelToCoord(
@@ -1595,9 +1600,15 @@ _CALIBRATION_JS = r"""
       const footprint=croppedFootprint(p,r.captureW,r.captureH);
       const opticalX=r.info.x+p.ox, opticalY=r.info.y+p.oy;
       const tile=tileBounds[String(r.info.id)];
-      const crop=tile||[
+      const safe=[
         opticalX-footprint[0]/2,opticalY-footprint[1]/2,
         opticalX+footprint[0]/2,opticalY+footprint[1]/2];
+      if(tile&&(tile[0]<safe[0]-.01||tile[1]<safe[1]-.01
+          ||tile[2]>safe[2]+.01||tile[3]>safe[3]+.01)) uncoveredTiles++;
+      const crop=tile?[
+        Math.max(tile[0],safe[0]),Math.max(tile[1],safe[1]),
+        Math.min(tile[2],safe[2]),Math.min(tile[3],safe[3])]:safe;
+      if(crop[0]>=crop[2]||crop[1]>=crop[3]) return;
       const clip=[
         toCanvas(crop[0],crop[1]),toCanvas(crop[2],crop[1]),
         toCanvas(crop[2],crop[3]),toCanvas(crop[0],crop[3])];
@@ -1623,6 +1634,10 @@ _CALIBRATION_JS = r"""
         +', but '+mismatched.length+' loaded photo(s) report '+mismatchDimensions
         +'. All photos are still shown at their reported size.')
       :'';
+    const spacingWarning=uncoveredTiles
+      ?(' Warning: '+uncoveredTiles+' existing tile(s) were captured too far apart '
+        +'for this rotation. Start a new photo grid to fill the revealed spaces.')
+      :'';
     const bounds=scene.bed_bounds
       ?(' Bed: X '+gxmin+'–'+gxmax+' mm, Y '+gymin+'–'+gymax+' mm'
         +(scene.bed_bounds_source?(' ('+scene.bed_bounds_source+')'):'')+'.')
@@ -1630,7 +1645,8 @@ _CALIBRATION_JS = r"""
     status.textContent='Full tessellated grid: '+ready.length+' photos'
       +'; actual capture '+dimensions+'. '+scene.plants.length+' plants, '
       +scene.weeds.length+' weeds. '
-      +'Confirm centres sit on their plants across the bed.'+bounds+resolutionWarning;
+      +'Confirm centres sit on their plants across the bed.'
+      +bounds+resolutionWarning+spacingWarning;
   }
   function marker(p,toCanvas,P,pt,colour,label){
     const c=toCanvas(pt.x,pt.y);
@@ -1744,24 +1760,28 @@ _DASHBOARD_JS = r"""
     return value>0?value:null;
   }
   function gridCroppedFootprint(calibration,captureW,captureH){
-    let width=calibration.coordinate_scale
+    const width=calibration.coordinate_scale
       *(captureW||calibration.reference_width);
-    let height=calibration.coordinate_scale
+    const height=calibration.coordinate_scale
       *(captureH||calibration.reference_height);
-    const angle=Math.abs(calibration.rotation_degrees);
-    let closest=angle%90;if(closest>45) closest=90-closest;
-    const rotated90=(angle+45)%180>90;
-    if(closest>40){
-      const side=Math.min(width,height)/Math.sqrt(2);
-      return [side,side];
+    let angle=Math.abs(calibration.rotation_degrees)%180*Math.PI/180;
+    if(angle>Math.PI/2) angle=Math.PI-angle;
+    const sinAngle=Math.abs(Math.sin(angle)),cosAngle=Math.abs(Math.cos(angle));
+    if(sinAngle<1e-12) return [width,height];
+    const widthIsLonger=width>=height;
+    const longSide=Math.max(width,height),shortSide=Math.min(width,height);
+    let usableWidth,usableHeight;
+    if(shortSide<=2*sinAngle*cosAngle*longSide
+        ||Math.abs(sinAngle-cosAngle)<1e-12){
+      const halfShort=shortSide/2;
+      usableWidth=halfShort/(widthIsLonger?sinAngle:cosAngle);
+      usableHeight=halfShort/(widthIsLonger?cosAngle:sinAngle);
+    }else{
+      const cosDouble=cosAngle*cosAngle-sinAngle*sinAngle;
+      usableWidth=(width*cosAngle-height*sinAngle)/cosDouble;
+      usableHeight=(height*cosAngle-width*sinAngle)/cosDouble;
     }
-    let crop=0;
-    if(closest>0){
-      const factor=(5.61-.095*closest*closest+9.06*closest)/640;
-      crop=Math.round(Math.max(width,height)*factor);
-    }
-    width=Math.max(1,width-crop);height=Math.max(1,height-crop);
-    return rotated90?[height,width]:[width,height];
+    return [Math.max(1,usableWidth),Math.max(1,usableHeight)];
   }
   function gridTileBounds(record){
     const calibration=record.calibration;
@@ -1813,6 +1833,7 @@ _DASHBOARD_JS = r"""
     const signs=gridOriginSigns(calibration.origin_location);
     const rotation=-calibration.rotation_degrees*Math.PI/180;
     const dimensions=new Set();
+    const uncoveredTargets=new Set();
     const loadFrame=function(frame){
       const url='api/vision/image/'+frame.image_id+'.jpg?entry_id='
         +encodeURIComponent(configEntryId);
@@ -1862,9 +1883,19 @@ _DASHBOARD_JS = r"""
         const opticalX=frame.x+calibration.offset_x_mm;
         const opticalY=frame.y+calibration.offset_y_mm;
         const tile=tileBounds&&tileBounds[String(frame.target_index)];
-        const crop=tile||[
+        const safe=[
           opticalX-footprint[0]/2,opticalY-footprint[1]/2,
           opticalX+footprint[0]/2,opticalY+footprint[1]/2];
+        if(tile&&(tile[0]<safe[0]-.01||tile[1]<safe[1]-.01
+            ||tile[2]>safe[2]+.01||tile[3]>safe[3]+.01)){
+          uncoveredTargets.add(String(frame.target_index));
+        }
+        const crop=tile?[
+          Math.max(tile[0],safe[0]),Math.max(tile[1],safe[1]),
+          Math.min(tile[2],safe[2]),Math.min(tile[3],safe[3])]:safe;
+        if(crop[0]>=crop[2]||crop[1]>=crop[3]){
+          URL.revokeObjectURL(result.objectUrl);return;
+        }
         const clip=[
           project(crop[0],crop[1]),project(crop[2],crop[1]),
           project(crop[2],crop[3]),project(crop[0],crop[3])];
@@ -1880,7 +1911,7 @@ _DASHBOARD_JS = r"""
         URL.revokeObjectURL(result.objectUrl);
         loaded++;
       });
-      onDone(loaded,frames.length-loaded,[...dimensions]);
+      onDone(loaded,frames.length-loaded,[...dimensions],uncoveredTargets.size);
     });
   }
   function drawPhotoGrid(data){
@@ -1898,7 +1929,8 @@ _DASHBOARD_JS = r"""
     ctx.fillStyle='#283f30';ctx.fillRect(0,0,photoGridCanvas.width,photoGridCanvas.height);
     if(!layeredFrames.length){photoGridStatus.textContent='This grid has no verified photos yet';return;}
     drawFramesInto(ctx,photoGridCanvas.width,photoGridCanvas.height,layeredFrames,calibration,
-      record.config_entry_id,project,tileBounds,function(loaded,failed,dimensions){
+      record.config_entry_id,project,tileBounds,function(
+        loaded,failed,dimensions,uncoveredTiles){
         ctx.setTransform(1,0,0,1,0,0);
         strokeGridTiles(
           ctx,tileBounds,project,photoGridCanvas.width,photoGridCanvas.height);
@@ -1920,6 +1952,10 @@ _DASHBOARD_JS = r"""
           +' verified photos rendered as tessellated cells'
           +(dimensions.length?' · actual capture '+dimensions.join(', '):'')
           +(failed?' · '+failed+' image(s) could not be loaded':'')
+          +(uncoveredTiles
+            ?' · '+uncoveredTiles
+              +' tile(s) need a new grid run at this rotation to fill revealed spaces.'
+            :'')
           +(legacySpacing
             ?' · This grid uses older rotation spacing; start a new photo grid to close the gaps.'
             :'');

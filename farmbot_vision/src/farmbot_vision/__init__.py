@@ -1,6 +1,6 @@
 """FarmBot Vision application."""
 
-__version__ = "3.6.0"
+__version__ = "3.6.1"
 ALGORITHM_VERSION = "classical-weed-verifier-0.6.0"
 
 # Version of the typed companion-integration contract this app speaks. v2 adds

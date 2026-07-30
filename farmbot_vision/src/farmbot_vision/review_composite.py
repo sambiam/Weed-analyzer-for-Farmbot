@@ -8,7 +8,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from .photo_grid import photo_grid_cell_bounds
+from .photo_grid import farmbot_cropped_footprint, photo_grid_cell_bounds
 from .plant_measurement import (
     relative_pixel_to_plant_mm_transform,
     select_measurement_evidence,
@@ -124,6 +124,9 @@ def build_plant_review(
         else {}
     )
     grid_cells = photo_grid_cell_bounds(grid_record) if grid_record is not None else {}
+    grid_footprint = (
+        farmbot_cropped_footprint(grid_record.calibration) if grid_record is not None else None
+    )
     frames: list[dict] = []
     for item in measurements:
         if int(item.image_id) not in allowed_image_ids or not item.source_image_path:
@@ -142,6 +145,21 @@ def build_plant_review(
         absolute_cell = (
             grid_cells.get(int(grid_frame.target_index)) if grid_frame is not None else None
         )
+        if absolute_cell is not None and grid_footprint is not None:
+            optical_x = float(grid_frame.x) + float(grid_record.calibration.offset_x_mm)
+            optical_y = float(grid_frame.y) + float(grid_record.calibration.offset_y_mm)
+            safe_cell = (
+                optical_x - grid_footprint[0] / 2,
+                optical_y - grid_footprint[1] / 2,
+                optical_x + grid_footprint[0] / 2,
+                optical_y + grid_footprint[1] / 2,
+            )
+            absolute_cell = (
+                max(absolute_cell[0], safe_cell[0]),
+                max(absolute_cell[1], safe_cell[1]),
+                min(absolute_cell[2], safe_cell[2]),
+                min(absolute_cell[3], safe_cell[3]),
+            )
         relative_cell = (
             (
                 absolute_cell[0] - target_x,
@@ -410,6 +428,7 @@ def build_plant_review(
         "tile_window": window_details,
         "tessellated_rectangular_cells": bool(tessellated_cells),
         "garden_border": bool(tessellated_cells),
+        "blank_free_source_crop": bool(grid_footprint),
         "standard_and_diagnostic_geometry_identical": True,
     }
     output_path.with_suffix(".json").write_text(

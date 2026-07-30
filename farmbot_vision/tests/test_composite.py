@@ -209,12 +209,12 @@ def test_leaf_repair_overlay_is_painted_above_retained_original(tmp_path):
         replacement.source_image_path,
         np.full((100, 100, 3), (20, 210, 20), np.uint8),
     )
-    target = PhotoGridTarget(index=0, row=0, column=0, x=100, y=100, z=0)
+    target = PhotoGridTarget(index=0, row=0, column=0, x=0, y=0, z=0)
     record = PhotoGridRecord(
         config_entry_id="bot",
         started_at=now,
         status="complete",
-        bed_bounds={"x": (0, 200), "y": (0, 200)},
+        bed_bounds={"x": (-100, 100), "y": (-100, 100)},
         footprint_width_mm=100,
         footprint_height_mm=100,
         calibration=FarmbotCalibrationInput(
@@ -223,15 +223,20 @@ def test_leaf_repair_overlay_is_painted_above_retained_original(tmp_path):
             reference_height=100,
         ),
         targets=[target],
-        frames=[PhotoGridFrame(target_index=0, image_id=31, x=100, y=100, z=0)],
-        quality_overlay_frames=[PhotoGridFrame(target_index=0, image_id=32, x=100, y=100, z=0)],
+        frames=[PhotoGridFrame(target_index=0, image_id=31, x=0, y=0, z=0)],
+        quality_overlay_frames=[PhotoGridFrame(target_index=0, image_id=32, x=0, y=0, z=0)],
     )
 
     assert build_plant_composite([original, replacement], output, grid_record=record)
     composite = cv2.imread(str(output))
 
     assert composite is not None
-    assert float(np.mean(composite[:, :, 1])) > float(np.mean(composite[:, :, 0])) * 2
+    covered = composite[55:145, 55:145]
+    assert float(np.mean(covered[:, :, 1])) > float(np.mean(covered[:, :, 0])) * 2
+    # This deliberately sparse legacy record has one 100 mm photo assigned to
+    # a 200 mm bed. The renderer must not enlarge it into unavailable pixels;
+    # a newly planned grid supplies the additional surrounding captures.
+    assert np.mean(composite[5:40, 5:40]) < 10
 
 
 def test_one_by_two_evidence_region_builds_three_by_four_grid_crop(tmp_path):
@@ -341,6 +346,7 @@ def test_one_by_two_evidence_region_builds_three_by_four_grid_crop(tmp_path):
     assert metadata["tile_window"]["columns"] == 4
     assert metadata["tessellated_rectangular_cells"] is True
     assert metadata["garden_border"] is True
+    assert metadata["blank_free_source_crop"] is True
     assert metadata["crop_mm"] == [-160.0, -160.0, 160.0, 80.0]
     assert clean.shape == diagnostic.shape
     # Every populated grid cell reaches the shared midpoint seams: the
