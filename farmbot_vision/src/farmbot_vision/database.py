@@ -794,6 +794,26 @@ class Database:
             )
         return cursor.rowcount > 0
 
+    def import_weed_training_samples(self, samples: list[tuple[str, str, dict]]) -> int:
+        """Insert labelled samples from an exported bundle.
+
+        No crop path is stored: the imported detection's crop belongs to the
+        install that produced it, and a dangling path would break the review
+        thumbnails. The features are what training needs.
+        """
+        with self.connection:
+            self.connection.executemany(
+                """INSERT INTO weed_training_samples(detection_id,label,features_json,crop_path)
+                VALUES(?,?,?,NULL) ON CONFLICT(detection_id) DO UPDATE SET
+                label=excluded.label,features_json=excluded.features_json,
+                created_at=CURRENT_TIMESTAMP""",
+                [
+                    (detection_id, label, json.dumps(features, separators=(",", ":")))
+                    for detection_id, label, features in samples
+                ],
+            )
+        return len(samples)
+
     def clear_weed_training_samples(self) -> list[str]:
         """Remove all verifier samples and return their stored crop paths."""
         paths = [
@@ -807,9 +827,14 @@ class Database:
         return paths
 
     def weed_training_samples(self) -> list[dict]:
+        # The detection carries the image the sample was cut from. Training
+        # holds whole images out of validation, so a sample without a surviving
+        # detection row simply gets a null image and forms its own group.
         samples = []
         for row in self.connection.execute(
-            "SELECT * FROM weed_training_samples ORDER BY created_at,detection_id"
+            """SELECT s.*,d.image_id AS image_id FROM weed_training_samples s
+            LEFT JOIN weed_detections d ON d.detection_id=s.detection_id
+            ORDER BY s.created_at,s.detection_id"""
         ):
             item = dict(row)
             try:
@@ -818,6 +843,26 @@ class Database:
                 item["features"] = {}
             samples.append(item)
         return samples
+
+    def unlabelled_weed_detections(self, limit: int = 200) -> list[dict]:
+        """Detections that have been scored but never labelled by the reviewer.
+
+        Ordered arbitrarily here; the caller ranks them by how close they sit
+        to the decision boundary, because a label near the boundary teaches the
+        verifier far more than another obvious weed.
+        """
+        return [
+            dict(row)
+            for row in self.connection.execute(
+                """SELECT d.* FROM weed_detections d
+                WHERE NOT EXISTS (
+                  SELECT 1 FROM weed_training_samples s WHERE s.detection_id=d.detection_id
+                )
+                AND d.crop_path IS NOT NULL
+                ORDER BY d.image_timestamp DESC LIMIT ?""",
+                (limit,),
+            )
+        ]
 
     def weed_training_summary(self) -> dict[str, int]:
         summary = {
@@ -1439,6 +1484,68 @@ class Database:
         return sorted(consolidated, key=lambda row: str(row["image_timestamp"]), reverse=True)[
             :limit
         ]
+
+    def pending_plant_measurements(
+        self,
+        config_entry_id: str,
+        plant_id: int,
+        image_ids: Iterable[int],
+    ) -> list[Measurement]:
+        """Return the newest pending result for each requested source image.
+
+        Photo-grid uploads arrive as separate vision events. Reading their
+        pending rows back as one set lets a later tile consolidate and stitch
+        the current grid instead of behaving like an isolated photo.
+        """
+        selected_ids = sorted({int(image_id) for image_id in image_ids})
+        if not selected_ids:
+            return []
+        selected_id_set = set(selected_ids)
+        rows = self.connection.execute(
+            """SELECT m.* FROM measurements m
+            WHERE m.config_entry_id=? AND m.plant_id=?
+            AND NOT EXISTS (
+              SELECT 1 FROM decisions d WHERE d.measurement_id=m.measurement_id
+              AND d.action IN
+                ('applied','approved_no_change','reject','removed','keep','superseded')
+            )
+            ORDER BY m.image_timestamp DESC,m.created_at DESC""",
+            (config_entry_id, plant_id),
+        ).fetchall()
+        by_image: dict[int, sqlite3.Row] = {}
+        for row in rows:
+            image_id = int(row["image_id"])
+            if image_id in selected_id_set:
+                by_image.setdefault(image_id, row)
+
+        measurements: list[Measurement] = []
+        for row in by_image.values():
+            item = dict(row)
+            try:
+                item["artifact_paths"] = json.loads(item.get("artifact_paths_json") or "[]")
+            except (TypeError, json.JSONDecodeError):
+                item["artifact_paths"] = []
+            try:
+                item["boundary_sectors"] = json.loads(item.get("boundary_sectors_json") or "[]")
+            except (TypeError, json.JSONDecodeError):
+                item["boundary_sectors"] = []
+            if item.get("recommended_center_px_x") is not None:
+                item["recommended_center_px"] = (
+                    item["recommended_center_px_x"],
+                    item["recommended_center_px_y"],
+                )
+            if item.get("plant_center_px_x") is not None:
+                item["plant_center_px"] = (
+                    item["plant_center_px_x"],
+                    item["plant_center_px_y"],
+                )
+            payload = {
+                field: item[field]
+                for field in Measurement.model_fields
+                if field in item and item[field] is not None
+            }
+            measurements.append(Measurement.model_validate(payload))
+        return measurements
 
     def has_terminal_decision(self, measurement_id: str) -> bool:
         return (

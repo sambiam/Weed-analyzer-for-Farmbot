@@ -43,7 +43,10 @@ class WeedSettings(BaseModel):
     visual_verifier_shadow_mode: bool = True
     visual_verifier_required_for_automatic: bool = True
     visual_verifier_minimum_confidence: float = Field(default=0.85, ge=0, le=1)
-    visual_verifier_weight: float = Field(default=0.7, ge=0, le=1)
+    # Applied to the three shape gates only while the verifier is scoring. The
+    # heuristic's job then is recall -- finding every candidate worth judging --
+    # and the verifier decides. Set to 1 to keep the gates identical either way.
+    candidate_recall_boost: float = Field(default=0.6, ge=0.1, le=1)
     training_minimum_per_class: int = Field(default=10, ge=2, le=10_000)
     automatic_retraining: bool = False
     candidate_crop_storage_enabled: bool = True

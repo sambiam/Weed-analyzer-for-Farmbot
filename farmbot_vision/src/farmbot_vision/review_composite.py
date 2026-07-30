@@ -8,18 +8,30 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+from .photo_grid import photo_grid_cell_bounds
 from .plant_measurement import (
-    parse_transform,
     relative_pixel_to_plant_mm_transform,
     select_measurement_evidence,
     selection_diagnostics,
 )
 
 
-def _grid_window(selection, grid_record) -> tuple[set[int], dict[str, int]] | None:
-    if grid_record is None or not selection.used:
+def _grid_frames(grid_record) -> list:
+    return [
+        *grid_record.frames,
+        *getattr(grid_record, "quality_overlay_frames", []),
+    ]
+
+
+def _grid_window(
+    selection,
+    grid_record,
+    target_x: float,
+    target_y: float,
+) -> tuple[set[int], dict[str, int]] | None:
+    if grid_record is None:
         return None
-    frames_by_image = {int(frame.image_id): frame for frame in grid_record.frames}
+    frames_by_image = {int(frame.image_id): frame for frame in _grid_frames(grid_record)}
     targets_by_index = {int(target.index): target for target in grid_record.targets}
     used_targets = [
         targets_by_index[frames_by_image[int(item.image_id)].target_index]
@@ -27,14 +39,34 @@ def _grid_window(selection, grid_record) -> tuple[set[int], dict[str, int]] | No
         if int(item.image_id) in frames_by_image
         and frames_by_image[int(item.image_id)].target_index in targets_by_index
     ]
-    if len(used_targets) != len(selection.used):
+    if selection.used and len(used_targets) != len(selection.used):
+        return None
+    cells = photo_grid_cell_bounds(grid_record)
+    target_cell = next(
+        (
+            targets_by_index[index]
+            for index, bounds in cells.items()
+            if index in targets_by_index
+            and bounds[0] <= target_x <= bounds[2]
+            and bounds[1] <= target_y <= bounds[3]
+        ),
+        None,
+    )
+    if target_cell is None and targets_by_index:
+        target_cell = min(
+            targets_by_index.values(),
+            key=lambda target: (float(target.x) - target_x) ** 2
+            + (float(target.y) - target_y) ** 2,
+        )
+    anchors = [*used_targets, *([target_cell] if target_cell is not None else [])]
+    if not anchors:
         return None
     rows = [int(target.row) for target in grid_record.targets]
     columns = [int(target.column) for target in grid_record.targets]
-    row_min = max(min(rows), min(int(target.row) for target in used_targets) - 1)
-    row_max = min(max(rows), max(int(target.row) for target in used_targets) + 1)
-    col_min = max(min(columns), min(int(target.column) for target in used_targets) - 1)
-    col_max = min(max(columns), max(int(target.column) for target in used_targets) + 1)
+    row_min = max(min(rows), min(int(target.row) for target in anchors) - 1)
+    row_max = min(max(rows), max(int(target.row) for target in anchors) + 1)
+    col_min = max(min(columns), min(int(target.column) for target in anchors) - 1)
+    col_max = min(max(columns), max(int(target.column) for target in anchors) + 1)
     indexes = {
         int(target.index)
         for target in grid_record.targets
@@ -62,28 +94,36 @@ def build_plant_review(
     """Write geometry-identical standard and target-mask diagnostic images."""
 
     selection = select_measurement_evidence(measurements)
-    if not selection.used:
+    if not selection.candidates:
         return False
-    grid_window = (
-        None if selection.mode == "single_complete" else _grid_window(selection, grid_record)
-    )
+    representative = selection.used[0] if selection.used else selection.candidates[0]
+    target_x = float(representative.recorded_center_x or 0)
+    target_y = float(representative.recorded_center_y or 0)
+    grid_window = _grid_window(selection, grid_record, target_x, target_y)
+    if not selection.used and grid_window is None:
+        return False
     allowed_image_ids: set[int]
     window_details: dict[str, int] | None = None
     theoretical_targets = []
     if grid_window is not None:
         allowed_target_indexes, window_details = grid_window
-        frames_by_target = {
-            int(frame.target_index): frame
-            for frame in grid_record.frames
+        allowed_image_ids = {
+            int(frame.image_id)
+            for frame in _grid_frames(grid_record)
             if int(frame.target_index) in allowed_target_indexes
         }
-        allowed_image_ids = {int(frame.image_id) for frame in frames_by_target.values()}
         theoretical_targets = [
             target for target in grid_record.targets if int(target.index) in allowed_target_indexes
         ]
     else:
         allowed_image_ids = {int(item.image_id) for item in selection.used}
 
+    grid_frames_by_image = (
+        {int(frame.image_id): frame for frame in _grid_frames(grid_record)}
+        if grid_record is not None
+        else {}
+    )
+    grid_cells = photo_grid_cell_bounds(grid_record) if grid_record is not None else {}
     frames: list[dict] = []
     for item in measurements:
         if int(item.image_id) not in allowed_image_ids or not item.source_image_path:
@@ -98,12 +138,28 @@ def build_plant_review(
             np.float64([[[0, 0], [width, 0], [0, height], [width, height]]]),
             transform,
         )[0]
+        grid_frame = grid_frames_by_image.get(int(item.image_id))
+        absolute_cell = (
+            grid_cells.get(int(grid_frame.target_index)) if grid_frame is not None else None
+        )
+        relative_cell = (
+            (
+                absolute_cell[0] - target_x,
+                absolute_cell[1] - target_y,
+                absolute_cell[2] - target_x,
+                absolute_cell[3] - target_y,
+            )
+            if absolute_cell is not None
+            else None
+        )
         frames.append(
             {
                 "item": item,
                 "image": image,
                 "transform": transform,
                 "scale": scale,
+                "target_index": (int(grid_frame.target_index) if grid_frame is not None else None),
+                "cell_bounds": relative_cell,
                 "bounds": (
                     float(corners[:, 0].min()),
                     float(corners[:, 0].max()),
@@ -119,26 +175,29 @@ def build_plant_review(
     max_x = max(frame["bounds"][1] for frame in frames)
     min_y = min(frame["bounds"][2] for frame in frames)
     max_y = max(frame["bounds"][3] for frame in frames)
-    # Preserve empty cells inside the expanded grid rectangle. Their theoretical
-    # footprint extends the crop, but no neighbouring image is stretched into
-    # the unavailable space.
+    tessellated_cells: dict[int, tuple[float, float, float, float]] = {}
     if theoretical_targets:
-        prototype = frames[0]
-        transform_meta = parse_transform(prototype["item"])
-        image_x = transform_meta.get("image_x")
-        image_y = transform_meta.get("image_y")
-        if image_x is not None and image_y is not None:
-            base = prototype["bounds"]
-            for target in theoretical_targets:
-                shift_x = float(target.x) - float(image_x)
-                shift_y = float(target.y) - float(image_y)
-                min_x = min(min_x, base[0] + shift_x)
-                max_x = max(max_x, base[1] + shift_x)
-                min_y = min(min_y, base[2] + shift_y)
-                max_y = max(max_y, base[3] + shift_y)
+        tessellated_cells = {
+            int(target.index): (
+                grid_cells[int(target.index)][0] - target_x,
+                grid_cells[int(target.index)][1] - target_y,
+                grid_cells[int(target.index)][2] - target_x,
+                grid_cells[int(target.index)][3] - target_y,
+            )
+            for target in theoretical_targets
+            if int(target.index) in grid_cells
+        }
+        if tessellated_cells:
+            min_x = min(cell[0] for cell in tessellated_cells.values())
+            min_y = min(cell[1] for cell in tessellated_cells.values())
+            max_x = max(cell[2] for cell in tessellated_cells.values())
+            max_y = max(cell[3] for cell in tessellated_cells.values())
     else:
-        current = float(selection.used[0].current_radius_mm)
-        proposed = max(float(item.recommended_protection_radius_mm) for item in selection.used)
+        current = float(representative.current_radius_mm)
+        proposed = max(
+            float(item.recommended_protection_radius_mm)
+            for item in (selection.used or selection.candidates)
+        )
         focus = max(60.0, current, proposed) * 2.5
         focused = (
             max(min_x, -focus),
@@ -157,6 +216,11 @@ def build_plant_review(
     priority = np.full((canvas_height, canvas_width), -np.inf, dtype=np.float32)
     ownership = np.zeros((canvas_height, canvas_width), dtype=np.uint8)
     newest = max(item.image_timestamp for item in measurements)
+    overlay_image_ids = (
+        {int(frame.image_id) for frame in getattr(grid_record, "quality_overlay_frames", [])}
+        if grid_record is not None
+        else set()
+    )
     for frame in sorted(frames, key=lambda frame: frame["item"].image_timestamp):
         affine = frame["transform"].copy()
         affine[0] *= ppm
@@ -178,8 +242,22 @@ def build_plant_review(
             flags=cv2.INTER_NEAREST,
             borderMode=cv2.BORDER_CONSTANT,
         )
+        cell_mask = None
+        cell_bounds = frame["cell_bounds"]
+        if cell_bounds is not None:
+            cell_mask = np.zeros((canvas_height, canvas_width), dtype=np.uint8)
+            cell_x0 = max(0, round((cell_bounds[0] - min_x) * ppm))
+            cell_y0 = max(0, round((cell_bounds[1] - min_y) * ppm))
+            cell_x1 = min(canvas_width, round((cell_bounds[2] - min_x) * ppm))
+            cell_y1 = min(canvas_height, round((cell_bounds[3] - min_y) * ppm))
+            cell_mask[cell_y0:cell_y1, cell_x0:cell_x1] = 255
+            valid = cv2.bitwise_and(valid, cell_mask)
         age_seconds = max(0.0, (newest - frame["item"].image_timestamp).total_seconds())
-        score = float(frame["item"].image_quality) + 1e-6 / (1.0 + age_seconds)
+        # A selected leaf-repair view is an explicit top layer. Its offset
+        # means it covers only its real calibrated footprint; exposed pixels
+        # from the original tile remain visible underneath.
+        layer = 2.0 if int(frame["item"].image_id) in overlay_image_ids else 0.0
+        score = layer + float(frame["item"].image_quality) + 1e-6 / (1.0 + age_seconds)
         selected_pixels = (valid > 0) & (score >= priority)
         canvas[selected_pixels] = warped[selected_pixels]
         priority[selected_pixels] = score
@@ -193,6 +271,8 @@ def build_plant_review(
                     flags=cv2.INTER_NEAREST,
                     borderMode=cv2.BORDER_CONSTANT,
                 )
+                if cell_mask is not None:
+                    warped_mask = cv2.bitwise_and(warped_mask, cell_mask)
                 ownership = cv2.max(ownership, warped_mask)
 
     diagnostic = canvas.copy()
@@ -202,9 +282,33 @@ def build_plant_review(
         + np.asarray((255, 190, 20), dtype=np.float32) * 0.45
     ).astype(np.uint8)
 
-    representative = selection.used[0]
-    target_x = float(representative.recorded_center_x or 0)
-    target_y = float(representative.recorded_center_y or 0)
+    def draw_tessellation(target: np.ndarray) -> None:
+        if not tessellated_cells:
+            return
+        line_width = max(1, round(min(canvas_width, canvas_height) / 700))
+        for cell in tessellated_cells.values():
+            x0 = round((cell[0] - min_x) * ppm)
+            y0 = round((cell[1] - min_y) * ppm)
+            x1 = round((cell[2] - min_x) * ppm)
+            y1 = round((cell[3] - min_y) * ppm)
+            cv2.rectangle(
+                target,
+                (x0, y0),
+                (max(x0, x1 - 1), max(y0, y1 - 1)),
+                (78, 104, 86),
+                line_width,
+            )
+        cv2.rectangle(
+            target,
+            (0, 0),
+            (canvas_width - 1, canvas_height - 1),
+            (32, 78, 48),
+            max(2, line_width * 2),
+        )
+
+    draw_tessellation(canvas)
+    draw_tessellation(diagnostic)
+
     proposals = proposed_radii or {}
     current_target = float(representative.current_radius_mm)
     proposed_target = float(
@@ -304,6 +408,8 @@ def build_plant_review(
         "pixel_dimensions": [canvas_width, canvas_height],
         "pixels_per_mm": ppm,
         "tile_window": window_details,
+        "tessellated_rectangular_cells": bool(tessellated_cells),
+        "garden_border": bool(tessellated_cells),
         "standard_and_diagnostic_geometry_identical": True,
     }
     output_path.with_suffix(".json").write_text(

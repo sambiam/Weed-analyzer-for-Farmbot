@@ -7,6 +7,7 @@ import os
 import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Literal
 from uuid import uuid4
 
 from pydantic import BaseModel, Field
@@ -58,6 +59,43 @@ def photo_grid_chunk_size(capabilities: object) -> int:
     return PHOTO_GRID_CONTINUOUS_MAX_TARGETS if supported else PHOTO_GRID_CHUNK_SIZE
 
 
+def farmbot_cropped_footprint(
+    calibration: FarmbotCalibrationInput,
+) -> tuple[float, float]:
+    """Return the usable map-photo rectangle after FarmBot's rotation crop.
+
+    FarmBot first scales the native image into millimetres, rotates it for the
+    map, and then clips small rotations to an axis-aligned rectangle. Its
+    ``cropAmount`` function removes the same rounded amount from both
+    dimensions. Near a quarter turn the displayed axes swap; rotations near
+    45 degrees use FarmBot's circular crop and therefore have a square usable
+    footprint.
+    """
+    width = round(calibration.coordinate_scale * calibration.reference_width, 3)
+    height = round(calibration.coordinate_scale * calibration.reference_height, 3)
+    angle = float(calibration.rotation_degrees)
+    closest = abs(angle) % 90
+    if closest > 45:
+        closest = 90 - closest
+    rotated_90 = (abs(angle) + 45) % 180 > 90
+
+    if closest > 40:
+        # FarmBot switches to a circle at steep angles. Plan against the
+        # largest axis-aligned square wholly inside that circle, otherwise the
+        # nominal rectangular cells would still leave uncovered corner gaps.
+        side = min(width, height) / math.sqrt(2)
+        return side, side
+
+    crop = 0
+    if closest > 0:
+        factor = (5.61 - 0.095 * closest**2 + 9.06 * closest) / 640
+        # Lodash round(), used by FarmBot, rounds positive .5 values upward.
+        crop = math.floor(max(width, height) * factor + 0.5)
+    usable_width = max(1.0, width - crop)
+    usable_height = max(1.0, height - crop)
+    return (usable_height, usable_width) if rotated_90 else (usable_width, usable_height)
+
+
 class PhotoGridTarget(BaseModel):
     index: int = Field(ge=0)
     row: int = Field(ge=0)
@@ -91,6 +129,20 @@ class TargetedPlantCapture(BaseModel):
     completed_at: datetime | None = None
 
 
+class PhotoGridQualityRepair(BaseModel):
+    """One persisted quality-repair attempt for one original grid frame."""
+
+    target_index: int = Field(ge=0)
+    issue: Literal["washed_out", "leaf_obstruction"]
+    original_image_id: int = Field(gt=0)
+    status: Literal["attempting", "complete", "failed"] = "attempting"
+    attempted_at: datetime
+    completed_at: datetime | None = None
+    candidate_image_ids: list[int] = Field(default_factory=list)
+    selected_image_id: int | None = None
+    message: str = ""
+
+
 class PhotoGridRecord(BaseModel):
     session_id: str = Field(default_factory=lambda: str(uuid4()))
     config_entry_id: str
@@ -112,8 +164,20 @@ class PhotoGridRecord(BaseModel):
     # index. Older schemas reject unknown target keys, so this stays off for
     # them and frames fall back to coordinate matching.
     indexed_targets: bool = False
+    # Existing persisted grids predate the quality pass and must not start
+    # moving the bot after an upgrade. Newly planned grids explicitly enable
+    # it when they are created.
+    quality_repair_enabled: bool = False
     targeted_captures: list[TargetedPlantCapture] = Field(default_factory=list)
     targeted_capture_diagnostics: list[dict[str, object]] = Field(default_factory=list)
+    # Leaf repairs retain the original in ``frames`` as the background and
+    # paint the selected offset view afterwards as an explicit top layer.
+    quality_overlay_frames: list[PhotoGridFrame] = Field(default_factory=list)
+    quality_repairs: list[PhotoGridQualityRepair] = Field(default_factory=list)
+    # FarmBot deletion is best-effort across integration versions. This list
+    # is the app-side safety barrier that prevents discarded captures from
+    # contributing analysis even when remote deletion is unavailable.
+    excluded_image_ids: list[int] = Field(default_factory=list)
 
 
 class PhotoGridStore:
@@ -142,6 +206,67 @@ class PhotoGridStore:
         finally:
             handle.close()
         os.replace(handle.name, self.path)
+
+
+def photo_grid_cell_bounds(
+    record: PhotoGridRecord,
+) -> dict[int, tuple[float, float, float, float]]:
+    """Partition the garden bed into midpoint-bounded rectangular grid cells.
+
+    Every neighbouring pair shares one exact boundary, while the outside row
+    and column extend to the configured bed border. Coordinates are based on
+    the camera's optical centres (gantry position plus calibration offset), so
+    these rectangles tessellate without gaps or overlap.
+    """
+
+    def axis_bounds(
+        label: str,
+        coordinate: str,
+        lower: float,
+        upper: float,
+        offset: float,
+    ) -> dict[int, tuple[float, float]]:
+        grouped: dict[int, list[float]] = {}
+        for target in record.targets:
+            grouped.setdefault(int(getattr(target, label)), []).append(
+                float(getattr(target, coordinate)) + offset
+            )
+        ordered = sorted(
+            (
+                label_value,
+                float(sum(values) / len(values)),
+            )
+            for label_value, values in grouped.items()
+        )
+        result: dict[int, tuple[float, float]] = {}
+        for index, (label_value, center) in enumerate(ordered):
+            left = lower if index == 0 else (ordered[index - 1][1] + center) / 2
+            right = upper if index == len(ordered) - 1 else (center + ordered[index + 1][1]) / 2
+            result[label_value] = (max(lower, left), min(upper, right))
+        return result
+
+    calibration = record.calibration
+    x_cells = axis_bounds(
+        "column",
+        "x",
+        *record.bed_bounds["x"],
+        calibration.offset_x_mm,
+    )
+    y_cells = axis_bounds(
+        "row",
+        "y",
+        *record.bed_bounds["y"],
+        calibration.offset_y_mm,
+    )
+    return {
+        int(target.index): (
+            x_cells[int(target.column)][0],
+            y_cells[int(target.row)][0],
+            x_cells[int(target.column)][1],
+            y_cells[int(target.row)][1],
+        )
+        for target in record.targets
+    }
 
 
 def _capture_centres(
@@ -187,17 +312,15 @@ def plan_photo_grid(
 ) -> tuple[list[PhotoGridTarget], float, float]:
     """Create a serpentine grid from FarmBot calibration and motion bounds.
 
-    FarmBot's scale is millimetres per native pixel. Camera rotation expands
-    the axis-aligned garden footprint, while calibration offsets translate the
+    FarmBot's scale is millimetres per native pixel. Capture spacing uses the
+    usable rectangle left by FarmBot's post-rotation map crop, rather than the
+    larger rotated bounding box, so cropped photos retain the configured
+    overlap without leaving regular gaps. Calibration offsets translate the
     optical centre relative to the gantry coordinate stored with each photo.
     """
     if not math.isfinite(z):
         raise ValueError("photo-grid Z coordinate must be finite")
-    width = calibration.coordinate_scale * calibration.reference_width
-    height = calibration.coordinate_scale * calibration.reference_height
-    theta = math.radians(calibration.rotation_degrees)
-    footprint_x = abs(math.cos(theta)) * width + abs(math.sin(theta)) * height
-    footprint_y = abs(math.sin(theta)) * width + abs(math.cos(theta)) * height
+    footprint_x, footprint_y = farmbot_cropped_footprint(calibration)
     xs = _capture_centres(*x_bounds, footprint_x, calibration.offset_x_mm)
     ys = _capture_centres(*y_bounds, footprint_y, calibration.offset_y_mm)
 

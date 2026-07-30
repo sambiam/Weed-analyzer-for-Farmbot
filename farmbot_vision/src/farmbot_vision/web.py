@@ -14,7 +14,7 @@ from urllib.parse import quote
 from uuid import UUID, uuid4
 
 import cv2
-from fastapi import BackgroundTasks, FastAPI, Form, HTTPException, Request
+from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import (
     FileResponse,
     HTMLResponse,
@@ -71,6 +71,7 @@ from .models import (
 from .photo_grid import (
     PHOTO_GRID_CONTINUOUS_CAPABILITY,
     PhotoGridFrame,
+    PhotoGridQualityRepair,
     PhotoGridRecord,
     PhotoGridStore,
     PhotoGridTarget,
@@ -79,11 +80,17 @@ from .photo_grid import (
     plan_photo_grid,
     plan_targeted_plant_captures,
 )
+from .photo_quality import PhotoQuality, best_unobscured_photo, inspect_photo_quality
 from .settings import Settings
 from .soil_jobs import SoilJobManager
 from .vision import garden_to_pixel
 from .weed_settings import WeedSettings, WeedSettingsStore
-from .weed_verifier import ALL_LABELS, WeedVisualVerifier
+from .weed_verifier import (
+    ALL_LABELS,
+    FEATURE_NAMES,
+    LABEL_DESCRIPTIONS,
+    WeedVisualVerifier,
+)
 from .zones import (
     Zone,
     ZoneAspect,
@@ -109,7 +116,13 @@ grid_repair_settings_store = GridRepairSettingsStore(
 )
 repair_capture_store = RepairCaptureStore(settings.data_dir / "grid_repair_captures.json")
 photo_grid_store = PhotoGridStore(settings.data_dir / "photo_grid_latest.json")
-weed_verifier = WeedVisualVerifier(settings.data_dir / "weed_visual_model.json")
+# A model shipped inside the image gives a fresh install useful filtering
+# before its owner has labelled anything. It is only consulted when no locally
+# trained model exists (see WeedVisualVerifier.reload).
+weed_verifier = WeedVisualVerifier(
+    settings.data_dir / "weed_visual_model.json",
+    bundled_path=Path(__file__).with_name("bundled_weed_model.json"),
+)
 zone_store = ZoneStore(settings.data_dir / "zones.json")
 jobs = JobManager(settings, database, client, weed_settings_store, zone_store)
 soil_jobs = SoilJobManager(database, client, settings.data_dir, jobs.lock, zone_store)
@@ -143,6 +156,9 @@ PHOTO_GRID_WORKER_MAX_PASSES = 3
 # terminal status message so a large failure can't flood either.
 PHOTO_GRID_MISSING_LOG_LIMIT = 20
 PHOTO_GRID_MESSAGE_EXAMPLE_LIMIT = 5
+# Move far enough for the camera to look around a close leaf while retaining
+# generous overlap with the original cell.
+PHOTO_GRID_LEAF_OFFSET_FRACTION = 0.20
 # A cell whose fresh photo still shows the gantry will photograph the gantry
 # again; give it one retry, then move on rather than loop on it forever.
 MAX_REPAIR_ATTEMPTS_PER_CELL = 2
@@ -159,6 +175,21 @@ TRAINING_LABELS = (
     "fungus_moss",
     "hardware_other",
 )
+
+
+def _verifier_label_guess(features: dict) -> list[dict[str, object]]:
+    """What the verifier thinks the object actually is, best guess first.
+
+    Purely descriptive: the accept/reject decision stays with the binary score.
+    It exists because a borderline detection is far easier to review when the
+    model can say "this looks like moss".
+    """
+    if not isinstance(features, dict):
+        return []
+    return [
+        {"label": LABEL_DESCRIPTIONS.get(label, label.replace("_", " ")), "probability": value}
+        for label, value in weed_verifier.explain(features)[:3]
+    ]
 
 
 async def inspect_photo_grid(*, force: bool = False) -> GridRun | None:
@@ -780,6 +811,258 @@ async def _capture_targeted_plant_photos(record: PhotoGridRecord) -> None:
             )
 
 
+async def _quality_jpeg(record: PhotoGridRecord, image_id: int) -> bytes:
+    response = await client.image(
+        VisionImageRequest(
+            config_entry_id=record.config_entry_id,
+            image_id=image_id,
+            max_width=640,
+            max_height=640,
+        ),
+        settings.max_image_payload_bytes,
+    )
+    return base64.b64decode(response.image_base64, validate=True)
+
+
+async def _delete_discarded_grid_image(
+    record: PhotoGridRecord,
+    image_id: int,
+    *,
+    reason: str,
+) -> None:
+    """Best-effort remote deletion after app-side analysis exclusion."""
+
+    try:
+        result = await client.delete_image(record.config_entry_id, image_id)
+        if str(result.get("status") or "") != "deleted":
+            LOGGER.warning(
+                "Photo-grid image %d was excluded but remote deletion did not complete: %s",
+                image_id,
+                result.get("message") or result.get("status"),
+            )
+            return
+        LOGGER.info("Deleted photo-grid image %d (%s)", image_id, reason)
+    except HomeAssistantError as exc:
+        LOGGER.warning(
+            "Photo-grid image %d remains remotely stored but is excluded from analysis: %s",
+            image_id,
+            exc,
+        )
+
+
+def _exclude_grid_image(record: PhotoGridRecord, image_id: int) -> None:
+    record.excluded_image_ids = sorted(set(record.excluded_image_ids) | {int(image_id)})
+    jobs.queued_image_ids = [
+        queued for queued in jobs.queued_image_ids if int(queued) != int(image_id)
+    ]
+    jobs.current["queue_length"] = len(jobs.queued_image_ids)
+
+
+def _leaf_offset_targets(
+    record: PhotoGridRecord,
+    target: PhotoGridTarget,
+) -> list[PhotoGridTarget]:
+    """Plan four bounded views around one obstructed cell."""
+
+    dx = max(20.0, record.footprint_width_mm * PHOTO_GRID_LEAF_OFFSET_FRACTION)
+    dy = max(20.0, record.footprint_height_mm * PHOTO_GRID_LEAF_OFFSET_FRACTION)
+    lower_x, upper_x = record.bed_bounds["x"]
+    lower_y, upper_y = record.bed_bounds["y"]
+    vectors = (
+        (-dx, 0.0),
+        (dx, 0.0),
+        (0.0, -dy),
+        (0.0, dy),
+        (-dx, -dy),
+        (dx, -dy),
+        (-dx, dy),
+        (dx, dy),
+        (-dx / 2, 0.0),
+        (dx / 2, 0.0),
+        (0.0, -dy / 2),
+        (0.0, dy / 2),
+    )
+    coordinates: list[tuple[float, float]] = []
+    for offset_x, offset_y in vectors:
+        x = round(min(upper_x, max(lower_x, target.x + offset_x)), 3)
+        y = round(min(upper_y, max(lower_y, target.y + offset_y)), 3)
+        if (x, y) == (target.x, target.y) or (x, y) in coordinates:
+            continue
+        coordinates.append((x, y))
+        if len(coordinates) == 4:
+            break
+    base_index = len(record.targets) + len(record.quality_repairs) * 16
+    return [
+        PhotoGridTarget(
+            index=base_index + index,
+            row=target.row,
+            column=target.column,
+            x=x,
+            y=y,
+            z=target.z,
+        )
+        for index, (x, y) in enumerate(coordinates)
+    ]
+
+
+async def _capture_quality_targets(
+    record: PhotoGridRecord,
+    targets: list[PhotoGridTarget],
+) -> list[PhotoGridFrame]:
+    """Make one capture call and return its verified frames without retrying."""
+
+    if not targets:
+        return []
+    started = await _start_photo_grid_batch(record, targets)
+    repair_id = str(started.get("repair_id") or "")
+    while True:
+        result = await client.grid_repair_status(record.config_entry_id, repair_id)
+        status = str(result.get("status") or "")
+        if status in {"queued", "running", "waiting_images"}:
+            await asyncio.sleep(GRID_REPAIR_STATUS_POLL_SECONDS)
+            continue
+        return match_verified_frames(targets, result.get("frames"))
+
+
+async def _repair_washed_out_frame(
+    record: PhotoGridRecord,
+    frame: PhotoGridFrame,
+    repair: PhotoGridQualityRepair,
+) -> None:
+    target = next(item for item in record.targets if item.index == frame.target_index)
+    _exclude_grid_image(record, frame.image_id)
+    record.frames = [item for item in record.frames if item.image_id != frame.image_id]
+    photo_grid_store.save(record)
+    await _delete_discarded_grid_image(record, frame.image_id, reason="washed out")
+
+    replacements = await _capture_quality_targets(record, [target])
+    repair.candidate_image_ids = [item.image_id for item in replacements]
+    photo_grid_store.save(record)
+    if not replacements:
+        repair.status = "failed"
+        repair.message = "The single same-coordinate retake produced no verified image"
+        return
+    replacement = replacements[0]
+    quality = inspect_photo_quality(await _quality_jpeg(record, replacement.image_id))
+    if quality.issue == "washed_out":
+        _exclude_grid_image(record, replacement.image_id)
+        await _delete_discarded_grid_image(
+            record,
+            replacement.image_id,
+            reason="washed-out repair was still unusable",
+        )
+        repair.status = "failed"
+        repair.message = "The single retake was also washed out and was discarded"
+        return
+    record.frames.append(replacement.model_copy(update={"target_index": frame.target_index}))
+    record.frames.sort(key=lambda item: item.target_index)
+    repair.selected_image_id = replacement.image_id
+    repair.status = "complete"
+    repair.message = "Washed-out original deleted and replaced by one verified retake"
+
+
+async def _repair_leaf_obstruction(
+    record: PhotoGridRecord,
+    frame: PhotoGridFrame,
+    repair: PhotoGridQualityRepair,
+) -> None:
+    target = next(item for item in record.targets if item.index == frame.target_index)
+    offsets = _leaf_offset_targets(record, target)
+    candidates = await _capture_quality_targets(record, offsets)
+    repair.candidate_image_ids = [item.image_id for item in candidates]
+    # Until ranking finishes, none of the four offset photos is authorised for
+    # analysis. Persist that conservative state before downloading them.
+    for candidate in candidates:
+        _exclude_grid_image(record, candidate.image_id)
+    photo_grid_store.save(record)
+    inspected: list[tuple[int, PhotoQuality]] = []
+    for candidate in candidates:
+        try:
+            inspected.append(
+                (
+                    candidate.image_id,
+                    inspect_photo_quality(await _quality_jpeg(record, candidate.image_id)),
+                )
+            )
+        except (HomeAssistantError, ValueError) as exc:
+            LOGGER.warning(
+                "Could not inspect leaf-repair candidate %d: %s",
+                candidate.image_id,
+                exc,
+            )
+    selected_id = best_unobscured_photo(inspected)
+    for candidate in candidates:
+        if candidate.image_id == selected_id:
+            continue
+        await _delete_discarded_grid_image(
+            record,
+            candidate.image_id,
+            reason="unselected leaf-obstruction offset",
+        )
+    if selected_id is None:
+        repair.status = "failed"
+        repair.message = "The four-position repair produced no inspectable verified image"
+        return
+    selected = next(item for item in candidates if item.image_id == selected_id)
+    record.excluded_image_ids = [
+        image_id for image_id in record.excluded_image_ids if image_id != selected_id
+    ]
+    record.quality_overlay_frames = [
+        item for item in record.quality_overlay_frames if item.target_index != frame.target_index
+    ]
+    record.quality_overlay_frames.append(
+        selected.model_copy(update={"target_index": frame.target_index})
+    )
+    repair.selected_image_id = selected_id
+    repair.status = "complete"
+    repair.message = (
+        "Selected the offset with the most unobscured plant; original retained as background"
+    )
+
+
+async def _photo_grid_quality_pass(record: PhotoGridRecord) -> None:
+    """Inspect every base tile once and persist at most one repair per issue."""
+
+    attempted = {item.original_image_id for item in record.quality_repairs}
+    originals = [item for item in record.frames if item.image_id not in attempted]
+    targets = {item.index for item in record.targets}
+    for frame in originals:
+        if frame.target_index not in targets:
+            continue
+        try:
+            quality = inspect_photo_quality(await _quality_jpeg(record, frame.image_id))
+        except (HomeAssistantError, ValueError) as exc:
+            LOGGER.warning("Could not quality-check photo-grid image %d: %s", frame.image_id, exc)
+            continue
+        if quality.issue == "usable":
+            continue
+        repair = PhotoGridQualityRepair(
+            target_index=frame.target_index,
+            issue=quality.issue,
+            original_image_id=frame.image_id,
+            attempted_at=datetime.now(UTC),
+        )
+        # Save before moving the bot. A restart can report this attempt as
+        # interrupted, but can never issue an accidental second repair.
+        record.quality_repairs.append(repair)
+        photo_grid_store.save(record)
+        try:
+            if quality.issue == "washed_out":
+                await _repair_washed_out_frame(record, frame, repair)
+            else:
+                await _repair_leaf_obstruction(record, frame, repair)
+        except (HomeAssistantError, ValueError, StopIteration) as exc:
+            repair.status = "failed"
+            repair.message = str(exc)
+            LOGGER.warning(
+                "Quality repair for grid image %d failed safely: %s",
+                frame.image_id,
+                exc,
+            )
+        repair.completed_at = datetime.now(UTC)
+        photo_grid_store.save(record)
+
+
 async def _photo_grid_worker(record: PhotoGridRecord) -> None:
     """Capture the calibrated bed grid, retrying only coordinates not verified."""
     try:
@@ -884,10 +1167,28 @@ async def _photo_grid_worker(record: PhotoGridRecord) -> None:
         photo_grid_store.save(record)
         if record.status == "complete":
             try:
+                if record.quality_repair_enabled:
+                    record.status = "quality_check"
+                    record.message = (
+                        "Photo grid captured; checking exposure and close-leaf obstruction"
+                    )
+                    photo_grid_store.save(record)
+                    await _photo_grid_quality_pass(record)
+                    record.status = "complete"
+                    repaired = sum(item.status == "complete" for item in record.quality_repairs)
+                    record.message = (
+                        f"Photo grid complete: {len(record.frames)} base photos verified"
+                        + (
+                            f" · {repaired} quality repair{'s' if repaired != 1 else ''} complete"
+                            if record.quality_repairs
+                            else ""
+                        )
+                    )
+                    photo_grid_store.save(record)
                 await _capture_targeted_plant_photos(record)
             except HomeAssistantError as exc:
                 LOGGER.warning(
-                    "Targeted plant capture planning failed after grid %s: %s",
+                    "Post-grid capture work failed after grid %s: %s",
                     record.session_id,
                     exc,
                 )
@@ -959,6 +1260,7 @@ async def start_calibrated_photo_grid() -> PhotoGridRecord:
         targets=targets,
         chunk_size=chunk_size,
         indexed_targets=bot.supports("indexed_photo_grid_targets"),
+        quality_repair_enabled=True,
     )
     if chunk_size < len(targets):
         LOGGER.warning(
@@ -1096,6 +1398,66 @@ _CALIBRATION_JS = r"""
   function imagePpm(p,iw,ih,captureW,captureH){
     return [iw/(p.scale*(captureW||p.refw)),ih/(p.scale*(captureH||p.refh))];
   }
+  function croppedFootprint(p,captureW,captureH){
+    let width=p.scale*(captureW||p.refw), height=p.scale*(captureH||p.refh);
+    const angle=Math.abs(num('rotation'));
+    let closest=angle%90;if(closest>45) closest=90-closest;
+    const rotated90=(angle+45)%180>90;
+    if(closest>40){
+      const side=Math.min(width,height)/Math.sqrt(2);
+      return [side,side];
+    }
+    let crop=0;
+    if(closest>0){
+      const factor=(5.61-.095*closest*closest+9.06*closest)/640;
+      crop=Math.round(Math.max(width,height)*factor);
+    }
+    width=Math.max(1,width-crop);height=Math.max(1,height-crop);
+    return rotated90?[height,width]:[width,height];
+  }
+  function calibrationTileBounds(records,p,xmin,xmax,ymin,ymax){
+    const axis=function(values,lower,upper){
+      const sorted=values.slice().sort((a,b)=>a-b),groups=[];
+      sorted.forEach(function(value){
+        const last=groups[groups.length-1];
+        if(last&&Math.abs(value-last.center)<=25){
+          last.values.push(value);
+          last.center=last.values.reduce((a,b)=>a+b,0)/last.values.length;
+        }else groups.push({values:[value],center:value});
+      });
+      return function(value){
+        let nearest=0;
+        groups.forEach(function(group,index){
+          if(Math.abs(group.center-value)<Math.abs(groups[nearest].center-value)) nearest=index;
+        });
+        return [
+          nearest===0?lower:(groups[nearest-1].center+groups[nearest].center)/2,
+          nearest===groups.length-1?upper:(groups[nearest].center+groups[nearest+1].center)/2];
+      };
+    };
+    const xCell=axis(records.map(r=>r.info.x+p.ox),xmin,xmax);
+    const yCell=axis(records.map(r=>r.info.y+p.oy),ymin,ymax);
+    const result={};
+    records.forEach(function(r){
+      const x=xCell(r.info.x+p.ox),y=yCell(r.info.y+p.oy);
+      result[String(r.info.id)]=[x[0],y[0],x[1],y[1]];
+    });
+    return result;
+  }
+  function strokeCalibrationTiles(ctx,tiles,toCanvas,width,height){
+    ctx.save();ctx.setTransform(1,0,0,1,0,0);
+    ctx.strokeStyle='rgba(225,238,227,.32)';ctx.lineWidth=1;
+    Object.values(tiles).forEach(function(cell){
+      const points=[
+        toCanvas(cell[0],cell[1]),toCanvas(cell[2],cell[1]),
+        toCanvas(cell[2],cell[3]),toCanvas(cell[0],cell[3])];
+      ctx.beginPath();ctx.moveTo(points[0][0],points[0][1]);
+      points.slice(1).forEach(function(point){ctx.lineTo(point[0],point[1]);});
+      ctx.closePath();ctx.stroke();
+    });
+    ctx.strokeStyle='#245b38';ctx.lineWidth=4;
+    ctx.strokeRect(2,2,width-4,height-4);ctx.restore();
+  }
   // Map a source pixel (u,v) of an image taken at (cx,cy) to a garden coord.
   // Inverse of vision.garden_to_pixel.
   function pixelToCoord(p,cx,cy,iw,ih,u,v,captureW,captureH){
@@ -1168,22 +1530,17 @@ _CALIBRATION_JS = r"""
     const loaded=current.images.filter(r=>r.loaded&&r.img.naturalWidth>0);
     if(!p){clearCanvas('Enter FarmBot calibration values to build the composite');return;}
     if(!loaded.length){return;}
-    // FarmBot only displays images whose actual dimensions agree with the
-    // calibration image. This prevents a mixed-resolution date range from
-    // stretching older captures with the current scale.
+    // Resolution differences are diagnostic, not a reason to hide evidence.
+    // FarmBot sizes every map photo from the loaded image itself, so render
+    // every capture with its own actual dimensions and warn below the grid.
     const matchesCalibration=function(r){
       if(!(r.captureW&&r.captureH)) return true; // legacy integration fallback
       const direct=Math.abs(r.captureW-p.refw)<5&&Math.abs(r.captureH-p.refh)<5;
       const swapped=Math.abs(r.captureH-p.refw)<5&&Math.abs(r.captureW-p.refh)<5;
       return direct||swapped;
     };
-    const ready=loaded.filter(matchesCalibration);
-    if(!ready.length){
-      clearCanvas('No loaded photos match the selected FarmBot camera resolution');
-      status.textContent='Loaded '+loaded.length+' photos, but their actual dimensions do not '
-        +'match '+p.refw+'×'+p.refh+'. Select the Camera settings resolution used for this run.';
-      return;
-    }
+    const ready=loaded;
+    const mismatched=loaded.filter(function(r){return !matchesCalibration(r);});
     // Garden-space bounding box from every image's four corners.
     let gxmin=Infinity,gxmax=-Infinity,gymin=Infinity,gymax=-Infinity,ppmSum=0;
     ready.forEach(r=>{
@@ -1221,6 +1578,7 @@ _CALIBRATION_JS = r"""
       }
       return [x*P,y*P];
     };
+    const tileBounds=calibrationTileBounds(ready,p,gxmin,gxmax,gymin,gymax);
     ctx.setTransform(1,0,0,1,0,0);
     ctx.fillStyle='#111';ctx.fillRect(0,0,canvas.width,canvas.height);
     // Paint each image via the affine that maps its source pixels into the
@@ -1234,25 +1592,45 @@ _CALIBRATION_JS = r"""
         p,r.info.x,r.info.y,iw,ih,iw,0,r.captureW,r.captureH));
       const pv=toCanvas.apply(null,pixelToCoord(
         p,r.info.x,r.info.y,iw,ih,0,ih,r.captureW,r.captureH));
+      const footprint=croppedFootprint(p,r.captureW,r.captureH);
+      const opticalX=r.info.x+p.ox, opticalY=r.info.y+p.oy;
+      const tile=tileBounds[String(r.info.id)];
+      const crop=tile||[
+        opticalX-footprint[0]/2,opticalY-footprint[1]/2,
+        opticalX+footprint[0]/2,opticalY+footprint[1]/2];
+      const clip=[
+        toCanvas(crop[0],crop[1]),toCanvas(crop[2],crop[1]),
+        toCanvas(crop[2],crop[3]),toCanvas(crop[0],crop[3])];
+      ctx.setTransform(1,0,0,1,0,0);ctx.save();
+      ctx.beginPath();ctx.moveTo(clip[0][0],clip[0][1]);
+      clip.slice(1).forEach(function(point){ctx.lineTo(point[0],point[1]);});
+      ctx.closePath();ctx.clip();
       ctx.setTransform((pu[0]-p0[0])/iw,(pu[1]-p0[1])/iw,
                        (pv[0]-p0[0])/ih,(pv[1]-p0[1])/ih,p0[0],p0[1]);
-      ctx.drawImage(r.img,0,0);
+      ctx.drawImage(r.img,0,0);ctx.restore();
     });
     ctx.setTransform(1,0,0,1,0,0);
+    strokeCalibrationTiles(ctx,tileBounds,toCanvas,canvas.width,canvas.height);
     if(checked('showoverlay')) drawOverlay(p,toCanvas,P);
-    const skipped=loaded.length-ready.length;
     const dimensions=[...new Set(ready.map(function(r){
       return r.captureW&&r.captureH?(r.captureW+'×'+r.captureH):'legacy dimensions';
     }))].join(', ');
+    const mismatchDimensions=[...new Set(mismatched.map(function(r){
+      return r.captureW+'×'+r.captureH;
+    }))].join(', ');
+    const resolutionWarning=mismatched.length
+      ?(' Warning: selected resolution '+p.refw+'×'+p.refh
+        +', but '+mismatched.length+' loaded photo(s) report '+mismatchDimensions
+        +'. All photos are still shown at their reported size.')
+      :'';
     const bounds=scene.bed_bounds
       ?(' Bed: X '+gxmin+'–'+gxmax+' mm, Y '+gymin+'–'+gymax+' mm'
         +(scene.bed_bounds_source?(' ('+scene.bed_bounds_source+')'):'')+'.')
       :'';
-    status.textContent='Full grid: '+ready.length+' photos'
-      +(skipped?(', '+skipped+' different-resolution photos hidden'):'')
+    status.textContent='Full tessellated grid: '+ready.length+' photos'
       +'; actual capture '+dimensions+'. '+scene.plants.length+' plants, '
       +scene.weeds.length+' weeds. '
-      +'Confirm centres sit on their plants across the bed.'+bounds;
+      +'Confirm centres sit on their plants across the bed.'+bounds+resolutionWarning;
   }
   function marker(p,toCanvas,P,pt,colour,label){
     const c=toCanvas(pt.x,pt.y);
@@ -1361,23 +1739,115 @@ _DASHBOARD_JS = r"""
     return [(origin==='top_right'||origin==='bottom_right')?-1:1,
             (origin==='bottom_left'||origin==='bottom_right')?-1:1];
   }
+  function gridPositiveHeader(response,name){
+    const value=parseFloat(response.headers.get(name));
+    return value>0?value:null;
+  }
+  function gridCroppedFootprint(calibration,captureW,captureH){
+    let width=calibration.coordinate_scale
+      *(captureW||calibration.reference_width);
+    let height=calibration.coordinate_scale
+      *(captureH||calibration.reference_height);
+    const angle=Math.abs(calibration.rotation_degrees);
+    let closest=angle%90;if(closest>45) closest=90-closest;
+    const rotated90=(angle+45)%180>90;
+    if(closest>40){
+      const side=Math.min(width,height)/Math.sqrt(2);
+      return [side,side];
+    }
+    let crop=0;
+    if(closest>0){
+      const factor=(5.61-.095*closest*closest+9.06*closest)/640;
+      crop=Math.round(Math.max(width,height)*factor);
+    }
+    width=Math.max(1,width-crop);height=Math.max(1,height-crop);
+    return rotated90?[height,width]:[width,height];
+  }
+  function gridTileBounds(record){
+    const calibration=record.calibration;
+    const axis=function(label,coordinate,offset,limits){
+      const groups=new Map();
+      (record.targets||[]).forEach(function(target){
+        const key=String(target[label]);
+        if(!groups.has(key)) groups.set(key,[]);
+        groups.get(key).push(Number(target[coordinate])+offset);
+      });
+      const ordered=[...groups.entries()].map(function(entry){
+        return {key:entry[0],center:entry[1].reduce((a,b)=>a+b,0)/entry[1].length};
+      }).sort(function(a,b){return a.center-b.center;});
+      const result={};
+      ordered.forEach(function(item,index){
+        result[item.key]=[
+          index===0?limits[0]:(ordered[index-1].center+item.center)/2,
+          index===ordered.length-1?limits[1]:(item.center+ordered[index+1].center)/2];
+      });
+      return result;
+    };
+    const xs=axis('column','x',calibration.offset_x_mm,record.bed_bounds.x);
+    const ys=axis('row','y',calibration.offset_y_mm,record.bed_bounds.y);
+    const result={};
+    (record.targets||[]).forEach(function(target){
+      const x=xs[String(target.column)],y=ys[String(target.row)];
+      result[String(target.index)]=[x[0],y[0],x[1],y[1]];
+    });
+    return result;
+  }
+  function strokeGridTiles(ctx,tileBounds,project,canvasWidth,canvasHeight){
+    ctx.save();ctx.setTransform(1,0,0,1,0,0);
+    ctx.strokeStyle='rgba(225,238,227,.32)';ctx.lineWidth=1;
+    Object.values(tileBounds).forEach(function(cell){
+      const a=project(cell[0],cell[1]),b=project(cell[2],cell[3]);
+      ctx.strokeRect(a[0]+.5,a[1]+.5,b[0]-a[0]-1,b[1]-a[1]-1);
+    });
+    ctx.strokeStyle='#245b38';ctx.lineWidth=4;
+    ctx.strokeRect(2,2,canvasWidth-4,canvasHeight-4);ctx.restore();
+  }
   /* Draws each frame's photo into ctx using the same calibrated, per-pixel
      projective transform regardless of whether the caller wants the whole
      bed (drawPhotoGrid) or the stored, tightly cropped plant review artifact.
      project(x,y) maps a garden-mm coordinate to canvas pixels; onDone(loaded,
-     failed) fires once every frame has resolved (loaded or failed). */
-  function drawFramesInto(ctx,canvasWidth,canvasHeight,frames,calibration,configEntryId,project,onDone){
-    if(!frames.length){onDone(0,0);return;}
+     failed,dimensions) fires once every frame has resolved (loaded or failed). */
+  function drawFramesInto(ctx,canvasWidth,canvasHeight,frames,calibration,configEntryId,
+      project,tileBounds,onDone){
+    if(!frames.length){onDone(0,0,[]);return;}
     const signs=gridOriginSigns(calibration.origin_location);
     const rotation=-calibration.rotation_degrees*Math.PI/180;
-    let loaded=0, failed=0;
-    const finish=function(){if(loaded+failed===frames.length) onDone(loaded,failed);};
-    frames.forEach(function(frame){
-      const image=new Image();
-      image.onload=function(){
+    const dimensions=new Set();
+    const loadFrame=function(frame){
+      const url='api/vision/image/'+frame.image_id+'.jpg?entry_id='
+        +encodeURIComponent(configEntryId);
+      return fetch(url).then(function(response){
+        if(!response.ok) throw new Error('HTTP '+response.status);
+        const captureW=gridPositiveHeader(response,'X-FarmBot-Oriented-Width');
+        const captureH=gridPositiveHeader(response,'X-FarmBot-Oriented-Height');
+        if(captureW&&captureH) dimensions.add(captureW+'×'+captureH);
+        return response.blob().then(function(blob){
+          return new Promise(function(resolve,reject){
+            const image=new Image();
+            const objectUrl=URL.createObjectURL(blob);
+            image.onload=function(){
+              resolve({frame:frame,image:image,captureW:captureW,captureH:captureH,
+                       objectUrl:objectUrl});
+            };
+            image.onerror=function(){
+              URL.revokeObjectURL(objectUrl);reject(new Error('Image decode failed'));
+            };
+            image.src=objectUrl;
+          });
+        });
+      }).catch(function(){return null;});
+    };
+    Promise.all(frames.map(loadFrame)).then(function(results){
+      let loaded=0;
+      results.forEach(function(result){
+        if(!result) return;
+        const frame=result.frame, image=result.image;
+        const captureW=result.captureW, captureH=result.captureH;
         const iw=image.naturalWidth, ih=image.naturalHeight;
-        const ppmX=iw/(calibration.coordinate_scale*calibration.reference_width);
-        const ppmY=ih/(calibration.coordinate_scale*calibration.reference_height);
+        const ppmX=iw/(calibration.coordinate_scale
+          *(captureW||calibration.reference_width));
+        const ppmY=ih/(calibration.coordinate_scale
+          *(captureH||calibration.reference_height));
         const garden=function(u,v){
           const rx=u-iw/2, ry=v-ih/2;
           const vx=Math.cos(rotation)*rx-Math.sin(rotation)*ry;
@@ -1388,21 +1858,35 @@ _DASHBOARD_JS = r"""
         const p0=project.apply(null,garden(0,0));
         const pu=project.apply(null,garden(iw,0));
         const pv=project.apply(null,garden(0,ih));
+        const footprint=gridCroppedFootprint(calibration,captureW,captureH);
+        const opticalX=frame.x+calibration.offset_x_mm;
+        const opticalY=frame.y+calibration.offset_y_mm;
+        const tile=tileBounds&&tileBounds[String(frame.target_index)];
+        const crop=tile||[
+          opticalX-footprint[0]/2,opticalY-footprint[1]/2,
+          opticalX+footprint[0]/2,opticalY+footprint[1]/2];
+        const clip=[
+          project(crop[0],crop[1]),project(crop[2],crop[1]),
+          project(crop[2],crop[3]),project(crop[0],crop[3])];
         ctx.save();
         ctx.beginPath();ctx.rect(0,0,canvasWidth,canvasHeight);ctx.clip();
+        ctx.beginPath();ctx.moveTo(clip[0][0],clip[0][1]);
+        clip.slice(1).forEach(function(point){ctx.lineTo(point[0],point[1]);});
+        ctx.closePath();ctx.clip();
         ctx.globalAlpha=.96;
         ctx.setTransform((pu[0]-p0[0])/iw,(pu[1]-p0[1])/iw,
                          (pv[0]-p0[0])/ih,(pv[1]-p0[1])/ih,p0[0],p0[1]);
         ctx.drawImage(image,0,0);ctx.restore();
-        loaded++;finish();
-      };
-      image.onerror=function(){failed++;finish();};
-      image.src='api/vision/image/'+frame.image_id+'.jpg?entry_id='
-        +encodeURIComponent(configEntryId);
+        URL.revokeObjectURL(result.objectUrl);
+        loaded++;
+      });
+      onDone(loaded,frames.length-loaded,[...dimensions]);
     });
   }
   function drawPhotoGrid(data){
     const record=data.grid, bounds=record.bed_bounds, calibration=record.calibration;
+    const layeredFrames=(record.frames||[]).concat(record.quality_overlay_frames||[]);
+    const tileBounds=gridTileBounds(record);
     const spanX=bounds.x[1]-bounds.x[0], spanY=bounds.y[1]-bounds.y[0];
     const displayWidth=900;
     photoGridCanvas.width=displayWidth;
@@ -1412,10 +1896,12 @@ _DASHBOARD_JS = r"""
     const project=function(x,y){return [(x-bounds.x[0])*sx,(y-bounds.y[0])*sy];};
     ctx.setTransform(1,0,0,1,0,0);
     ctx.fillStyle='#283f30';ctx.fillRect(0,0,photoGridCanvas.width,photoGridCanvas.height);
-    if(!record.frames.length){photoGridStatus.textContent='This grid has no verified photos yet';return;}
-    drawFramesInto(ctx,photoGridCanvas.width,photoGridCanvas.height,record.frames,calibration,
-      record.config_entry_id,project,function(loaded,failed){
+    if(!layeredFrames.length){photoGridStatus.textContent='This grid has no verified photos yet';return;}
+    drawFramesInto(ctx,photoGridCanvas.width,photoGridCanvas.height,layeredFrames,calibration,
+      record.config_entry_id,project,tileBounds,function(loaded,failed,dimensions){
         ctx.setTransform(1,0,0,1,0,0);
+        strokeGridTiles(
+          ctx,tileBounds,project,photoGridCanvas.width,photoGridCanvas.height);
         (data.plants||[]).forEach(function(plant){
           const c=project(plant.x,plant.y);
           ctx.fillStyle='rgba(32,160,82,.18)';ctx.strokeStyle='#39d878';ctx.lineWidth=2;
@@ -1426,8 +1912,17 @@ _DASHBOARD_JS = r"""
           const c=project(weed.x,weed.y);
           ctx.fillStyle='#ef476f';ctx.beginPath();ctx.arc(c[0],c[1],4,0,Math.PI*2);ctx.fill();
         });
-        photoGridStatus.textContent=record.message+' · '+loaded+' verified photos rendered'
-          +(failed?' · '+failed+' image(s) could not be loaded':'');
+        const planned=gridCroppedFootprint(
+          calibration,calibration.reference_width,calibration.reference_height);
+        const legacySpacing=Math.abs(record.footprint_width_mm-planned[0])>1
+          ||Math.abs(record.footprint_height_mm-planned[1])>1;
+        photoGridStatus.textContent=record.message+' · '+loaded
+          +' verified photos rendered as tessellated cells'
+          +(dimensions.length?' · actual capture '+dimensions.join(', '):'')
+          +(failed?' · '+failed+' image(s) could not be loaded':'')
+          +(legacySpacing
+            ?' · This grid uses older rotation spacing; start a new photo grid to close the gaps.'
+            :'');
       });
   }
   function showPlantPhotoTab(showPhoto){
@@ -1484,6 +1979,7 @@ _DASHBOARD_JS = r"""
   const weedImg=document.getElementById('weed-modal-img');
   const weedMarker=document.getElementById('weed-modal-marker');
   const weedDetails=document.getElementById('weed-modal-details');
+  const weedGuess=document.getElementById('weed-modal-guess');
   const weedMessage=document.getElementById('weed-modal-message');
   const weedAccept=document.getElementById('weed-modal-accept');
   const weedAcceptAll=document.getElementById('weed-modal-accept-all');
@@ -1603,6 +2099,7 @@ _DASHBOARD_JS = r"""
     weedMarker.hidden=true;
     weedDetails.textContent='Every weed recommendation has been reviewed.';
     weedLegend.textContent='';
+    weedGuess.hidden=true; weedGuess.textContent='';
     weedCounter.textContent='0 / 0'; weedImageCounter.textContent='0 / 0';
     [weedPrevious,weedNext,weedPreviousImage,weedNextImage].forEach(function(button){
       button.disabled=true;
@@ -1631,6 +2128,17 @@ _DASHBOARD_JS = r"""
       : (weedImageGroups[previousImageIndex]||weedImageGroups[previousImageIndex-1]||[])[0];
     if(!target){showWeedEmptyState(); return;}
     openWeedModal(parseWeedViewer(target),weedReturnFocus,true);
+  }
+  function showWeedGuess(data){
+    /* Describes what the verifier thinks the object is, which is what a
+       reviewer actually needs on a borderline detection. It never contradicts
+       the accept/reject gate -- that is the confidence figure above. */
+    const guess=(data&&data.verifierGuess)||[];
+    if(!guess.length){weedGuess.hidden=true; weedGuess.textContent=''; return;}
+    weedGuess.textContent='Verifier best guess: '+guess.map(function(entry){
+      return entry.label+' '+Math.round(entry.probability*100)+'%';
+    }).join(' · ');
+    weedGuess.hidden=false;
   }
   function openWeedModal(data,trigger,keepFocus){
     weedData=data;
@@ -1661,6 +2169,7 @@ _DASHBOARD_JS = r"""
       +' · '+(data.observations||1)+' independent look(s)'
       +(data.verifierConfidence!=null?(' · verifier '+data.verifierConfidence.toFixed(2)):'')
       +(others?(' · '+others+' other weed(s) in this image'):'');
+    showWeedGuess(data);
     updateWeedNavigation();
     /* Only grab focus when the dialog first appears. Advancing after a label
        must leave focus on the button that was pressed, so the reviewer can
@@ -2028,6 +2537,23 @@ _ZONES_JS = r"""
 
 async def event_listener() -> None:
     async for event in client.vision_events():
+        # Grid images are quality-gated as one completed set. In particular,
+        # a washed-out frame must be deleted and excluded before any new-image
+        # event can derive analysis from it.
+        active_grid = photo_grid_task
+        if event.image_id is not None and active_grid is not None and not active_grid.done():
+            await asyncio.shield(active_grid)
+            record = photo_grid_store.load()
+            if (
+                record is not None
+                and record.config_entry_id == event.config_entry_id
+                and event.image_id in record.excluded_image_ids
+            ):
+                LOGGER.info(
+                    "Skipped analysis event for discarded photo-grid image %d",
+                    event.image_id,
+                )
+                continue
         # Await each automatic request so photos cannot be silently discarded
         # merely because the previous image is still being analysed.
         await jobs.run(
@@ -2540,6 +3066,12 @@ async def dashboard(request: Request) -> HTMLResponse:
     for w in pending_weeds:
         weeds_by_image.setdefault(w["image_id"], []).append(w)
 
+    def _verifier_guess(w: dict) -> list[dict[str, object]]:
+        try:
+            return _verifier_label_guess(json.loads(w.get("features_json") or "{}"))
+        except (TypeError, json.JSONDecodeError):
+            return []
+
     def _weed_view_button(w: dict) -> str:
         if not w.get("overlay_path"):
             return "<span class=muted>None</span>"
@@ -2560,6 +3092,7 @@ async def dashboard(request: Request) -> HTMLResponse:
             "confidence": w["confidence"],
             "observations": w.get("observation_count", 1),
             "verifierConfidence": w.get("verifier_confidence"),
+            "verifierGuess": _verifier_guess(w),
         }
         marker_json = escape(json.dumps(marker, separators=(",", ":")), quote=True)
         return f'<button type=button class=weed-view data-weed="{marker_json}">View</button>'
@@ -2766,6 +3299,7 @@ value="{repair_values.delay_minutes}" required> minutes after the photo grid com
 </div>
 <div id=weed-image-wrap class=weed-image-wrap><img id=weed-modal-img alt="Weed detection"><div id=weed-modal-marker class=weed-marker hidden></div></div>
 <figcaption id=weed-modal-details></figcaption>
+<p id=weed-modal-guess class=legend hidden></p>
 <p id=weed-modal-legend class=legend>Blue circle = the weed being reviewed; red circles = other detected weeds in this image.</p>
 <div class="modal-controls weed-navigation" aria-label="Navigate weeds in this image">
 <button id=weed-modal-prev-weed type=button>Previous weed</button>
@@ -3491,13 +4025,47 @@ async def weed_settings_page(request: Request) -> HTMLResponse:
     def checked(value: bool) -> str:
         return " checked" if value else ""
 
-    model_status = (
-        f"Trained {escape(str(model['created_at']))} from {model['sample_count']} labels; "
-        f"validation precision {model['metrics']['precision']:.1%}, "
-        f"recall {model['metrics']['recall']:.1%}."
-        if model
-        else "No trained verifier model yet."
-    )
+    if not model:
+        model_status = "No trained verifier model yet."
+        threshold_html = ""
+    else:
+        origin = (
+            "Bundled starter model shipped with this add-on"
+            if weed_verifier.is_bundled
+            else f"Trained {escape(str(model['created_at']))}"
+        )
+        held_out = (
+            f"{model.get('validation_groups', 0)} held-out image(s)"
+            if model.get("grouped_validation")
+            else "the training data itself (too few distinct images to hold any out)"
+        )
+        suggested = weed_verifier.suggested_threshold
+        model_status = (
+            f"{origin} from {model['sample_count']} labels "
+            f"({model['positive_count']} weed / {model['negative_count']} non-weed). "
+            f"Measured on {held_out}: precision {model['metrics']['precision']:.1%} "
+            f"(at least {float(model['metrics'].get('precision_lower_bound', 0)):.0%} with 90% "
+            f"confidence), recall {model['metrics']['recall']:.1%}"
+            + (f" at threshold {suggested:.2f}." if suggested is not None else ".")
+        )
+        # The threshold that hits the target precision is the one number worth
+        # acting on, so offer it as a single click rather than asking the user
+        # to transcribe it into the field above.
+        threshold_html = ""
+        if suggested is not None:
+            matches = abs(suggested - values.visual_verifier_minimum_confidence) < 5e-3
+            threshold_html = (
+                f"<p>Suggested verifier threshold for "
+                f"{float(model.get('target_precision', 0.95)):.0%} precision: "
+                f"<b>{suggested:.2f}</b> — currently set to "
+                f"{values.visual_verifier_minimum_confidence:.2f}."
+                + (
+                    " Already applied.</p>"
+                    if matches
+                    else '</p><form method=post action="weed-model/apply-threshold">'
+                    "<button>Apply suggested threshold</button></form>"
+                )
+            )
     training_notice = request.query_params.get("training")
     training_notice_html = f"<p class=warn>{escape(training_notice)}</p>" if training_notice else ""
 
@@ -3534,6 +4102,61 @@ async def weed_settings_page(request: Request) -> HTMLResponse:
         else f"<table><thead><tr><th>Image</th><th>Detection</th><th>Labeled</th>"
         f"<th>Tag</th></tr></thead><tbody>{training_sample_rows}</tbody></table>"
     )
+    # Labelling a candidate the model is already sure about teaches it nothing.
+    # Rank the unlabelled backlog by how close each one sits to the operating
+    # threshold and offer the most ambiguous handful first.
+    boundary = weed_verifier.suggested_threshold or values.visual_verifier_minimum_confidence
+    uncertain: list[tuple[float, dict, list[dict[str, object]]]] = []
+    if weed_verifier.available:
+        for candidate in database.unlabelled_weed_detections():
+            try:
+                features = json.loads(candidate.get("features_json") or "{}")
+            except (TypeError, json.JSONDecodeError):
+                continue
+            score = weed_verifier.predict(features) if isinstance(features, dict) else None
+            if score is None:
+                continue
+            uncertain.append((abs(score - boundary), candidate, _verifier_label_guess(features)))
+        uncertain.sort(key=lambda item: item[0])
+    del uncertain[8:]
+
+    def uncertain_row(candidate: dict, guess: list[dict[str, object]]) -> str:
+        detection_id = str(candidate["detection_id"])
+        crop_path = candidate.get("crop_path")
+        crop = (
+            f'<img class=training-crop src="artifact/{escape(Path(crop_path).name, quote=True)}" '
+            f'alt="Candidate crop {escape(detection_id, quote=True)}">'
+            if crop_path
+            else "<span class=muted>No crop image</span>"
+        )
+        guess_text = (
+            " · ".join(
+                f"{escape(str(entry['label']))} {float(entry['probability']):.0%}"
+                for entry in guess
+            )
+            or "<span class=muted>no per-category heads yet</span>"
+        )
+        options = "".join(
+            f'<option value="{escape(label, quote=True)}">{escape(label.replace("_", "/"))}</option>'
+            for label in TRAINING_LABELS
+        )
+        return (
+            f"<tr><td>{crop}</td><td>image {candidate['image_id']}<br>"
+            f"<span class=muted>{guess_text}</span></td>"
+            f'<td><form method=post action="weed-model/label/{escape(detection_id, quote=True)}">'
+            f'<select name=label aria-label="Label for {escape(detection_id, quote=True)}">'
+            f"{options}</select> <button>Save label</button></form></td></tr>"
+        )
+
+    uncertain_html = (
+        "<p class=muted>Nothing to suggest yet — train the verifier first, then the most "
+        "ambiguous unlabelled candidates appear here.</p>"
+        if not uncertain
+        else "<table><thead><tr><th>Image</th><th>Detection</th><th>Label</th></tr></thead>"
+        f"<tbody>{''.join(uncertain_row(row, guess) for _, row, guess in uncertain)}"
+        "</tbody></table>"
+    )
+
     body = f"""<section class=card><h2>Weed detection and automation</h2>
 <p>Every stage is configurable. Start in review/shadow mode, label real examples, train the
 local verifier, then enable enforcement or automatic FarmBot creation when its validation
@@ -3578,7 +4201,10 @@ Automatically create detected weeds in FarmBot</label><br>
 <label><input type=checkbox name=visual_verifier_shadow_mode value=true{checked(values.visual_verifier_shadow_mode)}> Shadow mode (score but do not reject)</label><br>
 <label><input type=checkbox name=visual_verifier_required_for_automatic value=true{checked(values.visual_verifier_required_for_automatic)}> Require verifier approval for automatic creation</label><br>
 <label>Verifier confidence threshold <input type=number name=visual_verifier_minimum_confidence min=0 max=1 step=.01 value="{values.visual_verifier_minimum_confidence:g}"></label><br>
-<label>Verifier weight in final score <input type=number name=visual_verifier_weight min=0 max=1 step=.05 value="{values.visual_verifier_weight:g}"></label><br>
+<label>Candidate recall boost while the verifier scores <input type=number name=candidate_recall_boost min=.1 max=1 step=.05 value="{values.candidate_recall_boost:g}"></label><br>
+<span class=muted>Relaxes the colour/shape gates above by this factor once a trained verifier is
+enforcing, so borderline weeds reach the verifier instead of being dropped by rules that cannot
+tell a weed from moss. 1 keeps the gates unchanged.</span><br>
 <label>Minimum weed and non-weed labels for training <input type=number name=training_minimum_per_class min=2 step=1 value="{values.training_minimum_per_class}"></label><br>
 <label><input type=checkbox name=automatic_retraining value=true{checked(values.automatic_retraining)}> Retrain automatically after each new label once enough labels exist</label><br>
 <label><input type=checkbox name=candidate_crop_storage_enabled value=true{checked(values.candidate_crop_storage_enabled)}> Store candidate crops for review/training</label>
@@ -3594,16 +4220,33 @@ Automatically remove known weeds that disappear</label><br>
 </fieldset>
 <button>Save all weed settings</button></form></section>
 <section class=card><h2>Verifier training</h2>{training_notice_html}<p>{model_status}</p>
+{threshold_html}
 <p>Labels: {labels["weed"]} weeds · {labels["crop"]} crops ·
 {labels["fallen_leaf"]} fallen leaves · {labels["mushroom"]} mushrooms ·
 {labels["moss"]} moss · {labels["soil"]} soil · {labels["hardware"]} hardware.</p>
 <div class=button-row><form method=post action="weed-model/train"><button>Train verifier now</button></form>
+<form method=get action="weed-model/export"><button>Export labels and model</button></form>
+<form method=get action="weed-model/export"><input type=hidden name=crops value=true>
+<button>Export with crop images</button></form>
 <form method=post action="weed-model/clear" onsubmit="return confirm('Clear all labeled training images and the trained verifier?');">
 <button type=submit>Clear all training images</button></form></div>
+<form method=post action="weed-model/import" enctype="multipart/form-data" class=button-row>
+<label>Import a training bundle <input type=file name=bundle accept="application/json,.json" required></label>
+<label><input type=checkbox name=replace value=true> Replace existing labels</label>
+<button>Import</button></form>
+<p class=muted>Export produces a JSON bundle of every label and its features. It is the format to
+share a starter model between installs: drop an exported bundle in as
+<code>bundled_weed_model.json</code> beside the source, or import it here and retrain. Crop images
+are omitted unless you ask for them, because they make the file large and are only needed for
+re-checking labels by eye.</p>
 <p class=muted>Accepting a weed records a positive label. Rejection and the category buttons on
 the Analysis page record hard negative examples from this FarmBot. Edit a tag below if a
 review decision was wrong. Saving a tag does not change the detection review status.</p>
-{training_samples_html}</section>"""
+{training_samples_html}</section>
+<section class=card><h2>Most informative to label next</h2>
+<p class=muted>These unlabelled candidates sit closest to the verifier's decision boundary, so each
+label here moves the model more than another obvious weed does.</p>
+{uncertain_html}</section>"""
     return layout(request, body, "Weed settings")
 
 
@@ -3642,7 +4285,7 @@ async def save_weed_settings(
     visual_verifier_shadow_mode: bool = Form(False),
     visual_verifier_required_for_automatic: bool = Form(False),
     visual_verifier_minimum_confidence: float = Form(0.85),
-    visual_verifier_weight: float = Form(0.7),
+    candidate_recall_boost: float = Form(0.6),
     training_minimum_per_class: int = Form(10),
     automatic_retraining: bool = Form(False),
     candidate_crop_storage_enabled: bool = Form(False),
@@ -3683,7 +4326,7 @@ async def save_weed_settings(
             visual_verifier_shadow_mode=visual_verifier_shadow_mode,
             visual_verifier_required_for_automatic=visual_verifier_required_for_automatic,
             visual_verifier_minimum_confidence=visual_verifier_minimum_confidence,
-            visual_verifier_weight=visual_verifier_weight,
+            candidate_recall_boost=candidate_recall_boost,
             training_minimum_per_class=training_minimum_per_class,
             automatic_retraining=automatic_retraining,
             candidate_crop_storage_enabled=candidate_crop_storage_enabled,
@@ -3757,6 +4400,116 @@ async def edit_weed_training_sample(detection_id: UUID, label: str = Form(...)) 
             message += "; retraining will start when both classes have enough labels"
     # Two levels up: this route lives at /weed-model/samples/{detection_id}.
     return RedirectResponse(f"../../weed-settings?training={quote(message)}", status_code=303)
+
+
+@app.post("/weed-model/label/{detection_id}")
+async def label_weed_candidate(detection_id: UUID, label: str = Form(...)) -> RedirectResponse:
+    """Label an unreviewed candidate straight from the uncertainty queue.
+
+    Unlike the review actions this only teaches the verifier; it deliberately
+    leaves the detection's own review status alone so a candidate can be used
+    as training data without being accepted into or removed from FarmBot.
+    """
+    await _record_weed_label(detection_id, label)
+    message = f"Labelled candidate as {label.replace('_', '/')}"
+    # Two levels up: this route lives at /weed-model/label/{detection_id}.
+    return RedirectResponse(f"../../weed-settings?training={quote(message)}", status_code=303)
+
+
+@app.post("/weed-model/apply-threshold")
+async def apply_suggested_threshold() -> RedirectResponse:
+    weed_verifier.reload()
+    suggested = weed_verifier.suggested_threshold
+    if suggested is None:
+        return RedirectResponse(
+            "../weed-settings?training=" + quote("No suggested threshold available yet"),
+            status_code=303,
+        )
+    values = weed_settings_store.load()
+    weed_settings_store.save(
+        values.model_copy(update={"visual_verifier_minimum_confidence": suggested})
+    )
+    message = f"Verifier threshold set to {suggested:.2f}"
+    return RedirectResponse(f"../weed-settings?training={quote(message)}", status_code=303)
+
+
+@app.get("/weed-model/export")
+async def export_weed_training(crops: bool = False) -> JSONResponse:
+    """Export every label with its features, and the trained model if present.
+
+    This is the portable artifact: features are what training consumes, so a
+    bundle from one FarmBot can seed another install or be shipped as the
+    add-on's starter model. Crop images are optional because they multiply the
+    file size and are only useful for re-checking labels by eye.
+    """
+    weed_verifier.reload()
+    samples = []
+    for sample in database.weed_training_samples():
+        entry = {
+            "detection_id": sample["detection_id"],
+            "label": sample["label"],
+            "features": sample["features"],
+            "created_at": str(sample["created_at"]),
+            "image_id": sample.get("image_id"),
+        }
+        crop_path = sample.get("crop_path")
+        if crops and crop_path:
+            try:
+                entry["crop_base64"] = base64.b64encode(Path(crop_path).read_bytes()).decode(
+                    "ascii"
+                )
+            except OSError:
+                LOGGER.warning("Could not read crop %s for export", crop_path)
+        samples.append(entry)
+    bundle = {
+        "bundle_version": 1,
+        "exported_at": datetime.now(UTC).isoformat(),
+        "app_version": __version__,
+        "feature_names": list(FEATURE_NAMES),
+        "samples": samples,
+        "model": None if weed_verifier.is_bundled else weed_verifier.model,
+    }
+    filename = f"farmbot-weed-training-{datetime.now(UTC).strftime('%Y%m%dT%H%M%SZ')}.json"
+    return JSONResponse(
+        bundle,
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@app.post("/weed-model/import")
+async def import_weed_training(
+    bundle: Annotated[UploadFile, File()], replace: bool = Form(False)
+) -> RedirectResponse:
+    try:
+        payload = json.loads((await bundle.read()).decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise HTTPException(422, f"Bundle is not valid JSON: {exc}") from exc
+    samples = payload.get("samples") if isinstance(payload, dict) else None
+    if not isinstance(samples, list) or not samples:
+        raise HTTPException(422, "Bundle contains no samples")
+    accepted = []
+    for sample in samples:
+        if not isinstance(sample, dict):
+            continue
+        label = sample.get("label")
+        features = sample.get("features")
+        detection_id = sample.get("detection_id")
+        if label not in ALL_LABELS or not isinstance(features, dict) or not detection_id:
+            continue
+        accepted.append((str(detection_id), str(label), features))
+    if not accepted:
+        raise HTTPException(422, "Bundle contains no usable labelled samples")
+    if replace:
+        _remove_weed_training_crops(database.clear_weed_training_samples())
+    imported = database.import_weed_training_samples(accepted)
+    message = f"Imported {imported} labelled sample(s)"
+    if weed_settings_store.load().automatic_retraining:
+        try:
+            model = await _train_weed_verifier()
+            message += f" and retrained from {model['sample_count']} labels"
+        except ValueError:
+            message += "; retraining will start when both classes have enough labels"
+    return RedirectResponse(f"../weed-settings?training={quote(message)}", status_code=303)
 
 
 def _remove_weed_training_crops(paths: list[str]) -> int:
@@ -4253,9 +5006,9 @@ tools needed.</p>
 <p><button type=button id=load>Load photo grid</button></p>
 <hr>
 <p class=muted>Copy scale, rotation, origin, and offsets exactly as shown in FarmBot.
-Copy the selected resolution from Photos → Camera settings. The preview verifies that
-against each downloaded photo's actual dimensions and hides captures made at another
-resolution, matching FarmBot's own map filter.</p>
+Copy the selected resolution from Photos → Camera settings. The preview reports each
+downloaded photo's actual dimensions and warns about differences, but always shows the
+photos so the values can be corrected interactively.</p>
 <label>Pixel coordinate scale (mm/pixel)<br><input id=fb_scale type=number min=0 step=any value="{v_scale}"></label>
 <label>FarmBot capture width (px)<br><input id=fb_refw type=number min=1 step=1 value="{v_refw}"></label>
 <label>FarmBot capture height (px)<br><input id=fb_refh type=number min=1 step=1 value="{v_refh}"></label>
@@ -4289,8 +5042,9 @@ centre at the photo's recorded gantry coordinate plus these offsets.</p>
  style="display:block;width:100%;background:#111"></canvas></div>
 <p class=muted>Green = known plants (name · crop). Red = FarmBot weeds. Adjust the
 values above and the complete grid updates live. Within the selected range, only the
-newest photo at each FarmBot coordinate is shown. Zoom in, then use the scrollbars
-to inspect individual seams and marker centres.</p>
+newest photo at each FarmBot coordinate is shown. Photos are cropped at shared
+camera-centre midpoints into gap-free rectangular cells, with the outside cells clipped
+to the garden border. Zoom in, then use the scrollbars to inspect seams and marker centres.</p>
 </div>
 </div>
 </section>

@@ -167,6 +167,59 @@ logged or persisted.
 
 The classical pipeline combines HSV and Excess Green, morphology, components, known-centre seeds, nearest-centre ownership, historical-mask evidence, maximum accepted distance, and confidence. Ambiguous overlap prevents writes. The protection radius is the largest accepted leaf distance plus safety and calibration margins; a separate 90th-percentile value is retained only as the typical canopy measurement.
 
+## Weed detection and the learned verifier
+
+Weed detection runs in two stages, and it matters which one is doing what.
+
+The **heuristic** turns vegetation that no known plant owns into candidates,
+using area, colour purity and shape. Everything it measures rises for moss,
+fallen leaves and crop foliage exactly as it does for a weed, so it is a
+candidate generator, not a classifier — tightening its thresholds mostly
+removes small weeds rather than false positives.
+
+The **learned verifier** is a small logistic model trained on your own labels.
+It sees sixteen visual features the heuristic ignores (hue, saturation,
+texture, edge density, and what surrounds the candidate: mulch orange, bare
+neutral soil, neighbouring canopy) plus the distance to the nearest known
+plant. Once it is trained and enforcing, its score *is* the weed confidence and
+the **verifier confidence threshold** is the gate.
+
+The intended path:
+
+1. Enable weed detection with the verifier in **shadow mode**. Candidates are
+   scored but the heuristic still decides, so nothing changes yet.
+2. Review detections. Accepting records a weed; the category buttons record
+   hard negatives (moss, mushroom, fallen leaf, mulch/soil, hardware). The
+   **Most informative to label next** list on the weed settings page shows the
+   candidates sitting closest to the decision boundary — those teach the model
+   far more than another obvious weed.
+3. Train. Validation holds out whole images, and the reported precision comes
+   with a 90% lower confidence bound so a small label set is not flattered.
+4. Apply the **suggested threshold**, which is the highest-recall operating
+   point whose precision is confidently at or above 95%.
+5. Turn shadow mode off. The **candidate recall boost** then relaxes the
+   colour/shape gates so borderline weeds reach the verifier rather than being
+   dropped by rules that cannot classify them.
+6. Only then consider automatic creation, which can additionally require
+   verifier approval and several independent looks.
+
+During review the dialog shows the verifier's **best guess** at what the object
+is — "moss 71% · fallen leaf 18%" — from per-category heads trained on the same
+labels. It is there to make a borderline detection easier to judge and never
+affects the accept/reject decision.
+
+Multi-image confirmation filters flicker from shadows, wind and exposure. It
+does not help against moss, stones or hardware, which are perfectly persistent
+and will be seen the same way on every pass; those need labels, not more looks.
+
+**Export and import.** *Export labels and model* produces a JSON bundle of every
+label with its features, which is what training consumes. Use it to back up
+your labels, move them to another FarmBot, or seed a fresh install: import the
+bundle and retrain, or place it next to the source as
+`bundled_weed_model.json`, where a new install will use it until it has trained
+a model of its own. Crop images are only included if you ask for them, since
+they are needed only for re-checking labels by eye.
+
 ## Boundaries and exclusion zones
 
 The **Boundaries & zones** tab defines where the app may place things, in FarmBot

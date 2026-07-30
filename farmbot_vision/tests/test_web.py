@@ -10,6 +10,7 @@ import pytest
 import yaml
 
 import farmbot_vision.web as web
+import farmbot_vision.weed_verifier as weed_verifier_module
 from farmbot_vision.models import (
     BotList,
     Decision,
@@ -971,11 +972,18 @@ async def asgi_request(
     query_string: bytes = b"",
     headers: list[tuple[bytes, bytes]] | None = None,
     form: dict[str, str] | None = None,
+    raw_body: bytes | None = None,
+    content_type: str | None = None,
 ) -> tuple[int, dict[bytes, bytes], bytes]:
     messages: list[dict] = []
     body = bytearray()
-    request_body = urlencode(form).encode() if form is not None else b""
+    request_body = urlencode(form).encode() if form is not None else (raw_body or b"")
     request_headers = list(headers or [])
+    if raw_body is not None and content_type is not None:
+        request_headers += [
+            (b"content-type", content_type.encode()),
+            (b"content-length", str(len(request_body)).encode()),
+        ]
     if form is not None:
         request_headers += [
             (b"content-type", b"application/x-www-form-urlencoded"),
@@ -1106,6 +1114,10 @@ async def test_root_and_duplicate_leading_slash_routes():
     assert b'action="analysis/clear-recommendations"' in body
     assert b'action="analysis/clear-weeds"' in body
     assert b'action="analysis/clear-measurements"' in body
+    assert b"gridCroppedFootprint" in body
+    assert b"gridTileBounds" in body
+    assert b"strokeGridTiles" in body
+    assert b"X-FarmBot-Oriented-Width" in body
 
     for path in ("//", "///"):
         status, _, body = await asgi_request(path)
@@ -1130,7 +1142,11 @@ async def test_duplicate_slashes_reach_health_and_settings():
     assert b"id=zoom-in" in body
     assert b"id=zoom-out" in body
     assert b"id=zoom-reset" in body
+    assert b"calibrationTileBounds" in body
+    assert b"strokeCalibrationTiles" in body
     assert b"Copy both FarmBot camera offsets unchanged" in body
+    assert b"All photos are still shown at their reported size" in body
+    assert b"No loaded photos match the selected FarmBot camera resolution" not in body
 
     status, _, body = await asgi_request("/health")
     assert status == 200
@@ -1517,7 +1533,11 @@ async def test_weed_settings_page_exposes_pipeline_training_and_automation_contr
     assert "name=automatic_creation_confidence" in html
     assert 'action="weed-model/train"' in html
     assert 'action="weed-model/clear"' in html
+    assert 'action="weed-model/export"' in html
+    assert 'action="weed-model/import"' in html
     assert "Clear all training images" in html
+    assert "Most informative to label next" in html
+    assert "name=candidate_recall_boost" in html
 
 
 @pytest.mark.asyncio
@@ -1560,6 +1580,134 @@ async def test_editing_a_training_tag_saves_and_redirects_back_to_the_settings_p
         sample["detection_id"]: sample["label"] for sample in web.database.weed_training_samples()
     }
     assert labels[detection_id] == "mulch_soil"
+
+
+def _store_labelled_detection(detection_id: str, label: str, image_id: int = 11) -> None:
+    web.database.save_weed_detection(
+        detection_id=detection_id,
+        config_entry_id="export-bot",
+        image_id=image_id,
+        image_timestamp=datetime.now(UTC),
+        x=10,
+        y=20,
+        z=0,
+        area_mm2=80,
+        radius_mm=15,
+        confidence=0.9,
+        overlay_path=None,
+        features={name: 0.3 for name in weed_verifier_module.FEATURE_NAMES},
+    )
+    assert web.database.label_weed_detection(detection_id, label)
+
+
+@pytest.mark.asyncio
+async def test_training_bundle_exports_labels_with_their_features():
+    detection_id = str(uuid4())
+    _store_labelled_detection(detection_id, "moss")
+
+    status, headers, body = await asgi_request("/weed-model/export")
+    bundle = json.loads(body)
+
+    assert status == 200
+    assert b"attachment" in headers[b"content-disposition"]
+    exported = {sample["detection_id"]: sample for sample in bundle["samples"]}
+    assert exported[detection_id]["label"] == "moss"
+    # Features are what training consumes, so they are the payload that makes
+    # a bundle portable between installs.
+    assert exported[detection_id]["features"]["strong_green_fraction"] == 0.3
+    assert exported[detection_id]["image_id"] == 11
+    # Crops are omitted unless explicitly requested.
+    assert "crop_base64" not in exported[detection_id]
+    assert bundle["feature_names"] == list(weed_verifier_module.FEATURE_NAMES)
+
+
+@pytest.mark.asyncio
+async def test_a_bundle_round_trips_back_into_an_empty_install(monkeypatch):
+    detection_id = str(uuid4())
+    _store_labelled_detection(detection_id, "mushroom")
+    manual = web.weed_settings_store.load().model_copy(update={"automatic_retraining": False})
+    monkeypatch.setattr(web.weed_settings_store, "load", lambda: manual)
+
+    _, _, body = await asgi_request("/weed-model/export")
+    web.database.clear_weed_training_samples()
+    assert web.database.weed_training_samples() == []
+
+    boundary = "----bundleboundary"
+    payload = (
+        (
+            f"--{boundary}\r\n"
+            'Content-Disposition: form-data; name="bundle"; filename="bundle.json"\r\n'
+            "Content-Type: application/json\r\n\r\n"
+        ).encode()
+        + body
+        + f"\r\n--{boundary}--\r\n".encode()
+    )
+
+    status, headers, _ = await asgi_request(
+        "/weed-model/import",
+        method="POST",
+        raw_body=payload,
+        content_type=f"multipart/form-data; boundary={boundary}",
+    )
+
+    assert status == 303
+    assert "Imported" in unquote(headers[b"location"].decode())
+    restored = {sample["detection_id"]: sample for sample in web.database.weed_training_samples()}
+    assert restored[detection_id]["label"] == "mushroom"
+    assert restored[detection_id]["features"]["strong_green_fraction"] == 0.3
+
+
+@pytest.mark.asyncio
+async def test_importing_a_bundle_with_no_usable_samples_is_rejected():
+    boundary = "----emptyboundary"
+    payload = (
+        f"--{boundary}\r\n"
+        'Content-Disposition: form-data; name="bundle"; filename="bundle.json"\r\n'
+        "Content-Type: application/json\r\n\r\n"
+        '{"samples": [{"label": "not_a_label", "features": {}, "detection_id": "x"}]}'
+        f"\r\n--{boundary}--\r\n"
+    ).encode()
+
+    status, _, _ = await asgi_request(
+        "/weed-model/import",
+        method="POST",
+        raw_body=payload,
+        content_type=f"multipart/form-data; boundary={boundary}",
+    )
+
+    assert status == 422
+
+
+@pytest.mark.asyncio
+async def test_the_suggested_threshold_can_be_applied_in_one_click(monkeypatch):
+    monkeypatch.setattr(web.weed_verifier, "reload", lambda: None)
+    monkeypatch.setattr(type(web.weed_verifier), "suggested_threshold", property(lambda self: 0.78))
+    saved: list[float] = []
+    monkeypatch.setattr(
+        web.weed_settings_store,
+        "save",
+        lambda values: saved.append(values.visual_verifier_minimum_confidence),
+    )
+
+    status, headers, _ = await asgi_request("/weed-model/apply-threshold", method="POST")
+
+    assert status == 303
+    assert saved == [0.78]
+    assert "0.78" in unquote(headers[b"location"].decode())
+
+
+@pytest.mark.asyncio
+async def test_best_guess_names_categories_in_plain_language(monkeypatch):
+    monkeypatch.setattr(
+        web.weed_verifier,
+        "explain",
+        lambda features: [("fallen_leaf", 0.7), ("weed", 0.3)],
+    )
+
+    guess = web._verifier_label_guess({"strong_green_fraction": 0.4})
+
+    assert guess[0]["label"] == "fallen leaf"
+    assert guess[0]["probability"] == 0.7
 
 
 @pytest.mark.asyncio

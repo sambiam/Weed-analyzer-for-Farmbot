@@ -181,6 +181,29 @@ def test_exclusion_reasons_are_persisted_without_entering_confidence_denominator
     assert rows[2]["exclusion_reason"] == "no target-owned canopy evidence"
 
 
+def test_pending_grid_context_restores_one_measurement_per_source_image(tmp_path):
+    now = datetime(2026, 7, 30, tzinfo=UTC)
+    database = Database(tmp_path / "db.sqlite")
+    first = _measurement(101, timestamp=now, confidence=0.88)
+    second = _measurement(
+        102,
+        timestamp=now + timedelta(minutes=1),
+        confidence=0.05,
+        sectors=[],
+        has_evidence=False,
+        center_visible=False,
+    )
+    database.save_measurements([first, second])
+
+    restored = database.pending_plant_measurements("bot", 17, [101, 102, 999])
+
+    assert {item.image_id for item in restored} == {101, 102}
+    restored_first = next(item for item in restored if item.image_id == 101)
+    assert restored_first.measurement_id == first.measurement_id
+    assert restored_first.boundary_sectors == list(range(72))
+    assert restored_first.has_plant_evidence is True
+
+
 def test_relative_transform_matches_main_rotation_scale_and_translation_once(tmp_path):
     photo = np.zeros((100, 100, 3), np.uint8)
     mask = np.zeros((100, 100), np.uint8)

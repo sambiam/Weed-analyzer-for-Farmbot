@@ -1045,6 +1045,17 @@ class ClassicalVisionEngine(ImageAnalysisEngine):
             # stem fragments of one continuous weed produce one detection.
             count, candidate_labels = _nearby_component_labels(candidate_mask, group_gap_px)
             area_scale = calibration.pixels_per_mm_x * calibration.pixels_per_mm_y
+            # When the learned verifier is doing the accepting and rejecting,
+            # the heuristic's remaining job is recall: hand it every candidate
+            # worth judging rather than pre-filtering with rules that cannot
+            # tell a weed from moss anyway.
+            verifier_scoring = self.weed_verifier is not None and self.weed_verifier.available
+            verifier_authoritative = (
+                verifier_scoring
+                and weed_settings.visual_verifier_enabled
+                and not weed_settings.visual_verifier_shadow_mode
+            )
+            gate_scale = weed_settings.candidate_recall_boost if verifier_authoritative else 1.0
             owned_seed_indices = [
                 index for index in range(len(seeds)) if np.any(ownership == index + 1)
             ]
@@ -1088,6 +1099,19 @@ class ClassicalVisionEngine(ImageAnalysisEngine):
                     weed_settings.minimum_area_mm2 <= area_mm2 <= weed_settings.maximum_area_mm2
                 ):
                     continue
+                # Distance to the nearest known crop separates an interrow weed
+                # from a crop leaf that escaped the exclusion mask, and it is
+                # the one feature the candidate crop cannot supply on its own.
+                distance_to_plant_mm = min(
+                    (
+                        math.hypot(
+                            (wx - seed.center_px[0]) / calibration.pixels_per_mm_x,
+                            (wy - seed.center_px[1]) / calibration.pixels_per_mm_y,
+                        )
+                        for seed in seeds
+                    ),
+                    default=None,
+                )
                 features = extract_visual_features(
                     image,
                     component,
@@ -1098,12 +1122,15 @@ class ClassicalVisionEngine(ImageAnalysisEngine):
                     strong_green_minimum_excess_green=(
                         weed_settings.strong_green_minimum_excess_green
                     ),
+                    distance_to_plant_mm=distance_to_plant_mm,
                 )
                 if weed_settings.shape_filter_enabled and (
-                    features["strong_green_fraction"] < weed_settings.minimum_green_purity
-                    or features["solidity"] < weed_settings.minimum_solidity
-                    or features["circularity"] < weed_settings.minimum_circularity
-                    or features["aspect_ratio"] * 12 > weed_settings.maximum_aspect_ratio
+                    features["strong_green_fraction"]
+                    < weed_settings.minimum_green_purity * gate_scale
+                    or features["solidity"] < weed_settings.minimum_solidity * gate_scale
+                    or features["circularity"] < weed_settings.minimum_circularity * gate_scale
+                    or features["aspect_ratio"] * 12
+                    > weed_settings.maximum_aspect_ratio / gate_scale
                 ):
                     continue
                 area_score = min(
@@ -1113,6 +1140,10 @@ class ClassicalVisionEngine(ImageAnalysisEngine):
                         / max(1.0, weed_settings.minimum_area_mm2 * 2)
                     ),
                 )
+                # The heuristic score measures plant-ness, not weed-ness: every
+                # term rises for moss, fallen leaves and crop foliage just as it
+                # does for a weed. It is a usable fallback ordering before the
+                # verifier is trained, never a substitute for it.
                 heuristic_confidence = min(
                     0.98,
                     0.25
@@ -1122,26 +1153,21 @@ class ClassicalVisionEngine(ImageAnalysisEngine):
                     + features["circularity"] * 0.10,
                 )
                 verifier_confidence = (
-                    self.weed_verifier.predict(features)
-                    if self.weed_verifier is not None
-                    and (
-                        weed_settings.visual_verifier_enabled
-                        or weed_settings.visual_verifier_shadow_mode
-                    )
-                    else None
+                    self.weed_verifier.predict(features) if verifier_scoring else None
                 )
-                confidence = heuristic_confidence
-                if (
-                    weed_settings.visual_verifier_enabled
-                    and not weed_settings.visual_verifier_shadow_mode
-                    and verifier_confidence is not None
-                ):
-                    weight = weed_settings.visual_verifier_weight
-                    confidence = heuristic_confidence * (1 - weight) + verifier_confidence * weight
+                if verifier_authoritative and verifier_confidence is not None:
+                    # A trained verifier is the score. Blending it with the
+                    # heuristic used to compress its calibrated range into
+                    # roughly [0.25, 0.95] and drag every rejection upwards,
+                    # which made the verifier threshold the only real gate
+                    # while the reported confidence said otherwise.
+                    confidence = verifier_confidence
                     if verifier_confidence < weed_settings.visual_verifier_minimum_confidence:
                         continue
-                if confidence < weed_settings.minimum_confidence:
-                    continue
+                else:
+                    confidence = heuristic_confidence
+                    if confidence < weed_settings.minimum_confidence:
+                        continue
                 component_radius_mm = float(
                     np.max(
                         np.sqrt(

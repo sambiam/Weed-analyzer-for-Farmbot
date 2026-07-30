@@ -374,7 +374,13 @@ class JobManager:
             if grid_record is not None and grid_record.config_entry_id != entry_id:
                 grid_record = None
             grid_frames_by_image = (
-                {int(frame.image_id): frame for frame in grid_record.frames}
+                {
+                    int(frame.image_id): frame
+                    for frame in [
+                        *grid_record.frames,
+                        *grid_record.quality_overlay_frames,
+                    ]
+                }
                 if grid_record is not None
                 else {}
             )
@@ -382,6 +388,11 @@ class JobManager:
                 {int(target.index): target for target in grid_record.targets}
                 if grid_record is not None
                 else {}
+            )
+            excluded_grid_image_ids = (
+                {int(image_id) for image_id in grid_record.excluded_image_ids}
+                if grid_record is not None
+                else set()
             )
             self.current["progress"] = "Inventory loaded"
             resolution = self.settings.resolution
@@ -405,7 +416,9 @@ class JobManager:
             images = [
                 image
                 for image in sorted(inventory.images, key=lambda item: item.created_at)
-                if image.processed and (not wanted_image_ids or image.id in wanted_image_ids)
+                if image.processed
+                and image.id not in excluded_grid_image_ids
+                and (not wanted_image_ids or image.id in wanted_image_ids)
             ]
             if wanted_image_ids and not images:
                 return await self._finish(
@@ -1085,6 +1098,25 @@ class JobManager:
             measurements_by_plant: dict[int, list] = {}
             for measurement in all_measurements:
                 measurements_by_plant.setdefault(measurement.plant_id, []).append(measurement)
+            current_image_ids = {int(item.image_id) for item in all_measurements}
+            current_grid_image_ids = set(grid_frames_by_image)
+            # A photo grid is uploaded as separate new-image events. Include
+            # measurements already saved for this verified grid so evidence
+            # selection, fusion, and the review image describe one garden
+            # neighbourhood rather than whichever upload happened to run last.
+            if (
+                current_image_ids
+                and current_grid_image_ids
+                and current_image_ids <= current_grid_image_ids
+            ):
+                for plant_id in list(measurements_by_plant):
+                    grid_measurements = self.db.pending_plant_measurements(
+                        entry_id,
+                        plant_id,
+                        current_grid_image_ids,
+                    )
+                    if grid_measurements:
+                        measurements_by_plant[plant_id] = grid_measurements
             proposed_radii = {
                 candidate_plant_id: float(
                     Database._consolidate_measurement_rows(

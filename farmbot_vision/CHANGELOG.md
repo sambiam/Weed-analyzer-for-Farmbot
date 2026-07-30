@@ -1,5 +1,96 @@
 # Changelog
 
+## 3.6.0 - 2026-07-30
+
+- The trained visual verifier is now the weed score outright rather than being
+  blended with the shape heuristic. Blending compressed the verifier's
+  calibrated range into roughly 0.25-0.95 and lifted every rejected candidate,
+  so the displayed confidence disagreed with the gate that was actually
+  deciding. `Verifier weight in final score` is removed; the verifier threshold
+  is the single gate whenever enforcement is on.
+- The heuristic score is now what it always measured — plant-ness, not
+  weed-ness — and is used only as an ordering before the verifier is trained.
+  Every one of its terms rises for moss, fallen leaves and crop foliage exactly
+  as it does for weeds, which is why reweighting it could never separate them.
+- Added a `Candidate recall boost` setting that relaxes the colour/shape gates
+  while a trained verifier is enforcing, so borderline weeds reach the model
+  instead of being dropped by rules that cannot classify them. Behaviour is
+  unchanged when the verifier is off or in shadow mode.
+- Three spatial features feed the verifier: distance to the nearest known
+  plant, surrounding vegetation density, and proximity to the frame edge.
+  Samples labelled by earlier versions lack them, so training falls back to the
+  original sixteen features until every sample carries the full set.
+- Verifier scores are corrected back to the observed class balance. The fit is
+  class-weighted, so its 0.5 was a balanced-prior answer and far too permissive
+  for a real candidate stream.
+- Training now holds out whole images rather than individual candidates.
+  Two crops from one photo are usually the same weed under the same light, and
+  splitting between them reported a precision the model did not have.
+- Training sweeps the threshold curve and suggests the highest-recall operating
+  point whose precision is confidently at or above 95%, judged on the Wilson
+  lower bound so a small lucky validation fold cannot justify a permissive
+  threshold. One click applies the suggestion.
+- The weed review dialog shows the verifier's best guess at what the object
+  actually is ("moss 71%"), using per-category heads trained from the same
+  labels. It is descriptive only and never changes the accept/reject decision.
+- The weed settings page lists the unlabelled candidates closest to the
+  decision boundary, which are worth far more per label than another obvious
+  weed, and can label them without changing their review status.
+- Added export and import of the training bundle (labels plus features,
+  optionally the crop images). An exported bundle can be shipped with the
+  add-on as `bundled_weed_model.json`, which a fresh install uses until it has
+  trained a model of its own.
+
+## 3.5.1 - 2026-07-30
+
+- Fixed per-photo grid events so plant evidence, confidence, fusion, and review
+  composites are rebuilt from every pending measurement in the current
+  verified grid instead of whichever individual upload ran last.
+- Plant review now shows the target plant's surrounding grid cells even when a
+  complete single photo supplies the measurement or no usable evidence was
+  selected. Zero-evidence rows no longer fall back to a shared unrelated
+  diagnostic image.
+
+## 3.5.0 - 2026-07-30
+
+- Calibration, latest full-grid, and plant-measurement composites now crop
+  every photo to a deterministic rectangular grid cell. Cell boundaries meet
+  at exact camera-centre midpoints and the outside cells terminate at the
+  configured garden-bed border, eliminating overlap-shaped and rotated seams.
+- Added subtle cell borders and a stronger garden/window outline to all grid
+  views, matching the FarmBot map's legible tiled presentation.
+- Plant review images now restrict base and quality-repair photos, masks, and
+  priority selection to their assigned cell. Standard and diagnostic views
+  retain identical tessellated geometry.
+
+## 3.4.0 - 2026-07-30
+
+- Added a persisted second-pass quality gate for newly captured photo grids,
+  detecting washed-out frames and close leaves that obscure the camera.
+- Washed-out originals are excluded from analysis, deleted through the
+  companion integration, and given one same-coordinate retake. A still-washed
+  retake is also discarded without triggering another repair.
+- Leaf-obstructed cells keep their original background, capture four offset
+  views in one repair attempt, rank them by unobscured plant content, and paint
+  the selected view as the top layer in grid and plant composites.
+- Delayed new-image analysis until the grid quality pass finishes and persisted
+  discarded image IDs, preventing rejected or unselected frames from producing
+  measurements even when remote deletion is unavailable.
+
+## 3.3.0 - 2026-07-30
+
+- Calibration now renders every loaded photo even when its reported dimensions
+  differ from the selected Camera settings resolution. The actual resolutions
+  remain visible as a warning so the user can diagnose and correct the setting
+  without losing the calibration grid.
+- Photo-grid capture planning now reproduces FarmBot's post-rotation rectangle
+  crop instead of treating the larger rotated bounding box as usable coverage.
+  New grids use closer coordinates where necessary and retain the configured
+  overlap after FarmBot crops the displayed map photos.
+- The calibration and analysis-page grid renderers now apply the same FarmBot
+  crop geometry and use each downloaded photo's reported dimensions. Both
+  views therefore agree with the capture planner and FarmBot map more closely.
+
 ## 3.2.0 - 2026-07-30
 
 - Selected complete single-image plant evidence exclusively and separated

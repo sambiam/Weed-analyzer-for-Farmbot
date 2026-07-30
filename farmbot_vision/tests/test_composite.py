@@ -171,6 +171,69 @@ def test_composite_applies_calibrated_rotation_and_origin(tmp_path):
     )
 
 
+def test_leaf_repair_overlay_is_painted_above_retained_original(tmp_path):
+    now = datetime(2026, 7, 26, tzinfo=UTC)
+    output = tmp_path / "leaf-layered.jpg"
+    transform = json.dumps(
+        {
+            "pixels_per_mm_x": 1,
+            "pixels_per_mm_y": 1,
+            "rotation_degrees": 0,
+            "origin_location": "top_left",
+            "image_x": 100,
+            "image_y": 100,
+        }
+    )
+    original = _measurement(
+        tmp_path,
+        31,
+        50,
+        now,
+        size=(100, 100),
+        visible_fraction=0.5,
+        boundary_sectors=list(range(36)),
+        transform_json=transform,
+    )
+    replacement = _measurement(
+        tmp_path,
+        32,
+        50,
+        now + timedelta(seconds=1),
+        size=(100, 100),
+        visible_fraction=0.5,
+        boundary_sectors=list(range(36, 72)),
+        transform_json=transform,
+    )
+    cv2.imwrite(original.source_image_path, np.full((100, 100, 3), (210, 20, 20), np.uint8))
+    cv2.imwrite(
+        replacement.source_image_path,
+        np.full((100, 100, 3), (20, 210, 20), np.uint8),
+    )
+    target = PhotoGridTarget(index=0, row=0, column=0, x=100, y=100, z=0)
+    record = PhotoGridRecord(
+        config_entry_id="bot",
+        started_at=now,
+        status="complete",
+        bed_bounds={"x": (0, 200), "y": (0, 200)},
+        footprint_width_mm=100,
+        footprint_height_mm=100,
+        calibration=FarmbotCalibrationInput(
+            coordinate_scale=1,
+            reference_width=100,
+            reference_height=100,
+        ),
+        targets=[target],
+        frames=[PhotoGridFrame(target_index=0, image_id=31, x=100, y=100, z=0)],
+        quality_overlay_frames=[PhotoGridFrame(target_index=0, image_id=32, x=100, y=100, z=0)],
+    )
+
+    assert build_plant_composite([original, replacement], output, grid_record=record)
+    composite = cv2.imread(str(output))
+
+    assert composite is not None
+    assert float(np.mean(composite[:, :, 1])) > float(np.mean(composite[:, :, 0])) * 2
+
+
 def test_one_by_two_evidence_region_builds_three_by_four_grid_crop(tmp_path):
     now = datetime(2026, 7, 26, tzinfo=UTC)
     output = tmp_path / "grid-composite.jpg"
@@ -276,7 +339,14 @@ def test_one_by_two_evidence_region_builds_three_by_four_grid_crop(tmp_path):
     diagnostic = cv2.imread(str(overlay))
     assert metadata["tile_window"]["rows"] == 3
     assert metadata["tile_window"]["columns"] == 4
+    assert metadata["tessellated_rectangular_cells"] is True
+    assert metadata["garden_border"] is True
+    assert metadata["crop_mm"] == [-160.0, -160.0, 160.0, 80.0]
     assert clean.shape == diagnostic.shape
+    # Every populated grid cell reaches the shared midpoint seams: the
+    # interior contains no black canvas gaps between warped photos.
+    interior = clean[5:-5, 5:-5]
+    assert np.count_nonzero(np.all(interior < 5, axis=2)) == 0
     assert metadata["standard_and_diagnostic_geometry_identical"] is True
     difference = cv2.absdiff(clean, diagnostic)
     ppm = metadata["pixels_per_mm"]
@@ -293,3 +363,100 @@ def test_one_by_two_evidence_region_builds_three_by_four_grid_crop(tmp_path):
     ]
     assert float(np.mean(target_patch)) > 3
     assert float(np.mean(neighbour_patch)) < 3
+
+
+def _three_by_three_grid(tmp_path, *, useful: bool) -> tuple[list[Measurement], PhotoGridRecord]:
+    now = datetime(2026, 7, 30, tzinfo=UTC)
+    targets = [
+        PhotoGridTarget(
+            index=row * 3 + column,
+            row=row,
+            column=column,
+            x=50 + column * 100,
+            y=50 + row * 100,
+            z=0,
+        )
+        for row in range(3)
+        for column in range(3)
+    ]
+    frames = [
+        PhotoGridFrame(
+            target_index=target.index,
+            image_id=2000 + target.index,
+            x=target.x,
+            y=target.y,
+            z=0,
+        )
+        for target in targets
+    ]
+    record = PhotoGridRecord(
+        config_entry_id="bot",
+        started_at=now,
+        status="complete",
+        bed_bounds={"x": (0, 300), "y": (0, 300)},
+        footprint_width_mm=100,
+        footprint_height_mm=100,
+        calibration=FarmbotCalibrationInput(
+            coordinate_scale=1,
+            reference_width=100,
+            reference_height=100,
+        ),
+        targets=targets,
+        frames=frames,
+    )
+    measurements = []
+    for target, frame in zip(targets, frames, strict=True):
+        is_target_tile = target.index == 4
+        item = _measurement(
+            tmp_path,
+            frame.image_id,
+            150 - target.x + 50,
+            now + timedelta(seconds=target.index),
+            center_y=150 - target.y + 50,
+            size=(100, 100),
+            boundary_sectors=list(range(72)) if useful and is_target_tile else [],
+            center_visible=is_target_tile,
+            has_plant_evidence=useful and is_target_tile,
+            visible_fraction=1 if useful and is_target_tile else 0,
+            transform_json=json.dumps(
+                {
+                    "pixels_per_mm_x": 1,
+                    "pixels_per_mm_y": 1,
+                    "rotation_degrees": 0,
+                    "origin_location": "top_left",
+                    "image_x": target.x,
+                    "image_y": target.y,
+                }
+            ),
+        ).model_copy(update={"recorded_center_x": 150, "recorded_center_y": 150})
+        measurements.append(item)
+    return measurements, record
+
+
+def test_complete_single_view_still_shows_surrounding_grid_context(tmp_path):
+    measurements, record = _three_by_three_grid(tmp_path, useful=True)
+    output = tmp_path / "single-complete-context.jpg"
+
+    assert build_plant_composite(measurements, output, grid_record=record)
+
+    metadata = json.loads(output.with_suffix(".json").read_text())
+    composite = cv2.imread(str(output))
+    assert metadata["selection_mode"] == "single_complete"
+    assert metadata["tile_window"]["rows"] == 3
+    assert metadata["tile_window"]["columns"] == 3
+    assert composite.shape[:2] == (300, 300)
+
+
+def test_no_evidence_uses_target_grid_neighbourhood_not_latest_unrelated_photo(tmp_path):
+    measurements, record = _three_by_three_grid(tmp_path, useful=False)
+    output = tmp_path / "no-evidence-context.jpg"
+
+    assert build_plant_composite(measurements, output, grid_record=record)
+
+    metadata = json.loads(output.with_suffix(".json").read_text())
+    composite = cv2.imread(str(output))
+    assert metadata["selection_mode"] == "no_evidence"
+    assert metadata["selected_image_ids"] == []
+    assert metadata["tile_window"]["rows"] == 3
+    assert metadata["tile_window"]["columns"] == 3
+    assert composite.shape[:2] == (300, 300)

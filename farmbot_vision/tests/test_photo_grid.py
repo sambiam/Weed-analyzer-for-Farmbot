@@ -10,7 +10,9 @@ from farmbot_vision.photo_grid import (
     PhotoGridFrame,
     PhotoGridRecord,
     PhotoGridTarget,
+    farmbot_cropped_footprint,
     match_verified_frames,
+    photo_grid_cell_bounds,
     photo_grid_chunk_size,
     plan_photo_grid,
     plan_targeted_plant_captures,
@@ -78,6 +80,57 @@ def test_rotation_changes_projected_camera_footprint():
     assert round(height) == 250
 
 
+def test_small_rotation_uses_farmbot_rectangular_crop_not_expanded_bounds():
+    calibration = _calibration(
+        coordinate_scale=0.5,
+        reference_width=1280,
+        reference_height=960,
+        rotation_degrees=5,
+        offset_x_mm=0,
+        offset_y_mm=0,
+    )
+
+    # FarmBot cropAmount rounds a 48.535 mm crop to 49 mm, removing it from
+    # both dimensions of the 640 x 480 mm native image.
+    assert farmbot_cropped_footprint(calibration) == (591.0, 431.0)
+
+    targets, width, height = plan_photo_grid(
+        calibration,
+        x_bounds=BED_X_BOUNDS,
+        y_bounds=BED_Y_BOUNDS,
+        z=0,
+    )
+    xs = sorted({target.x for target in targets})
+    ys = sorted({target.y for target in targets})
+
+    assert (width, height) == (591.0, 431.0)
+    assert (len(xs), len(ys), len(targets)) == (9, 6, 54)
+    assert max(b - a for a, b in zip(xs, xs[1:], strict=False)) <= width * (1 - 0.15)
+    assert max(b - a for a, b in zip(ys, ys[1:], strict=False)) <= height * (1 - 0.15)
+
+
+def test_quarter_turn_swaps_the_cropped_footprint_axes():
+    calibration = _calibration(
+        coordinate_scale=0.5,
+        reference_width=1280,
+        reference_height=960,
+        rotation_degrees=90,
+    )
+    assert farmbot_cropped_footprint(calibration) == (480.0, 640.0)
+
+
+def test_steep_rotation_plans_inside_farmbots_circular_crop():
+    calibration = _calibration(
+        coordinate_scale=0.5,
+        reference_width=1280,
+        reference_height=960,
+        rotation_degrees=45,
+    )
+    side = 480 / math.sqrt(2)
+    width, height = farmbot_cropped_footprint(calibration)
+    assert width == height == side
+
+
 def test_verified_frames_require_matching_xyz_coordinates():
     targets, _, _ = plan_photo_grid(_calibration(), x_bounds=(0, 1000), y_bounds=(0, 600), z=0)
     result = match_verified_frames(
@@ -140,6 +193,35 @@ def test_bed_grid_uses_even_spacing_from_the_configured_geometry():
     # The real bed's spacing, derived rather than hard-coded.
     assert x_spacing == {373.0}
     assert y_spacing == {294.0}
+
+
+def test_grid_cells_tessellate_from_midpoints_to_exact_bed_border():
+    targets, footprint_width, footprint_height = plan_photo_grid(
+        _calibration(offset_x_mm=10, offset_y_mm=-5),
+        x_bounds=(0, 1000),
+        y_bounds=(0, 600),
+        z=0,
+    )
+    record = PhotoGridRecord(
+        config_entry_id="bot",
+        started_at=datetime(2026, 7, 30, tzinfo=UTC),
+        bed_bounds={"x": (0, 1000), "y": (0, 600)},
+        footprint_width_mm=footprint_width,
+        footprint_height_mm=footprint_height,
+        calibration=_calibration(offset_x_mm=10, offset_y_mm=-5),
+        targets=targets,
+    )
+    cells = photo_grid_cell_bounds(record)
+    by_position = {(target.row, target.column): cells[target.index] for target in targets}
+
+    assert by_position[(0, 0)][:2] == (0, 0)
+    assert by_position[(3, 4)][2:] == (1000, 600)
+    for row in range(4):
+        for column in range(4):
+            assert by_position[(row, column)][2] == by_position[(row, column + 1)][0]
+    for row in range(3):
+        for column in range(5):
+            assert by_position[(row, column)][3] == by_position[(row + 1, column)][1]
 
 
 def test_bed_grid_is_one_continuous_serpentine_route():

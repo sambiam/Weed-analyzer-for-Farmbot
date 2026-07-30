@@ -392,3 +392,130 @@ def test_decode_keeps_processed_resolution_and_caps_at_ceiling():
     assert ok
     decoded = decode_jpeg(encoded.tobytes())
     assert decoded.shape[1] <= 1280 and decoded.shape[0] <= 960
+
+
+class _StubVerifier:
+    """Stands in for a trained WeedVisualVerifier with a fixed score."""
+
+    def __init__(self, score: float | None, available: bool = True):
+        self.score = score
+        self.available = available
+        self.seen: list[dict[str, float]] = []
+
+    def predict(self, features: dict[str, float]) -> float | None:
+        self.seen.append(features)
+        return self.score
+
+
+def _weed_scene(verifier, **overrides):
+    from farmbot_vision.weed_settings import WeedSettings
+
+    settings = {
+        "enabled": True,
+        "plant_exclusion_margin_mm": 10,
+        "minimum_area_mm2": 25,
+        "minimum_confidence": 0.7,
+        "visual_verifier_enabled": True,
+        "visual_verifier_shadow_mode": False,
+        "visual_verifier_minimum_confidence": 0.6,
+    }
+    settings.update(overrides)
+    calibration = Calibration(
+        source="manual", pixels_per_mm_x=1, pixels_per_mm_y=1, uncertainty_mm=10
+    )
+    seed = PlantSeed(
+        plant_id=1,
+        crop_slug="lettuce",
+        center_px=(160, 120),
+        current_radius_mm=60,
+        planted_at=datetime(2026, 1, 1, tzinfo=UTC),
+    )
+    return ClassicalVisionEngine(weed_verifier=verifier).analyse(
+        jpeg([("circle", ((160, 120), 25)), ("circle", ((285, 40), 10))]),
+        9,
+        NOW,
+        [seed],
+        calibration,
+        {},
+        WeedSettings(**settings),
+    )
+
+
+def test_trained_verifier_replaces_rather_than_dilutes_the_heuristic_score():
+    verifier = _StubVerifier(0.72)
+
+    result = _weed_scene(verifier)
+
+    assert len(result.weeds) == 1
+    weed = result.weeds[0]
+    # Exactly the verifier's number: blending it with the heuristic used to
+    # compress and decalibrate the score every downstream threshold reads.
+    assert weed.confidence == 0.72
+    assert weed.verifier_confidence == 0.72
+    # The heuristic is still recorded so the two can be compared in review.
+    assert weed.heuristic_confidence > 0
+
+
+def test_verifier_rejection_drops_the_candidate():
+    result = _weed_scene(_StubVerifier(0.4), visual_verifier_minimum_confidence=0.6)
+
+    assert result.weeds == []
+
+
+def test_shadow_mode_scores_without_deciding():
+    verifier = _StubVerifier(0.05)
+
+    result = _weed_scene(verifier, visual_verifier_shadow_mode=True)
+
+    assert len(result.weeds) == 1
+    weed = result.weeds[0]
+    # Scored and recorded, but the heuristic still owns the decision.
+    assert weed.verifier_confidence == 0.05
+    assert weed.confidence == weed.heuristic_confidence
+
+
+def test_untrained_verifier_falls_back_to_the_heuristic():
+    result = _weed_scene(_StubVerifier(None, available=False))
+
+    assert len(result.weeds) == 1
+    weed = result.weeds[0]
+    assert weed.verifier_confidence is None
+    assert weed.confidence == weed.heuristic_confidence
+
+
+def test_distance_to_the_nearest_plant_reaches_the_verifier():
+    verifier = _StubVerifier(0.9)
+
+    _weed_scene(verifier)
+
+    assert verifier.seen
+    features = verifier.seen[0]
+    # The weed sits ~160mm from the single seed at 1 px/mm, well inside the
+    # 300mm saturation distance, so the feature must be informative.
+    assert 0.3 < features["distance_to_plant"] < 0.8
+
+
+def test_recall_boost_only_relaxes_the_gates_while_the_verifier_enforces():
+    # A circularity floor the candidate cannot quite meet on its own terms.
+    strict = _weed_scene(
+        _StubVerifier(0.9),
+        minimum_circularity=1.0,
+        candidate_recall_boost=1.0,
+    )
+    assert strict.weeds == []
+
+    relaxed = _weed_scene(
+        _StubVerifier(0.9),
+        minimum_circularity=1.0,
+        candidate_recall_boost=0.5,
+    )
+    assert len(relaxed.weeds) == 1
+
+    # Shadow mode is not enforcement, so the gates stay where the user set them.
+    shadowed = _weed_scene(
+        _StubVerifier(0.9),
+        minimum_circularity=1.0,
+        candidate_recall_boost=0.5,
+        visual_verifier_shadow_mode=True,
+    )
+    assert shadowed.weeds == []
