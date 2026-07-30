@@ -52,6 +52,7 @@ from .weed_verifier import WeedVisualVerifier
 from .zones import Zone, ZoneAspect, ZoneStore, evaluate
 
 LOGGER = logging.getLogger(__name__)
+ANALYSIS_COOPERATIVE_PAUSE_SECONDS = 0.1
 
 
 def build_plant_composite(
@@ -108,12 +109,26 @@ class JobManager:
 
     def resources_available(self) -> tuple[bool, str]:
         memory_mb = psutil.virtual_memory().available / 1024 / 1024
-        cpu = psutil.cpu_percent(interval=0.1)
+        # interval=None is non-blocking. The old 100 ms sampling interval ran
+        # synchronously on the web event loop before every image.
+        cpu = psutil.cpu_percent(interval=None)
         if memory_mb < self.settings.minimum_free_memory_mb:
             return False, f"free memory below {self.settings.minimum_free_memory_mb} MB"
         if cpu > self.settings.maximum_system_load_percent:
             return False, f"system CPU load above {self.settings.maximum_system_load_percent}%"
         return True, "resources available"
+
+    async def _yield_for_server(self) -> tuple[bool, str]:
+        """Leave scheduling space for Home Assistant and interactive requests."""
+        await asyncio.sleep(ANALYSIS_COOPERATIVE_PAUSE_SECONDS)
+        while True:
+            available, reason = self.resources_available()
+            if available:
+                return True, reason
+            if reason.startswith("free memory"):
+                return False, reason
+            self.current["progress"] = f"Yielding to Home Assistant: {reason}"
+            await asyncio.sleep(0.5)
 
     async def _update_curve_after_radius(
         self, entry_id: str, inventory, measurement, *, human_approved: bool
@@ -441,7 +456,7 @@ class JobManager:
             artifacts = self.settings.data_dir / "artifacts"
             artifacts.mkdir(parents=True, exist_ok=True)
             for image_number, image_info in enumerate(images):
-                available, resource_reason = self.resources_available()
+                available, resource_reason = await self._yield_for_server()
                 if not available:
                     LOGGER.warning("Analysis paused: %s", resource_reason)
                     break
@@ -1130,7 +1145,18 @@ class JobManager:
                 evidence_diagnostics = selection_diagnostics(evidence)
                 self.db.set_evidence_selection(plant_measurements)
                 LOGGER.info(
-                    "Plant measurement evidence: %s",
+                    "Plant evidence: plant_id=%s crop=%s candidates=%d useful=%d "
+                    "selected=%d mode=%s coverage=%.0f%%",
+                    plant_id,
+                    plant_measurements[0].crop_slug,
+                    len(evidence.candidates),
+                    len(evidence.useful),
+                    len(evidence.used),
+                    evidence.mode,
+                    evidence.boundary_coverage * 100,
+                )
+                LOGGER.debug(
+                    "Plant measurement evidence details: %s",
                     json.dumps(
                         {
                             "plant_id": plant_id,
@@ -1154,7 +1180,9 @@ class JobManager:
                         separators=(",", ":"),
                     ),
                 )
-                fused = fuse_canopy_masks(plant_measurements, fusion_settings)
+                fused = await asyncio.to_thread(
+                    fuse_canopy_masks, plant_measurements, fusion_settings
+                )
                 if fused is not None:
                     individual = Database._consolidate_measurement_rows(
                         [item.model_dump(mode="json") for item in plant_measurements]
@@ -1216,14 +1244,16 @@ class JobManager:
                 composite_overlay_path = (
                     artifacts / f"{job_id}-plant-{plant_id}-composite-overlay.jpg"
                 )
-                if build_plant_composite(
+                composite_built = await asyncio.to_thread(
+                    build_plant_composite,
                     plant_measurements,
                     composite_path,
                     composite_overlay_path,
                     plants=inventory.plants,
                     proposed_radii=proposed_radii,
                     grid_record=grid_record,
-                ):
+                )
+                if composite_built:
                     self.db.set_composite_path(
                         [str(item.measurement_id) for item in plant_measurements],
                         str(composite_path),

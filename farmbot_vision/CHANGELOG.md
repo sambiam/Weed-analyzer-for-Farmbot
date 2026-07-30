@@ -1,7 +1,55 @@
 # Changelog
 
+## 3.8.0 - 2026-07-30
+
+- The weed verifier's automatic retraining now retrains after every N new
+  labels (user-configurable, default 1) instead of after each single new
+  label once the minimum dataset exists. The settings page shows how many
+  new labels have accumulated since the last trained run.
+
+## 3.7.1 - 2026-07-30
+
+- Fixed plant evidence consolidation so the dashboard limit applies after
+  grouping all photo-grid images by plant. Useful earlier tiles are no longer
+  discarded when a run contains more than 100 raw plant/image measurements.
+- Removed the unsafe raw-frame fallback from plant review buttons, which could
+  show the same unrelated grid photo for every no-evidence recommendation.
+- Added correctly centred, labelled garden-grid placeholders for plants whose
+  local neighbourhood has not been photographed yet.
+
+## 3.7.0 - 2026-07-30
+
+- Added global-blur detection to the canonical photo-grid quality pass using
+  strong-edge density, Laplacian detail, image contrast, and adjacent grid
+  photos as a local sharpness baseline.
+- Blurry originals are excluded from analysis, deleted, and retaken once at
+  the same coordinate. A retake that remains blurry or fails another quality
+  rule is also discarded without starting a repair loop.
+- Added regression coverage for severe blur, neighbour-relative moderate blur,
+  successful clear retakes, and still-blurry retakes.
+
+- Coalesced bursts of new-photo events into one analysis job, eliminating the
+  repeated whole-grid evidence, fusion, and composite work that grew
+  quadratically during a photo-grid upload.
+- Kept Home Assistant responsive during analysis by lowering the add-on's CPU
+  scheduling priority, limiting OpenCV to one worker, yielding between images
+  and while system load is high, and moving fusion/composite work off the web
+  event loop. Full-resolution analysis and output algorithms are unchanged.
+- Cached processed UI images on disk and in the browser, deduplicating
+  concurrent requests and avoiding repeated Home Assistant image RPCs.
+- Capped the soil tab's cold live lookup at 750 ms, cached its safe-site plan
+  for repeat navigation, and added database indexes for pending-analysis views.
+- Replaced multi-kilobyte per-plant INFO records with compact summaries while
+  retaining the complete evidence diagnostics at DEBUG level.
+
 ## 3.6.1 - 2026-07-30
 
+- Removed the separate legacy photo-grid repair controls and scheduler. Missing
+  frames, washed-out retakes, leaf-free alternate views, and large-plant
+  follow-ups now remain part of the app's canonical photo-grid sequence.
+- Added a live Grid status card whose squares come directly from the persisted
+  target plan, with verified/current/retrying state, completion percentage,
+  and current bot instruction. A 6 by 9 plan now displays exactly 54 cells.
 - Replaced the approximate FarmBot display crop with the exact maximum-area
   axis-aligned rectangle contained inside each rotated camera image. Mosaic
   cells can no longer request pixels beyond a rotated source edge.

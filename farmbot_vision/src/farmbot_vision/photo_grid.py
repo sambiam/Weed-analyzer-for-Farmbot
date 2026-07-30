@@ -140,7 +140,7 @@ class PhotoGridQualityRepair(BaseModel):
     """One persisted quality-repair attempt for one original grid frame."""
 
     target_index: int = Field(ge=0)
-    issue: Literal["washed_out", "leaf_obstruction"]
+    issue: Literal["washed_out", "leaf_obstruction", "blurry"]
     original_image_id: int = Field(gt=0)
     status: Literal["attempting", "complete", "failed"] = "attempting"
     attempted_at: datetime

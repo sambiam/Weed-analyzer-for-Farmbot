@@ -466,3 +466,38 @@ def test_no_evidence_uses_target_grid_neighbourhood_not_latest_unrelated_photo(t
     assert metadata["tile_window"]["rows"] == 3
     assert metadata["tile_window"]["columns"] == 3
     assert composite.shape[:2] == (300, 300)
+
+
+def test_uncaptured_neighbourhood_writes_a_plant_specific_placeholder(tmp_path):
+    measurements, record = _three_by_three_grid(tmp_path, useful=False)
+    # Simulate a partially completed grid whose only captured frame is far
+    # outside the target plant's 3x3 review neighbourhood.
+    record = record.model_copy(
+        update={
+            "targets": [
+                *record.targets,
+                PhotoGridTarget(index=9, row=4, column=4, x=450, y=450, z=0),
+            ],
+            "frames": [record.frames[0]],
+        }
+    )
+    measurement = measurements[0].model_copy(
+        update={
+            "recorded_center_x": 450,
+            "recorded_center_y": 450,
+            "plant_center_px": (450, 450),
+        }
+    )
+    output = tmp_path / "uncaptured-context.jpg"
+
+    assert build_plant_composite([measurement], output, grid_record=record)
+
+    metadata = json.loads(output.with_suffix(".json").read_text())
+    composite = cv2.imread(str(output))
+    assert metadata["selection_mode"] == "no_evidence"
+    assert metadata["captured_frame_count"] == 0
+    assert metadata["missing_photo_context"] is True
+    assert metadata["tile_window"]["rows"] == 2
+    assert metadata["tile_window"]["columns"] == 2
+    assert composite is not None
+    assert float(np.mean(composite)) > 5

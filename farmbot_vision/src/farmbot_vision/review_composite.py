@@ -186,13 +186,6 @@ def build_plant_review(
                 ),
             }
         )
-    if not frames:
-        return False
-
-    min_x = min(frame["bounds"][0] for frame in frames)
-    max_x = max(frame["bounds"][1] for frame in frames)
-    min_y = min(frame["bounds"][2] for frame in frames)
-    max_y = max(frame["bounds"][3] for frame in frames)
     tessellated_cells: dict[int, tuple[float, float, float, float]] = {}
     if theoretical_targets:
         tessellated_cells = {
@@ -205,12 +198,21 @@ def build_plant_review(
             for target in theoretical_targets
             if int(target.index) in grid_cells
         }
-        if tessellated_cells:
-            min_x = min(cell[0] for cell in tessellated_cells.values())
-            min_y = min(cell[1] for cell in tessellated_cells.values())
-            max_x = max(cell[2] for cell in tessellated_cells.values())
-            max_y = max(cell[3] for cell in tessellated_cells.values())
+
+    if tessellated_cells:
+        min_x = min(cell[0] for cell in tessellated_cells.values())
+        min_y = min(cell[1] for cell in tessellated_cells.values())
+        max_x = max(cell[2] for cell in tessellated_cells.values())
+        max_y = max(cell[3] for cell in tessellated_cells.values())
+    elif frames:
+        min_x = min(frame["bounds"][0] for frame in frames)
+        max_x = max(frame["bounds"][1] for frame in frames)
+        min_y = min(frame["bounds"][2] for frame in frames)
+        max_y = max(frame["bounds"][3] for frame in frames)
     else:
+        return False
+
+    if not theoretical_targets:
         current = float(representative.current_radius_mm)
         proposed = max(
             float(item.recommended_protection_radius_mm)
@@ -226,11 +228,19 @@ def build_plant_review(
         if focused[1] - focused[0] > 1 and focused[3] - focused[2] > 1:
             min_x, max_x, min_y, max_y = focused
 
-    ppm = float(np.median([frame["scale"] for frame in frames]))
+    ppm = (
+        float(np.median([frame["scale"] for frame in frames]))
+        if frames
+        else min(1.5, 1200 / max(1.0, max(max_x - min_x, max_y - min_y)))
+    )
     ppm = min(ppm, 2400 / max(1.0, max(max_x - min_x, max_y - min_y)))
     canvas_width = max(1, round((max_x - min_x) * ppm))
     canvas_height = max(1, round((max_y - min_y) * ppm))
-    canvas = np.zeros((canvas_height, canvas_width, 3), dtype=np.uint8)
+    canvas = (
+        np.zeros((canvas_height, canvas_width, 3), dtype=np.uint8)
+        if frames
+        else np.full((canvas_height, canvas_width, 3), (25, 33, 28), dtype=np.uint8)
+    )
     priority = np.full((canvas_height, canvas_width), -np.inf, dtype=np.float32)
     ownership = np.zeros((canvas_height, canvas_width), dtype=np.uint8)
     newest = max(item.image_timestamp for item in measurements)
@@ -326,6 +336,35 @@ def build_plant_review(
 
     draw_tessellation(canvas)
     draw_tessellation(diagnostic)
+
+    if not frames:
+        lines = ("No captured grid photos", "around this plant yet")
+        font_scale = max(0.45, min(1.1, canvas_width / 900))
+        thickness = max(1, round(font_scale * 2))
+        line_height = max(24, round(38 * font_scale))
+        baseline_y = canvas_height // 2 - line_height // 2
+        for line_index, line in enumerate(lines):
+            (text_width, _), _ = cv2.getTextSize(
+                line,
+                cv2.FONT_HERSHEY_SIMPLEX,
+                font_scale,
+                thickness,
+            )
+            origin = (
+                max(8, (canvas_width - text_width) // 2),
+                baseline_y + line_index * line_height,
+            )
+            for target in (canvas, diagnostic):
+                cv2.putText(
+                    target,
+                    line,
+                    origin,
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    font_scale,
+                    (220, 230, 222),
+                    thickness,
+                    cv2.LINE_AA,
+                )
 
     proposals = proposed_radii or {}
     current_target = float(representative.current_radius_mm)
@@ -429,6 +468,8 @@ def build_plant_review(
         "tessellated_rectangular_cells": bool(tessellated_cells),
         "garden_border": bool(tessellated_cells),
         "blank_free_source_crop": bool(grid_footprint),
+        "captured_frame_count": len(frames),
+        "missing_photo_context": not frames,
         "standard_and_diagnostic_geometry_identical": True,
     }
     output_path.with_suffix(".json").write_text(

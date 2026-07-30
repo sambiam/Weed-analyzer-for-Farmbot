@@ -265,6 +265,86 @@ def _photo_grid_record(targets, *, tmp_path):
     )
 
 
+def test_grid_status_uses_the_canonical_6_by_9_plan(tmp_path):
+    from farmbot_vision.photo_grid import PhotoGridFrame, PhotoGridTarget
+
+    targets = [
+        PhotoGridTarget(
+            index=row * 9 + column,
+            row=row,
+            column=column,
+            x=column * 100,
+            y=row * 100,
+            z=0,
+        )
+        for row in range(6)
+        for column in range(9)
+    ]
+    record = _photo_grid_record(targets, tmp_path=tmp_path)
+    record.status = "running"
+    record.message = "Taking the next coordinate-verified photo"
+    record.frames = [
+        PhotoGridFrame(
+            target_index=target.index,
+            image_id=1000 + target.index,
+            x=target.x,
+            y=target.y,
+            z=target.z,
+        )
+        for target in targets[:10]
+    ]
+
+    status = web._photo_grid_status(record)
+
+    assert status["rows"] == 6
+    assert status["columns"] == 9
+    assert status["total"] == 54
+    assert status["verified"] == 10
+    assert status["percentage"] == 19
+    assert [cell["state"] for cell in status["cells"][:12]] == [
+        *(["verified"] * 10),
+        "active",
+        "unattempted",
+    ]
+
+
+def test_grid_status_marks_failed_and_quality_repair_cells_blue(tmp_path):
+    from farmbot_vision.photo_grid import (
+        PhotoGridFrame,
+        PhotoGridQualityRepair,
+        PhotoGridTarget,
+    )
+
+    targets = [
+        PhotoGridTarget(index=index, row=0, column=index, x=index * 100, y=0, z=0)
+        for index in range(4)
+    ]
+    record = _photo_grid_record(targets, tmp_path=tmp_path)
+    record.status = "failed"
+    record.frames = [
+        PhotoGridFrame(target_index=0, image_id=10, x=0, y=0, z=0),
+        PhotoGridFrame(target_index=1, image_id=11, x=100, y=0, z=0),
+    ]
+    record.quality_repairs.append(
+        PhotoGridQualityRepair(
+            target_index=1,
+            issue="leaf_obstruction",
+            original_image_id=11,
+            status="failed",
+            attempted_at=datetime.now(UTC),
+        )
+    )
+
+    status = web._photo_grid_status(record)
+
+    assert [cell["state"] for cell in status["cells"]] == [
+        "verified",
+        "active",
+        "active",
+        "active",
+    ]
+
+
 @pytest.mark.asyncio
 async def test_worker_requeues_only_unverified_targets_after_batch_error(monkeypatch, tmp_path):
     """A batch error must not discard frames verified during that same batch's
@@ -476,11 +556,8 @@ async def test_worker_stops_early_when_a_pass_verifies_no_new_frames(monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_grid_repair_recheck_forces_a_fresh_inventory_lookup(monkeypatch):
-    """The Recheck button must not be blocked by the 5-minute inspection cache
-    or by the photo_grid_repair capability check -- it only reads the grid
-    state, so it must work even when a repair itself can't be started.
-    """
+async def test_legacy_grid_repair_recheck_route_is_removed(monkeypatch):
+    """Repair is part of the canonical grid run and has no manual endpoint."""
     import base64 as b64
     from types import SimpleNamespace
 
@@ -533,9 +610,8 @@ async def test_grid_repair_recheck_forces_a_fresh_inventory_lookup(monkeypatch):
     finally:
         web.settings.selected_config_entry_id = previous
 
-    assert status == 303
-    location = unquote(headers[b"location"].decode())
-    assert "Found 1 missing and 0 gantry" in location
+    assert status == 404
+    assert b"location" not in headers
 
 
 @pytest.mark.asyncio
@@ -891,7 +967,7 @@ async def test_grid_repair_gives_up_on_a_cell_that_stays_unusable(monkeypatch, t
 
 
 @pytest.mark.asyncio
-async def test_dashboard_gantry_debug_view_shows_photos_coordinates_and_disposition(
+async def test_dashboard_removes_legacy_gantry_repair_controls(
     monkeypatch,
 ):
     from farmbot_vision.grid_repair import GridRun, RepairTarget
@@ -934,14 +1010,10 @@ async def test_dashboard_gantry_debug_view_shows_photos_coordinates_and_disposit
     html = body.decode()
 
     assert status == 200
-    assert "View gantry photos (2)" in html
-    assert "id=gantry-modal" in html
-    assert "Image #2" in html
-    assert "X 0.0, Y 100.0, Z 0.0 mm" in html
-    assert "Perimeter positive — ignored for repair" in html
-    assert "Image #5" in html
-    assert "Interior repair target" in html
-    assert "gantryModal.hidden=false" in html
+    assert "Repair photo grid" not in html
+    assert "View gantry photos" not in html
+    assert "id=gantry-modal" not in html
+    assert "Grid status" in html
 
 
 def _review_measurement(**updates) -> Measurement:
@@ -1396,9 +1468,8 @@ async def test_dashboard_modal_uses_artifact_manifest_and_pending_rows(tmp_path,
     html = body.decode()
     assert status == 200
     assert "id=overlay-modal" in html
-    assert "data-artifacts=" in html
     assert "artifact/review-overlay.jpg" in html
-    assert "artifact/review-mask.png" in html
+    assert "artifact/review-mask.png" not in html
     assert "Previous weed" in html and "Next weed" in html
     assert "Previous image" in html and "Next image" in html
     assert "Reject as" in html
@@ -1741,6 +1812,8 @@ async def test_dashboard_plant_view_uses_only_clean_and_mask_composites(tmp_path
         overlay_path=str(diagnostic_overlay),
         mask_path=str(raw_mask),
         artifact_paths=[str(diagnostic_overlay), str(raw_mask)],
+        recorded_center_x=100,
+        recorded_center_y=200,
     )
     web.database.save_measurements([measurement])
     monkeypatch.setattr(web.settings, "data_dir", tmp_path)
@@ -1755,6 +1828,37 @@ async def test_dashboard_plant_view_uses_only_clean_and_mask_composites(tmp_path
     assert "Diagnostic mask" in html
     assert "artifact/frame-overlay.jpg" not in html
     assert "artifact/frame-mask.png" not in html
+
+
+@pytest.mark.asyncio
+async def test_dashboard_plant_without_composite_never_reuses_frame_artifacts(
+    tmp_path, monkeypatch
+):
+    artifact_dir = tmp_path / "artifacts"
+    artifact_dir.mkdir()
+    diagnostic_overlay = artifact_dir / "unrelated-frame-overlay.jpg"
+    raw_mask = artifact_dir / "unrelated-frame-mask.png"
+    diagnostic_overlay.write_bytes(b"overlay")
+    raw_mask.write_bytes(b"mask")
+    measurement = _review_measurement(
+        composite_path=None,
+        composite_overlay_path=None,
+        overlay_path=str(diagnostic_overlay),
+        mask_path=str(raw_mask),
+        artifact_paths=[str(diagnostic_overlay), str(raw_mask)],
+        recorded_center_x=100,
+        recorded_center_y=200,
+    )
+    web.database.save_measurements([measurement])
+    monkeypatch.setattr(web.settings, "data_dir", tmp_path)
+
+    status, _, body = await asgi_request("/")
+    html = body.decode()
+
+    assert status == 200
+    assert 'data-artifacts="[]"' in html
+    assert "artifact/unrelated-frame-overlay.jpg" not in html
+    assert "artifact/unrelated-frame-mask.png" not in html
 
 
 @pytest.mark.asyncio
@@ -1861,6 +1965,35 @@ async def test_event_listener_targets_new_image_and_uses_configured_mode(
             "queue_if_busy": True,
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_event_listener_batches_burst_images_into_one_job(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    async def events():
+        for image_id in (97, 98, 99, 98):
+            yield VisionRequestEvent(
+                config_entry_id="entry-1",
+                device_id="device_42",
+                image_id=image_id,
+            )
+
+    calls = []
+
+    async def fake_run(**kwargs):
+        calls.append(kwargs)
+        return {"accepted": True}
+
+    monkeypatch.setattr(web.client, "vision_events", events)
+    monkeypatch.setattr(web.jobs, "run", fake_run)
+    monkeypatch.setattr(web.settings, "mode", web.OperatingMode.RECOMMEND)
+
+    await web.event_listener()
+
+    assert len(calls) == 1
+    assert calls[0]["image_ids"] == [97, 98, 99]
+    assert calls[0]["plant_ids"] == []
 
 
 @pytest.mark.asyncio
@@ -2114,11 +2247,15 @@ async def test_calibration_grid_prefers_live_axis_bounds(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_calibration_image_reports_actual_dimensions(monkeypatch):
+async def test_calibration_image_reports_actual_dimensions(monkeypatch, tmp_path):
     import base64
     from types import SimpleNamespace
 
+    calls = 0
+
     async def image(_request, _max_bytes):
+        nonlocal calls
+        calls += 1
         return SimpleNamespace(
             image_base64=base64.b64encode(b"jpeg bytes").decode(),
             width=960,
@@ -2128,13 +2265,25 @@ async def test_calibration_image_reports_actual_dimensions(monkeypatch):
         )
 
     monkeypatch.setattr(web.client, "image", image)
+    monkeypatch.setattr(web, "image_file_cache", web.ImageFileCache(tmp_path / "image-cache"))
+    web._vision_image_locks.clear()
     response = await web.vision_image(entry_id="bot-grid", image_id=123)
 
     assert response.headers["x-farmbot-processed-width"] == "960"
     assert response.headers["x-farmbot-processed-height"] == "720"
     assert response.headers["x-farmbot-oriented-width"] == "1280"
     assert response.headers["x-farmbot-oriented-height"] == "960"
+    assert response.headers["cache-control"] == "private, max-age=86400, immutable"
     assert response.body == b"jpeg bytes"
+
+    status, headers, body = await asgi_request(
+        "/api/vision/image/123.jpg",
+        query_string=b"entry_id=bot-grid",
+    )
+    assert status == 200
+    assert headers[b"cache-control"] == b"private, max-age=86400, immutable"
+    assert body == b"jpeg bytes"
+    assert calls == 1
 
 
 @pytest.mark.asyncio

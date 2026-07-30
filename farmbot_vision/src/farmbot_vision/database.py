@@ -299,6 +299,17 @@ MIGRATIONS = [
     ALTER TABLE measurements ADD COLUMN exclusion_reason TEXT;
     ALTER TABLE measurements ADD COLUMN diagnostics_json TEXT NOT NULL DEFAULT '{}';
     """,
+    # Migration 19: dashboard and grid aggregation read these columns for every
+    # navigation and completed image batch. Cover them so an accumulated
+    # measurement history cannot turn tab loading into a full-table scan.
+    """
+    CREATE INDEX IF NOT EXISTS idx_measurements_pending_time
+      ON measurements(image_timestamp DESC);
+    CREATE INDEX IF NOT EXISTS idx_measurements_entry_plant_image
+      ON measurements(config_entry_id,plant_id,image_id,image_timestamp DESC);
+    CREATE INDEX IF NOT EXISTS idx_decisions_measurement_action
+      ON decisions(measurement_id,action);
+    """,
 ]
 
 
@@ -883,6 +894,23 @@ class Database:
             summary[str(row["label"])] = int(row["count"])
         return summary
 
+    def weed_labels_since_last_model_run(self) -> int:
+        """New/edited labels since the last trained run, for the label-count retrain trigger.
+
+        Compares against total sample count rather than timestamps: the run's
+        created_at is an ISO-8601 string while the samples' created_at is
+        SQLite's CURRENT_TIMESTAMP format, so the two are not safely
+        comparable as strings.
+        """
+        total = self.connection.execute(
+            "SELECT COUNT(*) AS count FROM weed_training_samples"
+        ).fetchone()["count"]
+        last_run = self.connection.execute(
+            "SELECT sample_count FROM weed_model_runs ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        baseline = int(last_run["sample_count"]) if last_run is not None else 0
+        return max(0, int(total) - baseline)
+
     def record_weed_model_run(self, model: dict) -> None:
         with self.connection:
             self.connection.execute(
@@ -1457,8 +1485,7 @@ class Database:
               AND d.action IN
                 ('applied','approved_no_change','reject','removed','keep','superseded')
             )
-            ORDER BY m.image_timestamp DESC LIMIT ?""",
-            (limit,),
+            ORDER BY m.image_timestamp DESC,m.created_at DESC""",
         ).fetchall()
         result = [dict(row) for row in rows]
         for row in result:

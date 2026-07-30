@@ -149,14 +149,21 @@ on while capturing and restores its previous state afterward. It acknowledges
 each safe movement, waits for live X/Y/Z position confirmation, takes the
 photo, and waits for the processed image inventory. The app also checks each
 returned frame against its requested X/Y/Z coordinate within 25 mm. Only
-verified frames count. Missing or mismatched targets are retried once; a grid
-with any remaining hole is marked failed rather than complete.
+verified frames count. Missing or mismatched targets are retried within the
+same grid sequence; a grid with any remaining hole is marked failed rather
+than complete. After capture, that same sequence quality-checks every frame,
+retakes washed-out or blurry images, tries alternate views for leaf-obstructed
+images, and captures clear centred views of large plants when needed. Blur is
+judged from whole-frame detail and strong edges, with adjacent grid cells used
+as the local sharpness baseline when available.
 
 The latest-grid view draws verified frames into one calibrated birds-eye
 garden mosaic and overlays current FarmBot plants and weeds. The plan and
 verified frame IDs are saved in `/data`, so completed progress survives an app
-restart. The existing **Repair photo grid** card remains available for
-externally created or older grids.
+restart. The **Grid status** card renders one square per canonical target, so
+its dimensions and count always match the current bot's plan. It shows verified
+photos in green, the current/failed/retrying target in blue, completion
+percentage, and a live description of the capture or quality-repair phase.
 
 The app asks the integration for inventory in the configured lookback window,
 then retrieves processed JPEGs one at a time at the configured resolution (at

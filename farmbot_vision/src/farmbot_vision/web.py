@@ -38,7 +38,6 @@ from .curves import fit_monotonic_curve
 from .database import Database
 from .grid_repair import (
     COORDINATE_TOLERANCE_MM,
-    GridRepairSettings,
     GridRepairSettingsStore,
     GridRun,
     RepairCaptures,
@@ -50,6 +49,7 @@ from .grid_repair import (
     target_payload,
 )
 from .home_assistant import HomeAssistantClient, HomeAssistantError, StaleRadiusError
+from .image_cache import CachedImage, ImageFileCache
 from .jobs import JobManager
 from .models import (
     ApplyPlantCenterRequest,
@@ -80,7 +80,12 @@ from .photo_grid import (
     plan_photo_grid,
     plan_targeted_plant_captures,
 )
-from .photo_quality import PhotoQuality, best_unobscured_photo, inspect_photo_quality
+from .photo_quality import (
+    PhotoQuality,
+    best_unobscured_photo,
+    inspect_photo_quality,
+    with_neighbor_blur,
+)
 from .settings import Settings
 from .soil_jobs import SoilJobManager
 from .vision import garden_to_pixel
@@ -104,6 +109,10 @@ from .zones import (
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 LOGGER = logging.getLogger(__name__)
 settings = Settings.load()
+# OpenCV may otherwise create a worker per CPU core inside the analysis thread.
+# One worker preserves identical algorithms/results while leaving CPU time for
+# Home Assistant and web requests.
+cv2.setNumThreads(1)
 database = Database(settings.data_dir / "farmbot_vision.db")
 calibration_store = CalibrationStore(settings.data_dir / "farmbot_calibration.json")
 client = HomeAssistantClient()
@@ -111,6 +120,9 @@ weed_settings_store = WeedSettingsStore(settings.data_dir / "weed_settings.json"
 canopy_fusion_settings_store = CanopyFusionSettingsStore(
     settings.data_dir / "canopy_fusion_settings.json"
 )
+# Kept only to read installations that still have legacy repair state. The
+# scheduler and HTTP controls which could start that workflow have been
+# removed; all repair now belongs to the canonical photo-grid worker.
 grid_repair_settings_store = GridRepairSettingsStore(
     settings.data_dir / "grid_repair_settings.json"
 )
@@ -126,6 +138,8 @@ weed_verifier = WeedVisualVerifier(
 zone_store = ZoneStore(settings.data_dir / "zones.json")
 jobs = JobManager(settings, database, client, weed_settings_store, zone_store)
 soil_jobs = SoilJobManager(database, client, settings.data_dir, jobs.lock, zone_store)
+image_file_cache = ImageFileCache(settings.data_dir / "image_cache")
+_vision_image_locks: dict[tuple[str, int, int, int], asyncio.Lock] = {}
 grid_repair_state: dict[str, object] = {
     "run": None,
     "checked_at": None,
@@ -159,8 +173,6 @@ PHOTO_GRID_MESSAGE_EXAMPLE_LIMIT = 5
 # Move far enough for the camera to look around a close leaf while retaining
 # generous overlap with the original cell.
 PHOTO_GRID_LEAF_OFFSET_FRACTION = 0.20
-# A cell whose fresh photo still shows the gantry will photograph the gantry
-# again; give it one retry, then move on rather than loop on it forever.
 MAX_REPAIR_ATTEMPTS_PER_CELL = 2
 TRAINING_LABELS = (
     "weed",
@@ -622,6 +634,72 @@ def _coordinate_label(target: PhotoGridTarget) -> str:
     return f"{target.x:g},{target.y:g}"
 
 
+def _photo_grid_status(record: PhotoGridRecord | None) -> dict[str, object]:
+    """Build the lightweight, canonical state used by the dashboard grid."""
+    if record is None:
+        return {
+            "session_id": None,
+            "status": "idle",
+            "message": "No photo grid has been started yet.",
+            "percentage": 0,
+            "verified": 0,
+            "total": 0,
+            "rows": 0,
+            "columns": 0,
+            "cells": [],
+        }
+
+    verified = {
+        frame.target_index
+        for frame in record.frames
+        if frame.image_id not in record.excluded_image_ids
+    }
+    missing = [target.index for target in record.targets if target.index not in verified]
+    blue: set[int] = {
+        repair.target_index
+        for repair in record.quality_repairs
+        if repair.status in {"attempting", "failed"}
+    }
+    if record.status in {"retrying", "failed"}:
+        blue.update(missing)
+    elif record.status in {"queued", "running"} and missing:
+        # The integration reports verified frames as it advances. The first
+        # unverified canonical target is therefore the current/next target;
+        # later cells remain visibly unattempted.
+        blue.add(missing[0])
+
+    rows = 1 + max((target.row for target in record.targets), default=-1)
+    columns = 1 + max((target.column for target in record.targets), default=-1)
+    cells = [
+        {
+            "index": target.index,
+            "row": target.row,
+            "column": target.column,
+            "state": (
+                "active"
+                if target.index in blue
+                else "verified"
+                if target.index in verified
+                else "unattempted"
+            ),
+        }
+        for target in sorted(record.targets, key=lambda item: (item.row, item.column))
+    ]
+    verified_count = len(verified.intersection(target.index for target in record.targets))
+    total = len(record.targets)
+    return {
+        "session_id": record.session_id,
+        "status": record.status,
+        "message": record.message or record.status.replace("_", " "),
+        "percentage": round(100 * verified_count / total) if total else 0,
+        "verified": verified_count,
+        "total": total,
+        "rows": rows,
+        "columns": columns,
+        "cells": cells,
+    }
+
+
 async def _start_photo_grid_batch(
     record: PhotoGridRecord,
     targets: list[PhotoGridTarget],
@@ -751,8 +829,18 @@ async def _capture_targeted_plant_photos(record: PhotoGridRecord) -> None:
     # Persist queued state before calling Home Assistant. A worker restart or a
     # second completion callback therefore cannot enqueue an equivalent move.
     record.targeted_captures.extend(planned)
+    record.status = "targeted_captures"
+    record.message = (
+        f"Taking {len(planned)} additional image"
+        f"{'s' if len(planned) != 1 else ''} of large plants for a clear, centred view"
+    )
     photo_grid_store.save(record)
-    for capture in planned:
+    for capture_number, capture in enumerate(planned, start=1):
+        record.message = (
+            f"Taking a clear image of large plant {capture.crop_name} "
+            f"({capture_number} of {len(planned)})"
+        )
+        photo_grid_store.save(record)
         target = PhotoGridTarget(
             index=len(record.targets) + record.targeted_captures.index(capture),
             row=0,
@@ -809,6 +897,15 @@ async def _capture_targeted_plant_photos(record: PhotoGridRecord) -> None:
                 capture.plant_id,
                 exc,
             )
+    completed = sum(item.status == "complete" for item in planned)
+    failed = len(planned) - completed
+    record.status = "complete" if not failed else "complete_with_warnings"
+    record.message = (
+        f"Photo grid complete: all {len(record.targets)} grid photos verified"
+        f" · {completed} large-plant photo{'s' if completed != 1 else ''} captured"
+        + (f" · {failed} follow-up{'s' if failed != 1 else ''} failed" if failed else "")
+    )
+    photo_grid_store.save(record)
 
 
 async def _quality_jpeg(record: PhotoGridRecord, image_id: int) -> bytes:
@@ -924,16 +1021,18 @@ async def _capture_quality_targets(
         return match_verified_frames(targets, result.get("frames"))
 
 
-async def _repair_washed_out_frame(
+async def _repair_discarded_frame(
     record: PhotoGridRecord,
     frame: PhotoGridFrame,
     repair: PhotoGridQualityRepair,
+    blur_neighbors: list[PhotoQuality],
 ) -> None:
+    issue_label = "washed out" if repair.issue == "washed_out" else "blurry"
     target = next(item for item in record.targets if item.index == frame.target_index)
     _exclude_grid_image(record, frame.image_id)
     record.frames = [item for item in record.frames if item.image_id != frame.image_id]
     photo_grid_store.save(record)
-    await _delete_discarded_grid_image(record, frame.image_id, reason="washed out")
+    await _delete_discarded_grid_image(record, frame.image_id, reason=issue_label)
 
     replacements = await _capture_quality_targets(record, [target])
     repair.candidate_image_ids = [item.image_id for item in replacements]
@@ -943,22 +1042,30 @@ async def _repair_washed_out_frame(
         repair.message = "The single same-coordinate retake produced no verified image"
         return
     replacement = replacements[0]
-    quality = inspect_photo_quality(await _quality_jpeg(record, replacement.image_id))
-    if quality.issue == "washed_out":
+    quality = with_neighbor_blur(
+        inspect_photo_quality(await _quality_jpeg(record, replacement.image_id)),
+        blur_neighbors,
+    )
+    if quality.issue != "usable":
         _exclude_grid_image(record, replacement.image_id)
         await _delete_discarded_grid_image(
             record,
             replacement.image_id,
-            reason="washed-out repair was still unusable",
+            reason=f"{issue_label} repair was still unusable ({quality.issue})",
         )
         repair.status = "failed"
-        repair.message = "The single retake was also washed out and was discarded"
+        repair.message = (
+            f"The single {issue_label} retake was still unusable "
+            f"({quality.issue}) and was discarded"
+        )
         return
     record.frames.append(replacement.model_copy(update={"target_index": frame.target_index}))
     record.frames.sort(key=lambda item: item.target_index)
     repair.selected_image_id = replacement.image_id
     repair.status = "complete"
-    repair.message = "Washed-out original deleted and replaced by one verified retake"
+    repair.message = (
+        f"{issue_label.capitalize()} original deleted and replaced by one clear verified retake"
+    )
 
 
 async def _repair_leaf_obstruction(
@@ -1025,15 +1132,38 @@ async def _photo_grid_quality_pass(record: PhotoGridRecord) -> None:
 
     attempted = {item.original_image_id for item in record.quality_repairs}
     originals = [item for item in record.frames if item.image_id not in attempted]
-    targets = {item.index for item in record.targets}
-    for frame in originals:
+    targets = {item.index: item for item in record.targets}
+    quality_by_image: dict[int, PhotoQuality] = {}
+    for frame_number, frame in enumerate(originals, start=1):
         if frame.target_index not in targets:
             continue
+        record.status = "quality_check"
+        record.message = (
+            f"Checking grid photo {frame_number} of {len(originals)} for washed-out "
+            "exposure, blur, or leaf obstruction"
+        )
+        photo_grid_store.save(record)
         try:
-            quality = inspect_photo_quality(await _quality_jpeg(record, frame.image_id))
+            quality_by_image[frame.image_id] = inspect_photo_quality(
+                await _quality_jpeg(record, frame.image_id)
+            )
         except (HomeAssistantError, ValueError) as exc:
             LOGGER.warning("Could not quality-check photo-grid image %d: %s", frame.image_id, exc)
+
+    for frame in originals:
+        quality = quality_by_image.get(frame.image_id)
+        target = targets.get(frame.target_index)
+        if quality is None or target is None:
             continue
+        blur_neighbors = [
+            neighboring_quality
+            for other in originals
+            if other.image_id != frame.image_id
+            and (other_target := targets.get(other.target_index)) is not None
+            and abs(other_target.row - target.row) + abs(other_target.column - target.column) == 1
+            and (neighboring_quality := quality_by_image.get(other.image_id)) is not None
+        ]
+        quality = with_neighbor_blur(quality, blur_neighbors)
         if quality.issue == "usable":
             continue
         repair = PhotoGridQualityRepair(
@@ -1045,10 +1175,28 @@ async def _photo_grid_quality_pass(record: PhotoGridRecord) -> None:
         # Save before moving the bot. A restart can report this attempt as
         # interrupted, but can never issue an accidental second repair.
         record.quality_repairs.append(repair)
+        record.status = "quality_repair"
+        record.message = (
+            f"Retaking washed-out grid photo {frame.target_index + 1} of {len(record.targets)}"
+            if quality.issue == "washed_out"
+            else (
+                f"Retaking blurry grid photo {frame.target_index + 1} of {len(record.targets)}"
+                if quality.issue == "blurry"
+                else (
+                    f"Taking alternate views of grid photo {frame.target_index + 1} of "
+                    f"{len(record.targets)} to find a leaf-free image"
+                )
+            )
+        )
         photo_grid_store.save(record)
         try:
-            if quality.issue == "washed_out":
-                await _repair_washed_out_frame(record, frame, repair)
+            if quality.issue in {"washed_out", "blurry"}:
+                await _repair_discarded_frame(
+                    record,
+                    frame,
+                    repair,
+                    blur_neighbors,
+                )
             else:
                 await _repair_leaf_obstruction(record, frame, repair)
         except (HomeAssistantError, ValueError, StopIteration) as exc:
@@ -1745,12 +1893,38 @@ _DASHBOARD_JS = r"""
   const queueModal=document.getElementById('queue-modal');
   const queueRows=document.getElementById('queue-image-rows');
   const queueMessage=document.getElementById('queue-message');
-  const gantryModal=document.getElementById('gantry-modal');
-  const gantryOpen=document.getElementById('gantry-debug-open');
   const photoGridModal=document.getElementById('photo-grid-modal');
   const photoGridOpen=document.getElementById('photo-grid-open');
   const photoGridCanvas=document.getElementById('photo-grid-canvas');
   const photoGridStatus=document.getElementById('photo-grid-status');
+  const gridStatusCells=document.getElementById('grid-status-cells');
+  const gridStatusPercentage=document.getElementById('grid-status-percentage');
+  const gridStatusCount=document.getElementById('grid-status-count');
+  const gridStatusMessage=document.getElementById('grid-status-message');
+  function renderGridStatus(data){
+    if(!gridStatusCells) return;
+    gridStatusPercentage.textContent=data.percentage+'%';
+    gridStatusCount.textContent=data.verified+' of '+data.total+' photos verified';
+    gridStatusMessage.textContent=data.message;
+    gridStatusCells.style.setProperty('--grid-columns',Math.max(1,data.columns));
+    gridStatusCells.replaceChildren(...(data.cells||[]).map(function(cell){
+      const square=document.createElement('span');
+      square.className='grid-status-cell '+cell.state;
+      square.dataset.index=cell.index;
+      square.setAttribute('role','gridcell');
+      square.setAttribute('aria-label','Photo '+(cell.index+1)+': '+cell.state);
+      return square;
+    }));
+  }
+  async function refreshGridStatus(){
+    try{
+      const response=await fetch('api/photo-grid/status',{cache:'no-store'});
+      if(response.ok) renderGridStatus(await response.json());
+    }catch(_error){
+      /* Keep the last known state visible during a temporary connection loss. */
+    }
+  }
+  if(gridStatusCells) window.setInterval(refreshGridStatus,2000);
   function gridOriginSigns(origin){
     return [(origin==='top_right'||origin==='bottom_right')?-1:1,
             (origin==='bottom_left'||origin==='bottom_right')?-1:1];
@@ -2394,7 +2568,6 @@ _DASHBOARD_JS = r"""
     if(event.key!=='Escape') return;
     if(!modal.hidden) closeModal();
     if(!weedModal.hidden) closeWeedModal();
-    if(!gantryModal.hidden) gantryModal.hidden=true;
   });
   document.getElementById('queue-open').addEventListener('click',function(){
     const to=new Date(), from=new Date(to.getTime()-72*60*60*1000);
@@ -2409,16 +2582,6 @@ _DASHBOARD_JS = r"""
     queueModal.hidden=false;loadQueueImages();
   });
   document.getElementById('queue-close').addEventListener('click',function(){queueModal.hidden=true;});
-  if(gantryOpen) gantryOpen.addEventListener('click',function(){
-    gantryModal.hidden=false;
-    gantryModal.querySelector('.modal-close').focus();
-  });
-  document.getElementById('gantry-close').addEventListener('click',function(){
-    gantryModal.hidden=true;
-  });
-  gantryModal.addEventListener('click',function(event){
-    if(event.target===gantryModal) gantryModal.hidden=true;
-  });
   if(photoGridOpen) photoGridOpen.addEventListener('click',function(){
     photoGridModal.hidden=false;loadPhotoGrid();
     photoGridModal.querySelector('.modal-close').focus();
@@ -2571,35 +2734,97 @@ _ZONES_JS = r"""
 """
 
 
+EVENT_BATCH_WINDOW_SECONDS = 0.75
+
+
+async def _eligible_vision_event(event):
+    """Wait for grid quality control and reject only its discarded frames."""
+    active_grid = photo_grid_task
+    if event.image_id is not None and active_grid is not None and not active_grid.done():
+        await asyncio.shield(active_grid)
+        record = photo_grid_store.load()
+        if (
+            record is not None
+            and record.config_entry_id == event.config_entry_id
+            and event.image_id in record.excluded_image_ids
+        ):
+            LOGGER.info(
+                "Skipped analysis event for discarded photo-grid image %d",
+                event.image_id,
+            )
+            return None
+    return event
+
+
 async def event_listener() -> None:
-    async for event in client.vision_events():
-        # Grid images are quality-gated as one completed set. In particular,
-        # a washed-out frame must be deleted and excluded before any new-image
-        # event can derive analysis from it.
-        active_grid = photo_grid_task
-        if event.image_id is not None and active_grid is not None and not active_grid.done():
-            await asyncio.shield(active_grid)
-            record = photo_grid_store.load()
-            if (
-                record is not None
-                and record.config_entry_id == event.config_entry_id
-                and event.image_id in record.excluded_image_ids
-            ):
-                LOGGER.info(
-                    "Skipped analysis event for discarded photo-grid image %d",
-                    event.image_id,
+    """Coalesce upload bursts so one grid is analysed once, not once per tile."""
+    events = client.vision_events().__aiter__()
+    exhausted = False
+    while not exhausted:
+        try:
+            first = await anext(events)
+        except StopAsyncIteration:
+            break
+        first = await _eligible_vision_event(first)
+        if first is None:
+            continue
+        batch = [first]
+        deadline = asyncio.get_running_loop().time() + EVENT_BATCH_WINDOW_SECONDS
+        while True:
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                break
+            try:
+                candidate = await asyncio.wait_for(anext(events), timeout=remaining)
+            except TimeoutError:
+                break
+            except StopAsyncIteration:
+                exhausted = True
+                break
+            candidate = await _eligible_vision_event(candidate)
+            if candidate is not None:
+                batch.append(candidate)
+
+        grouped: dict[tuple[str, OperatingMode], list] = {}
+        for event in batch:
+            mode = OperatingMode(event.mode) if event.mode is not None else settings.mode
+            grouped.setdefault((event.config_entry_id, mode), []).append(event)
+        for (entry_id, mode), grouped_events in grouped.items():
+            full_inventory = any(event.image_id is None for event in grouped_events)
+            image_ids = (
+                None
+                if full_inventory
+                else list(
+                    dict.fromkeys(
+                        int(event.image_id)
+                        for event in grouped_events
+                        if event.image_id is not None
+                    )
                 )
-                continue
-        # Await each automatic request so photos cannot be silently discarded
-        # merely because the previous image is still being analysed.
-        await jobs.run(
-            entry_id=event.config_entry_id,
-            mode=OperatingMode(event.mode) if event.mode is not None else settings.mode,
-            plant_ids=event.plant_ids,
-            image_ids=[event.image_id] if event.image_id is not None else None,
-            trigger="new_image" if event.image_id is not None else "event",
-            queue_if_busy=True,
-        )
+            )
+            all_plants = any(not event.plant_ids for event in grouped_events)
+            plant_ids = (
+                []
+                if all_plants
+                else list(
+                    dict.fromkeys(
+                        plant_id for event in grouped_events for plant_id in event.plant_ids
+                    )
+                )
+            )
+            if image_ids and len(image_ids) > 1:
+                LOGGER.info(
+                    "Coalesced %d new-image events into one analysis job",
+                    len(image_ids),
+                )
+            await jobs.run(
+                entry_id=entry_id,
+                mode=mode,
+                plant_ids=plant_ids,
+                image_ids=image_ids,
+                trigger="new_image" if image_ids is not None else "event",
+                queue_if_busy=True,
+            )
 
 
 async def heartbeat() -> None:
@@ -2647,7 +2872,6 @@ async def resolve_config_entry() -> None:
 
 async def scheduler() -> None:
     last_run_date = None
-    last_repair_completed_at: datetime | None = None
     while True:
         now = datetime.now().astimezone()
         if (
@@ -2659,23 +2883,6 @@ async def scheduler() -> None:
         ):
             last_run_date = now.date()
             await jobs.run(trigger="schedule")
-        repair_settings = grid_repair_settings_store.load()
-        if repair_settings.enabled and settings.selected_config_entry_id:
-            # inspect_photo_grid() caches its inventory lookup for 5 minutes,
-            # so polling every tick here does not add extra Home Assistant load.
-            candidate_run = await inspect_photo_grid()
-            if (
-                candidate_run is not None
-                and candidate_run.completed_at != last_repair_completed_at
-                and now - candidate_run.completed_at.astimezone()
-                >= timedelta(minutes=repair_settings.delay_minutes)
-            ):
-                last_repair_completed_at = candidate_run.completed_at
-                try:
-                    result = await start_photo_grid_repair()
-                    LOGGER.info("Automatic photo-grid repair: %s", result.get("message"))
-                except HomeAssistantError as exc:
-                    LOGGER.warning("Automatic photo-grid repair failed to start: %s", exc)
         await asyncio.sleep(30)
 
 
@@ -2717,6 +2924,9 @@ async def lifespan(_: FastAPI):
         "queued",
         "running",
         "retrying",
+        "quality_check",
+        "quality_repair",
+        "targeted_captures",
     }:
         interrupted_grid.status = "failed"
         interrupted_grid.completed_at = datetime.now(UTC)
@@ -2749,9 +2959,6 @@ async def lifespan(_: FastAPI):
     yield
     for task in tasks:
         task.cancel()
-    if grid_repair_task is not None and not grid_repair_task.done():
-        grid_repair_task.cancel()
-        await asyncio.gather(grid_repair_task, return_exceptions=True)
     if photo_grid_task is not None and not photo_grid_task.done():
         photo_grid_task.cancel()
         await asyncio.gather(photo_grid_task, return_exceptions=True)
@@ -2797,6 +3004,17 @@ button{{background:var(--green);border:0;border-radius:6px;padding:.65rem 1rem;c
 .photo-grid-dialog{{width:min(96vw,1000px)}}.photo-grid-dialog canvas{{display:block;width:100%;max-height:72vh;
 background:#243a2c;border:1px solid #bcc9c0;border-radius:6px}}
 .photo-grid-card form{{margin:0}}
+.grid-status-heading{{display:flex;align-items:baseline;justify-content:space-between;gap:1rem}}
+.grid-status-heading h2{{margin-bottom:.45rem}}#grid-status-percentage{{font-size:1.35rem;color:#176b42}}
+.grid-status-cells{{display:grid;grid-template-columns:repeat(var(--grid-columns),minmax(12px,1fr));
+gap:5px;width:min(100%,420px);margin:.45rem 0 .75rem}}
+.grid-status-cell{{display:block;aspect-ratio:1;border:2px solid #17221b;border-radius:2px;background:white}}
+.grid-status-cell.verified{{background:#35a867;border-color:#237a49}}
+.grid-status-cell.active{{background:#168cff;border-color:#075bab}}
+.grid-status-legend{{display:flex;gap:.8rem;flex-wrap:wrap;font-size:.78rem;color:var(--muted)}}
+.grid-status-legend span{{display:flex;align-items:center;gap:.3rem}}
+.grid-status-legend .grid-status-cell{{display:inline-block;width:13px;height:13px;aspect-ratio:auto;border-width:1px}}
+#grid-status-message{{margin-bottom:0}}
 .calibration-grid-viewport{{width:100%;max-height:72vh;overflow:auto;background:#111;
 border:1px solid #ccc;border-radius:6px}}.calibration-grid-viewport canvas{{display:block;
 width:100%;height:auto;max-width:none}}
@@ -2868,9 +3086,8 @@ async def health() -> JSONResponse:
 
 @app.get("/", response_class=HTMLResponse)
 async def dashboard(request: Request) -> HTMLResponse:
-    grid_run = await inspect_photo_grid()
     photo_grid_record = photo_grid_store.load()
-    repair_values = grid_repair_settings_store.load()
+    grid_status = _photo_grid_status(photo_grid_record)
     rows = database.pending_measurements()
     crop_slugs = sorted({row["crop_slug"] for row in rows})
     curves = {
@@ -2951,22 +3168,14 @@ async def dashboard(request: Request) -> HTMLResponse:
                     f'data-details="{details_json}">Fusion</button>'
                 )
             return composite_button
-        paths = r.get("artifact_paths") or []
-        if not paths and r.get("overlay_path"):
-            paths = [r["overlay_path"]]
-        if r.get("fusion_diagnostic_path"):
-            paths = [*paths, r["fusion_diagnostic_path"]]
-        urls = [f"artifact/{Path(path).name}" for path in paths if path]
-        if not urls:
-            if not plant_attrs:
-                return "<span class=muted>None</span>"
-            return (
-                f'<button type=button data-artifacts="[]" '
-                f'data-details="{details_json}"{plant_attrs}>View</button>'
-            )
-        artifacts_json = escape(json.dumps(urls, separators=(",", ":")), quote=True)
+        # A per-frame overlay is not a plant review artifact. Reusing one here
+        # made every no-evidence plant open whichever grid photo happened to be
+        # the representative row. The modal's plant attributes can request a
+        # correctly centred context image; until then, show an empty manifest.
+        if not plant_attrs:
+            return "<span class=muted>None</span>"
         return (
-            f'<button type=button data-artifacts="{artifacts_json}" '
+            f'<button type=button data-artifacts="[]" '
             f'data-details="{details_json}"{plant_attrs}>View</button>'
         )
 
@@ -3164,7 +3373,18 @@ async def dashboard(request: Request) -> HTMLResponse:
     photo_grid_running = photo_grid_task is not None and not photo_grid_task.done()
     photo_grid_start_disabled = " disabled" if photo_grid_running else ""
     photo_grid_message = escape(request.query_params.get("photo_grid", ""))
+    grid_cells = "".join(
+        f'<span class="grid-status-cell {escape(str(cell["state"]))}" '
+        f'data-index="{cell["index"]}" role=gridcell '
+        f'aria-label="Photo {cell["index"] + 1}: {escape(str(cell["state"]))}"></span>'
+        for cell in grid_status["cells"]
+    )
+    grid_columns = max(1, int(grid_status["columns"]))
 
+    # Legacy detector values are retained only while old persisted settings
+    # migrate; they no longer trigger inventory inspection or dashboard UI.
+    grid_run = None
+    repair_values = grid_repair_settings_store.load()
     if grid_run is None:
         repair_summary = escape(
             str(grid_repair_state.get("error") or "No recent photo-grid run found")
@@ -3230,6 +3450,15 @@ async def dashboard(request: Request) -> HTMLResponse:
         or "<p>No images in the latest grid were classified as gantry photos.</p>"
     )
     gantry_debug_disabled = " disabled" if not gantry_images else ""
+    _ = (
+        repair_summary,
+        repair_details,
+        repair_disabled,
+        repair_checked,
+        repair_message,
+        gantry_cards,
+        gantry_debug_disabled,
+    )
 
     def _dims(value: object) -> str:
         if isinstance(value, list) and len(value) == 2 and value[0] is not None:
@@ -3267,17 +3496,17 @@ async def dashboard(request: Request) -> HTMLResponse:
 <p class=muted><small>Uses the saved scale, reference image size, rotation and camera
 offsets with the FarmBot axis limits. Every uploaded photo is coordinate-checked before
 the bot advances.</small></p></section>
-<section class=card><h2>Repair photo grid</h2><p>{repair_summary}</p>
-<p class=muted>{repair_details}</p>
-<form method=post action="grid-repair/settings">
-<label><input type=checkbox name=enabled value=true{repair_checked}> Repair automatically</label>
-<input type=number name=delay_minutes min=1 max=1440 step=1
-value="{repair_values.delay_minutes}" required> minutes after the photo grid completes
-<button>Save</button></form>
-<form method=post action="grid-repair/run"><button{repair_disabled}>Repair now</button></form>
-<form method=post action="grid-repair/recheck"><button>Recheck grid</button></form>
-<button id=gantry-debug-open type=button{gantry_debug_disabled}>View gantry photos ({len(gantry_images)})</button>
-<small class=action-message>{repair_message}</small></section>
+<section class="card grid-status-card" aria-labelledby=grid-status-heading>
+<div class=grid-status-heading><h2 id=grid-status-heading>Grid status</h2>
+<strong id=grid-status-percentage>{grid_status["percentage"]}%</strong></div>
+<div id=grid-status-cells class=grid-status-cells role=grid
+aria-label="Photo grid status" style="--grid-columns:{grid_columns}">{grid_cells}</div>
+<div class=grid-status-legend aria-label="Grid status legend">
+<span><i class="grid-status-cell verified"></i> Verified</span>
+<span><i class="grid-status-cell active"></i> Current or retrying</span>
+<span><i class="grid-status-cell unattempted"></i> Not attempted</span></div>
+<p id=grid-status-count class=muted>{grid_status["verified"]} of {grid_status["total"]} photos verified</p>
+<p id=grid-status-message>{escape(str(grid_status["message"]))}</p></section>
 <section class=card><h2>Analysis</h2><p><span id=queue-count>{len(jobs.queued_image_ids)}</span> queued</p>
 <div class=button-row><form method=post action="analyse"><button>Analyse queue</button></form>
 <button id=queue-open type=button>Add to queue</button></div>
@@ -3376,12 +3605,6 @@ open and moves on to the next weed.</small></p>
 <th>Plants present</th><th>Date taken</th></tr></thead><tbody id=queue-image-rows></tbody></table>
 <div class=button-row><button id=queue-add type=button>Add selected images to queue</button></div>
 </figure></div>
-<div id=gantry-modal class=overlay-modal hidden role=dialog aria-modal=true aria-label="Gantry classifier debug photos">
-<figure><button id=gantry-close class=modal-close type=button aria-label=Close>&times;</button>
-<h2>Gantry classifier debug</h2>
-<p class=muted>Every positive from the latest photo batch is shown. Perimeter positives are displayed for diagnosis but are not repair targets.</p>
-<div class=gantry-gallery>{gantry_cards}</div>
-</figure></div>
 <div id=photo-grid-modal class=overlay-modal hidden role=dialog aria-modal=true aria-label="Most recent photo grid">
 <figure class=photo-grid-dialog><button id=photo-grid-close class=modal-close type=button aria-label=Close>&times;</button>
 <h2>Most recent photo grid</h2>
@@ -3438,40 +3661,10 @@ async def latest_calibrated_photo_grid() -> JSONResponse:
     return JSONResponse({"grid": record.model_dump(mode="json"), "plants": plants, "weeds": weeds})
 
 
-@app.post("/grid-repair/settings")
-async def save_grid_repair_settings(
-    delay_minutes: Annotated[int, Form()],
-    enabled: Annotated[bool | None, Form()] = None,
-) -> RedirectResponse:
-    values = GridRepairSettings(enabled=bool(enabled), delay_minutes=delay_minutes)
-    grid_repair_settings_store.save(values)
-    return RedirectResponse(
-        f"../?repair={quote('Photo-grid repair schedule saved')}", status_code=303
-    )
-
-
-@app.post("/grid-repair/run")
-async def run_grid_repair() -> RedirectResponse:
-    try:
-        result = await start_photo_grid_repair()
-        message = str(result.get("message") or result.get("status") or "Repair requested")
-    except HomeAssistantError as exc:
-        message = f"Could not start repair: {exc}"
-    return RedirectResponse(f"../?repair={quote(message)}", status_code=303)
-
-
-@app.post("/grid-repair/recheck")
-async def recheck_grid_repair() -> RedirectResponse:
-    run = await inspect_photo_grid(force=True)
-    if run is None:
-        message = str(grid_repair_state.get("error") or "No recent photo-grid run was found")
-    elif not run.targets:
-        message = "Photo grid is complete"
-    else:
-        missing = sum(target.reason == "missing" for target in run.targets)
-        gantry = sum(target.reason == "gantry" for target in run.targets)
-        message = f"Found {missing} missing and {gantry} gantry photo(s) to repair"
-    return RedirectResponse(f"../?repair={quote(message)}", status_code=303)
+@app.get("/api/photo-grid/status")
+async def calibrated_photo_grid_status() -> JSONResponse:
+    """Return live progress without the inventory work needed by the mosaic."""
+    return JSONResponse(_photo_grid_status(photo_grid_store.load()))
 
 
 @app.post("/analyse")
@@ -3601,8 +3794,27 @@ async def soil_height_page(request: Request) -> HTMLResponse:
     calibration = database.active_soil_calibration(entry_id) if entry_id else None
     planning_baseline = calibration.baseline_mm if calibration else 15
     if entry_id:
+        sites_task = asyncio.create_task(
+            soil_jobs.safe_sites(entry_id, planning_baseline),
+            name="soil-sites-for-page",
+        )
         try:
-            inventory, sites = await soil_jobs.safe_sites(entry_id, planning_baseline)
+            inventory, sites = await asyncio.wait_for(asyncio.shield(sites_task), timeout=0.75)
+        except TimeoutError:
+            inventory_error = (
+                "Live soil planning is still loading; the tab remains available "
+                "and the next refresh will use the cached result."
+            )
+
+            def _finish_soil_sites(task: asyncio.Task) -> None:
+                if task.cancelled():
+                    return
+                try:
+                    task.result()
+                except HomeAssistantError as exc:
+                    LOGGER.warning("Background soil planning refresh failed: %s", exc)
+
+            sites_task.add_done_callback(_finish_soil_sites)
         except HomeAssistantError as exc:
             inventory_error = str(exc)
     measurements = database.recent_soil_measurements(entry_id, 200)
@@ -4242,7 +4454,9 @@ Automatically create detected weeds in FarmBot</label><br>
 enforcing, so borderline weeds reach the verifier instead of being dropped by rules that cannot
 tell a weed from moss. 1 keeps the gates unchanged.</span><br>
 <label>Minimum weed and non-weed labels for training <input type=number name=training_minimum_per_class min=2 step=1 value="{values.training_minimum_per_class}"></label><br>
-<label><input type=checkbox name=automatic_retraining value=true{checked(values.automatic_retraining)}> Retrain automatically after each new label once enough labels exist</label><br>
+<label><input type=checkbox name=automatic_retraining value=true{checked(values.automatic_retraining)}> Retrain automatically once enough labels exist</label><br>
+<label>Retrain after every <input type=number name=retrain_after_label_count min=1 max=500 step=1 value="{values.retrain_after_label_count}"> new label(s)</label><br>
+<span class=muted>{database.weed_labels_since_last_model_run()} new label(s) since the last trained run.</span><br>
 <label><input type=checkbox name=candidate_crop_storage_enabled value=true{checked(values.candidate_crop_storage_enabled)}> Store candidate crops for review/training</label>
 </fieldset>
 <fieldset><legend>Existing weed maintenance</legend>
@@ -4324,6 +4538,7 @@ async def save_weed_settings(
     candidate_recall_boost: float = Form(0.6),
     training_minimum_per_class: int = Form(10),
     automatic_retraining: bool = Form(False),
+    retrain_after_label_count: int = Form(1),
     candidate_crop_storage_enabled: bool = Form(False),
     weed_radius_mm: float = Form(15),
 ) -> RedirectResponse:
@@ -4365,6 +4580,7 @@ async def save_weed_settings(
             candidate_recall_boost=candidate_recall_boost,
             training_minimum_per_class=training_minimum_per_class,
             automatic_retraining=automatic_retraining,
+            retrain_after_label_count=retrain_after_label_count,
             candidate_crop_storage_enabled=candidate_crop_storage_enabled,
             weed_radius_mm=weed_radius_mm,
         )
@@ -4393,12 +4609,18 @@ async def _train_weed_verifier() -> dict:
     return model
 
 
+def _automatic_retraining_due(values: WeedSettings) -> bool:
+    if not values.automatic_retraining:
+        return False
+    return database.weed_labels_since_last_model_run() >= values.retrain_after_label_count
+
+
 async def _record_weed_label(detection_id: UUID, label: str) -> None:
     if label not in ALL_LABELS:
         raise HTTPException(422, "Unsupported training label")
     if not database.label_weed_detection(str(detection_id), label):
         raise HTTPException(404, "Weed detection not found")
-    if weed_settings_store.load().automatic_retraining:
+    if _automatic_retraining_due(weed_settings_store.load()):
         try:
             await _train_weed_verifier()
         except ValueError:
@@ -4428,7 +4650,7 @@ async def edit_weed_training_sample(detection_id: UUID, label: str = Form(...)) 
         raise HTTPException(404, "Training sample not found")
 
     message = f"Updated training tag to {label.replace('_', '/')}"
-    if weed_settings_store.load().automatic_retraining:
+    if _automatic_retraining_due(weed_settings_store.load()):
         try:
             model = await _train_weed_verifier()
             message += f" and retrained from {model['sample_count']} labels"
@@ -4539,7 +4761,7 @@ async def import_weed_training(
         _remove_weed_training_crops(database.clear_weed_training_samples())
     imported = database.import_weed_training_samples(accepted)
     message = f"Imported {imported} labelled sample(s)"
-    if weed_settings_store.load().automatic_retraining:
+    if _automatic_retraining_due(weed_settings_store.load()):
         try:
             model = await _train_weed_verifier()
             message += f" and retrained from {model['sample_count']} labels"
@@ -5191,37 +5413,62 @@ async def vision_images(
 
 @app.get("/api/vision/image/{image_id}.jpg")
 async def vision_image(entry_id: str, image_id: int) -> Response:
-    try:
-        response = await client.image(
-            VisionImageRequest(
-                config_entry_id=entry_id,
-                image_id=image_id,
-                max_width=settings.analysis_width,
-                max_height=settings.analysis_height,
-            ),
-            settings.max_image_payload_bytes,
-        )
-    except HomeAssistantError as exc:
-        LOGGER.warning(
-            "GET /api/vision/image/%s.jpg failed: entry_id=%s (%s): %s",
-            image_id,
+    width, height = settings.analysis_width, settings.analysis_height
+    key = (entry_id, image_id, width, height)
+    lock = _vision_image_locks.setdefault(key, asyncio.Lock())
+    async with lock:
+        cached = await asyncio.to_thread(image_file_cache.get, entry_id, image_id, width, height)
+        if cached is not None:
+            return FileResponse(
+                cached.path,
+                media_type="image/jpeg",
+                headers=_vision_image_headers(cached),
+            )
+        try:
+            response = await client.image(
+                VisionImageRequest(
+                    config_entry_id=entry_id,
+                    image_id=image_id,
+                    max_width=width,
+                    max_height=height,
+                ),
+                settings.max_image_payload_bytes,
+            )
+        except HomeAssistantError as exc:
+            LOGGER.warning(
+                "GET /api/vision/image/%s.jpg failed: entry_id=%s (%s): %s",
+                image_id,
+                entry_id,
+                type(exc).__name__,
+                exc,
+            )
+            raise HTTPException(502, "could not load image") from exc
+        jpeg = base64.b64decode(response.image_base64)
+        cached = await asyncio.to_thread(
+            image_file_cache.put,
             entry_id,
-            type(exc).__name__,
-            exc,
+            image_id,
+            width,
+            height,
+            jpeg,
+            width=response.width,
+            height=response.height,
+            oriented_width=response.oriented_width,
+            oriented_height=response.oriented_height,
         )
-        raise HTTPException(502, "could not load image") from exc
+    return Response(jpeg, media_type="image/jpeg", headers=_vision_image_headers(cached))
+
+
+def _vision_image_headers(cached: CachedImage) -> dict[str, str]:
     headers = {
-        "X-FarmBot-Processed-Width": str(response.width),
-        "X-FarmBot-Processed-Height": str(response.height),
+        "Cache-Control": "private, max-age=86400, immutable",
+        "X-FarmBot-Processed-Width": str(cached.width),
+        "X-FarmBot-Processed-Height": str(cached.height),
     }
-    if response.oriented_width is not None and response.oriented_height is not None:
-        headers["X-FarmBot-Oriented-Width"] = str(response.oriented_width)
-        headers["X-FarmBot-Oriented-Height"] = str(response.oriented_height)
-    return Response(
-        base64.b64decode(response.image_base64),
-        media_type="image/jpeg",
-        headers=headers,
-    )
+    if cached.oriented_width is not None and cached.oriented_height is not None:
+        headers["X-FarmBot-Oriented-Width"] = str(cached.oriented_width)
+        headers["X-FarmBot-Oriented-Height"] = str(cached.oriented_height)
+    return headers
 
 
 @app.post("/calibration")
@@ -5281,7 +5528,10 @@ async def artifact(name: str) -> FileResponse:
     path = settings.data_dir / "artifacts" / safe_name
     if safe_name != name or not path.is_file():
         raise HTTPException(404)
-    return FileResponse(path)
+    return FileResponse(
+        path,
+        headers={"Cache-Control": "private, max-age=86400, immutable"},
+    )
 
 
 def _measurement_from_row(row: dict) -> Measurement:

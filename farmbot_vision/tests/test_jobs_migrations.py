@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import uuid4
 
@@ -281,6 +281,37 @@ def test_pending_views_are_consolidated_with_outlier_resistance(tmp_path):
     assert rows[0]["measurement_count"] == 3
     assert rows[0]["recommended_protection_radius_mm"] in {130, 135}
     assert rows[0]["recommended_protection_radius_mm"] < 200
+
+
+def test_pending_measurement_limit_is_applied_after_plant_consolidation(tmp_path):
+    database = Database(tmp_path / "db.sqlite")
+    timestamp = datetime(2026, 7, 30, tzinfo=UTC)
+    measurements = []
+    for plant_id in range(1, 25):
+        for image_index in range(15):
+            useful = image_index == 0
+            measurements.append(
+                _measurement(
+                    config_entry_id="grid-bot",
+                    plant_id=plant_id,
+                    image_id=3000 + image_index,
+                    image_timestamp=timestamp + timedelta(minutes=image_index),
+                    confidence=0.9 if useful else 0.05,
+                    visible_fraction=1 if useful else 0,
+                    boundary_coverage=1 if useful else 0,
+                    boundary_sectors=list(range(72)) if useful else [],
+                    center_visible=useful,
+                    has_plant_evidence=useful,
+                )
+            )
+    database.save_measurements(measurements)
+
+    rows = database.pending_measurements(limit=100)
+
+    assert len(rows) == 24
+    assert {row["measurement_count"] for row in rows} == {15}
+    assert {row["useful_measurement_count"] for row in rows} == {1}
+    assert {tuple(row["selected_image_ids"]) for row in rows} == {(3000,)}
 
 
 def test_reanalysis_supersedes_the_old_review_row_without_deleting_history(tmp_path):

@@ -49,6 +49,7 @@ class WeedSettings(BaseModel):
     candidate_recall_boost: float = Field(default=0.6, ge=0.1, le=1)
     training_minimum_per_class: int = Field(default=10, ge=2, le=10_000)
     automatic_retraining: bool = False
+    retrain_after_label_count: int = Field(default=1, ge=1, le=500)
     candidate_crop_storage_enabled: bool = True
     weed_radius_mm: float = Field(default=15, ge=1, le=250)
 

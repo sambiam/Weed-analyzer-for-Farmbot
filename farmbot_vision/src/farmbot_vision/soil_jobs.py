@@ -7,6 +7,7 @@ import base64
 import json
 import logging
 import math
+import time
 from pathlib import Path
 from uuid import UUID, uuid4
 
@@ -31,6 +32,7 @@ from .soil_sites import plan_safe_soil_sites
 from .zones import ZoneStore
 
 LOGGER = logging.getLogger(__name__)
+SAFE_SITE_CACHE_SECONDS = 30.0
 
 
 class SoilJobManager:
@@ -52,6 +54,10 @@ class SoilJobManager:
         self.task: asyncio.Task | None = None
         self.stop_requested = False
         self.current: dict = {"status": "idle", "message": "Not run"}
+        self._safe_site_cache: dict[
+            tuple[str, float], tuple[float, tuple[SoilPointInventory, list[SoilSite]]]
+        ] = {}
+        self._safe_site_lock = asyncio.Lock()
 
     @property
     def running(self) -> bool:
@@ -155,19 +161,39 @@ class SoilJobManager:
         return ordered
 
     async def safe_sites(
-        self, config_entry_id: str, baseline_mm: float
+        self, config_entry_id: str, baseline_mm: float, *, refresh: bool = False
     ) -> tuple[SoilPointInventory, list[SoilSite]]:
-        soil, garden = await asyncio.gather(
-            self.client.soil_points(config_entry_id),
-            self.client.inventory(InventoryRequest(config_entry_id=config_entry_id)),
-        )
-        return soil, plan_safe_soil_sites(
-            soil,
-            garden,
-            self.db.current_vision_plants(config_entry_id),
-            self.db.current_vision_weeds(config_entry_id),
-            self.zone_store.zones(),
-            baseline_mm=baseline_mm,
+        key = (config_entry_id, round(float(baseline_mm), 3))
+        cached = self._safe_site_cache.get(key)
+        if not refresh and cached and time.monotonic() - cached[0] < SAFE_SITE_CACHE_SECONDS:
+            return cached[1]
+        async with self._safe_site_lock:
+            cached = self._safe_site_cache.get(key)
+            if not refresh and cached and time.monotonic() - cached[0] < SAFE_SITE_CACHE_SECONDS:
+                return cached[1]
+            soil, garden = await asyncio.gather(
+                self.client.soil_points(config_entry_id),
+                self.client.inventory(InventoryRequest(config_entry_id=config_entry_id)),
+            )
+            result = (
+                soil,
+                plan_safe_soil_sites(
+                    soil,
+                    garden,
+                    self.db.current_vision_plants(config_entry_id),
+                    self.db.current_vision_weeds(config_entry_id),
+                    self.zone_store.zones(),
+                    baseline_mm=baseline_mm,
+                ),
+            )
+            self._safe_site_cache[key] = (time.monotonic(), result)
+            return result
+
+    def invalidate_safe_sites(self, config_entry_id: str, baseline_mm: float) -> None:
+        """Force the safety-critical job path to fetch a fresh live plan."""
+        self._safe_site_cache.pop(
+            (config_entry_id, round(float(baseline_mm), 3)),
+            None,
         )
 
     @staticmethod
@@ -277,6 +303,7 @@ class SoilJobManager:
         self.db.start_soil_job(job_id, config_entry_id, "calibration", [point_id])
         try:
             async with self.shared_lock:
+                self.invalidate_safe_sites(config_entry_id, baseline_mm)
                 inventory, sites = await self.safe_sites(config_entry_id, baseline_mm)
                 site = next((item for item in sites if item.point_id == point_id), None)
                 if site is None:
@@ -349,6 +376,7 @@ class SoilJobManager:
         completed = failed = 0
         try:
             async with self.shared_lock:
+                self.invalidate_safe_sites(config_entry_id, baseline_mm)
                 inventory, sites = await self.safe_sites(config_entry_id, baseline_mm)
                 wanted = [site for site in sites if site.point_id in set(point_ids)]
                 if len(wanted) != len(set(point_ids)):

@@ -12,7 +12,7 @@ from farmbot_vision.photo_grid import (
     PhotoGridStore,
     PhotoGridTarget,
 )
-from farmbot_vision.photo_quality import inspect_photo_quality
+from farmbot_vision.photo_quality import inspect_photo_quality, with_neighbor_blur
 
 
 def _jpeg(image: np.ndarray) -> bytes:
@@ -47,6 +47,26 @@ def _blocking_leaf(*, clear_plant: bool = False) -> np.ndarray:
     return image
 
 
+def _textured_garden() -> np.ndarray:
+    rng = np.random.default_rng(7)
+    image = _garden()
+    for _ in range(160):
+        x, y = rng.integers((0, 0), (320, 240))
+        colour = int(rng.integers(85, 155))
+        cv2.circle(
+            image,
+            (int(x), int(y)),
+            int(rng.integers(1, 4)),
+            (colour - 25, colour - 10, colour),
+            -1,
+        )
+    return image
+
+
+def _blurry(image: np.ndarray, sigma: float = 4.0) -> np.ndarray:
+    return cv2.GaussianBlur(image, (0, 0), sigma)
+
+
 def _record() -> PhotoGridRecord:
     target = PhotoGridTarget(index=0, row=0, column=0, x=300, y=250, z=0)
     return PhotoGridRecord(
@@ -69,7 +89,70 @@ def _record() -> PhotoGridRecord:
 def test_quality_rule_separates_washout_close_leaf_and_normal_garden():
     assert inspect_photo_quality(_jpeg(_washed_out())).issue == "washed_out"
     assert inspect_photo_quality(_jpeg(_blocking_leaf())).issue == "leaf_obstruction"
+    assert inspect_photo_quality(_jpeg(_blurry(_garden()))).issue == "blurry"
     assert inspect_photo_quality(_jpeg(_garden())).issue == "usable"
+
+
+def test_neighbor_comparison_finds_moderate_blur_without_a_universal_threshold():
+    clear = inspect_photo_quality(_jpeg(_textured_garden()))
+    moderate = inspect_photo_quality(_jpeg(_blurry(_textured_garden(), 1.0)))
+
+    assert moderate.issue == "usable"
+    assert with_neighbor_blur(moderate, [clear, clear]).issue == "blurry"
+    assert with_neighbor_blur(moderate, [clear]).issue == "usable"
+
+
+@pytest.mark.asyncio
+async def test_grid_pass_uses_adjacent_cells_to_repair_moderate_blur(monkeypatch, tmp_path):
+    record = _record()
+    record.targets = [
+        PhotoGridTarget(index=index, row=0, column=index, x=200 + index * 100, y=250, z=0)
+        for index in range(3)
+    ]
+    record.frames = [
+        PhotoGridFrame(
+            target_index=index,
+            image_id=10 + index,
+            x=target.x,
+            y=target.y,
+            z=0,
+        )
+        for index, target in enumerate(record.targets)
+    ]
+    store = PhotoGridStore(tmp_path / "grid.json")
+    monkeypatch.setattr(web, "photo_grid_store", store)
+    calls = []
+
+    async def quality_jpeg(_record, image_id):
+        if image_id == 11:
+            return _jpeg(_blurry(_textured_garden(), 1.0))
+        return _jpeg(_textured_garden())
+
+    async def capture(_record, targets):
+        calls.append(targets[0].index)
+        target = targets[0]
+        return [
+            PhotoGridFrame(
+                target_index=target.index,
+                image_id=30,
+                x=target.x,
+                y=target.y,
+                z=target.z,
+            )
+        ]
+
+    async def delete(_record, _image_id, *, reason):
+        assert reason == "blurry"
+
+    monkeypatch.setattr(web, "_quality_jpeg", quality_jpeg)
+    monkeypatch.setattr(web, "_capture_quality_targets", capture)
+    monkeypatch.setattr(web, "_delete_discarded_grid_image", delete)
+
+    await web._photo_grid_quality_pass(record)
+
+    assert calls == [1]
+    assert [item.original_image_id for item in record.quality_repairs] == [11]
+    assert sorted(item.image_id for item in record.frames) == [10, 12, 30]
 
 
 def test_leaf_repair_plans_four_distinct_offset_coordinates():
@@ -117,6 +200,72 @@ async def test_washed_out_original_is_excluded_deleted_and_retaken_once(monkeypa
     assert record.excluded_image_ids == [10]
     assert [item.image_id for item in record.frames] == [20]
     assert record.quality_repairs[0].status == "complete"
+
+
+@pytest.mark.asyncio
+async def test_blurry_original_is_excluded_deleted_and_retaken_once(monkeypatch, tmp_path):
+    record = _record()
+    store = PhotoGridStore(tmp_path / "grid.json")
+    monkeypatch.setattr(web, "photo_grid_store", store)
+    deleted = []
+    calls = []
+
+    async def quality_jpeg(_record, image_id):
+        return _jpeg(_blurry(_garden()) if image_id == 10 else _garden())
+
+    async def capture(_record, targets):
+        calls.append([(item.x, item.y) for item in targets])
+        return [PhotoGridFrame(target_index=0, image_id=20, x=300, y=250, z=0)]
+
+    async def delete(_record, image_id, *, reason):
+        deleted.append((image_id, reason))
+
+    monkeypatch.setattr(web, "_quality_jpeg", quality_jpeg)
+    monkeypatch.setattr(web, "_capture_quality_targets", capture)
+    monkeypatch.setattr(web, "_delete_discarded_grid_image", delete)
+
+    await web._photo_grid_quality_pass(record)
+    await web._photo_grid_quality_pass(record)
+
+    assert calls == [[(300.0, 250.0)]]
+    assert deleted == [(10, "blurry")]
+    assert record.excluded_image_ids == [10]
+    assert [item.image_id for item in record.frames] == [20]
+    assert record.quality_repairs[0].issue == "blurry"
+    assert record.quality_repairs[0].status == "complete"
+
+
+@pytest.mark.asyncio
+async def test_still_blurry_retake_is_discarded_without_another_attempt(monkeypatch, tmp_path):
+    record = _record()
+    store = PhotoGridStore(tmp_path / "grid.json")
+    monkeypatch.setattr(web, "photo_grid_store", store)
+    deleted = []
+    calls = 0
+
+    async def quality_jpeg(_record, _image_id):
+        return _jpeg(_blurry(_garden()))
+
+    async def capture(_record, _targets):
+        nonlocal calls
+        calls += 1
+        return [PhotoGridFrame(target_index=0, image_id=20, x=300, y=250, z=0)]
+
+    async def delete(_record, image_id, *, reason):
+        deleted.append((image_id, reason))
+
+    monkeypatch.setattr(web, "_quality_jpeg", quality_jpeg)
+    monkeypatch.setattr(web, "_capture_quality_targets", capture)
+    monkeypatch.setattr(web, "_delete_discarded_grid_image", delete)
+
+    await web._photo_grid_quality_pass(record)
+    await web._photo_grid_quality_pass(record)
+
+    assert calls == 1
+    assert {item[0] for item in deleted} == {10, 20}
+    assert record.excluded_image_ids == [10, 20]
+    assert record.frames == []
+    assert record.quality_repairs[0].status == "failed"
 
 
 @pytest.mark.asyncio
