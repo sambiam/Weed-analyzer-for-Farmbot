@@ -366,7 +366,6 @@ def build_plant_review(
                     cv2.LINE_AA,
                 )
 
-    proposals = proposed_radii or {}
     current_target = float(representative.current_radius_mm)
     proposed_target = float(
         representative.fused_recommended_radius_mm
@@ -374,9 +373,15 @@ def build_plant_review(
         else representative.recommended_protection_radius_mm
     )
 
-    overlay_plants = list(plants or [])
-    if not any(int(plant.id) == int(representative.plant_id) for plant in overlay_plants):
-        overlay_plants.append(
+    # A plant-radius review must be visually unambiguous.  The wider grid
+    # context remains visible, but only the target plant gets a centre marker,
+    # label and radius circles; neighbouring circles previously overwhelmed
+    # dense beds and made it unclear which proposal the dialog was reviewing.
+    overlay_plants = [
+        plant for plant in (plants or []) if int(plant.id) == int(representative.plant_id)
+    ][:1]
+    if not overlay_plants:
+        overlay_plants = [
             type(
                 "ReviewPlant",
                 (),
@@ -389,7 +394,7 @@ def build_plant_review(
                     "radius": current_target,
                 },
             )()
-        )
+        ]
 
     def annotate(target: np.ndarray) -> None:
         thickness = max(2, round(min(canvas_width, canvas_height) / 350))
@@ -399,14 +404,8 @@ def build_plant_review(
             if not (0 <= px < canvas_width and 0 <= py < canvas_height):
                 continue
             plant_id = int(plant.id)
-            current = (
-                current_target if plant_id == int(representative.plant_id) else float(plant.radius)
-            )
-            proposed = (
-                proposed_target
-                if plant_id == int(representative.plant_id)
-                else proposals.get(plant_id)
-            )
+            current = current_target
+            proposed = proposed_target
             cv2.circle(
                 target,
                 (px, py),
@@ -471,6 +470,7 @@ def build_plant_review(
         "captured_frame_count": len(frames),
         "missing_photo_context": not frames,
         "standard_and_diagnostic_geometry_identical": True,
+        "annotated_plant_ids": [int(representative.plant_id)],
     }
     output_path.with_suffix(".json").write_text(
         json.dumps(metadata, indent=2),

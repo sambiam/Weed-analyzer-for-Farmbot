@@ -1,5 +1,47 @@
 # Changelog
 
+## 3.14.0 - 2026-07-31
+
+- Added an experimental **Draw shape** tab that traces a shape on the XY plane
+  by sending raw firmware G-code to FarmBot. Choose a circle or a regular
+  polygon (3-24 sides), give it a centre, a circumradius and a rotation, and
+  the app plans the path, previews it over the bed, and writes the G-code
+  program out in an editable box. What is sent is exactly the text in that box,
+  hand edits included.
+- **This is the only feature in the app that moves FarmBot outside FarmBot OS's
+  motion planning.** The program reaches the Farmduino through FarmBot OS's Lua
+  `gcode()` function, which validates nothing, so the companion integration
+  (2.6.0+, capability `experimental_raw_gcode`) re-checks the whole program
+  against live axis bounds and firmware config and refuses it as a unit if any
+  point leaves the bed. A "Validate only" button runs exactly that check
+  without moving anything.
+- Circles are drawn as many short `G00` chords rather than as an arc: the
+  FarmBot firmware does not implement `G01`, and `G00` is explicitly not
+  guaranteed to travel in a straight line. The segment count is chosen from a
+  chord-tolerance (sagitta) budget, defaulting to 0.5 mm, so "how round" is
+  stated in millimetres instead of guessed at. Expect approximate results --
+  this measures how well a bot tracks a path, it is not a plotter.
+- The path always approaches at the travel Z, descends to the draw Z only once
+  it is over the start point, and retracts at the end, so a mistyped centre
+  drags through air rather than through the bed. Nothing is actuated; only the
+  gantry moves.
+
+## 3.13.0 - 2026-07-31
+
+- Replaced farthest-owned-pixel plant sizing with a Pi-friendly 72-sector
+  supported boundary estimator. It uses the existing radius as a temporal
+  prior, rejects broad implausible expansion from soil, moss and attached
+  weeds, preserves narrow genuine leaves, and confidence-caps clipped results
+  so they cannot be applied automatically.
+- Trimmed rejected outer evidence from each plant ownership mask before weed
+  candidate verification and calibrated multi-image fusion.
+- Kept radius measurements relative to FarmBot's stored centre so a slightly
+  offset centre still encloses the far leaf edge, while clean masks can propose
+  reductions for previously oversized radii.
+- Plant-radius review images now draw the current and proposed circles only for
+  the plant being reviewed; neighbouring plants remain visible in the photo
+  context without competing labels or circles.
+
 ## 3.12.7 - 2026-07-31
 
 - Prevented tiny plant footprints from producing negative confidence values

@@ -20,6 +20,8 @@ from .models import (
     ApplySoilHeightRequest,
     BotList,
     CreateWeedRequest,
+    GcodeRunRequest,
+    GcodeRunStatus,
     Inventory,
     InventoryRequest,
     RemoveWeedRequest,
@@ -302,6 +304,17 @@ class HomeAssistantClient:
         return await self._service(
             "get_vision_grid_repair",
             {"config_entry_id": config_entry_id, "repair_id": repair_id},
+        )  # type: ignore[return-value]
+
+    async def start_gcode_run(self, request: GcodeRunRequest) -> GcodeRunStatus:
+        """Send an experimental raw G-code program (or validate it, if dry_run)."""
+        return await self._service("start_vision_gcode", request, GcodeRunStatus)  # type: ignore[return-value]
+
+    async def gcode_run_status(self, config_entry_id: str, run_id: str) -> GcodeRunStatus:
+        return await self._service(
+            "get_vision_gcode",
+            {"config_entry_id": config_entry_id, "run_id": run_id},
+            GcodeRunStatus,
         )  # type: ignore[return-value]
 
     async def delete_image(self, config_entry_id: str, image_id: int) -> dict[str, Any]:

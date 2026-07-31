@@ -1,4 +1,4 @@
-﻿# FarmBot Vision 3.12.7
+﻿# FarmBot Vision 3.14.0
 
 Lightweight, experimental canopy measurement and safe FarmBot plant-radius recommendations. Open the app through Home Assistant Ingress after installation.
 
@@ -39,6 +39,15 @@ measurement across all usable views. This is more reliable than measuring
 each partial image independently or segmenting a stitched RGB panorama,
 because segmentation retains the original pixels while fusion avoids
 double-counted overlap and visible stitching seams.
+
+Radius measurement uses a 72-sector supported boundary instead of the single
+farthest mask pixel. The current FarmBot protection radius supplies the prior
+canopy edge after configured margins are removed. Broad expansion beyond a
+small growth band is clipped and cannot be written automatically, while a
+narrow supported leaf can still establish the true outer edge. The resulting
+protection radius slightly overestimates the accepted foliage edge by the
+configured safety and calibration margins, which is useful for watering and
+crop protection without turning nearby soil into plant canopy.
 
 The **Canopy fusion** page controls activation, minimum views, time window,
 source-edge weighting, corroboration, radial percentile, angular coverage,

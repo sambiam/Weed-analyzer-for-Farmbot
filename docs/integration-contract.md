@@ -13,7 +13,7 @@ All actions are in the `farmbot` domain. Response actions must support Home Assi
 No input. Response:
 
 ```json
-{"bots":[{"config_entry_id":"string","device_id":"string","name":"string","integration_version":"2.2.0","capabilities":["photo_grid_repair","verified_photo_grid_repair","position_verified_photo_grid_repair","illuminated_photo_grid_capture"]}]}
+{"bots":[{"config_entry_id":"string","device_id":"string","name":"string","integration_version":"2.2.0","capabilities":["photo_grid_repair","verified_photo_grid_repair","position_verified_photo_grid_repair","illuminated_photo_grid_capture","experimental_raw_gcode"]}]}
 ```
 
 ## `farmbot.get_vision_inventory`
@@ -110,6 +110,50 @@ Each verified repair frame's `image_id` is what lets the app attribute a
 repair photo to the grid run that needed it. A repair happens well outside the
 one-hour window that defines a run, so without those IDs the repaired cell
 would keep reading as missing and would be re-photographed forever.
+
+## Experimental raw G-code services
+
+Advertised as the `experimental_raw_gcode` capability by integration 2.6.0 and
+newer. This is the only part of the contract that moves FarmBot outside FarmBot
+OS's motion planning: FarmBot OS accepts only CeleryScript on its normal path,
+so the program is delivered through FarmBot OS v15's Lua `gcode()` function,
+which forwards a command to the Farmduino verbatim and validates nothing. The
+integration is therefore the whole of the safety story on this path, and the
+app must not treat its own checks as sufficient.
+
+`gcode()` requires **FarmBot OS v15 or newer**. Nothing in the contract reports
+the Lua API's version, so an older FarmBot OS is not detected up front: the run
+is accepted and then fails when its first chunk executes. Advertising
+`experimental_raw_gcode` says the *integration* supports this, not that the bot
+does.
+
+`farmbot.start_vision_gcode` accepts `config_entry_id`, `lines` (the program,
+one line per entry, at most 2000), `feed_mm_per_min` (1-3000, default 400),
+`return_to_start`, `dry_run`, and a required `acknowledge_experimental` that
+must be `true`. It accepts only `G21`, `G90`, `G91`, `G00` (with X/Y/Z/F/A/B/C)
+and a standalone `F`; everything else is rejected by name, including `G01`,
+which the FarmBot firmware does not implement. `Q` is rejected because FarmBot
+OS appends its own and setting it crashes FarmBot OS.
+
+The integration resolves every move to an absolute XYZ target, refuses the
+whole program if any resolved point leaves the axis bounds derived from
+firmware config, and converts the feed rate into the per-axis `A`/`B`/`C`
+speeds in steps/second the firmware takes, scaled so all axes finish together
+(`G00` does not interpolate) and clamped to `movement_max_spd_*`. Explicit
+A/B/C on a line pass through, still clamped. It refuses to start unless the bot
+is connected, unlocked, idle and reporting a position on all three axes, aborts
+between chunks on disconnect or emergency stop, and returns to the starting
+position through FarmBot OS's own supervised movement with `safe_z`.
+
+With `dry_run: true` it returns `{"status":"validated", "moves", "total_distance_mm",
+"feed_mm_per_min", "extent", "warnings", "message"}` and moves nothing.
+Otherwise it returns `{"status":"queued", "run_id", "message"}`, or
+`{"status":"rejected", "message"}` naming the offending line.
+
+`farmbot.get_vision_gcode` accepts `config_entry_id` and `run_id` and returns
+`queued|running|complete|failed` with `message`, `moves`, `chunks_sent`,
+`chunks_total`, `total_distance_mm`, `feed_mm_per_min`, `start_position`,
+`extent` and `warnings`.
 
 ## Soil-height services
 

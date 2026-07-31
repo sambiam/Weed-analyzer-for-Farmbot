@@ -1,7 +1,7 @@
 """FarmBot Vision application."""
 
-__version__ = "3.12.7"
-ALGORITHM_VERSION = "classical-weed-verifier-0.6.0"
+__version__ = "3.14.0"
+ALGORITHM_VERSION = "classical-canopy-sectors-0.7.0"
 
 # Version of the typed companion-integration contract this app speaks. v2 adds
 # the returned-JPEG checksum, source/oriented/processed dimensions, resize

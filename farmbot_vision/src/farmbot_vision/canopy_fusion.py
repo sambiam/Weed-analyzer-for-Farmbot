@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import cv2
 import numpy as np
 
+from .canopy_radius import estimate_canopy_radius
 from .canopy_settings import CanopyFusionSettings
 from .plant_measurement import (
     MINIMUM_PARTIAL_BOUNDARY_COVERAGE,
@@ -183,16 +184,24 @@ def fuse_canopy_masks(
     dy = (ys - center_y) / ppm
     distances = np.hypot(dx, dy)
     angles = (np.arctan2(dy, dx) + 2 * math.pi) % (2 * math.pi)
-    sectors = np.floor(angles / (2 * math.pi) * settings.angular_sectors).astype(int)
-    sector_outer = [
-        float(np.percentile(distances[sectors == sector], 98))
-        for sector in range(settings.angular_sectors)
-        if np.count_nonzero(sectors == sector) >= 3
-    ]
-    if not sector_outer:
+    radius_estimate = estimate_canopy_radius(
+        distances,
+        angles,
+        current_radius_mm=float(np.median([frame["item"].current_radius_mm for frame in frames])),
+        protection_margin_mm=max(
+            float(frame["item"].safety_margin_mm) + float(frame["item"].calibration_uncertainty_mm)
+            for frame in frames
+        ),
+        angular_sectors=settings.angular_sectors,
+        radial_percentile=settings.radial_percentile,
+    )
+    if radius_estimate is None:
         return None
-    typical = float(np.percentile(distances, 90))
-    maximum = float(np.percentile(sector_outer, settings.radial_percentile))
+    if not np.all(radius_estimate.keep):
+        accepted_u8[ys[~radius_estimate.keep], xs[~radius_estimate.keep]] = 0
+        accepted = accepted_u8 > 0
+    typical = radius_estimate.typical_radius_mm
+    maximum = radius_estimate.outer_radius_mm
 
     yy, xx = np.indices(accepted.shape)
     all_dx = (xx - center_x) / ppm
@@ -233,6 +242,8 @@ def fuse_canopy_masks(
             0.99,
         )
     )
+    if radius_estimate.broad_overreach:
+        confidence = min(confidence, 0.74)
     if coverage < MINIMUM_PARTIAL_BOUNDARY_COVERAGE:
         confidence = min(confidence, 0.45)
 
@@ -248,6 +259,7 @@ def fuse_canopy_masks(
     label = (
         f"{len(frames)} views | {maximum:.1f} mm | coverage {coverage:.0%} | "
         f"corroborated {corroborated:.0%}"
+        f"{' | broad growth clipped' if radius_estimate.broad_overreach else ''}"
     )
     cv2.putText(
         diagnostic,

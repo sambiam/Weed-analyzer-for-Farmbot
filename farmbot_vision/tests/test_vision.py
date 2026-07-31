@@ -111,6 +111,65 @@ def test_hairline_connected_weed_does_not_inflate_crop_radius(seed, calibration)
     assert result.measurements[0].maximum_accepted_canopy_radius_mm < 40
 
 
+def test_broad_attached_green_background_cannot_create_a_radius_jump(seed, calibration):
+    """A soil/moss block touching the plant must not become its outer edge."""
+
+    result = analyse(
+        [
+            ("circle", ((160, 120), 35)),
+            ("rect", ((185, 35), (315, 205))),
+        ],
+        seed,
+        calibration,
+    )
+    measurement = result.measurements[0]
+    ownership = cv2.imdecode(np.frombuffer(result.ownership_mask, np.uint8), cv2.IMREAD_UNCHANGED)
+
+    assert measurement.maximum_accepted_canopy_radius_mm < 55
+    assert measurement.confidence <= 0.74
+    assert "broad outer-mask expansion was rejected" in measurement.reason
+    assert ownership[120, 160] == 1
+    assert ownership[120, 300] == 0
+
+
+def test_small_growth_is_measured_from_previous_protection_radius(seed, calibration):
+    result = analyse([("circle", ((160, 120), 40))], seed, calibration)
+    measurement = result.measurements[0]
+
+    # The stored 60 mm radius represents the earlier ~30 mm canopy plus the
+    # configured 20 + 10 mm margins.  A new 40 mm edge is a small real growth.
+    assert 38 <= measurement.maximum_accepted_canopy_radius_mm <= 42
+    assert 68 <= measurement.recommended_protection_radius_mm <= 72
+
+
+def test_radius_encloses_canopy_when_recorded_center_is_slightly_offset(calibration):
+    seed = PlantSeed(
+        plant_id=1,
+        crop_slug="lettuce",
+        center_px=(160, 120),
+        current_radius_mm=60,
+    )
+    result = analyse([("circle", ((175, 120), 30))], seed, calibration)
+
+    # Radius remains relative to FarmBot's stored centre, so the far leaf edge
+    # is about 15 + 30 mm away even before a centre correction is approved.
+    assert 43 <= result.measurements[0].maximum_accepted_canopy_radius_mm <= 47
+
+
+def test_clean_mask_can_reduce_a_previously_overestimated_radius(calibration):
+    seed = PlantSeed(
+        plant_id=1,
+        crop_slug="lettuce",
+        center_px=(160, 120),
+        current_radius_mm=180,
+    )
+    result = analyse([("circle", ((160, 120), 35))], seed, calibration)
+    measurement = result.measurements[0]
+
+    assert 33 <= measurement.maximum_accepted_canopy_radius_mm <= 37
+    assert measurement.recommended_protection_radius_mm < 70
+
+
 def test_overlapping_crops_keep_reviewable_nearest_seed_ownership(calibration):
     seeds = [
         PlantSeed(plant_id=1, crop_slug="lettuce", center_px=(135, 120), current_radius_mm=50),

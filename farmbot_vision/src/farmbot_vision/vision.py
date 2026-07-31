@@ -11,6 +11,7 @@ import cv2
 import numpy as np
 
 from . import ALGORITHM_VERSION, CONTRACT_VERSION
+from .canopy_radius import estimate_canopy_radius
 from .models import (
     AnalysisResult,
     Calibration,
@@ -1053,8 +1054,38 @@ class ClassicalVisionEngine(ImageAnalysisEngine):
                 calibration,
             )
             distances_mm = np.hypot(dx_mm, dy_mm)
-            typical = float(np.percentile(distances_mm, 90))
-            maximum = float(distances_mm.max())
+            angles_radians = np.arctan2(dy_mm, dx_mm)
+            effective_calibration_margin = max(
+                self.calibration_uncertainty_mm, calibration.uncertainty_mm
+            )
+            radius_estimate = estimate_canopy_radius(
+                distances_mm,
+                angles_radians,
+                current_radius_mm=seed.current_radius_mm,
+                protection_margin_mm=self.safety_margin_mm + effective_calibration_margin,
+            )
+            if radius_estimate is None:
+                # Connected-component validation above guarantees meaningful
+                # foreground, but retain a conservative fallback for extremely
+                # small/angularly degenerate calibrated masks.
+                typical = float(np.percentile(distances_mm, 90))
+                maximum = float(np.percentile(distances_mm, 98))
+                clipped_fraction = 0.0
+                broad_overreach = False
+            else:
+                keep = radius_estimate.keep
+                if not np.all(keep):
+                    ownership[ys[~keep], xs[~keep]] = 0
+                    ys = ys[keep]
+                    xs = xs[keep]
+                    dx_mm = np.asarray(dx_mm)[keep]
+                    dy_mm = np.asarray(dy_mm)[keep]
+                    distances_mm = distances_mm[keep]
+                    owned = ownership == index + 1
+                typical = radius_estimate.typical_radius_mm
+                maximum = radius_estimate.outer_radius_mm
+                clipped_fraction = radius_estimate.clipped_point_fraction
+                broad_overreach = radius_estimate.broad_overreach
             _visible_fraction, visible_boundary_sectors = _canopy_visibility(
                 seed.center_px,
                 max(seed.current_radius_mm, maximum),
@@ -1099,11 +1130,11 @@ class ClassicalVisionEngine(ImageAnalysisEngine):
                     - (0.08 if canopy_truncated else 0),
                 ),
             )
-            recommendation = (
-                maximum
-                + self.safety_margin_mm
-                + max(self.calibration_uncertainty_mm, calibration.uncertainty_mm)
-            )
+            if broad_overreach:
+                # A clipped broad expansion is useful review evidence, but it
+                # must never pass the automatic-write confidence threshold.
+                confidence = min(confidence, 0.74)
+            recommendation = maximum + self.safety_margin_mm + effective_calibration_margin
             canopy_center = (float(np.median(xs)), float(np.median(ys)))
             center_offset_x_mm, center_offset_y_mm = _pixel_offsets_to_world_mm(
                 canopy_center[0] - seed.center_px[0],
@@ -1122,6 +1153,11 @@ class ClassicalVisionEngine(ImageAnalysisEngine):
                 if plant_ambiguous
                 else "maximum accepted leaf extent plus safety and calibration margins"
             )
+            if broad_overreach:
+                reason += (
+                    f"; broad outer-mask expansion was rejected as implausible "
+                    f"single-observation growth ({clipped_fraction:.0%} of owned pixels removed)"
+                )
             if center_misaligned:
                 reason += "; canopy centre is offset and can be moved during review"
             measurements.append(

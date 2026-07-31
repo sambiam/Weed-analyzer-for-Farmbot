@@ -348,6 +348,7 @@ def test_one_by_two_evidence_region_builds_three_by_four_grid_crop(tmp_path):
     assert metadata["garden_border"] is True
     assert metadata["blank_free_source_crop"] is True
     assert metadata["crop_mm"] == [-160.0, -160.0, 160.0, 80.0]
+    assert metadata["annotated_plant_ids"] == [7]
     assert clean.shape == diagnostic.shape
     # Every populated grid cell reaches the shared midpoint seams: the
     # interior contains no black canvas gaps between warped photos.
@@ -369,6 +370,13 @@ def test_one_by_two_evidence_region_builds_three_by_four_grid_crop(tmp_path):
     ]
     assert float(np.mean(target_patch)) > 3
     assert float(np.mean(neighbour_patch)) < 3
+    # Context photos still contain the neighbour, but a review of plant 7 must
+    # not draw plant 8's marker, label, current circle, or proposed circle.
+    neighbour_center = clean[
+        neighbour_px[1] - 8 : neighbour_px[1] + 9,
+        neighbour_px[0] - 8 : neighbour_px[0] + 9,
+    ]
+    assert np.count_nonzero(np.all(neighbour_center > 180, axis=2)) < 5
 
 
 def _three_by_three_grid(tmp_path, *, useful: bool) -> tuple[list[Measurement], PhotoGridRecord]:

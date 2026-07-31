@@ -232,6 +232,80 @@ class SoilMotionState(StrictModel):
     axis_bounds: dict[Literal["x", "y", "z"], tuple[float, float] | None]
 
 
+class DrawShapePlanRequest(StrictModel):
+    """Form values from the Draw shape tab, before any G-code exists.
+
+    Bounds here are a courtesy so the browser gets a clear message; the real
+    authority on every one of them is shape_gcode, and then the integration.
+    """
+
+    shape: str
+    center_x: float
+    center_y: float
+    circumradius_mm: float
+    sides: int | None = None
+    rotation_deg: float = 0
+    segments: int | None = None
+    chord_tolerance_mm: float = Field(default=0.5, gt=0, le=25)
+    draw_z: float = 0
+    travel_z: float = 0
+    feed_mm_per_min: float = Field(default=400, ge=1, le=3000)
+
+    @field_validator("sides", "segments", mode="before")
+    @classmethod
+    def _blank_is_absent(cls, value: object) -> object:
+        """An untouched "auto" field posts as "", which is not a missing value."""
+        return None if value in ("", None) else value
+
+
+class DrawShapeRunRequest(StrictModel):
+    """The G-code as it stands in the editor, plus how to run it."""
+
+    lines: str
+    feed_mm_per_min: float = Field(default=400, ge=1, le=3000)
+    return_to_start: bool = True
+    dry_run: bool = False
+
+
+class GcodeRunRequest(StrictModel):
+    """EXPERIMENTAL raw firmware G-code, for the Draw shape tab.
+
+    ``acknowledge_experimental`` is required by the integration and has no
+    default here on purpose: this path bypasses FarmBot OS motion planning, so
+    a caller has to state that it means to use it.
+    """
+
+    config_entry_id: str
+    lines: list[str] = Field(min_length=1, max_length=2000)
+    feed_mm_per_min: float = Field(default=400, ge=1, le=3000)
+    return_to_start: bool = True
+    dry_run: bool = False
+    acknowledge_experimental: Literal[True] = True
+
+
+class GcodeRunStatus(StrictModel):
+    """Status of a raw G-code run, or the verdict on a dry run.
+
+    Deliberately tolerant about which fields are present: ``rejected`` and
+    ``validated`` responses carry only a subset, and a run that never started
+    has no chunk counts to report.
+    """
+
+    status: Literal["queued", "running", "complete", "failed", "rejected", "validated"]
+    message: str = ""
+    run_id: UUID | None = None
+    moves: int | None = None
+    chunks_sent: int | None = None
+    chunks_total: int | None = None
+    total_distance_mm: float | None = None
+    feed_mm_per_min: float | None = None
+    start_position: dict[Literal["x", "y", "z"], float] | None = None
+    extent: dict[Literal["x", "y", "z"], tuple[float, float]] | None = None
+    warnings: list[str] = Field(default_factory=list)
+    created_at: datetime | None = None
+    completed_at: datetime | None = None
+
+
 class SoilPointInventory(StrictModel):
     device_id: str
     generated_at: datetime

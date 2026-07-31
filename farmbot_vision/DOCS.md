@@ -175,7 +175,22 @@ base64, JPEG format, decoded dimensions, resize-scale consistency, aspect ratio,
 absence of upscaling, and payload/dimension limits. Base64 image data is never
 logged or persisted.
 
-The classical pipeline combines HSV and Excess Green, morphology, components, known-centre seeds, nearest-centre ownership, historical-mask evidence, maximum accepted distance, and confidence. Ambiguous overlap prevents writes. The protection radius is the largest accepted leaf distance plus safety and calibration margins; a separate 90th-percentile value is retained only as the typical canopy measurement.
+The classical pipeline combines HSV and Excess Green, morphology, components,
+known-centre seeds, nearest-centre ownership, historical-mask evidence and
+confidence. Radius is measured in 72 angular sectors: each sector uses a robust
+outer percentile, then the boundary rejects a broad jump beyond the previous
+canopy edge's normal growth band. A narrow, radially supported leaf is retained
+even when it extends farther. Rejected outer pixels are removed from the plant
+ownership mask and the observation is capped below automatic-write confidence.
+This makes attached weeds, moss and green soil unable to define a new radius
+from one anomalous image. Ambiguous overlap also prevents writes.
+
+The reported protection radius is the accepted foliage edge plus the configured
+safety and calibration margins. This deliberately gives a small outward bias
+for watering clearance and crop protection. Because the trained weed verifier
+can judge candidates outside the accepted plant mask, the app no longer needs
+an oversized exclusion circle to hide uncertain vegetation. A separate
+90th-percentile value remains the typical canopy measurement.
 
 ## Weed detection and the learned verifier
 

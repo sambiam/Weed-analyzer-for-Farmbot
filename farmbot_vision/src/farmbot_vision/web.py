@@ -29,6 +29,7 @@ from . import (
     CONTRACT_VERSION,
     MINIMUM_INTEGRATION_VERSION,
     __version__,
+    shape_gcode,
 )
 from .calibration import from_farmbot_calibration
 from .calibration_store import CalibrationStore, FarmbotCalibrationInput
@@ -65,6 +66,9 @@ from .models import (
     Bot,
     Calibration,
     CreateWeedRequest,
+    DrawShapePlanRequest,
+    DrawShapeRunRequest,
+    GcodeRunRequest,
     InventoryRequest,
     Measurement,
     OperatingMode,
@@ -3190,7 +3194,7 @@ _DASHBOARD_JS = r"""
           overlay:plantViewer.dataset.compositeOverlay||null
         };
         artifactControls.hidden=true;
-        overlayLegend.textContent='White cross = known center; cyan = current radius; red = proposed radius. Neighbour labels and circles stay fixed; diagnostic mode only adds the target mask.';
+        overlayLegend.textContent='White cross = selected plant center; cyan = current radius; red = proposed radius. Diagnostic mode only adds this plant\'s accepted mask.';
         if(plantComposite.clean) showPlantComposite(false); else modalImg.removeAttribute('src');
       } else {
         try{artifacts=JSON.parse(artifactViewer.dataset.artifacts||'[]');}catch(_){artifacts=[];}
@@ -3312,6 +3316,185 @@ _DASHBOARD_JS = r"""
   });
 })();
 """
+
+# Experimental Draw shape tab. The G-code itself is generated server-side (one
+# implementation, in shape_gcode.py) and returned with the path points, so the
+# preview canvas and the editable program can never disagree about what will
+# run -- and what is sent is literally the text in the box, edits included.
+_DRAW_SHAPE_JS = r"""
+(function(){
+  const form=document.getElementById('shape-form');
+  const canvas=document.getElementById('shape-preview');
+  const ctx=canvas.getContext('2d');
+  const program=document.getElementById('gcode-program');
+  const summary=document.getElementById('shape-summary');
+  const runStatus=document.getElementById('run-status');
+  const shape=document.getElementById('shape');
+  const sidesRow=document.getElementById('sides-row');
+  const segmentsRow=document.getElementById('segments-row');
+  let plan=null;
+  let poll=null;
+
+  let bounds=null;
+  try{bounds=JSON.parse(canvas.dataset.bounds||'null');}catch(_){bounds=null;}
+
+  function showConditionalFields(){
+    sidesRow.hidden=(shape.value!=='polygon');
+    segmentsRow.hidden=(shape.value!=='circle');
+  }
+
+  function values(){
+    const data={};
+    new FormData(form).forEach(function(value,key){data[key]=value;});
+    data.return_to_start=document.getElementById('return_to_start').checked;
+    return data;
+  }
+
+  function project(){
+    // Fit the whole bed when its size is known, so a shape is always shown
+    // where it actually sits rather than filling the canvas by itself.
+    let minX=0,maxX=1000,minY=0,maxY=1000;
+    if(bounds&&bounds.x&&bounds.y){
+      minX=bounds.x[0];maxX=bounds.x[1];minY=bounds.y[0];maxY=bounds.y[1];
+    }else if(plan&&plan.points.length){
+      const xs=plan.points.map(function(p){return p[0];});
+      const ys=plan.points.map(function(p){return p[1];});
+      minX=Math.min.apply(null,xs);maxX=Math.max.apply(null,xs);
+      minY=Math.min.apply(null,ys);maxY=Math.max.apply(null,ys);
+      const padX=Math.max(50,(maxX-minX)*0.2), padY=Math.max(50,(maxY-minY)*0.2);
+      minX-=padX;maxX+=padX;minY-=padY;maxY+=padY;
+    }
+    const spanX=Math.max(1,maxX-minX), spanY=Math.max(1,maxY-minY);
+    const scale=Math.min(canvas.width/spanX, canvas.height/spanY);
+    const offX=(canvas.width-spanX*scale)/2, offY=(canvas.height-spanY*scale)/2;
+    return {
+      scale:scale,
+      // FarmBot Y grows away from the origin; the canvas grows downward, so Y
+      // is flipped here and nowhere else.
+      to:function(x,y){return [offX+(x-minX)*scale, canvas.height-offY-(y-minY)*scale];},
+      box:[minX,minY,maxX,maxY]
+    };
+  }
+
+  function draw(){
+    ctx.clearRect(0,0,canvas.width,canvas.height);
+    ctx.fillStyle='#f3f7f4';
+    ctx.fillRect(0,0,canvas.width,canvas.height);
+    const p=project();
+    if(bounds&&bounds.x&&bounds.y){
+      const a=p.to(bounds.x[0],bounds.y[0]), b=p.to(bounds.x[1],bounds.y[1]);
+      ctx.strokeStyle='#9db3a5';ctx.lineWidth=1;ctx.setLineDash([5,4]);
+      ctx.strokeRect(Math.min(a[0],b[0]),Math.min(a[1],b[1]),
+                     Math.abs(b[0]-a[0]),Math.abs(b[1]-a[1]));
+      ctx.setLineDash([]);
+    }
+    if(!plan||!plan.points.length){
+      ctx.fillStyle='#74817a';ctx.font='14px system-ui';
+      ctx.fillText('Generate a shape to preview its path',14,24);
+      return;
+    }
+    if(plan.start){
+      const s=p.to(plan.start[0],plan.start[1]);
+      ctx.strokeStyle='#b0bdb4';ctx.setLineDash([3,3]);ctx.lineWidth=1;
+      const f=p.to(plan.points[0][0],plan.points[0][1]);
+      ctx.beginPath();ctx.moveTo(s[0],s[1]);ctx.lineTo(f[0],f[1]);ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.fillStyle='#74817a';ctx.beginPath();ctx.arc(s[0],s[1],4,0,Math.PI*2);ctx.fill();
+    }
+    ctx.strokeStyle='#1672c4';ctx.lineWidth=2;ctx.beginPath();
+    plan.points.forEach(function(point,index){
+      const c=p.to(point[0],point[1]);
+      if(index===0){ctx.moveTo(c[0],c[1]);}else{ctx.lineTo(c[0],c[1]);}
+    });
+    ctx.stroke();
+    // Every vertex is one G00. Showing them makes a too-coarse circle obvious
+    // before it is cut, which is the whole point of segmenting by tolerance.
+    if(plan.points.length<=200){
+      ctx.fillStyle='#0b4779';
+      plan.points.slice(0,-1).forEach(function(point){
+        const c=p.to(point[0],point[1]);
+        ctx.beginPath();ctx.arc(c[0],c[1],2,0,Math.PI*2);ctx.fill();
+      });
+    }
+    const centre=p.to(plan.center[0],plan.center[1]);
+    ctx.strokeStyle='#c62828';ctx.lineWidth=1;
+    ctx.beginPath();ctx.moveTo(centre[0]-6,centre[1]);ctx.lineTo(centre[0]+6,centre[1]);
+    ctx.moveTo(centre[0],centre[1]-6);ctx.lineTo(centre[0],centre[1]+6);ctx.stroke();
+  }
+
+  function setMessage(element,text,kind){
+    element.textContent=text;
+    element.className=(kind==='error')?'warn':'muted';
+  }
+
+  async function post(url,body){
+    const response=await fetch(url,{method:'POST',
+      headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    const data=await response.json().catch(function(){return {};});
+    if(!response.ok){throw new Error(data.detail||('Request failed ('+response.status+')'));}
+    return data;
+  }
+
+  async function generate(){
+    try{
+      plan=await post('api/draw-shape/plan',values());
+      program.value=plan.lines.join('\n');
+      setMessage(summary,plan.summary,'ok');
+      draw();
+    }catch(err){
+      plan=null;draw();
+      setMessage(summary,err.message,'error');
+    }
+  }
+
+  function runBody(dry){
+    const data=values();
+    return {lines:program.value,feed_mm_per_min:Number(data.feed_mm_per_min),
+            return_to_start:data.return_to_start,dry_run:dry};
+  }
+
+  async function send(dry){
+    if(!dry&&!window.confirm(
+        'Send raw G-code to FarmBot?\n\nThis bypasses FarmBot OS motion planning. '+
+        'Make sure the path is clear.')){return;}
+    setMessage(runStatus,dry?'Validating...':'Sending...','ok');
+    try{
+      const result=await post('api/draw-shape/run',runBody(dry));
+      setMessage(runStatus,result.message||result.status,
+                 (result.status==='rejected'||result.status==='failed')?'error':'ok');
+      if(result.status==='queued'){startPolling();}
+    }catch(err){setMessage(runStatus,err.message,'error');}
+  }
+
+  function startPolling(){
+    if(poll){clearInterval(poll);}
+    poll=setInterval(async function(){
+      try{
+        const response=await fetch('api/draw-shape/status');
+        if(!response.ok){return;}
+        const data=await response.json();
+        let text=data.message||data.status;
+        if(data.chunks_total){text+=' ('+data.chunks_sent+'/'+data.chunks_total+' chunks)';}
+        setMessage(runStatus,text,(data.status==='failed')?'error':'ok');
+        if(data.status==='complete'||data.status==='failed'){
+          clearInterval(poll);poll=null;
+        }
+      }catch(_){/* a transient poll failure is not worth surfacing */}
+    },1500);
+  }
+
+  shape.addEventListener('change',showConditionalFields);
+  form.addEventListener('input',function(){setMessage(summary,
+    'Settings changed - generate again to update the program.','ok');});
+  document.getElementById('generate').addEventListener('click',generate);
+  document.getElementById('validate').addEventListener('click',function(){send(true);});
+  document.getElementById('send').addEventListener('click',function(){send(false);});
+  showConditionalFields();
+  draw();
+  generate();
+})();
+"""
+
 
 # Boundaries and exclusion zones. The add form only shows the geometry fields of
 # the selected shape, permissions start at the sensible polarity for the chosen
@@ -3814,7 +3997,7 @@ background:#f3f7f4;border-radius:6px;padding:.6rem}}
 .shape-figs{{display:flex;gap:.9rem;flex-wrap:wrap;margin-top:.45rem}}
 .shape-figs figure{{margin:0;text-align:center;font-size:.71rem;color:var(--muted);max-width:5.5rem}}
 .shape-figs svg{{display:block;background:#f3f7f4;border-radius:6px;margin-bottom:.2rem}}
-</style></head><body><header><h1>🌱 FarmBot Vision</h1><nav><a href="./">Analysis</a><a href="soil-height">Soil height</a><a href="settings">Calibration</a><a href="weed-settings">Weed settings</a><a href="canopy-settings">Canopy fusion</a><a href="zones">Boundaries &amp; zones</a></nav></header>
+</style></head><body><header><h1>🌱 FarmBot Vision</h1><nav><a href="./">Analysis</a><a href="soil-height">Soil height</a><a href="settings">Calibration</a><a href="weed-settings">Weed settings</a><a href="canopy-settings">Canopy fusion</a><a href="zones">Boundaries &amp; zones</a><a href="draw-shape">Draw shape</a></nav></header>
 <main>{body}</main></body></html>"""
     )
 
@@ -6706,6 +6889,248 @@ def _zone_json(zones: list[Zone]) -> str:
         for zone in zones
     ]
     return escape(json.dumps(payload, separators=(",", ":")), quote=True)
+
+
+# --------------------------------------------------------------------------
+# Experimental Draw shape
+#
+# The only feature in this app that moves the bot outside FarmBot OS's motion
+# planning: the program is raw firmware G-code, delivered by the companion
+# integration through FarmBot OS's Lua `gcode()` escape hatch. The app plans
+# coordinates and writes the text; the integration re-validates all of it
+# against live axis bounds and firmware config and is the final authority.
+# --------------------------------------------------------------------------
+
+# The most recent run, so the status panel survives a page reload. Only one run
+# can be in flight anyway -- the integration refuses a second while one is
+# active -- so a single slot is the whole state this needs.
+_last_gcode_run: dict[str, str] = {}
+
+
+async def _require_gcode_capability() -> Bot:
+    bots = (await client.list_bots()).bots
+    bot = next(
+        (item for item in bots if item.config_entry_id == settings.selected_config_entry_id),
+        None,
+    )
+    if bot is None or not bot.supports("experimental_raw_gcode"):
+        version = bot.integration_version if bot is not None else None
+        loaded = f" (loaded version {version})" if version else ""
+        raise HTTPException(
+            409,
+            "Raw G-code requires FarmBot integration V2.6.0 or newer"
+            f"{loaded}. Install/update it and restart Home Assistant.",
+        )
+    return bot
+
+
+async def _bed_bounds() -> dict[str, list[float]] | None:
+    """Axis bounds for the preview, or None when they cannot be read.
+
+    Only used to frame the drawing; the integration bounds-checks the program
+    itself, so a failure here degrades the preview and nothing else.
+    """
+    entry_id = settings.selected_config_entry_id
+    if not entry_id:
+        return None
+    try:
+        inventory = await client.soil_points(entry_id)
+    except HomeAssistantError:
+        return None
+    bounds = inventory.motion.axis_bounds
+    if bounds.get("x") is None or bounds.get("y") is None:
+        return None
+    return {axis: list(value) for axis, value in bounds.items() if value is not None}
+
+
+@app.get("/draw-shape", response_class=HTMLResponse)
+async def draw_shape_page(request: Request) -> HTMLResponse:
+    entry_id = settings.selected_config_entry_id
+    bounds = await _bed_bounds()
+    shape_options = "".join(
+        f'<option value="{escape(key, quote=True)}">{escape(label)}</option>'
+        for key, label in shape_gcode.SHAPES.items()
+    )
+    default_x, default_y = 500.0, 500.0
+    if bounds:
+        default_x = round((bounds["x"][0] + bounds["x"][1]) / 2, 1)
+        default_y = round((bounds["y"][0] + bounds["y"][1]) / 2, 1)
+    bounds_json = escape(json.dumps(bounds or {}), quote=True)
+
+    body = f"""<section class=card><h2>Draw a shape (experimental)</h2>
+<p class=warn><b>This moves FarmBot outside FarmBot OS's motion planning.</b>
+The program below is raw firmware G-code, handed straight to the Farmduino
+through FarmBot OS's Lua <code>gcode()</code> function. FarmBot OS validates
+none of it. Clear the bed of anything the gantry or tool could hit, keep the
+emergency stop within reach, and start with a small shape well clear of your
+plants.</p>
+<p class=muted><b>Requires FarmBot OS v15 or newer.</b> The Lua
+<code>gcode()</code> function this depends on does not exist before v15; on an
+older FarmBot OS the run will fail when the first chunk is executed rather than
+being refused up front, because nothing reports the Lua API's version.</p>
+<p class=muted>The FarmBot firmware does not implement <code>G01</code>, and
+<code>G00</code> is explicitly not guaranteed to travel in a straight line, so
+a circle is drawn as many short <code>G00</code> chords rather than an arc. The
+companion integration scales each axis's speed so they finish together, which
+is what keeps a chord close to straight. Expect the result to be approximate:
+this is a way to find out how well your bot tracks a path, not a plotter.</p>
+<p>FarmBot: <b>{escape(entry_id or "none selected")}</b></p></section>
+
+<section class="card"><h2>Shape</h2>
+<div class=grid>
+<form id=shape-form>
+<label>Shape<br><select id=shape name=shape>{shape_options}</select></label>
+<label id=sides-row hidden>Sides<br><input type=number name=sides min=3 max=24
+ value=5></label>
+<label>Centre X (mm)<br><input type=number step=any name=center_x
+ value="{default_x:g}"></label>
+<label>Centre Y (mm)<br><input type=number step=any name=center_y
+ value="{default_y:g}"></label>
+<label>Circumradius (mm)<span class=hint title="Distance from the centre to a
+ vertex. A circle and a hexagon with the same circumradius touch the same
+ bounding circle.">?</span><br>
+ <input type=number step=any name=circumradius_mm min=5 max=2000 value=100></label>
+<label>Rotation (degrees)<br><input type=number step=any name=rotation_deg value=0></label>
+<label id=segments-row>Segments<span class=hint title="Leave blank to choose
+ automatically from the chord tolerance below.">?</span><br>
+ <input type=number name=segments min=8 max=720 placeholder="auto"></label>
+<label>Chord tolerance (mm)<span class=hint title="How far a straight chord may
+ sag from the true circle. Smaller means more segments.">?</span><br>
+ <input type=number step=any name=chord_tolerance_mm min=0.05 max=25 value=0.5></label>
+<label>Draw Z (mm)<span class=hint title="Height the shape is traced at. Nothing
+ is actuated; only the gantry moves.">?</span><br>
+ <input type=number step=any name=draw_z value=0></label>
+<label>Travel Z (mm)<span class=hint title="Height used to approach the start
+ point and to retract afterwards.">?</span><br>
+ <input type=number step=any name=travel_z value=0></label>
+<label>Feed rate (mm/min)<br><input type=number step=any name=feed_mm_per_min
+ min=1 max=3000 value=400></label>
+</form>
+<div>
+<canvas id=shape-preview width=520 height=420 data-bounds="{bounds_json}"
+ style="width:100%;border:1px solid #ccc;border-radius:6px"></canvas>
+<p id=shape-summary class=muted></p>
+<p class=legend>Blue = the path, dots = one <code>G00</code> each, red cross =
+centre, dashed grey = the bed and the approach from FarmBot's current
+position.</p>
+</div>
+</div>
+<div class=button-row><button id=generate type=button>Generate G-code</button></div>
+</section>
+
+<section class=card><h2>G-code</h2>
+<p class=muted>This exact text is what gets sent, edits included. Supported:
+<code>G21</code>, <code>G90</code>, <code>G91</code>, <code>G00</code>
+(X/Y/Z/F/A/B/C) and a standalone <code>F</code>. Anything else is refused by
+name before the bot moves.</p>
+<textarea id=gcode-program rows=14 style="width:100%;font-family:ui-monospace,
+monospace;font-size:.85rem"></textarea>
+<div class=button-row>
+<button id=validate type=button>Validate only (no movement)</button>
+<button id=send type=button class=clear-button>Send to FarmBot</button>
+</div>
+<p id=run-status class=muted></p>
+</section>
+<script>{_DRAW_SHAPE_JS}</script>"""  # noqa: S608 - HTML template; no SQL is constructed here.
+    return layout(request, body, "Draw shape · FarmBot Vision")
+
+
+@app.post("/api/draw-shape/plan")
+async def draw_shape_plan(request: DrawShapePlanRequest) -> JSONResponse:
+    """Plan a shape and render its G-code, without contacting FarmBot."""
+    try:
+        plan = shape_gcode.generate_program(
+            shape=request.shape,
+            center_x=request.center_x,
+            center_y=request.center_y,
+            circumradius_mm=request.circumradius_mm,
+            sides=request.sides,
+            rotation_deg=request.rotation_deg,
+            segments=request.segments,
+            chord_tolerance_mm=request.chord_tolerance_mm,
+            draw_z=request.draw_z,
+            travel_z=request.travel_z,
+            feed_mm_per_min=request.feed_mm_per_min,
+        )
+    except shape_gcode.ShapeError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+    start = None
+    entry_id = settings.selected_config_entry_id
+    if entry_id:
+        try:
+            motion = (await client.soil_points(entry_id)).motion.position
+            if motion.get("x") is not None and motion.get("y") is not None:
+                start = [motion["x"], motion["y"]]
+        except HomeAssistantError:
+            start = None
+
+    segments = len(plan.points) - 1
+    minutes = plan.perimeter_mm / plan.feed_mm_per_min if plan.feed_mm_per_min else 0
+    return JSONResponse(
+        {
+            "lines": plan.lines,
+            "points": [list(point) for point in plan.points],
+            "center": list(plan.center),
+            "start": start,
+            "segments": segments,
+            "perimeter_mm": round(plan.perimeter_mm, 1),
+            "extent": [round(value, 1) for value in plan.extent()],
+            "summary": (
+                f"{segments} segment(s), {plan.perimeter_mm:.0f} mm of path, "
+                f"about {minutes:.1f} min at {plan.feed_mm_per_min:g} mm/min"
+            ),
+        }
+    )
+
+
+@app.post("/api/draw-shape/run")
+async def draw_shape_run(request: DrawShapeRunRequest) -> JSONResponse:
+    """Validate or execute the G-code exactly as it stands in the editor."""
+    entry_id = settings.selected_config_entry_id
+    if not entry_id:
+        raise HTTPException(409, "No FarmBot config entry is selected")
+    await _require_gcode_capability()
+
+    lines = shape_gcode.program_lines(request.lines)
+    if not lines:
+        raise HTTPException(400, "The G-code program is empty")
+    try:
+        result = await client.start_gcode_run(
+            GcodeRunRequest(
+                config_entry_id=entry_id,
+                lines=lines,
+                feed_mm_per_min=request.feed_mm_per_min,
+                return_to_start=request.return_to_start,
+                dry_run=request.dry_run,
+            )
+        )
+    except HomeAssistantError as exc:
+        raise HTTPException(502, str(exc)) from exc
+
+    if result.run_id is not None:
+        _last_gcode_run[entry_id] = str(result.run_id)
+    LOGGER.info(
+        "Draw shape %s: %s (%d line(s), %s)",
+        "validation" if request.dry_run else "run",
+        result.status,
+        len(lines),
+        result.message or "no message",
+    )
+    return JSONResponse(result.model_dump(mode="json"))
+
+
+@app.get("/api/draw-shape/status")
+async def draw_shape_status() -> JSONResponse:
+    entry_id = settings.selected_config_entry_id
+    run_id = _last_gcode_run.get(entry_id or "")
+    if not entry_id or not run_id:
+        return JSONResponse({"status": "idle", "message": "No run has been started"})
+    try:
+        result = await client.gcode_run_status(entry_id, run_id)
+    except HomeAssistantError as exc:
+        raise HTTPException(502, str(exc)) from exc
+    return JSONResponse(result.model_dump(mode="json"))
 
 
 @app.get("/zones", response_class=HTMLResponse)

@@ -113,6 +113,34 @@ def test_fusion_excludes_stale_view_without_lowering_current_partial_estimate(tm
     assert result.angular_coverage >= 0.5
 
 
+def test_fusion_also_rejects_a_broad_implausible_radius_jump(tmp_path):
+    mask = np.zeros((160, 160), dtype=np.uint8)
+    cv2.circle(mask, (80, 80), 75, 255, -1)
+    first = tmp_path / "broad-first.png"
+    second = tmp_path / "broad-second.png"
+    cv2.imwrite(str(first), mask)
+    cv2.imwrite(str(second), mask)
+    now = datetime.now(UTC)
+
+    result = fuse_canopy_masks(
+        [
+            _measurement(str(first), image_id=1, timestamp=now),
+            _measurement(
+                str(second),
+                image_id=2,
+                timestamp=now + timedelta(minutes=1),
+                sectors=list(range(36, 72)),
+                center_visible=False,
+            ),
+        ],
+        CanopyFusionSettings(always_fuse_when_available=True),
+    )
+
+    assert result is not None
+    assert result.maximum_radius_mm < 40
+    assert result.confidence <= 0.74
+
+
 def test_canopy_settings_round_trip(tmp_path):
     store = CanopyFusionSettingsStore(tmp_path / "canopy.json")
     values = CanopyFusionSettings(
