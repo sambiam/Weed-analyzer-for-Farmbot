@@ -262,6 +262,7 @@ def _photo_grid_record(targets, *, tmp_path):
             reference_height=800,
         ),
         targets=targets,
+        quality_repair_enabled=True,
     )
 
 
@@ -481,6 +482,15 @@ async def test_worker_requeues_only_unverified_targets_after_batch_error(monkeyp
 
     monkeypatch.setattr(web, "_capture_photo_grid_targets", fake_capture)
 
+    async def no_analysis(_record):
+        return None
+
+    async def no_scout(_scout):
+        return None
+
+    monkeypatch.setattr(web, "_analyse_completed_photo_grid", no_analysis)
+    monkeypatch.setattr(web._LiveGridScout, "run", no_scout)
+
     await web._photo_grid_worker(record)
 
     # The already-verified target must never be resent to the bot.
@@ -655,6 +665,15 @@ async def test_worker_stops_early_when_a_pass_verifies_no_new_frames(monkeypatch
         return list(chunk)
 
     monkeypatch.setattr(web, "_capture_photo_grid_targets", fake_capture)
+
+    async def no_analysis(_record):
+        return None
+
+    async def no_scout(_scout):
+        return None
+
+    monkeypatch.setattr(web, "_analyse_completed_photo_grid", no_analysis)
+    monkeypatch.setattr(web._LiveGridScout, "run", no_scout)
 
     await web._photo_grid_worker(record)
 
@@ -1127,6 +1146,13 @@ async def test_dashboard_removes_legacy_gantry_repair_controls(
     assert "info-card" in html
     assert "analysis-card" in html
     assert "Photo analysis" in html
+    assert "Last job" not in html
+    assert "Last run:" not in html
+    assert "Calibration warnings" not in html
+    assert html.count("name=quality_repair_blurry_enabled") == 1
+    assert html.count("name=quality_repair_washed_out_enabled") == 1
+    assert html.count("name=quality_repair_close_leaf_enabled") == 1
+    assert "name=quality_repair_enabled" not in html
     assert "Uses the saved scale" not in html
     assert html.count('action="analysis/clear-measurements"') == 1
     assert html.count('action="analysis/clear-recommendations"') == 1
@@ -2153,6 +2179,49 @@ async def test_event_listener_batches_burst_images_into_one_job(
     assert len(calls) == 1
     assert calls[0]["image_ids"] == [97, 98, 99]
     assert calls[0]["plant_ids"] == []
+
+
+@pytest.mark.asyncio
+async def test_completed_grid_hands_off_verified_images_and_deduplicates_late_events(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+):
+    from farmbot_vision.photo_grid import PhotoGridFrame, PhotoGridStore, PhotoGridTarget
+
+    record = _photo_grid_record(
+        [PhotoGridTarget(index=0, row=0, column=0, x=100, y=200, z=0)],
+        tmp_path=tmp_path,
+    )
+    record.frames = [
+        PhotoGridFrame(target_index=0, image_id=10, x=100, y=200, z=0),
+        PhotoGridFrame(target_index=1, image_id=11, x=300, y=200, z=0),
+    ]
+    record.quality_overlay_frames = [PhotoGridFrame(target_index=1, image_id=12, x=300, y=200, z=0)]
+    record.excluded_image_ids = [11]
+    store = PhotoGridStore(tmp_path / "grid.json")
+    store.save(record)
+    monkeypatch.setattr(web, "photo_grid_store", store)
+    calls = []
+
+    async def fake_run(**kwargs):
+        calls.append(kwargs)
+        return {"accepted": True, "status": "idle", "images_processed": 2}
+
+    monkeypatch.setattr(web.jobs, "run", fake_run)
+    monkeypatch.setattr(web.settings, "mode", web.OperatingMode.RECOMMEND)
+
+    await web._analyse_completed_photo_grid(record)
+
+    assert calls[0]["image_ids"] == [10, 12]
+    assert calls[0]["trigger"] == "photo_grid"
+    assert store.load().analysis_handoff_image_ids == [10, 12]
+    assert (
+        await web._eligible_vision_event(VisionRequestEvent(config_entry_id="entry-1", image_id=10))
+        is None
+    )
+    assert (
+        await web._eligible_vision_event(VisionRequestEvent(config_entry_id="entry-1", image_id=11))
+        is None
+    )
 
 
 @pytest.mark.asyncio

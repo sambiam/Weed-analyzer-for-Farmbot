@@ -77,6 +77,16 @@ def _blurry(image: np.ndarray, sigma: float = 4.0) -> np.ndarray:
     return cv2.GaussianBlur(image, (0, 0), sigma)
 
 
+def _bright_but_detailed() -> np.ndarray:
+    image = np.full((240, 320, 3), (185, 205, 220), np.uint8)
+    rng = np.random.default_rng(3)
+    for _ in range(500):
+        x, y = rng.integers((0, 0), (320, 240))
+        colour = tuple(int(value) for value in rng.integers((120, 150, 170), (220, 235, 245)))
+        cv2.circle(image, (int(x), int(y)), int(rng.integers(1, 5)), colour, -1)
+    return image
+
+
 def _record() -> PhotoGridRecord:
     target = PhotoGridTarget(index=0, row=0, column=0, x=300, y=250, z=0)
     return PhotoGridRecord(
@@ -93,6 +103,7 @@ def _record() -> PhotoGridRecord:
         targets=[target],
         frames=[PhotoGridFrame(target_index=0, image_id=10, x=300, y=250, z=0)],
         indexed_targets=True,
+        quality_repair_enabled=True,
     )
 
 
@@ -102,6 +113,49 @@ def test_quality_rule_separates_washout_close_leaf_and_normal_garden():
     assert inspect_photo_quality(_jpeg(_large_canopy_with_visible_plant())).issue == "usable"
     assert inspect_photo_quality(_jpeg(_blurry(_garden()))).issue == "blurry"
     assert inspect_photo_quality(_jpeg(_garden())).issue == "usable"
+    assert inspect_photo_quality(_jpeg(_bright_but_detailed())).issue == "usable"
+
+
+def test_quality_retry_settings_support_legacy_and_individual_values():
+    legacy = _record()
+    assert legacy.quality_retries_enabled
+    selected = legacy.model_copy(
+        update={
+            "quality_repair_enabled": True,
+            "quality_repair_blurry_enabled": False,
+            "quality_repair_washed_out_enabled": True,
+            "quality_repair_close_leaf_enabled": False,
+        }
+    )
+    assert not selected.quality_retry_enabled("blurry")
+    assert selected.quality_retry_enabled("washed_out")
+    assert not selected.quality_retry_enabled("leaf_obstruction")
+
+
+@pytest.mark.asyncio
+async def test_disabled_quality_type_is_not_repaired(monkeypatch, tmp_path):
+    record = _record().model_copy(
+        update={
+            "quality_repair_enabled": True,
+            "quality_repair_blurry_enabled": False,
+            "quality_repair_washed_out_enabled": True,
+            "quality_repair_close_leaf_enabled": True,
+        }
+    )
+    monkeypatch.setattr(web, "photo_grid_store", PhotoGridStore(tmp_path / "grid.json"))
+    fetched = []
+
+    async def quality_jpeg(_record, image_id):
+        fetched.append(image_id)
+        return _jpeg(_blurry(_garden()))
+
+    monkeypatch.setattr(web, "_quality_jpeg", quality_jpeg)
+
+    await web._photo_grid_quality_pass(record)
+
+    assert fetched == [10]
+    assert record.quality_repairs == []
+    assert record.frames[0].image_id == 10
 
 
 def test_neighbor_comparison_finds_moderate_blur_without_a_universal_threshold():

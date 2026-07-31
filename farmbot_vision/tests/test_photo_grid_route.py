@@ -81,7 +81,15 @@ def _stub_inventory_for_route_tests(monkeypatch):
     async def inventory(_request):
         return SimpleNamespace(plants=[], images=[])
 
+    async def no_analysis(_record):
+        return None
+
+    async def no_scout(_scout):
+        return None
+
     monkeypatch.setattr(web.client, "inventory", inventory)
+    monkeypatch.setattr(web, "_analyse_completed_photo_grid", no_analysis)
+    monkeypatch.setattr(web._LiveGridScout, "run", no_scout)
 
 
 @pytest.mark.asyncio

@@ -88,6 +88,7 @@ from .photo_grid import (
     plan_targeted_plant_captures,
 )
 from .photo_quality import (
+    PhotoIssue,
     PhotoQuality,
     best_unobscured_photo,
     inspect_photo_quality,
@@ -771,12 +772,12 @@ def _photo_grid_status(record: PhotoGridRecord | None) -> dict[str, object]:
     issue_by_target: dict[int, str] = {
         analysis.target_index: analysis.issue
         for analysis in record.cell_analysis
-        if analysis.issue != "usable"
+        if analysis.issue != "usable" and record.quality_retry_enabled(analysis.issue)
     }
     for repair in record.quality_repairs:
         if repair.status == "complete":
             issue_by_target.pop(repair.target_index, None)
-        else:
+        elif record.quality_retry_enabled(repair.issue):
             issue_by_target[repair.target_index] = repair.issue
     repairing = {
         repair.target_index for repair in record.quality_repairs if repair.status == "attempting"
@@ -1529,6 +1530,8 @@ async def _photo_grid_quality_pass(
             if analysis.target_index == frame.target_index:
                 analysis.issue = quality.issue
                 analysis.blur_score = round(quality.blur_score, 3)
+        if quality.issue != "usable" and not record.quality_retry_enabled(quality.issue):
+            continue
         if quality.issue == "usable":
             continue
         repair = PhotoGridQualityRepair(
@@ -1712,7 +1715,7 @@ async def _photo_grid_worker(record: PhotoGridRecord) -> None:
         await _drain_grid_scout(record, scout, _scout_task)
         if record.status == "complete":
             try:
-                if record.quality_repair_enabled:
+                if record.quality_retries_enabled:
                     record.status = "quality_check"
                     record.message = (
                         "Photo grid captured; checking exposure and close-leaf obstruction"
@@ -1734,6 +1737,18 @@ async def _photo_grid_worker(record: PhotoGridRecord) -> None:
             except HomeAssistantError as exc:
                 LOGGER.warning(
                     "Post-grid capture work failed after grid %s: %s",
+                    record.session_id,
+                    exc,
+                )
+        if record.frames or record.quality_overlay_frames or record.targeted_captures:
+            try:
+                await _analyse_completed_photo_grid(record)
+            except Exception as exc:  # pylint: disable=broad-except
+                # A handoff failure must not turn an otherwise complete grid
+                # into a failed capture. The companion's delayed image events
+                # remain eligible and can retry the normal pipeline.
+                LOGGER.exception(
+                    "Photo grid %s could not hand verified photos to analysis: %s",
                     record.session_id,
                     exc,
                 )
@@ -1775,10 +1790,89 @@ async def _drain_grid_scout(
     scout_task.cancel()
 
 
+async def _analyse_completed_photo_grid(record: PhotoGridRecord) -> None:
+    """Send verified grid photos through the normal analysis job once.
+
+    Image events are intentionally delayed while a grid is active so quality
+    repair can exclude discarded originals. That delay is not a reliable
+    completion trigger, though: a websocket reconnect or a lost poll can leave
+    a fully captured grid with no analysis at all. The grid already owns the
+    verified image IDs, so use them as an explicit handoff and remember the
+    successful IDs for the delayed event listener.
+    """
+    excluded = {int(image_id) for image_id in record.excluded_image_ids}
+    image_ids = sorted(
+        {
+            int(frame.image_id)
+            for frame in [*record.frames, *record.quality_overlay_frames]
+            if int(frame.image_id) not in excluded
+        }
+        | {
+            int(capture.image_id)
+            for capture in record.targeted_captures
+            if capture.image_id is not None and int(capture.image_id) not in excluded
+        }
+    )
+    handed_off = {int(image_id) for image_id in record.analysis_handoff_image_ids}
+    pending = [image_id for image_id in image_ids if image_id not in handed_off]
+    if not pending:
+        return
+
+    result = await jobs.run(
+        entry_id=record.config_entry_id,
+        mode=settings.mode,
+        image_ids=pending,
+        trigger="photo_grid",
+        queue_if_busy=True,
+    )
+    processed = int(result.get("images_processed", 0) or 0)
+    if not result.get("accepted") or result.get("status") != "idle" or processed != len(pending):
+        LOGGER.warning(
+            "Photo grid %s analysis handoff processed %d of %d verified image(s); "
+            "late image events remain eligible",
+            record.session_id,
+            processed,
+            len(pending),
+        )
+        return
+    record.analysis_handoff_image_ids = sorted(handed_off | set(pending))
+    photo_grid_store.save(record)
+    LOGGER.info(
+        "Photo grid %s handed %d verified image(s) to the analysis pipeline",
+        record.session_id,
+        len(pending),
+    )
+
+
 async def start_calibrated_photo_grid(
-    quality_repair_enabled: bool = True,
+    quality_repair_enabled: bool | None = None,
+    *,
+    quality_repair_blurry_enabled: bool | None = None,
+    quality_repair_washed_out_enabled: bool | None = None,
+    quality_repair_close_leaf_enabled: bool | None = None,
 ) -> PhotoGridRecord:
     """Plan and start a reliable whole-bed grid without the legacy sequence."""
+    individual_settings = (
+        quality_repair_blurry_enabled,
+        quality_repair_washed_out_enabled,
+        quality_repair_close_leaf_enabled,
+    )
+    if all(setting is None for setting in individual_settings):
+        legacy_enabled = True if quality_repair_enabled is None else quality_repair_enabled
+        quality_repair_blurry_enabled = legacy_enabled
+        quality_repair_washed_out_enabled = legacy_enabled
+        quality_repair_close_leaf_enabled = legacy_enabled
+    else:
+        quality_repair_blurry_enabled = bool(quality_repair_blurry_enabled)
+        quality_repair_washed_out_enabled = bool(quality_repair_washed_out_enabled)
+        quality_repair_close_leaf_enabled = bool(quality_repair_close_leaf_enabled)
+    quality_repair_enabled = any(
+        (
+            quality_repair_blurry_enabled,
+            quality_repair_washed_out_enabled,
+            quality_repair_close_leaf_enabled,
+        )
+    )
     global photo_grid_task
     if photo_grid_task is not None and not photo_grid_task.done():
         current = photo_grid_store.load()
@@ -1836,6 +1930,9 @@ async def start_calibrated_photo_grid(
         chunk_size=chunk_size,
         indexed_targets=bot.supports("indexed_photo_grid_targets"),
         quality_repair_enabled=quality_repair_enabled,
+        quality_repair_blurry_enabled=quality_repair_blurry_enabled,
+        quality_repair_washed_out_enabled=quality_repair_washed_out_enabled,
+        quality_repair_close_leaf_enabled=quality_repair_close_leaf_enabled,
         known_points=[
             KnownMapPoint(
                 id=plant.id,
@@ -3292,17 +3389,22 @@ async def _eligible_vision_event(event):
     active_grid = photo_grid_task
     if event.image_id is not None and active_grid is not None and not active_grid.done():
         await asyncio.shield(active_grid)
-        record = photo_grid_store.load()
-        if (
-            record is not None
-            and record.config_entry_id == event.config_entry_id
-            and event.image_id in record.excluded_image_ids
-        ):
-            LOGGER.info(
-                "Skipped analysis event for discarded photo-grid image %d",
-                event.image_id,
-            )
-            return None
+    if event.image_id is None:
+        return event
+    record = photo_grid_store.load()
+    if (
+        record is not None
+        and record.config_entry_id == event.config_entry_id
+        and (
+            event.image_id in record.excluded_image_ids
+            or event.image_id in record.analysis_handoff_image_ids
+        )
+    ):
+        LOGGER.info(
+            "Skipped delayed analysis event for photo-grid image %d",
+            event.image_id,
+        )
+        return None
     return event
 
 
@@ -3563,6 +3665,9 @@ main{{max-width:1100px;margin:auto;padding:1.2rem}}nav a{{color:white;margin-rig
 .card{{background:white;border-radius:10px;padding:1rem;box-shadow:0 1px 4px #0002;overflow:auto}}table{{width:100%;border-collapse:collapse}}td,th{{padding:.5rem;text-align:left;border-bottom:1px solid #ddd}}
 button{{background:var(--green);border:0;border-radius:6px;padding:.65rem 1rem;cursor:pointer}}.warn{{color:#9b4b00}}.muted{{color:var(--muted)}}input,select{{padding:.5rem;max-width:100%}}img{{max-width:100%}}
 label{{display:block;margin-bottom:.6rem}}
+.photo-grid-quality-options{{margin:0 0 .8rem;padding:.55rem .7rem;border:1px solid #dbe5de;border-radius:6px}}
+.photo-grid-quality-options legend{{padding:0 .25rem;font-size:.85rem;color:var(--muted)}}
+.photo-grid-quality-options label{{display:inline-block;margin:0 .9rem .15rem 0}}
 .action-message{{display:block;color:#a40000;max-width:24rem}}.action-message.notice{{color:var(--muted)}}.overlay-modal[hidden]{{display:none}}
 .overlay-modal{{position:fixed;inset:0;z-index:1000;background:#000b;display:flex;align-items:center;justify-content:center;padding:1rem}}
 .overlay-modal figure{{position:relative;background:white;border-radius:10px;margin:0;padding:1rem;width:min(95vw,1000px);max-height:95vh;overflow:auto}}
@@ -3906,7 +4011,6 @@ async def dashboard(request: Request) -> HTMLResponse:
         for r in rows
         if not r.get("vegetation_absent")
     )
-    last = jobs.last
     curve_rows = "".join(
         f"<tr><td>{escape(slug)}</td><td>{escape(str(curve))}</td><td>diameter mm</td></tr>"
         for slug, curve in curves.items()
@@ -4045,8 +4149,19 @@ async def dashboard(request: Request) -> HTMLResponse:
         photo_grid_view_disabled = "" if photo_grid_record.frames else " disabled"
     photo_grid_running = photo_grid_task is not None and not photo_grid_task.done()
     photo_grid_start_disabled = " disabled" if photo_grid_running else ""
-    photo_grid_quality_checked = (
-        " checked" if photo_grid_record is None or photo_grid_record.quality_repair_enabled else ""
+
+    def _quality_retry_checked(issue: PhotoIssue) -> str:
+        enabled = photo_grid_record is None or photo_grid_record.quality_retry_enabled(issue)
+        return " checked" if enabled else ""
+
+    photo_grid_quality_options = (
+        '<fieldset class="photo-grid-quality-options"><legend>Retry quality issues</legend>'
+        "<label><input type=checkbox name=quality_repair_blurry_enabled value=true"
+        f"{_quality_retry_checked('blurry')}> Blurry</label>"
+        "<label><input type=checkbox name=quality_repair_washed_out_enabled value=true"
+        f"{_quality_retry_checked('washed_out')}> Washed out</label>"
+        "<label><input type=checkbox name=quality_repair_close_leaf_enabled value=true"
+        f"{_quality_retry_checked('leaf_obstruction')}> Close leaf</label></fieldset>"
     )
     photo_grid_message = escape(request.query_params.get("photo_grid", ""))
     grid_issue_labels = {
@@ -4123,20 +4238,6 @@ async def dashboard(request: Request) -> HTMLResponse:
             "New FarmBot image events are analysed automatically; use Add to queue to "
             "select specific images for a later run."
         )
-    if jobs.last:
-        last_pipeline = (
-            f"Last run: {jobs.last.get('status', 'unknown')} · "
-            f"{jobs.last.get('images_processed', 0)} images processed · "
-            f"{jobs.last.get('plants_measured', 0)} plants measured."
-        )
-    else:
-        last_pipeline = "No analysis run has completed yet."
-    timing = (
-        f"Duration {jobs.last.get('duration_seconds', '—')} s · "
-        f"CPU {jobs.last.get('cpu_seconds', '—')} s · "
-        f"peak {jobs.last.get('peak_memory_mb', '—')} MB"
-    )
-
     # Legacy detector values are retained only while old persisted settings
     # migrate; they no longer trigger inventory inspection or dashboard UI.
     grid_run = None
@@ -4216,18 +4317,6 @@ async def dashboard(request: Request) -> HTMLResponse:
         gantry_debug_disabled,
     )
 
-    def _dims(value: object) -> str:
-        if isinstance(value, list) and len(value) == 2 and value[0] is not None:
-            return f"{value[0]}x{value[1]}"
-        return "—"
-
-    warnings = last.get("calibration_warnings") or []
-    warning_html = (
-        "".join(f"<li class=warn>{escape(str(w))}</li>" for w in warnings)
-        if warnings
-        else "<li class=muted>None</li>"
-    )
-    skip_reasons = last.get("skip_reasons") or {}
     # The old overview template below still supplies the review modals; its
     # first section is replaced with the consolidated cards after assembly.
     photo_grid_summary = ""
@@ -4236,14 +4325,6 @@ async def dashboard(request: Request) -> HTMLResponse:
     # keep its grid interpolation inputs immediately adjacent to the template.
     grid_cells = "".join(_grid_cell_markup(cell) for cell in grid_status["cells"])
     grid_columns = max(1, int(grid_status["columns"]))
-    skip_html = (
-        "".join(
-            f"<li>Plant {escape(str(pid))}: {escape(str(reason))}</li>"
-            for pid, reason in skip_reasons.items()
-        )
-        if skip_reasons
-        else "<li class=muted>None</li>"
-    )
     body = f"""<div class=grid><section class=card><h2>Health</h2><b>{escape(jobs.current["status"])}</b>
 <p>{escape(jobs.current.get("progress", ""))}</p><p class=muted>App {__version__} · {ALGORITHM_VERSION} · {CONTRACT_VERSION}</p></section>
 <section class=card><h2>FarmBot</h2><p>{escape(settings.selected_config_entry_id or "Not selected")}</p>
@@ -4253,7 +4334,7 @@ async def dashboard(request: Request) -> HTMLResponse:
 <section class="card photo-grid-card"><h2>Photo grid</h2>
 <p><b>{photo_grid_summary}</b></p><p class=muted>{photo_grid_details}</p>
 <div class=button-row>
-<form method=post action="photo-grid/start"><label class=photo-grid-quality-option><input type=checkbox name=quality_repair_enabled value=true{photo_grid_quality_checked}> Retry photos with washed-out, blurry or close-leaf views</label><button{photo_grid_start_disabled}>Start photo grid</button></form>
+<form method=post action="photo-grid/start">{photo_grid_quality_options}<button{photo_grid_start_disabled}>Start photo grid</button></form>
 <button id=photo-grid-open type=button{photo_grid_view_disabled}>View most recent grid</button>
 </div>
 <small class=action-message>{photo_grid_message}</small>
@@ -4284,19 +4365,6 @@ aria-label="Photo grid status" style="--grid-columns:{grid_columns}">{grid_cells
 <button type=submit class=clear-button>Clear all weed recommendations</button></form>
 <form method=post action="analysis/clear-measurements" onsubmit="return confirm('Clear all pending measurements?');">
 <button type=submit class=clear-button>Clear all measurements</button></form></div></section></div>
-<section class=card><h2>Last job</h2>
-<p>{escape(last.get("message", "Never run"))}</p>
-<div class=grid>
-<div><b>Timing</b><p class=muted>Duration {last.get("duration_seconds", "—")} s · CPU {last.get("cpu_seconds", "—")} s · peak {last.get("peak_memory_mb", "—")} MB</p></div>
-<div><b>Images</b><p class=muted>{last.get("images_processed", "—")} processed · {last.get("uncalibrated_images", 0)} uncalibrated</p></div>
-<div><b>Plants</b><p class=muted>{last.get("plants_measured", "—")} measured · {last.get("uncertain", "—")} uncertain · {last.get("skipped", "—")} skipped</p></div>
-<div><b>Dimensions</b><p class=muted>source {escape(_dims(last.get("source_dimensions")))} · oriented {escape(_dims(last.get("oriented_dimensions")))} · processed {escape(_dims(last.get("processed_dimensions")))}</p></div>
-<div><b>Calibration</b><p class=muted>source {escape(str(last.get("calibration_source") or "—"))}</p></div>
-<div><b>Contract</b><p class=muted>{escape(str(last.get("contract_version") or CONTRACT_VERSION))} · min integration {MINIMUM_INTEGRATION_VERSION}</p></div>
-<div><b>Zones</b><p class=muted>{last.get("zone_blocked_weeds", 0)} weeds · {last.get("zone_blocked_radius", 0)} radius increases blocked</p></div>
-</div>
-<p><b>Calibration warnings</b></p><ul>{warning_html}</ul>
-<p><b>Skip reasons</b></p><ul>{skip_html}</ul></section>
 <section class=card><div class=section-heading><h2>Measurements</h2><div class=header-actions>
 <form method=post action="analysis/clear-measurements" onsubmit="return confirm('Clear all pending measurements?');"><button type=submit class=clear-button>Clear all measurements</button></form>
 <form method=post action="analysis/clear-recommendations" onsubmit="return confirm('Clear all pending recommendations?');"><button type=submit class=clear-button>Clear all recommendations</button></form>
@@ -4402,7 +4470,6 @@ and the dark labels identify the points.</small></p>
 <div class=info-grid>
 <div class=info-item><span class=muted>FarmBot status</span><strong>{escape(farmbot_status)}</strong></div>
 <div class=info-item><span class=muted>Analysis resolution</span><strong>{escape(resolution.label)}</strong><span class=muted>{resolution.pixel_count:,} px</span></div>
-<div class=info-item><span class=muted>Timing</span><strong>{escape(timing)}</strong></div>
 <div class=info-item><span class=muted>Mode</span><strong>{escape(settings.mode.value)}</strong></div>
 <div class=info-item><span class=muted>FarmBot ID</span><strong>{escape(settings.selected_config_entry_id or "Not selected")}</strong></div>
 </div></section>
@@ -4415,7 +4482,7 @@ and the dark labels identify the points.</small></p>
 <div id=grid-status-cells class=grid-status-cells role=grid
 aria-label="Photo grid status" style="--grid-columns:{grid_columns}">{grid_cells}</div>
 <div class=button-row>
-<form method=post action="photo-grid/start"><label class=photo-grid-quality-option><input type=checkbox name=quality_repair_enabled value=true{photo_grid_quality_checked}> Retry photos with washed-out, blurry or close-leaf views</label><button{photo_grid_start_disabled}>Start photo grid</button></form>
+<form method=post action="photo-grid/start">{photo_grid_quality_options}<button{photo_grid_start_disabled}>Start photo grid</button></form>
 <button id=photo-grid-open type=button{photo_grid_view_disabled}>View most recent grid</button>
 </div>
 <small class=action-message>{photo_grid_message}</small>
@@ -4438,24 +4505,40 @@ aria-label="Photo grid status" style="--grid-columns:{grid_columns}">{grid_cells
 <p><strong>{escape(pipeline_summary)}</strong></p>
 <p class=muted>{escape(current_progress)}</p>
 <p class=muted>{escape(pipeline_detail)}</p>
-<p class=muted>{escape(last_pipeline)}</p>
 </div>
 <p class=muted><span id=queue-count>{manual_queue_count}</span> images in the manual queue.</p>
 <div class=button-row><form method=post action="analyse"><button>Analyse queue</button></form>
 <button id=queue-open type=button>Add to queue</button></div>
 </div>
 </div></section></div>"""
-    last_job_marker = "<section class=card><h2>Last job</h2>"
-    body = overview_html + body[body.index(last_job_marker) :]
+    measurements_marker = "<section class=card><div class=section-heading><h2>Measurements</h2>"
+    body = overview_html + body[body.index(measurements_marker) :]
     return layout(request, body)
 
 
 @app.post("/photo-grid/start")
 async def run_calibrated_photo_grid(
-    quality_repair_enabled: bool = Form(False),
+    quality_repair_enabled: bool | None = Form(None),
+    quality_repair_blurry_enabled: bool | None = Form(None),
+    quality_repair_washed_out_enabled: bool | None = Form(None),
+    quality_repair_close_leaf_enabled: bool | None = Form(None),
 ) -> RedirectResponse:
     try:
-        record = await start_calibrated_photo_grid(quality_repair_enabled)
+        if (
+            quality_repair_enabled is None
+            and quality_repair_blurry_enabled is None
+            and quality_repair_washed_out_enabled is None
+            and quality_repair_close_leaf_enabled is None
+        ):
+            quality_repair_blurry_enabled = False
+            quality_repair_washed_out_enabled = False
+            quality_repair_close_leaf_enabled = False
+        record = await start_calibrated_photo_grid(
+            quality_repair_enabled,
+            quality_repair_blurry_enabled=quality_repair_blurry_enabled,
+            quality_repair_washed_out_enabled=quality_repair_washed_out_enabled,
+            quality_repair_close_leaf_enabled=quality_repair_close_leaf_enabled,
+        )
         message = record.message
     except (HomeAssistantError, ValueError) as exc:
         message = f"Could not start photo grid: {exc}"

@@ -1,5 +1,12 @@
 # Changelog
 
+## 3.12.3 - 2026-07-31
+
+- Fixed completed photo grids being left out of the normal analysis pipeline
+  when their delayed per-image events were held or lost. Verified grid photos
+  now have an explicit completion handoff, and late duplicate events are
+  ignored after that handoff succeeds.
+
 ## 3.12.2 - 2026-07-31
 
 - Fixed the most-recent photo grid losing all plant and weed circles whenever

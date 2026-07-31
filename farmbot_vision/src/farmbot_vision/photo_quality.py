@@ -20,6 +20,17 @@ MAXIMUM_REPORTED_BLOBS = 24
 # the camera. Require the edge-connected component to cover more of the frame
 # before treating it as a close leaf that warrants alternate views.
 LEAF_OBSTRUCTION_MINIMUM_AREA_FRACTION = 0.30
+# A close leaf should be the dominant vegetation in the frame. This excludes
+# ordinary tiles where a large edge-connected canopy is accompanied by other
+# clearly visible plants.
+LEAF_OBSTRUCTION_MAXIMUM_CLEAR_VEGETATION_FRACTION = 0.05
+LEAF_OBSTRUCTION_MINIMUM_DOMINANCE = 0.88
+# Bright soil, mulch, and pale foliage can make most of a frame bright without
+# being washed out. Require a meaningful area of near-clipped, low-saturation
+# highlights instead of using average brightness as the primary gate.
+WASHED_OUT_MINIMUM_HIGHLIGHT_FRACTION = 0.30
+WASHED_OUT_HIGHLIGHT_VALUE = 235
+WASHED_OUT_MAXIMUM_VEGETATION_FRACTION = 0.12
 
 
 @dataclass(frozen=True)
@@ -86,11 +97,15 @@ def inspect_photo_quality(jpeg: bytes) -> PhotoQuality:
     saturation = hsv[:, :, 1]
     value = hsv[:, :, 2]
     bright_neutral = float(np.mean((value >= 205) & (saturation <= 85)))
+    highlight_neutral = float(np.mean((value >= WASHED_OUT_HIGHLIGHT_VALUE) & (saturation <= 85)))
     median_value = float(np.median(value)) / 255.0
     lower_value = float(np.percentile(value, 10)) / 255.0
     washed_score = float(
         np.clip(
-            0.50 * bright_neutral + 0.30 * median_value + 0.20 * lower_value,
+            0.35 * bright_neutral
+            + 0.35 * highlight_neutral
+            + 0.20 * median_value
+            + 0.10 * lower_value,
             0.0,
             1.0,
         )
@@ -185,20 +200,21 @@ def inspect_photo_quality(jpeg: bytes) -> PhotoQuality:
     )
 
     washed_out = (
-        bright_neutral >= 0.68
-        and median_value >= 0.86
+        highlight_neutral >= WASHED_OUT_MINIMUM_HIGHLIGHT_FRACTION
+        and median_value >= 0.84
         and lower_value >= 0.58
-        and vegetation_fraction < 0.10
+        and vegetation_fraction < WASHED_OUT_MAXIMUM_VEGETATION_FRACTION
     )
     leaf_obstruction = (
         largest_obstruction >= LEAF_OBSTRUCTION_MINIMUM_AREA_FRACTION
         and vegetation_fraction >= 0.30
-        and dominance >= 0.62
+        and dominance >= LEAF_OBSTRUCTION_MINIMUM_DOMINANCE
+        and clear_fraction <= LEAF_OBSTRUCTION_MAXIMUM_CLEAR_VEGETATION_FRACTION
     )
     # This absolute gate is intentionally limited to severe whole-frame blur.
     # Less extreme defocus is decided relative to adjacent grid cells below,
     # avoiding false positives on naturally smooth soil or broad plain leaves.
-    blurry = laplacian_variance <= 8.0 and edge_density <= 0.030 and contrast >= 0.025
+    blurry = laplacian_variance <= 5.0 and edge_density <= 0.025 and contrast >= 0.025
     issue: PhotoIssue = (
         "washed_out"
         if washed_out

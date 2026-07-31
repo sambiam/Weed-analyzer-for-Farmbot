@@ -220,8 +220,15 @@ class PhotoGridRecord(BaseModel):
     indexed_targets: bool = False
     # Existing persisted grids predate the quality pass and must not start
     # moving the bot after an upgrade. Newly planned grids explicitly enable
-    # it when they are created.
+    # each selected issue type when they are created.
     quality_repair_enabled: bool = False
+    # These are nullable only for records written by versions that had the
+    # single ``quality_repair_enabled`` switch. In that case the helper below
+    # preserves the old all-or-nothing behaviour; new records always write
+    # explicit values for all three types.
+    quality_repair_blurry_enabled: bool | None = None
+    quality_repair_washed_out_enabled: bool | None = None
+    quality_repair_close_leaf_enabled: bool | None = None
     # Filled in as each cell's photo is verified, by the scout that runs while
     # the bot drives to the next coordinate. Existing persisted grids simply
     # have none, and the post-run quality pass still works without it.
@@ -238,6 +245,36 @@ class PhotoGridRecord(BaseModel):
     # is the app-side safety barrier that prevents discarded captures from
     # contributing analysis even when remote deletion is unavailable.
     excluded_image_ids: list[int] = Field(default_factory=list)
+    # Image events are held while a grid is running so a discarded original
+    # cannot enter the analysis queue before quality repair chooses its
+    # replacement. Record the explicit handoff so delayed events do not
+    # analyse the same verified photo a second time.
+    analysis_handoff_image_ids: list[int] = Field(default_factory=list)
+
+    def quality_retry_enabled(self, issue: PhotoIssue) -> bool:
+        """Return whether retries for one quality issue are enabled.
+
+        ``None`` means this is an older persisted record. Falling back to the
+        legacy switch makes upgrades safe without silently enabling retries on
+        an existing grid.
+        """
+
+        setting_name = {
+            "blurry": "quality_repair_blurry_enabled",
+            "washed_out": "quality_repair_washed_out_enabled",
+            "leaf_obstruction": "quality_repair_close_leaf_enabled",
+        }.get(issue)
+        if setting_name is None:
+            return False
+        setting = getattr(self, setting_name)
+        return self.quality_repair_enabled if setting is None else setting
+
+    @property
+    def quality_retries_enabled(self) -> bool:
+        return any(
+            self.quality_retry_enabled(issue)
+            for issue in ("blurry", "washed_out", "leaf_obstruction")
+        )
 
 
 class PhotoGridStore:

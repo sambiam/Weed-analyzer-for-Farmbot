@@ -151,11 +151,14 @@ photo, and waits for the processed image inventory. The app also checks each
 returned frame against its requested X/Y/Z coordinate within 25 mm. Only
 verified frames count. Missing or mismatched targets are retried within the
 same grid sequence; a grid with any remaining hole is marked failed rather
-than complete. After capture, that same sequence quality-checks every frame,
-retakes washed-out or blurry images, tries alternate views for leaf-obstructed
-images, and captures clear centred views of large plants when needed. Blur is
-judged from whole-frame detail and strong edges, with adjacent grid cells used
-as the local sharpness baseline when available.
+than complete. After capture, that same sequence quality-checks every frame.
+The card has independent retry controls for blurry, washed-out, and close-leaf
+views; only enabled issue types can trigger a retake. Washed-out photos require
+clipped, low-saturation highlights rather than merely high average brightness,
+and close-leaf photos must have one dominant edge-connected vegetation mass
+with little other visible vegetation. Blur is judged from whole-frame detail
+and strong edges, with adjacent grid cells used as the local sharpness baseline
+when available.
 
 The latest-grid view draws verified frames into one calibrated birds-eye
 garden mosaic and overlays current FarmBot plants and weeds. The plan and
