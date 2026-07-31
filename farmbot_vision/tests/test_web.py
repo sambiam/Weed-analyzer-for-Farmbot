@@ -2225,6 +2225,73 @@ async def test_completed_grid_hands_off_verified_images_and_deduplicates_late_ev
 
 
 @pytest.mark.asyncio
+async def test_grid_analyzes_quality_cleared_frames_before_slow_repairs(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+):
+    from farmbot_vision.photo_grid import (
+        PhotoGridCellAnalysis,
+        PhotoGridFrame,
+        PhotoGridStore,
+        PhotoGridTarget,
+    )
+
+    targets = [
+        PhotoGridTarget(index=0, row=0, column=0, x=100, y=200, z=0),
+        PhotoGridTarget(index=1, row=0, column=1, x=300, y=200, z=0),
+    ]
+    record = _photo_grid_record(targets, tmp_path=tmp_path)
+    record.frames = [
+        PhotoGridFrame(target_index=0, image_id=10, x=100, y=200, z=0),
+        PhotoGridFrame(target_index=1, image_id=11, x=300, y=200, z=0),
+    ]
+    record.cell_analysis = [
+        PhotoGridCellAnalysis(
+            target_index=0,
+            image_id=10,
+            issue="usable",
+            analysed_at=datetime.now(UTC),
+        ),
+        PhotoGridCellAnalysis(
+            target_index=1,
+            image_id=11,
+            issue="leaf_obstruction",
+            analysed_at=datetime.now(UTC),
+        ),
+    ]
+    store = PhotoGridStore(tmp_path / "grid.json")
+    store.save(record)
+    monkeypatch.setattr(web, "photo_grid_store", store)
+
+    async def empty_capture(*_args):
+        return []
+
+    monkeypatch.setattr(web, "_capture_photo_grid_targets", empty_capture)
+
+    calls = []
+
+    async def fake_analysis(_record, image_ids=None):
+        calls.append(("analysis", image_ids))
+
+    async def fake_quality(_record, _scout=None):
+        calls.append(("quality", None))
+
+    async def fake_targeted(_record):
+        calls.append(("targeted", None))
+
+    async def no_scout(_scout):
+        return None
+
+    monkeypatch.setattr(web, "_analyse_completed_photo_grid", fake_analysis)
+    monkeypatch.setattr(web, "_photo_grid_quality_pass", fake_quality)
+    monkeypatch.setattr(web, "_capture_targeted_plant_photos", fake_targeted)
+    monkeypatch.setattr(web._LiveGridScout, "run", no_scout)
+
+    await web._photo_grid_worker(record)
+
+    assert calls[:2] == [("analysis", [10]), ("quality", None)]
+
+
+@pytest.mark.asyncio
 async def test_startup_auto_selects_only_loaded_farmbot(monkeypatch: pytest.MonkeyPatch):
     async def list_bots():
         return BotList.model_validate(

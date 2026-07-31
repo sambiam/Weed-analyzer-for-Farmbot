@@ -129,6 +129,27 @@ def test_measurement_preserves_recorded_and_recommended_centers(tmp_path):
     assert row["recommended_center_y"] == 500.0
 
 
+def test_measurement_write_reconnects_after_database_cantopen(tmp_path, monkeypatch):
+    database = Database(tmp_path / "db.sqlite")
+    measurement = _measurement()
+    calls = 0
+    original = database._save_measurements_once
+
+    def fail_once(measurements):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise sqlite3.OperationalError("unable to open database file")
+        return original(measurements)
+
+    monkeypatch.setattr(database, "_save_measurements_once", fail_once)
+
+    database.save_measurements([measurement])
+
+    assert calls == 2
+    assert database.measurement(str(measurement.measurement_id)) is not None
+
+
 def test_fused_canopy_provenance_round_trips_and_overrides_consolidation(tmp_path):
     database = Database(tmp_path / "db.sqlite")
     first = _measurement(

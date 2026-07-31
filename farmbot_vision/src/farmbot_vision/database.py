@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
+import shutil
 import sqlite3
 from collections.abc import Iterable
 from datetime import UTC, datetime
@@ -15,6 +17,8 @@ from .models import (
     SoilStereoCalibration,
 )
 from .plant_measurement import select_measurement_evidence, selection_diagnostics
+
+LOGGER = logging.getLogger(__name__)
 
 MIGRATIONS = [
     """
@@ -373,6 +377,36 @@ class Database:
         connection.execute("PRAGMA busy_timeout=5000")
         return connection
 
+    def _reconnect(self) -> None:
+        """Reopen the data file after a transient SQLite storage failure."""
+
+        try:
+            self.connection.close()
+        finally:
+            self.connection = self._connect()
+
+    def _storage_summary(self) -> str:
+        """Return compact storage diagnostics without masking the original error."""
+
+        try:
+            usage = shutil.disk_usage(self.path.parent)
+            free = usage.free
+        except OSError:
+            free = None
+
+        def size(path: Path) -> int:
+            try:
+                return path.stat().st_size
+            except OSError:
+                return 0
+
+        free_text = "unknown" if free is None else str(free)
+        return (
+            f"path={self.path} free_bytes={free_text} "
+            f"db_bytes={size(self.path)} wal_bytes={size(Path(f'{self.path}-wal'))} "
+            f"shm_bytes={size(Path(f'{self.path}-shm'))}"
+        )
+
     def migrate(self) -> None:
         current = self.connection.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name='schema_version'"
@@ -504,7 +538,24 @@ class Database:
         )
 
     def save_measurements(self, measurements: Iterable[Measurement]) -> None:
+        """Persist measurements, reopening SQLite once after a storage error."""
+
         measurements = list(measurements)
+        try:
+            self._save_measurements_once(measurements)
+        except sqlite3.OperationalError as exc:
+            if "unable to open database file" not in str(exc).casefold():
+                raise
+            LOGGER.warning(
+                "SQLite measurement write could not open the database; reconnecting once "
+                "before retrying (%s): %s",
+                self._storage_summary(),
+                exc,
+            )
+            self._reconnect()
+            self._save_measurements_once(measurements)
+
+    def _save_measurements_once(self, measurements: list[Measurement]) -> None:
         values = []
         for m in measurements:
             values.append(

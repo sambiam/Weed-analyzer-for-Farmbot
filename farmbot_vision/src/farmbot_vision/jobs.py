@@ -475,7 +475,25 @@ class JobManager:
                 and image.id not in excluded_grid_image_ids
                 and (not wanted_image_ids or image.id in wanted_image_ids)
             ]
+            LOGGER.info(
+                "Analysis job %s selected %d of %d inventory image(s): trigger=%s "
+                "requested=%d excluded_grid=%d plants=%d known_weeds=%d calibration=%s",
+                job_id,
+                len(images),
+                len(inventory.images),
+                trigger,
+                len(wanted_image_ids),
+                len(excluded_grid_image_ids),
+                len(inventory.plants),
+                len(inventory.weeds),
+                "configured" if manual_calibration is not None else "not configured",
+            )
             if wanted_image_ids and not images:
+                LOGGER.warning(
+                    "Analysis job %s received requested image IDs but none were available "
+                    "as processed, non-excluded inventory images",
+                    job_id,
+                )
                 return await self._finish(
                     entry_id,
                     job_id,
@@ -490,6 +508,7 @@ class JobManager:
             self.current["images_processed"] = 0
             self.current["images_total"] = len(images)
             self.current["uncalibrated_images"] = 0
+            self.current["weed_candidates"] = 0
             self.current["calibration_warnings"] = []
             self.current["calibration_source"] = None
             self.current["zone_blocked_weeds"] = 0
@@ -550,6 +569,13 @@ class JobManager:
                 if resolved.calibration is None:
                     # No valid metric calibration: pixel-only diagnostics, no
                     # measurement, no write (Part 6).
+                    LOGGER.warning(
+                        "Analysis job %s image %d produced diagnostics only: no valid "
+                        "metric calibration (warnings=%s)",
+                        job_id,
+                        response.image_id,
+                        "; ".join(resolved.warnings) or "none",
+                    )
                     self.current["uncalibrated_images"] += 1
                     result = await asyncio.wait_for(
                         asyncio.to_thread(engine.diagnostic_only, image_bytes),
@@ -691,6 +717,46 @@ class JobManager:
                     overlay_path.write_bytes(result.overlay_jpeg)
                 if result.weed_review_jpeg:
                     weed_review_path.write_bytes(result.weed_review_jpeg)
+                vegetation_path = artifacts / f"{job_id}-{response.image_id}-mask.png"
+                if result.mask:
+                    vegetation_path.write_bytes(result.mask)
+                ownership = None
+                if result.ownership_mask:
+                    ownership = cv2.imdecode(
+                        np.frombuffer(result.ownership_mask, dtype=np.uint8), cv2.IMREAD_UNCHANGED
+                    )
+                labelled = {seed.plant_id: index + 1 for index, seed in enumerate(seeds)}
+                persisted = []
+                for item in decided:
+                    mask_path = artifacts / (
+                        f"{job_id}-{response.image_id}-plant-{item.plant_id}-mask.png"
+                    )
+                    if ownership is not None:
+                        cv2.imwrite(
+                            str(mask_path),
+                            (ownership == labelled[item.plant_id]).astype(np.uint8) * 255,
+                        )
+                    artifact_paths = [str(overlay_path)] if result.overlay_jpeg else []
+                    if result.mask:
+                        artifact_paths.append(str(vegetation_path))
+                    if ownership is not None:
+                        artifact_paths.append(str(mask_path))
+                    persisted.append(
+                        item.model_copy(
+                            update={
+                                "overlay_path": str(overlay_path),
+                                "mask_path": str(mask_path) if ownership is not None else None,
+                                "artifact_paths": artifact_paths,
+                                "source_image_path": str(source_image_path),
+                            }
+                        )
+                    )
+                # Persist plant evidence before per-image weed writes. This
+                # keeps plant recommendations reviewable if a later storage
+                # operation fails after weed candidates have been detected.
+                decided = persisted
+                self.db.save_measurements(decided)
+                self.current["weed_candidates"] += len(result.weeds)
                 if result.weed_candidate_stats:
                     stats = result.weed_candidate_stats
                     LOGGER.info(
@@ -1002,42 +1068,6 @@ class JobManager:
                             status=track_status,
                             absent_observations=absent_observations,
                         )
-                vegetation_path = artifacts / f"{job_id}-{response.image_id}-mask.png"
-                if result.mask:
-                    vegetation_path.write_bytes(result.mask)
-                ownership = None
-                if result.ownership_mask:
-                    ownership = cv2.imdecode(
-                        np.frombuffer(result.ownership_mask, dtype=np.uint8), cv2.IMREAD_UNCHANGED
-                    )
-                labelled = {seed.plant_id: index + 1 for index, seed in enumerate(seeds)}
-                persisted = []
-                for item in decided:
-                    mask_path = artifacts / (
-                        f"{job_id}-{response.image_id}-plant-{item.plant_id}-mask.png"
-                    )
-                    if ownership is not None:
-                        cv2.imwrite(
-                            str(mask_path),
-                            (ownership == labelled[item.plant_id]).astype(np.uint8) * 255,
-                        )
-                    artifact_paths = [str(overlay_path)] if result.overlay_jpeg else []
-                    if result.mask:
-                        artifact_paths.append(str(vegetation_path))
-                    if ownership is not None:
-                        artifact_paths.append(str(mask_path))
-                    persisted.append(
-                        item.model_copy(
-                            update={
-                                "overlay_path": str(overlay_path),
-                                "mask_path": str(mask_path) if ownership is not None else None,
-                                "artifact_paths": artifact_paths,
-                                "source_image_path": str(source_image_path),
-                            }
-                        )
-                    )
-                decided = persisted
-                self.db.save_measurements(decided)
                 skip_reasons = self.current.setdefault("skip_reasons", {})
                 for plant_id, reason in result.skipped.items():
                     skip_reasons[str(plant_id)] = reason
@@ -1503,6 +1533,7 @@ class JobManager:
             "analysis_resolution": self.settings.resolution.as_dict(),
             "images_processed": self.current.get("images_processed", 0),
             "uncalibrated_images": self.current.get("uncalibrated_images", 0),
+            "weed_candidates": self.current.get("weed_candidates", 0),
             "zone_blocked_weeds": self.current.get("zone_blocked_weeds", 0),
             "zone_blocked_radius": self.current.get("zone_blocked_radius", 0),
             "calibration_source": self.current.get("calibration_source"),
@@ -1522,6 +1553,20 @@ class JobManager:
         }
         self.db.finish_job(str(job_id), result)
         await self._status(entry_id, job_id, status, message, measurements)
+        LOGGER.info(
+            "Analysis job %s finished: status=%s images=%d uncalibrated=%d "
+            "plants=%d measured=%d recommendations=%d automatic=%d uncertain=%d message=%s",
+            job_id,
+            status,
+            result["images_processed"],
+            result["uncalibrated_images"],
+            result["plants_analysed"],
+            result["plants_measured"],
+            result["recommendations"],
+            result["automatically_applied"],
+            result["uncertain"],
+            message,
+        )
         return {"accepted": True, **result}
 
 

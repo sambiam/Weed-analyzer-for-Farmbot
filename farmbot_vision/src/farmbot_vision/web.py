@@ -1714,6 +1714,27 @@ async def _photo_grid_worker(record: PhotoGridRecord) -> None:
         # the post-grid pass own the remainder.
         await _drain_grid_scout(record, scout, _scout_task)
         if record.status == "complete":
+            # Quality repairs can require several FarmBot moves per cell and
+            # must not hold the real vision pipeline hostage. The live scout
+            # has already classified the usable frames, so analyse those now;
+            # the final handoff below will pick up selected replacements and
+            # any frame the scout could not inspect.
+            early_image_ids = _quality_cleared_grid_image_ids(record)
+            if early_image_ids:
+                record.message = (
+                    f"Analysing {len(early_image_ids)} quality-cleared grid photo"
+                    f"{'s' if len(early_image_ids) != 1 else ''} while quality repairs continue"
+                )
+                photo_grid_store.save(record)
+                try:
+                    await _analyse_completed_photo_grid(record, image_ids=early_image_ids)
+                except Exception as exc:  # pylint: disable=broad-except
+                    LOGGER.exception(
+                        "Photo grid %s early analysis handoff failed; the final handoff will "
+                        "retry it: %s",
+                        record.session_id,
+                        exc,
+                    )
             try:
                 if record.quality_retries_enabled:
                     record.status = "quality_check"
@@ -1790,7 +1811,10 @@ async def _drain_grid_scout(
     scout_task.cancel()
 
 
-async def _analyse_completed_photo_grid(record: PhotoGridRecord) -> None:
+async def _analyse_completed_photo_grid(
+    record: PhotoGridRecord,
+    image_ids: list[int] | None = None,
+) -> None:
     """Send verified grid photos through the normal analysis job once.
 
     Image events are intentionally delayed while a grid is active so quality
@@ -1801,7 +1825,7 @@ async def _analyse_completed_photo_grid(record: PhotoGridRecord) -> None:
     successful IDs for the delayed event listener.
     """
     excluded = {int(image_id) for image_id in record.excluded_image_ids}
-    image_ids = sorted(
+    grid_image_ids = sorted(
         {
             int(frame.image_id)
             for frame in [*record.frames, *record.quality_overlay_frames]
@@ -1813,6 +1837,11 @@ async def _analyse_completed_photo_grid(record: PhotoGridRecord) -> None:
             if capture.image_id is not None and int(capture.image_id) not in excluded
         }
     )
+    if image_ids is None:
+        image_ids = grid_image_ids
+    else:
+        allowed = set(grid_image_ids)
+        image_ids = sorted({int(image_id) for image_id in image_ids if int(image_id) in allowed})
     handed_off = {int(image_id) for image_id in record.analysis_handoff_image_ids}
     pending = [image_id for image_id in image_ids if image_id not in handed_off]
     if not pending:
@@ -1829,18 +1858,46 @@ async def _analyse_completed_photo_grid(record: PhotoGridRecord) -> None:
     if not result.get("accepted") or result.get("status") != "idle" or processed != len(pending):
         LOGGER.warning(
             "Photo grid %s analysis handoff processed %d of %d verified image(s); "
-            "late image events remain eligible",
+            "status=%s message=%s; late image events remain eligible",
             record.session_id,
             processed,
             len(pending),
+            result.get("status"),
+            result.get("message") or "",
         )
         return
     record.analysis_handoff_image_ids = sorted(handed_off | set(pending))
     photo_grid_store.save(record)
     LOGGER.info(
-        "Photo grid %s handed %d verified image(s) to the analysis pipeline",
+        "Photo grid %s handed %d verified image(s) to the analysis pipeline: "
+        "plants=%d recommendations=%d weeds=%d automatically_applied=%d",
         record.session_id,
         len(pending),
+        int(result.get("plants_analysed", 0) or 0),
+        int(result.get("recommendations", 0) or 0),
+        int(result.get("weed_candidates", 0) or 0),
+        int(result.get("automatically_applied", 0) or 0),
+    )
+
+
+def _quality_cleared_grid_image_ids(record: PhotoGridRecord) -> list[int]:
+    """Return live-scout frames safe to analyse while repairs are running.
+
+    The live scout has already paid the quality-inspection cost for these
+    frames. A flagged frame is deliberately withheld until its optional repair
+    either selects a replacement or the final handoff decides it is still the
+    best available evidence.
+    """
+
+    excluded = {int(image_id) for image_id in record.excluded_image_ids}
+    issue_by_target = {analysis.target_index: analysis.issue for analysis in record.cell_analysis}
+    return sorted(
+        {
+            int(frame.image_id)
+            for frame in record.frames
+            if int(frame.image_id) not in excluded
+            and issue_by_target.get(frame.target_index) == "usable"
+        }
     )
 
 

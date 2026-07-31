@@ -1,5 +1,19 @@
 # Changelog
 
+## 3.12.5 - 2026-07-31
+
+- Reconnect and retry plant measurement persistence after a transient SQLite
+  database-open failure, with storage diagnostics in the warning log.
+- Persist plant evidence before per-image weed writes so a later storage error
+  cannot leave a partial weed result while hiding all plant recommendations.
+
+## 3.12.4 - 2026-07-31
+
+- Start the normal analysis pipeline as soon as quality-cleared grid photos
+  are available, instead of waiting for slow optional quality repairs to finish.
+  Added explicit job and handoff summaries so missing recommendations identify
+  the stage that stopped them.
+
 ## 3.12.3 - 2026-07-31
 
 - Fixed completed photo grids being left out of the normal analysis pipeline
