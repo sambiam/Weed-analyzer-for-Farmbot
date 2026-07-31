@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+import os
 import shutil
 import sqlite3
 from collections.abc import Iterable
@@ -371,6 +372,9 @@ class Database:
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.path, check_same_thread=False, timeout=10)
         connection.row_factory = sqlite3.Row
+        # Keep SQLite auxiliary temporary storage away from inaccessible host
+        # temp directories in the restricted add-on container.
+        connection.execute("PRAGMA temp_store=MEMORY")
         connection.execute("PRAGMA journal_mode=WAL")
         connection.execute("PRAGMA synchronous=NORMAL")
         connection.execute("PRAGMA foreign_keys=ON")
@@ -403,6 +407,7 @@ class Database:
         free_text = "unknown" if free is None else str(free)
         return (
             f"path={self.path} free_bytes={free_text} "
+            f"sqlite_tmpdir={os.environ.get('SQLITE_TMPDIR') or '(unset)'} "
             f"db_bytes={size(self.path)} wal_bytes={size(Path(f'{self.path}-wal'))} "
             f"shm_bytes={size(Path(f'{self.path}-shm'))}"
         )
@@ -548,8 +553,10 @@ class Database:
                 raise
             LOGGER.warning(
                 "SQLite measurement write could not open the database; reconnecting once "
-                "before retrying (%s): %s",
+                "before retrying (%s; sqlite_error=%s/%s): %s",
                 self._storage_summary(),
+                getattr(exc, "sqlite_errorcode", "unknown"),
+                getattr(exc, "sqlite_errorname", "unknown"),
                 exc,
             )
             self._reconnect()

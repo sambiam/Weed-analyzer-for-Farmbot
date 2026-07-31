@@ -150,6 +150,13 @@ def test_measurement_write_reconnects_after_database_cantopen(tmp_path, monkeypa
     assert database.measurement(str(measurement.measurement_id)) is not None
 
 
+def test_sqlite_connection_keeps_temporary_storage_in_memory(tmp_path):
+    database = Database(tmp_path / "db.sqlite")
+
+    assert database.connection.execute("PRAGMA temp_store").fetchone()[0] == 2
+    assert database.connection.execute("PRAGMA busy_timeout").fetchone()[0] == 5000
+
+
 def test_fused_canopy_provenance_round_trips_and_overrides_consolidation(tmp_path):
     database = Database(tmp_path / "db.sqlite")
     first = _measurement(

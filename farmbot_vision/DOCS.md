@@ -306,7 +306,7 @@ Approved individual changes are auditable in the decisions table and protected b
 
 ## Retention, privacy, and export
 
-SQLite and artifacts live only in `/data`. The database uses WAL, normal synchronous mode, foreign keys, and a busy timeout. Successful masks default to 7 days and overlays to 14 days. Original FarmBot images and base64 payloads are not stored. Logs exclude image URLs, image data, tokens, and credentials.
+SQLite and artifacts live only in `/data`. The database uses WAL, normal synchronous mode, foreign keys, a busy timeout, and in-memory temporary storage. The container pins SQLite's auxiliary temp directory to writable `/tmp`; this is important under the add-on AppArmor profile. Successful masks default to 7 days and overlays to 14 days. Original FarmBot images and base64 payloads are not stored. Logs exclude image URLs, image data, tokens, and credentials.
 
 For future labelled-model work, back up the app and export selected overlay/mask files together with matching measurement rows from `farmbot_vision.db`. Remove garden-identifying metadata before sharing. The UI intentionally does not expose a bulk public export endpoint.
 
@@ -320,6 +320,7 @@ For future labelled-model work, back up the app and export selected overlay/mask
 - **Uncertain:** inspect overlap, a newly disconnected green region, edge clipping, or excessive growth.
 - **Stale radius:** the plant changed after measurement; rerun analysis.
 - **Paused:** reduce other workload or lower the image volume; do not disable memory protection casually.
+- **SQLite cannot open the database during measurement persistence:** upgrade to the current app version and restart it so `SQLITE_TMPDIR=/tmp` is applied. The warning includes SQLite's error code and temp directory; this is distinct from a genuine `database is locked` (`SQLITE_BUSY`) error.
 - **Corrupt database:** stop the app, restore `/data` from a Home Assistant backup, and retain the corrupt file for diagnosis.
 
 ## Future strategy: hybrid plant crop analysis

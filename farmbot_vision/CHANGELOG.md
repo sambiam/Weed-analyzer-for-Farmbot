@@ -1,5 +1,13 @@
 # Changelog
 
+## 3.12.6 - 2026-07-31
+
+- Fixed large measurement writes failing with `SQLITE_CANTOPEN` when SQLite
+  selected an inaccessible auxiliary temporary-file directory. SQLite now
+  uses in-memory temporary storage and the container explicitly pins its temp
+  directory to the AppArmor-writable `/tmp`.
+- Log SQLite error codes and names when a measurement write needs recovery.
+
 ## 3.12.5 - 2026-07-31
 
 - Reconnect and retry plant measurement persistence after a transient SQLite
