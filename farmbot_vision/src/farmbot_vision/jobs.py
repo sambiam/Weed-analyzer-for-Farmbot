@@ -507,6 +507,8 @@ class JobManager:
             self.current["resolution"] = resolution.as_dict()
             self.current["images_processed"] = 0
             self.current["images_total"] = len(images)
+            self.current["images_failed"] = 0
+            self.current["image_errors"] = []
             self.current["uncalibrated_images"] = 0
             self.current["weed_candidates"] = 0
             self.current["calibration_warnings"] = []
@@ -559,8 +561,6 @@ class JobManager:
                     if response.resize_scale_x
                     else None
                 )
-                self.current["images_processed"] += 1
-
                 overlay_path = artifacts / f"{job_id}-{response.image_id}-overlay.jpg"
                 weed_review_path = artifacts / f"{job_id}-{response.image_id}-weed-review.jpg"
                 source_image_path = artifacts / f"{job_id}-{response.image_id}-photo.jpg"
@@ -587,6 +587,13 @@ class JobManager:
                         (artifacts / f"{job_id}-{response.image_id}-mask.png").write_bytes(
                             result.mask
                         )
+                    self.current["images_processed"] += 1
+                    LOGGER.info(
+                        "Image %s persisted diagnostics only: source_photo=%s overlay=%s",
+                        response.image_id,
+                        source_image_path.is_file(),
+                        overlay_path.is_file(),
+                    )
                     del image_bytes, result
                     continue
 
@@ -616,19 +623,33 @@ class JobManager:
                     prior = decode_previous_mask(self.db.latest_mask_path(seed.plant_id))
                     if prior is not None:
                         previous_masks[seed.plant_id] = prior
-                result = await asyncio.wait_for(
-                    asyncio.to_thread(
-                        engine.analyse,
-                        image_bytes,
+                try:
+                    result = await asyncio.wait_for(
+                        asyncio.to_thread(
+                            engine.analyse,
+                            image_bytes,
+                            response.image_id,
+                            response.meta.created_at,
+                            seeds,
+                            calibration,
+                            previous_masks,
+                            weed_settings,
+                        ),
+                        timeout=60,
+                    )
+                except Exception as exc:
+                    self.current["images_failed"] += 1
+                    error = {
+                        "image_id": response.image_id,
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
+                    self.current["image_errors"].append(error)
+                    LOGGER.exception(
+                        "Analysis skipped image %s after the vision engine failed: %s",
                         response.image_id,
-                        response.meta.created_at,
-                        seeds,
-                        calibration,
-                        previous_masks,
-                        weed_settings,
-                    ),
-                    timeout=60,
-                )
+                        exc,
+                    )
+                    continue
                 del image_bytes, previous_masks
                 decided = []
                 plants_by_id = {plant.id: plant for plant in wanted}
@@ -756,6 +777,16 @@ class JobManager:
                 # operation fails after weed candidates have been detected.
                 decided = persisted
                 self.db.save_measurements(decided)
+                self.current["images_processed"] += 1
+                LOGGER.info(
+                    "Image %s persisted: plant_measurements=%d artifacts=%d source_photo=%s "
+                    "overlay=%s",
+                    response.image_id,
+                    len(decided),
+                    len(decided[0].artifact_paths) if decided else 0,
+                    source_image_path.is_file(),
+                    overlay_path.is_file(),
+                )
                 self.current["weed_candidates"] += len(result.weeds)
                 if result.weed_candidate_stats:
                     stats = result.weed_candidate_stats
@@ -1433,8 +1464,21 @@ class JobManager:
                         str(composite_path),
                         str(composite_overlay_path),
                     )
+            image_errors = self.current.get("image_errors", [])
+            completion_status = "warning" if image_errors else "idle"
+            completion_message = (
+                f"completed with {len(image_errors)} image error(s)"
+                if image_errors
+                else "completed"
+            )
             return await self._finish(
-                entry_id, job_id, "idle", start_wall, start_cpu, all_measurements, "completed"
+                entry_id,
+                job_id,
+                completion_status,
+                start_wall,
+                start_cpu,
+                all_measurements,
+                completion_message,
             )
         except Exception as exc:
             LOGGER.exception("Analysis failed for entry_id=%s: %s", entry_id, exc)
@@ -1532,6 +1576,8 @@ class JobManager:
             "duration_seconds": round((datetime.now(UTC) - start_wall).total_seconds(), 3),
             "analysis_resolution": self.settings.resolution.as_dict(),
             "images_processed": self.current.get("images_processed", 0),
+            "images_failed": self.current.get("images_failed", 0),
+            "image_errors": self.current.get("image_errors", []),
             "uncalibrated_images": self.current.get("uncalibrated_images", 0),
             "weed_candidates": self.current.get("weed_candidates", 0),
             "zone_blocked_weeds": self.current.get("zone_blocked_weeds", 0),
@@ -1554,11 +1600,12 @@ class JobManager:
         self.db.finish_job(str(job_id), result)
         await self._status(entry_id, job_id, status, message, measurements)
         LOGGER.info(
-            "Analysis job %s finished: status=%s images=%d uncalibrated=%d "
+            "Analysis job %s finished: status=%s images=%d failed=%d uncalibrated=%d "
             "plants=%d measured=%d recommendations=%d automatic=%d uncertain=%d message=%s",
             job_id,
             status,
             result["images_processed"],
+            result["images_failed"],
             result["uncalibrated_images"],
             result["plants_analysed"],
             result["plants_measured"],

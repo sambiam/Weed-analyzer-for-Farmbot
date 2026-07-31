@@ -7,7 +7,12 @@ import numpy as np
 from conftest import encode_jpeg, jpeg
 
 from farmbot_vision.models import Calibration, Decision, PlantSeed
-from farmbot_vision.vision import ClassicalVisionEngine, decode_jpeg, register_translation
+from farmbot_vision.vision import (
+    ClassicalVisionEngine,
+    _absence_confidence,
+    decode_jpeg,
+    register_translation,
+)
 
 NOW = datetime(2026, 2, 1, tzinfo=UTC)
 
@@ -24,6 +29,11 @@ def test_circular_plant_without_weeds(seed, calibration):
     assert 33 <= measurement.maximum_accepted_canopy_radius_mm <= 37
     assert measurement.recommended_protection_radius_mm >= 63
     assert measurement.confidence > 0.7
+
+
+def test_absence_confidence_is_bounded_for_tiny_fully_covered_cores():
+    assert _absence_confidence(1.0) == 0.05
+    assert 0.05 <= _absence_confidence(0.0) <= 0.98
 
 
 def test_radius_is_measured_in_bed_mm_after_anisotropic_rotation():

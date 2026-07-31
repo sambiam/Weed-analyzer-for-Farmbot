@@ -1,5 +1,14 @@
 # Changelog
 
+## 3.12.7 - 2026-07-31
+
+- Prevented tiny plant footprints from producing negative confidence values
+  that abort an entire multi-image analysis job.
+- Isolated vision-engine failures to the affected image and continued the
+  remaining batch, with failed-image details in the job result and logs.
+- Show source photos and per-frame overlays for partial runs before a plant
+  composite has been built.
+
 ## 3.12.6 - 2026-07-31
 
 - Fixed large measurement writes failing with `SQLITE_CANTOPEN` when SQLite

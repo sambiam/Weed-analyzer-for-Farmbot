@@ -4003,6 +4003,33 @@ async def dashboard(request: Request) -> HTMLResponse:
         # correctly centred context image; until then, show an empty manifest.
         if not plant_attrs:
             return "<span class=muted>None</span>"
+        # A failed or still-running multi-image job has no consolidated plant
+        # composite yet. Its per-frame source photo and overlay are still the
+        # correct evidence for this row, so expose them instead of rendering
+        # an empty viewer.
+        fallback_paths = []
+        if r.get("source_image_path"):
+            fallback_paths.append(r["source_image_path"])
+            fallback_paths.extend(r.get("artifact_paths") or [])
+        fallback_names = []
+        for raw_path in fallback_paths:
+            if not raw_path:
+                continue
+            name = Path(str(raw_path)).name
+            if name and name not in fallback_names:
+                fallback_names.append(name)
+        if fallback_names:
+            fallback_json = escape(
+                json.dumps(
+                    [f"artifact/{name}" for name in fallback_names],
+                    separators=(",", ":"),
+                ),
+                quote=True,
+            )
+            return (
+                f'<button type=button data-artifacts="{fallback_json}" '
+                f'data-details="{details_json}"{plant_attrs}>View frame</button>'
+            )
         return (
             f'<button type=button data-artifacts="[]" '
             f'data-details="{details_json}"{plant_attrs}>View</button>'

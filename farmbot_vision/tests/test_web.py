@@ -2047,6 +2047,33 @@ async def test_dashboard_plant_without_composite_never_reuses_frame_artifacts(
 
 
 @pytest.mark.asyncio
+async def test_dashboard_plant_without_composite_shows_its_source_and_frame_artifacts(
+    tmp_path, monkeypatch
+):
+    artifact_dir = tmp_path / "artifacts"
+    artifact_dir.mkdir()
+    source = artifact_dir / "source-photo.jpg"
+    overlay = artifact_dir / "source-overlay.jpg"
+    source.write_bytes(b"source")
+    overlay.write_bytes(b"overlay")
+    measurement = _review_measurement(
+        source_image_path=str(source),
+        artifact_paths=[str(overlay)],
+        recorded_center_x=100,
+        recorded_center_y=200,
+    )
+    web.database.save_measurements([measurement])
+    monkeypatch.setattr(web.settings, "data_dir", tmp_path)
+
+    status, _, body = await asgi_request("/")
+    html = body.decode()
+
+    assert status == 200
+    assert "artifact/source-photo.jpg" in html
+    assert "artifact/source-overlay.jpg" in html
+
+
+@pytest.mark.asyncio
 async def test_missing_plant_table_shows_crop_and_center_coordinates():
     measurement = _review_measurement(
         vegetation_absent=True,

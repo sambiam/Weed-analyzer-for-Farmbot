@@ -360,6 +360,17 @@ def _core_radius_px(seed: PlantSeed, params: ScaleParams) -> float:
     )
 
 
+def _absence_confidence(core_coverage: float) -> float:
+    """Return bounded confidence for an empty known plant centre.
+
+    Very small calibrated footprints can be completely covered while still
+    containing fewer pixels than the minimum connected-component area. That
+    is weak evidence, not a reason to emit a negative confidence.
+    """
+
+    return max(0.05, min(0.98, 0.72 + (0.25 * (1 - core_coverage / 0.035))))
+
+
 def _valid_component(stats: np.ndarray, label: int, params: ScaleParams) -> bool:
     _, _, width, height, area = stats[label]
     aspect = max(width, height) / max(1, min(width, height))
@@ -974,7 +985,7 @@ class ClassicalVisionEngine(ImageAnalysisEngine):
                     if len(nearby_x) >= params.min_area
                     else None
                 )
-                absence_confidence = min(0.98, 0.72 + (0.25 * (1 - core_coverage / 0.035)))
+                absence_confidence = _absence_confidence(core_coverage)
                 measurements.append(
                     Measurement(
                         measurement_id=uuid4(),
