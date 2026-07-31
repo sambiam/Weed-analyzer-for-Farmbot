@@ -2370,11 +2370,7 @@ async def test_latest_grid_keeps_snapshotted_weed_markers_when_inventory_is_offl
                 reference_height=1944,
             ),
             targets=[PhotoGridTarget(index=0, row=0, column=0, x=250, y=200, z=0)],
-            known_points=[
-                KnownMapPoint(
-                    id=91, kind="weed", name="", x=125, y=275, radius=22
-                )
-            ],
+            known_points=[KnownMapPoint(id=91, kind="weed", name="", x=125, y=275, radius=22)],
         )
     )
 

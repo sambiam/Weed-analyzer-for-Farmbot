@@ -4046,9 +4046,7 @@ async def dashboard(request: Request) -> HTMLResponse:
     photo_grid_running = photo_grid_task is not None and not photo_grid_task.done()
     photo_grid_start_disabled = " disabled" if photo_grid_running else ""
     photo_grid_quality_checked = (
-        " checked"
-        if photo_grid_record is None or photo_grid_record.quality_repair_enabled
-        else ""
+        " checked" if photo_grid_record is None or photo_grid_record.quality_repair_enabled else ""
     )
     photo_grid_message = escape(request.query_params.get("photo_grid", ""))
     grid_issue_labels = {
@@ -4497,14 +4495,10 @@ async def latest_calibrated_photo_grid() -> JSONResponse:
         # offline. Use the inventory snapshotted with the grid so its map
         # markers do not disappear with the connection.
         plants = [
-            point.model_dump(mode="json")
-            for point in record.known_points
-            if point.kind == "plant"
+            point.model_dump(mode="json") for point in record.known_points if point.kind == "plant"
         ]
         weeds = [
-            point.model_dump(mode="json")
-            for point in record.known_points
-            if point.kind == "weed"
+            point.model_dump(mode="json") for point in record.known_points if point.kind == "weed"
         ]
     return JSONResponse({"grid": record.model_dump(mode="json"), "plants": plants, "weeds": weeds})
 

@@ -1,4 +1,4 @@
-﻿"""FarmBot Vision application."""
+"""FarmBot Vision application."""
 
 __version__ = "3.12.2"
 ALGORITHM_VERSION = "classical-weed-verifier-0.6.0"
