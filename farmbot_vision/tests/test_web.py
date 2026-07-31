@@ -308,7 +308,9 @@ def test_grid_status_uses_the_canonical_6_by_9_plan(tmp_path):
     ]
 
 
-def test_grid_status_marks_failed_and_quality_repair_cells_blue(tmp_path):
+def test_grid_status_marks_cells_without_a_photo_red(tmp_path):
+    """A cell the run drove past without producing a photo is red; a cell that
+    holds a flawed photo stays green inside with a red border."""
     from farmbot_vision.photo_grid import (
         PhotoGridFrame,
         PhotoGridQualityRepair,
@@ -339,10 +341,118 @@ def test_grid_status_marks_failed_and_quality_repair_cells_blue(tmp_path):
 
     assert [cell["state"] for cell in status["cells"]] == [
         "verified",
-        "active",
-        "active",
-        "active",
+        "verified",
+        "missing",
+        "missing",
     ]
+    assert [cell["issue"] for cell in status["cells"]] == [None, "leaf_obstruction", None, None]
+    assert status["missing"] == 2
+    assert status["flagged"] == 1
+
+
+def test_grid_status_keeps_the_red_border_while_a_flagged_cell_is_retried(tmp_path):
+    """An in-progress repair turns the interior blue but must not clear the
+    red border, which only a completed repair earns."""
+    from farmbot_vision.photo_grid import (
+        PhotoGridCellAnalysis,
+        PhotoGridFrame,
+        PhotoGridQualityRepair,
+        PhotoGridTarget,
+    )
+
+    targets = [
+        PhotoGridTarget(index=index, row=0, column=index, x=index * 100, y=0, z=0)
+        for index in range(3)
+    ]
+    record = _photo_grid_record(targets, tmp_path=tmp_path)
+    record.status = "quality_repair"
+    record.frames = [
+        PhotoGridFrame(target_index=index, image_id=10 + index, x=index * 100, y=0, z=0)
+        for index in range(3)
+    ]
+    record.cell_analysis = [
+        PhotoGridCellAnalysis(
+            target_index=index,
+            image_id=10 + index,
+            issue="blurry" if index else "usable",
+            analysed_at=datetime.now(UTC),
+        )
+        for index in range(3)
+    ]
+    record.quality_repairs = [
+        PhotoGridQualityRepair(
+            target_index=1,
+            issue="blurry",
+            original_image_id=11,
+            status="attempting",
+            attempted_at=datetime.now(UTC),
+        ),
+        PhotoGridQualityRepair(
+            target_index=2,
+            issue="blurry",
+            original_image_id=12,
+            status="complete",
+            attempted_at=datetime.now(UTC),
+        ),
+    ]
+
+    status = web._photo_grid_status(record)
+
+    by_index = {cell["index"]: cell for cell in status["cells"]}
+    assert (by_index[0]["state"], by_index[0]["issue"]) == ("verified", None)
+    # Being retried: blue interior, red border retained.
+    assert (by_index[1]["state"], by_index[1]["issue"]) == ("active", "blurry")
+    # Verified as fixed: the border is earned back.
+    assert (by_index[2]["state"], by_index[2]["issue"]) == ("verified", None)
+    assert status["flagged"] == 1
+
+
+def test_grid_status_respects_map_origin_and_rotate_map(tmp_path):
+    """Cell layout must match the calibration tab's whole-map display
+    orientation, not the raw gantry row/column order."""
+    from farmbot_vision.calibration_store import FarmbotCalibrationInput
+    from farmbot_vision.photo_grid import PhotoGridRecord, PhotoGridTarget
+
+    targets = [
+        PhotoGridTarget(
+            index=row * 3 + column,
+            row=row,
+            column=column,
+            x=column * 100,
+            y=row * 100,
+            z=0,
+        )
+        for row in range(2)
+        for column in range(3)
+    ]
+    record = PhotoGridRecord(
+        config_entry_id="entry-1",
+        started_at=datetime.now(UTC),
+        bed_bounds={"x": (0, 300), "y": (0, 200)},
+        footprint_width_mm=250,
+        footprint_height_mm=200,
+        calibration=FarmbotCalibrationInput(
+            coordinate_scale=0.25,
+            reference_width=1000,
+            reference_height=800,
+            map_origin="bottom_right",
+            rotate_map=True,
+        ),
+        targets=targets,
+    )
+
+    status = web._photo_grid_status(record)
+
+    # rotate_map transposes the 2 rows x 3 columns lattice into 3 rows x 2
+    # columns; bottom_right then mirrors both axes of that transposed grid, so
+    # the physical (row 0, column 0) cell lands at the display's bottom-right.
+    assert status["rows"] == 3
+    assert status["columns"] == 2
+    by_index = {cell["index"]: (cell["row"], cell["column"]) for cell in status["cells"]}
+    assert by_index[0] == (2, 1)  # row=0,column=0 (physical top-left)
+    assert by_index[2] == (0, 1)  # row=0,column=2 (physical top-right)
+    assert by_index[3] == (2, 0)  # row=1,column=0 (physical bottom-left)
+    assert by_index[5] == (0, 0)  # row=1,column=2 (physical bottom-right)
 
 
 @pytest.mark.asyncio
@@ -1014,6 +1124,13 @@ async def test_dashboard_removes_legacy_gantry_repair_controls(
     assert "View gantry photos" not in html
     assert "id=gantry-modal" not in html
     assert "Grid status" in html
+    assert "info-card" in html
+    assert "analysis-card" in html
+    assert "Photo analysis" in html
+    assert "Uses the saved scale" not in html
+    assert html.count('action="analysis/clear-measurements"') == 1
+    assert html.count('action="analysis/clear-recommendations"') == 1
+    assert html.count('action="analysis/clear-weeds"') == 1
 
 
 def _review_measurement(**updates) -> Measurement:
@@ -2225,6 +2342,61 @@ async def test_calibration_grid_filters_dates_and_keeps_newest_per_location(monk
 
     assert [image["id"] for image in payload["images"]] == [3, 2]
     assert payload["bed_bounds"] is None
+
+
+@pytest.mark.asyncio
+async def test_latest_grid_keeps_snapshotted_weed_markers_when_inventory_is_offline(
+    monkeypatch, tmp_path
+):
+    from farmbot_vision.calibration_store import FarmbotCalibrationInput
+    from farmbot_vision.photo_grid import (
+        KnownMapPoint,
+        PhotoGridRecord,
+        PhotoGridStore,
+        PhotoGridTarget,
+    )
+
+    store = PhotoGridStore(tmp_path / "grid.json")
+    store.save(
+        PhotoGridRecord(
+            config_entry_id="bot-grid",
+            started_at=datetime.now(UTC),
+            bed_bounds={"x": (0, 1000), "y": (0, 800)},
+            footprint_width_mm=500,
+            footprint_height_mm=400,
+            calibration=FarmbotCalibrationInput(
+                coordinate_scale=0.25,
+                reference_width=2592,
+                reference_height=1944,
+            ),
+            targets=[PhotoGridTarget(index=0, row=0, column=0, x=250, y=200, z=0)],
+            known_points=[
+                KnownMapPoint(
+                    id=91, kind="weed", name="", x=125, y=275, radius=22
+                )
+            ],
+        )
+    )
+
+    async def inventory(_request):
+        raise web.HomeAssistantError("offline")
+
+    monkeypatch.setattr(web, "photo_grid_store", store)
+    monkeypatch.setattr(web.client, "inventory", inventory)
+
+    response = await web.latest_calibrated_photo_grid()
+    payload = json.loads(response.body)
+
+    assert payload["weeds"] == [
+        {
+            "id": 91,
+            "kind": "weed",
+            "name": "",
+            "x": 125.0,
+            "y": 275.0,
+            "radius": 22.0,
+        }
+    ]
 
 
 @pytest.mark.asyncio

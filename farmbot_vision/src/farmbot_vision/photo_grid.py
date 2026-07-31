@@ -13,6 +13,7 @@ from uuid import uuid4
 from pydantic import BaseModel, Field
 
 from .calibration_store import FarmbotCalibrationInput
+from .photo_quality import PhotoIssue
 
 PHOTO_GRID_OVERLAP = 0.15
 PHOTO_GRID_COORDINATE_TOLERANCE_MM = 25.0
@@ -136,6 +137,52 @@ class TargetedPlantCapture(BaseModel):
     completed_at: datetime | None = None
 
 
+class KnownMapPoint(BaseModel):
+    """A FarmBot plant or weed point, snapshotted when the grid was planned.
+
+    The grid worker already reads the inventory before planning, so carrying
+    the handful of numbers the live scout needs costs one list comprehension
+    instead of a second round trip per frame.
+    """
+
+    id: int
+    kind: Literal["plant", "weed"]
+    name: str = ""
+    x: float
+    y: float
+    radius: float = Field(default=0, ge=0)
+
+
+class PhotoGridCellAnalysis(BaseModel):
+    """What the live scout learned about one cell's photo during the run.
+
+    Everything here is derived either from the single quality inspection that
+    would otherwise have run after the grid, or from pure calibration geometry.
+    Nothing in this model replaces the full analysis pass: weed candidates are
+    unattributed vegetation, not confirmed detections, and plant radius is
+    deliberately absent because measuring it can need a composite of several
+    cells.
+    """
+
+    target_index: int = Field(ge=0)
+    image_id: int = Field(gt=0)
+    issue: PhotoIssue = "usable"
+    blur_score: float = 0.0
+    washed_out_score: float = 0.0
+    leaf_obstruction_score: float = 0.0
+    vegetation_fraction: float = 0.0
+    # Vegetation components this frame shows that sit clear of every known
+    # plant canopy -- a cheap "something is growing here that should not be"
+    # signal, refined later by the real weed pipeline.
+    weed_candidates: int = Field(default=0, ge=0)
+    weed_candidate_points: list[tuple[float, float]] = Field(default_factory=list)
+    # Plants whose whole safety-margined canopy falls inside this one frame, so
+    # this cell alone can measure them. Purely geometric; no pixels involved.
+    fully_framed_plant_ids: list[int] = Field(default_factory=list)
+    partially_framed_plant_ids: list[int] = Field(default_factory=list)
+    analysed_at: datetime
+
+
 class PhotoGridQualityRepair(BaseModel):
     """One persisted quality-repair attempt for one original grid frame."""
 
@@ -175,6 +222,12 @@ class PhotoGridRecord(BaseModel):
     # moving the bot after an upgrade. Newly planned grids explicitly enable
     # it when they are created.
     quality_repair_enabled: bool = False
+    # Filled in as each cell's photo is verified, by the scout that runs while
+    # the bot drives to the next coordinate. Existing persisted grids simply
+    # have none, and the post-run quality pass still works without it.
+    cell_analysis: list[PhotoGridCellAnalysis] = Field(default_factory=list)
+    # Plants and weeds FarmBot already knew about when this grid was planned.
+    known_points: list[KnownMapPoint] = Field(default_factory=list)
     targeted_captures: list[TargetedPlantCapture] = Field(default_factory=list)
     targeted_capture_diagnostics: list[dict[str, object]] = Field(default_factory=list)
     # Leaf repairs retain the original in ``frames`` as the background and
@@ -418,7 +471,7 @@ def match_verified_frames(
     return matched
 
 
-def _plant_area_coverage(
+def plant_area_coverage(
     plant_x: float,
     plant_y: float,
     radius_mm: float,
@@ -481,7 +534,7 @@ def plan_targeted_plant_captures(
         expected_diameter = expected_radius * 2
         best_coverage = max(
             (
-                _plant_area_coverage(
+                plant_area_coverage(
                     float(plant.x),
                     float(plant.y),
                     expected_radius,

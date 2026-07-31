@@ -1,10 +1,10 @@
-[build-system]
+﻿[build-system]
 requires = ["setuptools>=75"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "farmbot-vision"
-version = "3.10.0"
+version = "3.12.2"
 description = "Resource-conscious plant canopy analysis for FarmBot and Home Assistant"
 requires-python = ">=3.12"
 dependencies = [

@@ -10,6 +10,34 @@ import numpy as np
 
 PhotoIssue = Literal["usable", "washed_out", "leaf_obstruction", "blurry"]
 
+# Vegetation components smaller than this fraction of the frame are noise at the
+# 640px inspection resolution and are not reported as blobs.
+MINIMUM_BLOB_AREA_FRACTION = 0.0015
+# A hard cap on how many blobs one frame contributes, so a noisy photo cannot
+# bloat the persisted grid record. The largest components are kept.
+MAXIMUM_REPORTED_BLOBS = 24
+# A normal plant canopy can occupy a large part of a grid tile without hiding
+# the camera. Require the edge-connected component to cover more of the frame
+# before treating it as a close leaf that warrants alternate views.
+LEAF_OBSTRUCTION_MINIMUM_AREA_FRACTION = 0.30
+
+
+@dataclass(frozen=True)
+class VegetationBlob:
+    """One connected vegetation component, in resolution-independent units.
+
+    ``center_u``/``center_v`` are fractions of the frame's width and height, so
+    a caller can map them into garden millimetres from calibration alone
+    without knowing what resolution the inspection ran at. These come straight
+    out of the connected-components pass :func:`inspect_photo_quality` already
+    performs, so reporting them costs nothing beyond the tuple itself.
+    """
+
+    center_u: float
+    center_v: float
+    area_fraction: float
+    touches_edge: bool
+
 
 @dataclass(frozen=True)
 class PhotoQuality:
@@ -23,6 +51,7 @@ class PhotoQuality:
     laplacian_variance: float
     edge_density: float
     contrast: float
+    vegetation_blobs: tuple[VegetationBlob, ...] = ()
 
 
 def _decoded(jpeg: bytes) -> np.ndarray | None:
@@ -82,10 +111,11 @@ def inspect_photo_quality(jpeg: bytes) -> PhotoQuality:
     vegetation_fraction = float(np.mean(green > 0))
 
     height, width = green.shape
-    count, labels, stats, _ = cv2.connectedComponentsWithStats(green, 8)
+    count, labels, stats, centroids = cv2.connectedComponentsWithStats(green, 8)
     largest_obstruction = 0.0
     clear_pixels = 0
     minimum_thickness = min(height, width) * 0.075
+    blobs: list[VegetationBlob] = []
     for label in range(1, count):
         x, y, component_width, component_height, area = stats[label]
         selected = labels == label
@@ -104,6 +134,17 @@ def inspect_photo_quality(jpeg: bytes) -> PhotoQuality:
             largest_obstruction = max(largest_obstruction, fraction)
         else:
             clear_pixels += int(area)
+        if fraction >= MINIMUM_BLOB_AREA_FRACTION:
+            blobs.append(
+                VegetationBlob(
+                    center_u=float(centroids[label][0]) / float(width),
+                    center_v=float(centroids[label][1]) / float(height),
+                    area_fraction=fraction,
+                    touches_edge=touches > 0,
+                )
+            )
+    blobs.sort(key=lambda blob: blob.area_fraction, reverse=True)
+    del blobs[MAXIMUM_REPORTED_BLOBS:]
 
     # A close leaf must be both a substantial fraction of the photograph and
     # a substantial fraction of all detected vegetation.
@@ -150,7 +191,9 @@ def inspect_photo_quality(jpeg: bytes) -> PhotoQuality:
         and vegetation_fraction < 0.10
     )
     leaf_obstruction = (
-        largest_obstruction >= 0.24 and vegetation_fraction >= 0.30 and dominance >= 0.62
+        largest_obstruction >= LEAF_OBSTRUCTION_MINIMUM_AREA_FRACTION
+        and vegetation_fraction >= 0.30
+        and dominance >= 0.62
     )
     # This absolute gate is intentionally limited to severe whole-frame blur.
     # Less extreme defocus is decided relative to adjacent grid cells below,
@@ -176,6 +219,7 @@ def inspect_photo_quality(jpeg: bytes) -> PhotoQuality:
         laplacian_variance,
         edge_density,
         contrast,
+        tuple(blobs),
     )
 
 

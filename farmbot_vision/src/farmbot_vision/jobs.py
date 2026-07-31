@@ -488,6 +488,7 @@ class JobManager:
             all_measurements = []
             self.current["resolution"] = resolution.as_dict()
             self.current["images_processed"] = 0
+            self.current["images_total"] = len(images)
             self.current["uncalibrated_images"] = 0
             self.current["calibration_warnings"] = []
             self.current["calibration_source"] = None

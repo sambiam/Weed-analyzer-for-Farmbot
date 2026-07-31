@@ -48,6 +48,7 @@ from .grid_repair import (
     same_grid_run,
     target_payload,
 )
+from .grid_scout import scout_cell
 from .home_assistant import (
     HomeAssistantClient,
     HomeAssistantError,
@@ -75,6 +76,7 @@ from .models import (
 )
 from .photo_grid import (
     PHOTO_GRID_CONTINUOUS_CAPABILITY,
+    KnownMapPoint,
     PhotoGridFrame,
     PhotoGridQualityRepair,
     PhotoGridRecord,
@@ -205,6 +207,14 @@ PHOTO_GRID_MESSAGE_EXAMPLE_LIMIT = 5
 # Move far enough for the camera to look around a close leaf while retaining
 # generous overlap with the original cell.
 PHOTO_GRID_LEAF_OFFSET_FRACTION = 0.20
+# How often the live scout looks for a newly verified frame when it has caught
+# up. This only ever runs while a grid is capturing, and each check is a scan
+# of an in-memory list, so it is deliberately faster than the status poll: the
+# point is to use the drive to the next cell, not the drive after that.
+GRID_SCOUT_IDLE_POLL_SECONDS = 1
+# How long the worker lets the scout finish its backlog once capture ends,
+# before the post-grid pass takes over the remaining frames itself.
+GRID_SCOUT_DRAIN_TIMEOUT_SECONDS = 90
 MAX_REPAIR_ATTEMPTS_PER_CELL = 2
 TRAINING_LABELS = (
     "weed",
@@ -742,6 +752,11 @@ def _photo_grid_status(record: PhotoGridRecord | None) -> dict[str, object]:
             "rows": 0,
             "columns": 0,
             "cells": [],
+            "flagged": 0,
+            "missing": 0,
+            "analysed": 0,
+            "weed_candidates": 0,
+            "fully_framed_plants": 0,
         }
 
     verified = {
@@ -750,38 +765,93 @@ def _photo_grid_status(record: PhotoGridRecord | None) -> dict[str, object]:
         if frame.image_id not in record.excluded_image_ids
     }
     missing = [target.index for target in record.targets if target.index not in verified]
-    blue: set[int] = {
-        repair.target_index
-        for repair in record.quality_repairs
-        if repair.status in {"attempting", "failed"}
+    # A cell keeps its red border from the moment an issue is seen until a
+    # repair for that cell actually completes -- an attempted or failed repair
+    # is not a fix, so it does not clear the flag.
+    issue_by_target: dict[int, str] = {
+        analysis.target_index: analysis.issue
+        for analysis in record.cell_analysis
+        if analysis.issue != "usable"
     }
-    if record.status in {"retrying", "failed", "waiting_home_assistant"}:
-        blue.update(missing)
-    elif record.status in {"queued", "running"} and missing:
-        # The integration reports verified frames as it advances. The first
-        # unverified canonical target is therefore the current/next target;
-        # later cells remain visibly unattempted.
-        blue.add(missing[0])
+    for repair in record.quality_repairs:
+        if repair.status == "complete":
+            issue_by_target.pop(repair.target_index, None)
+        else:
+            issue_by_target[repair.target_index] = repair.issue
+    repairing = {
+        repair.target_index for repair in record.quality_repairs if repair.status == "attempting"
+    }
+    analysis_by_target = {analysis.target_index: analysis for analysis in record.cell_analysis}
+
+    # How far the run has actually reached. Batches follow the canonical route
+    # in index order, so every unverified cell behind the furthest verified one
+    # is a cell the bot has already driven past without producing a photo.
+    frontier = max(verified, default=-1)
+    finished = record.status not in {"queued", "running", "retrying", "waiting_home_assistant"}
+    blue: set[int] = set(repairing)
+    red: set[int] = set()
+    for index in missing:
+        if finished or index < frontier:
+            red.add(index)
+    if not finished:
+        ahead = [index for index in missing if index > frontier]
+        if ahead:
+            blue.add(ahead[0])
+        elif red and record.status in {"retrying", "waiting_home_assistant"}:
+            # Every remaining gap is behind the frontier, so the retry pass is
+            # working through them from the start of the route.
+            blue.add(min(red))
+            red.discard(min(red))
 
     rows = 1 + max((target.row for target in record.targets), default=-1)
     columns = 1 + max((target.column for target in record.targets), default=-1)
-    cells = [
-        {
+    # Match the calibration tab's whole-map display orientation (map_origin,
+    # rotate_map) so this mini-grid and the "view most recent grid" mosaic show
+    # the same corner-up, same-handed layout the user calibrated against.
+    rotate_map = record.calibration.rotate_map
+    map_origin = str(record.calibration.map_origin)
+    display_rows = columns if rotate_map else rows
+    display_columns = rows if rotate_map else columns
+
+    def display_position(target: PhotoGridTarget) -> tuple[int, int]:
+        disp_x = target.row if rotate_map else target.column
+        disp_y = target.column if rotate_map else target.row
+        if map_origin in ("top_right", "bottom_right"):
+            disp_x = display_columns - 1 - disp_x
+        if map_origin in ("bottom_left", "bottom_right"):
+            disp_y = display_rows - 1 - disp_y
+        return disp_y, disp_x
+
+    def cell_payload(target: PhotoGridTarget) -> dict[str, object]:
+        row, column = display_position(target)
+        analysis = analysis_by_target.get(target.index)
+        return {
             "index": target.index,
-            "row": target.row,
-            "column": target.column,
+            "row": row,
+            "column": column,
+            # The interior colour: what the cell holds right now.
             "state": (
                 "active"
                 if target.index in blue
+                else "missing"
+                if target.index in red
                 else "verified"
                 if target.index in verified
                 else "unattempted"
             ),
+            # The border: an unresolved quality problem, independent of state,
+            # so a cell can be blue-because-retrying and still read as faulty.
+            "issue": issue_by_target.get(target.index),
+            "analysed": analysis is not None,
+            "weed_candidates": analysis.weed_candidates if analysis else 0,
+            "fully_framed_plants": len(analysis.fully_framed_plant_ids) if analysis else 0,
+            "vegetation_fraction": analysis.vegetation_fraction if analysis else 0.0,
         }
-        for target in sorted(record.targets, key=lambda item: (item.row, item.column))
-    ]
+
+    cells = [cell_payload(target) for target in sorted(record.targets, key=display_position)]
     verified_count = len(verified.intersection(target.index for target in record.targets))
     total = len(record.targets)
+    analysed = [analysis_by_target[index] for index in analysis_by_target if index in verified]
     return {
         "session_id": record.session_id,
         "status": record.status,
@@ -789,9 +859,16 @@ def _photo_grid_status(record: PhotoGridRecord | None) -> dict[str, object]:
         "percentage": round(100 * verified_count / total) if total else 0,
         "verified": verified_count,
         "total": total,
-        "rows": rows,
-        "columns": columns,
+        "rows": display_rows,
+        "columns": display_columns,
         "cells": cells,
+        "flagged": len(issue_by_target),
+        "missing": len(red),
+        "analysed": len(analysed),
+        "weed_candidates": sum(item.weed_candidates for item in analysed),
+        "fully_framed_plants": len(
+            {plant_id for item in analysed for plant_id in item.fully_framed_plant_ids}
+        ),
     }
 
 
@@ -1230,11 +1307,35 @@ async def _repair_discarded_frame(
         return
     record.frames.append(replacement.model_copy(update={"target_index": frame.target_index}))
     record.frames.sort(key=lambda item: item.target_index)
+    _clear_repaired_cell_analysis(record, frame.target_index, replacement.image_id, quality)
     repair.selected_image_id = replacement.image_id
     repair.status = "complete"
     repair.message = (
         f"{issue_label.capitalize()} original deleted and replaced by one clear verified retake"
     )
+
+
+def _clear_repaired_cell_analysis(
+    record: PhotoGridRecord,
+    target_index: int,
+    image_id: int,
+    quality: PhotoQuality,
+) -> None:
+    """Re-point a repaired cell's analysis at the image that actually replaced it.
+
+    Without this the record would keep describing the discarded photo, so a
+    reload after a successful repair would put the red border back on a cell
+    that has already been fixed.
+    """
+    for analysis in record.cell_analysis:
+        if analysis.target_index != target_index:
+            continue
+        analysis.image_id = image_id
+        analysis.issue = quality.issue
+        analysis.blur_score = round(quality.blur_score, 3)
+        analysis.washed_out_score = round(quality.washed_out_score, 3)
+        analysis.leaf_obstruction_score = round(quality.leaf_obstruction_score, 3)
+        analysis.vegetation_fraction = round(quality.vegetation_fraction, 4)
 
 
 async def _repair_leaf_obstruction(
@@ -1289,6 +1390,12 @@ async def _repair_leaf_obstruction(
     record.quality_overlay_frames.append(
         selected.model_copy(update={"target_index": frame.target_index})
     )
+    _clear_repaired_cell_analysis(
+        record,
+        frame.target_index,
+        selected_id,
+        next(quality for image_id, quality in inspected if image_id == selected_id),
+    )
     repair.selected_image_id = selected_id
     repair.status = "complete"
     repair.message = (
@@ -1296,19 +1403,101 @@ async def _repair_leaf_obstruction(
     )
 
 
-async def _photo_grid_quality_pass(record: PhotoGridRecord) -> None:
+class _LiveGridScout:
+    """Inspect each grid photo while FarmBot drives to the next coordinate.
+
+    The grid worker spends almost all of its wall-clock time awaiting the
+    integration's status poll, so this adds no time to a run: the one quality
+    inspection each frame was always going to get simply happens now instead of
+    afterwards, and its result is cached for the post-grid pass. The OpenCV work
+    goes to a worker thread so it cannot delay a poll, and a frame that cannot
+    be fetched mid-run is left for the post-grid pass to retry rather than
+    failing the capture.
+    """
+
+    def __init__(self, record: PhotoGridRecord):
+        self.record = record
+        self.quality: dict[int, PhotoQuality] = {}
+        self._seen: set[int] = set()
+
+    def next_frame(self) -> PhotoGridFrame | None:
+        """The oldest verified frame this scout has not inspected yet.
+
+        Reading ``record.frames`` directly, rather than being handed each
+        batch, keeps the capture path completely unaware of the scout: frames
+        recovered from FarmBot's inventory after a dropped status poll are
+        picked up on exactly the same terms as frames the integration reported.
+        """
+        excluded = set(self.record.excluded_image_ids)
+        for frame in self.record.frames:
+            if frame.image_id not in self._seen and frame.image_id not in excluded:
+                return frame
+        return None
+
+    async def run(self) -> None:
+        """Inspect verified frames as they appear, until cancelled."""
+        targets = {target.index: target for target in self.record.targets}
+        while True:
+            frame = self.next_frame()
+            if frame is None:
+                await asyncio.sleep(GRID_SCOUT_IDLE_POLL_SECONDS)
+                continue
+            self._seen.add(frame.image_id)
+            target = targets.get(frame.target_index)
+            if target is None:
+                continue
+            try:
+                jpeg = await _quality_jpeg(self.record, frame.image_id)
+                quality = await asyncio.to_thread(inspect_photo_quality, jpeg)
+            except (HomeAssistantError, ValueError) as exc:
+                LOGGER.debug(
+                    "Live scout deferred photo-grid image %d to the post-grid pass: %s",
+                    frame.image_id,
+                    exc,
+                )
+                continue
+            self.quality[frame.image_id] = quality
+            analysis = scout_cell(
+                quality,
+                target,
+                frame.image_id,
+                self.record.calibration,
+                self.record.known_points,
+                safety_margin_mm=settings.safety_margin_mm,
+            )
+            self.record.cell_analysis = [
+                item
+                for item in self.record.cell_analysis
+                if item.target_index != analysis.target_index
+            ]
+            self.record.cell_analysis.append(analysis)
+            self.record.cell_analysis.sort(key=lambda item: item.target_index)
+            photo_grid_store.save(self.record)
+
+
+async def _photo_grid_quality_pass(
+    record: PhotoGridRecord,
+    scout: _LiveGridScout | None = None,
+) -> None:
     """Inspect every base tile once and persist at most one repair per issue."""
 
     attempted = {item.original_image_id for item in record.quality_repairs}
     originals = [item for item in record.frames if item.image_id not in attempted]
     targets = {item.index: item for item in record.targets}
-    quality_by_image: dict[int, PhotoQuality] = {}
-    for frame_number, frame in enumerate(originals, start=1):
+    # Frames the live scout already inspected during the run are not fetched or
+    # decoded a second time; only the ones it could not reach are.
+    quality_by_image: dict[int, PhotoQuality] = {
+        frame.image_id: scout.quality[frame.image_id]
+        for frame in originals
+        if scout is not None and frame.image_id in scout.quality
+    }
+    outstanding = [frame for frame in originals if frame.image_id not in quality_by_image]
+    for frame_number, frame in enumerate(outstanding, start=1):
         if frame.target_index not in targets:
             continue
         record.status = "quality_check"
         record.message = (
-            f"Checking grid photo {frame_number} of {len(originals)} for washed-out "
+            f"Checking grid photo {frame_number} of {len(outstanding)} for washed-out "
             "exposure, blur, or leaf obstruction"
         )
         photo_grid_store.save(record)
@@ -1333,6 +1522,13 @@ async def _photo_grid_quality_pass(record: PhotoGridRecord) -> None:
             and (neighboring_quality := quality_by_image.get(other.image_id)) is not None
         ]
         quality = with_neighbor_blur(quality, blur_neighbors)
+        # Relative blur can only be judged once neighbouring cells exist, so a
+        # cell the live scout called usable may be reclassified here. Keep the
+        # persisted per-cell analysis in step with that verdict.
+        for analysis in record.cell_analysis:
+            if analysis.target_index == frame.target_index:
+                analysis.issue = quality.issue
+                analysis.blur_score = round(quality.blur_score, 3)
         if quality.issue == "usable":
             continue
         repair = PhotoGridQualityRepair(
@@ -1382,6 +1578,8 @@ async def _photo_grid_quality_pass(record: PhotoGridRecord) -> None:
 
 async def _photo_grid_worker(record: PhotoGridRecord) -> None:
     """Capture the calibrated bed grid, retrying only coordinates not verified."""
+    scout = _LiveGridScout(record)
+    _scout_task = asyncio.create_task(scout.run(), name=f"photo-grid-scout-{record.session_id}")
     try:
         pending = list(record.targets)
         passes_run = 0
@@ -1508,6 +1706,10 @@ async def _photo_grid_worker(record: PhotoGridRecord) -> None:
                 "and coordinate-verified"
             )
         photo_grid_store.save(record)
+        # Capture is over, so nothing is left to overlap with: give the scout a
+        # bounded window to finish whatever it was still inspecting, then let
+        # the post-grid pass own the remainder.
+        await _drain_grid_scout(record, scout, _scout_task)
         if record.status == "complete":
             try:
                 if record.quality_repair_enabled:
@@ -1516,7 +1718,7 @@ async def _photo_grid_worker(record: PhotoGridRecord) -> None:
                         "Photo grid captured; checking exposure and close-leaf obstruction"
                     )
                     photo_grid_store.save(record)
-                    await _photo_grid_quality_pass(record)
+                    await _photo_grid_quality_pass(record, scout)
                     record.status = "complete"
                     repaired = sum(item.status == "complete" for item in record.quality_repairs)
                     record.message = (
@@ -1543,9 +1745,39 @@ async def _photo_grid_worker(record: PhotoGridRecord) -> None:
         record.status = "failed"
         record.message = f"Photo grid stopped safely: {exc}"
         photo_grid_store.save(record)
+    finally:
+        _scout_task.cancel()
 
 
-async def start_calibrated_photo_grid() -> PhotoGridRecord:
+async def _drain_grid_scout(
+    record: PhotoGridRecord,
+    scout: _LiveGridScout,
+    scout_task: asyncio.Task,
+) -> None:
+    """Let the live scout finish its backlog, then stop it."""
+
+    deadline = GRID_SCOUT_DRAIN_TIMEOUT_SECONDS
+    while deadline > 0 and scout.next_frame() is not None and not scout_task.done():
+        # A failed or interrupted grid keeps the terminal status the worker
+        # already decided; only a clean run narrates the tail of the check.
+        if record.status == "complete":
+            outstanding = len(record.frames) - len(record.cell_analysis)
+            record.message = (
+                "Photo grid captured; finishing the quality check on "
+                f"{outstanding} photo{'s' if outstanding != 1 else ''}"
+            )
+            record.status = "quality_check"
+            photo_grid_store.save(record)
+        await asyncio.sleep(GRID_SCOUT_IDLE_POLL_SECONDS)
+        deadline -= GRID_SCOUT_IDLE_POLL_SECONDS
+    if record.status == "quality_check":
+        record.status = "complete"
+    scout_task.cancel()
+
+
+async def start_calibrated_photo_grid(
+    quality_repair_enabled: bool = True,
+) -> PhotoGridRecord:
     """Plan and start a reliable whole-bed grid without the legacy sequence."""
     global photo_grid_task
     if photo_grid_task is not None and not photo_grid_task.done():
@@ -1603,7 +1835,29 @@ async def start_calibrated_photo_grid() -> PhotoGridRecord:
         targets=targets,
         chunk_size=chunk_size,
         indexed_targets=bot.supports("indexed_photo_grid_targets"),
-        quality_repair_enabled=True,
+        quality_repair_enabled=quality_repair_enabled,
+        known_points=[
+            KnownMapPoint(
+                id=plant.id,
+                kind="plant",
+                name=plant.name,
+                x=plant.x,
+                y=plant.y,
+                radius=plant.radius,
+            )
+            for plant in inventory.plants
+        ]
+        + [
+            KnownMapPoint(
+                id=weed.id,
+                kind="weed",
+                name=weed.name or "",
+                x=weed.x,
+                y=weed.y,
+                radius=weed.radius,
+            )
+            for weed in inventory.weeds
+        ],
     )
     if chunk_size < len(targets):
         LOGGER.warning(
@@ -2105,24 +2359,62 @@ _DASHBOARD_JS = r"""
   const queueMessage=document.getElementById('queue-message');
   const photoGridModal=document.getElementById('photo-grid-modal');
   const photoGridOpen=document.getElementById('photo-grid-open');
+  const photoGridViewport=document.getElementById('photo-grid-viewport');
   const photoGridCanvas=document.getElementById('photo-grid-canvas');
   const photoGridStatus=document.getElementById('photo-grid-status');
+  let photoGridZoom=1;
+  function applyPhotoGridZoom(next){
+    photoGridZoom=Math.max(1,Math.min(6,next));
+    photoGridCanvas.style.width=(photoGridZoom*100)+'%';
+    photoGridCanvas.style.height='auto';
+    document.getElementById('photo-grid-zoom-value').textContent=
+      Math.round(photoGridZoom*100)+'%';
+    document.getElementById('photo-grid-zoom-out').disabled=photoGridZoom<=1;
+    document.getElementById('photo-grid-zoom-in').disabled=photoGridZoom>=6;
+  }
   const gridStatusCells=document.getElementById('grid-status-cells');
   const gridStatusPercentage=document.getElementById('grid-status-percentage');
   const gridStatusCount=document.getElementById('grid-status-count');
   const gridStatusMessage=document.getElementById('grid-status-message');
+  const gridStatusAnalysis=document.getElementById('grid-status-analysis');
+  const GRID_ISSUE_LABELS={blurry:'blurry',washed_out:'washed out',
+    leaf_obstruction:'blocked by a close leaf'};
+  function gridCellDescription(cell){
+    let text='Photo '+(cell.index+1)+': '+cell.state;
+    if(cell.issue) text+=', '+(GRID_ISSUE_LABELS[cell.issue]||cell.issue)+' (awaiting a clear retake)';
+    if(cell.analysed){
+      if(cell.weed_candidates) text+=' · '+cell.weed_candidates+' possible weed'+
+        (cell.weed_candidates===1?'':'s');
+      if(cell.fully_framed_plants) text+=' · '+cell.fully_framed_plants+
+        ' fully framed plant'+(cell.fully_framed_plants===1?'':'s');
+    }
+    return text;
+  }
   function renderGridStatus(data){
     if(!gridStatusCells) return;
     gridStatusPercentage.textContent=data.percentage+'%';
     gridStatusCount.textContent=data.verified+' of '+data.total+' photos verified';
     gridStatusMessage.textContent=data.message;
+    if(gridStatusAnalysis){
+      const parts=[];
+      if(data.analysed) parts.push(data.analysed+' checked while capturing');
+      if(data.flagged) parts.push(data.flagged+' need'+(data.flagged===1?'s':'')+' a clear retake');
+      if(data.missing) parts.push(data.missing+' with no photo');
+      if(data.weed_candidates) parts.push(data.weed_candidates+' possible weed'+
+        (data.weed_candidates===1?'':'s'));
+      if(data.fully_framed_plants) parts.push(data.fully_framed_plants+
+        ' plant'+(data.fully_framed_plants===1?'':'s')+' fully framed');
+      gridStatusAnalysis.textContent=parts.join(' · ');
+    }
     gridStatusCells.style.setProperty('--grid-columns',Math.max(1,data.columns));
     gridStatusCells.replaceChildren(...(data.cells||[]).map(function(cell){
       const square=document.createElement('span');
-      square.className='grid-status-cell '+cell.state;
+      square.className='grid-status-cell '+cell.state+(cell.issue?' flagged':'');
       square.dataset.index=cell.index;
       square.setAttribute('role','gridcell');
-      square.setAttribute('aria-label','Photo '+(cell.index+1)+': '+cell.state);
+      const description=gridCellDescription(cell);
+      square.setAttribute('aria-label',description);
+      square.title=description;
       return square;
     }));
   }
@@ -2317,12 +2609,23 @@ _DASHBOARD_JS = r"""
     const layeredFrames=(record.frames||[]).concat(record.quality_overlay_frames||[]);
     const tileBounds=gridTileBounds(record);
     const spanX=bounds.x[1]-bounds.x[0], spanY=bounds.y[1]-bounds.y[0];
+    /* Match the calibration tab's whole-map display orientation (map_origin,
+       rotate_map) instead of always drawing garden-space (xmin,ymin) top-left. */
+    const rotate=!!calibration.rotate_map, mapOrigin=calibration.map_origin;
+    const displaySpanX=rotate?spanY:spanX, displaySpanY=rotate?spanX:spanY;
     const displayWidth=900;
     photoGridCanvas.width=displayWidth;
-    photoGridCanvas.height=Math.max(240,Math.min(650,Math.round(displayWidth*spanY/spanX)));
+    photoGridCanvas.height=Math.max(240,Math.min(650,
+      Math.round(displayWidth*displaySpanY/displaySpanX)));
     const ctx=photoGridCanvas.getContext('2d');
-    const sx=photoGridCanvas.width/spanX, sy=photoGridCanvas.height/spanY;
-    const project=function(x,y){return [(x-bounds.x[0])*sx,(y-bounds.y[0])*sy];};
+    const sx=photoGridCanvas.width/displaySpanX, sy=photoGridCanvas.height/displaySpanY;
+    const project=function(x,y){
+      let px=x-bounds.x[0], py=y-bounds.y[0];
+      if(rotate){const oldPx=px;px=py;py=oldPx;}
+      if(mapOrigin==='top_right'||mapOrigin==='bottom_right') px=displaySpanX-px;
+      if(mapOrigin==='bottom_left'||mapOrigin==='bottom_right') py=displaySpanY-py;
+      return [px*sx,py*sy];
+    };
     ctx.setTransform(1,0,0,1,0,0);
     ctx.fillStyle='#283f30';ctx.fillRect(0,0,photoGridCanvas.width,photoGridCanvas.height);
     if(!layeredFrames.length){photoGridStatus.textContent='This grid has no verified photos yet';return;}
@@ -2820,6 +3123,7 @@ _DASHBOARD_JS = r"""
   document.getElementById('queue-close').addEventListener('click',function(){queueModal.hidden=true;});
   if(photoGridOpen) photoGridOpen.addEventListener('click',function(){
     photoGridModal.hidden=false;loadPhotoGrid();
+    applyPhotoGridZoom(1);photoGridViewport.scrollLeft=0;photoGridViewport.scrollTop=0;
     photoGridModal.querySelector('.modal-close').focus();
   });
   document.getElementById('photo-grid-close').addEventListener('click',function(){
@@ -2828,6 +3132,16 @@ _DASHBOARD_JS = r"""
   photoGridModal.addEventListener('click',function(event){
     if(event.target===photoGridModal) photoGridModal.hidden=true;
   });
+  document.getElementById('photo-grid-zoom-in').addEventListener('click',function(){
+    applyPhotoGridZoom(photoGridZoom+.5);
+  });
+  document.getElementById('photo-grid-zoom-out').addEventListener('click',function(){
+    applyPhotoGridZoom(photoGridZoom-.5);
+  });
+  document.getElementById('photo-grid-zoom-reset').addEventListener('click',function(){
+    applyPhotoGridZoom(1);photoGridViewport.scrollLeft=0;photoGridViewport.scrollTop=0;
+  });
+  applyPhotoGridZoom(1);
   document.getElementById('queue-refresh').addEventListener('click',loadQueueImages);
   document.getElementById('queue-select-all').addEventListener('change',function(){
     document.querySelectorAll('.queue-checkbox').forEach(box=>box.checked=this.checked);
@@ -3227,8 +3541,28 @@ def layout(request: Request, body: str, title: str = "FarmBot Vision") -> HTMLRe
 body{{font:15px system-ui;margin:0;background:#f3f7f4;color:var(--dark)}}header{{background:#173f2c;color:white;padding:1rem 4vw}}
 main{{max-width:1100px;margin:auto;padding:1.2rem}}nav a{{color:white;margin-right:1rem}}.grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:1rem}}
 .calibration-grid{{grid-template-columns:minmax(240px,320px) minmax(0,1fr)}}@media(max-width:760px){{.calibration-grid{{grid-template-columns:1fr}}}}
+.dashboard-overview{{display:grid;gap:1rem}}
+.info-card,.analysis-card{{width:100%}}
+.info-grid{{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:1rem}}
+.info-item{{display:flex;flex-direction:column;gap:.3rem;min-width:0}}
+.info-item strong{{overflow-wrap:anywhere}}
+.analysis-layout{{display:grid;grid-template-columns:minmax(280px,1.35fr) minmax(180px,.8fr) minmax(220px,.9fr);gap:1.25rem;align-items:start}}
+.analysis-grid-panel,.analysis-grid-details,.analysis-actions{{min-width:0}}
+.analysis-grid-details,.analysis-actions{{border-left:1px solid #dbe5de;padding-left:1.25rem}}
+.analysis-grid-panel h3,.analysis-grid-details h3,.analysis-actions h3{{margin-top:0}}
+.analysis-grid-panel .button-row{{margin-top:.9rem}}
+.analysis-pipeline{{background:#f3f7f4;border-radius:8px;padding:.75rem 1rem;margin-bottom:1rem}}
+.analysis-pipeline p{{margin:.25rem 0}}
+.section-heading{{display:flex;align-items:center;justify-content:space-between;gap:1rem;flex-wrap:wrap}}
+.section-heading h2{{margin:0}}
+.header-actions{{display:flex;gap:.45rem;flex-wrap:wrap;align-items:center}}
+.header-actions form{{margin:0}}
+.header-actions button{{padding:.45rem .75rem;font-size:.9rem}}
+@media(max-width:900px){{.info-grid{{grid-template-columns:repeat(3,minmax(0,1fr))}}.analysis-layout{{grid-template-columns:minmax(250px,1.2fr) minmax(170px,.8fr)}}.analysis-actions{{grid-column:1/-1;border-left:0;border-top:1px solid #dbe5de;padding:1rem 0 0}}}}
+@media(max-width:600px){{.info-grid{{grid-template-columns:repeat(2,minmax(0,1fr))}}.analysis-layout{{display:block}}.analysis-grid-details,.analysis-actions{{border-left:0;border-top:1px solid #dbe5de;padding:1rem 0 0;margin-top:1rem}}}}
 .card{{background:white;border-radius:10px;padding:1rem;box-shadow:0 1px 4px #0002;overflow:auto}}table{{width:100%;border-collapse:collapse}}td,th{{padding:.5rem;text-align:left;border-bottom:1px solid #ddd}}
 button{{background:var(--green);border:0;border-radius:6px;padding:.65rem 1rem;cursor:pointer}}.warn{{color:#9b4b00}}.muted{{color:var(--muted)}}input,select{{padding:.5rem;max-width:100%}}img{{max-width:100%}}
+label{{display:block;margin-bottom:.6rem}}
 .action-message{{display:block;color:#a40000;max-width:24rem}}.action-message.notice{{color:var(--muted)}}.overlay-modal[hidden]{{display:none}}
 .overlay-modal{{position:fixed;inset:0;z-index:1000;background:#000b;display:flex;align-items:center;justify-content:center;padding:1rem}}
 .overlay-modal figure{{position:relative;background:white;border-radius:10px;margin:0;padding:1rem;width:min(95vw,1000px);max-height:95vh;overflow:auto}}
@@ -3237,8 +3571,10 @@ button{{background:var(--green);border:0;border-radius:6px;padding:.65rem 1rem;c
 .gantry-gallery{{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:1rem;min-width:min(85vw,900px)}}
 .gantry-gallery figure{{margin:0;padding:0;overflow:hidden}}.gantry-gallery img{{width:100%;height:180px;object-fit:contain;background:#111}}
 .gantry-gallery figcaption{{padding:.5rem 0}}.gantry-target{{color:#a40000;font-weight:bold}}
-.photo-grid-dialog{{width:min(96vw,1000px)}}.photo-grid-dialog canvas{{display:block;width:100%;max-height:72vh;
-background:#243a2c;border:1px solid #bcc9c0;border-radius:6px}}
+.photo-grid-dialog{{width:min(96vw,1000px)}}
+.photo-grid-viewport{{width:100%;max-height:72vh;overflow:auto;background:#243a2c;
+border:1px solid #bcc9c0;border-radius:6px}}.photo-grid-viewport canvas{{display:block;
+width:100%;height:auto;max-width:none}}
 .photo-grid-card form{{margin:0}}
 .grid-status-heading{{display:flex;align-items:baseline;justify-content:space-between;gap:1rem}}
 .grid-status-heading h2{{margin-bottom:.45rem}}#grid-status-percentage{{font-size:1.35rem;color:#176b42}}
@@ -3247,10 +3583,17 @@ gap:5px;width:min(100%,420px);margin:.45rem 0 .75rem}}
 .grid-status-cell{{display:block;aspect-ratio:1;border:2px solid #17221b;border-radius:2px;background:white}}
 .grid-status-cell.verified{{background:#35a867;border-color:#237a49}}
 .grid-status-cell.active{{background:#168cff;border-color:#075bab}}
+.grid-status-cell.missing{{background:#c62828;border-color:#8e0000}}
+/* The border is the photo's quality verdict and the interior is its capture
+   state, so a flagged cell stays outlined red while it is retried (blue) and
+   only loses the outline once a repair completes. */
+.grid-status-cell.flagged{{border-color:#d81b1b;box-shadow:inset 0 0 0 1px #d81b1b}}
 .grid-status-legend{{display:flex;gap:.8rem;flex-wrap:wrap;font-size:.78rem;color:var(--muted)}}
 .grid-status-legend span{{display:flex;align-items:center;gap:.3rem}}
 .grid-status-legend .grid-status-cell{{display:inline-block;width:13px;height:13px;aspect-ratio:auto;border-width:1px}}
+.grid-status-legend .grid-status-cell.flagged{{box-shadow:none}}
 #grid-status-message{{margin-bottom:0}}
+#grid-status-analysis{{margin:.1rem 0 .25rem;font-size:.82rem;color:var(--muted)}}
 .calibration-grid-viewport{{width:100%;max-height:72vh;overflow:auto;background:#111;
 border:1px solid #ccc;border-radius:6px}}.calibration-grid-viewport canvas{{display:block;
 width:100%;height:auto;max-width:none}}
@@ -3309,7 +3652,7 @@ background:#f3f7f4;border-radius:6px;padding:.6rem}}
 .shape-figs{{display:flex;gap:.9rem;flex-wrap:wrap;margin-top:.45rem}}
 .shape-figs figure{{margin:0;text-align:center;font-size:.71rem;color:var(--muted);max-width:5.5rem}}
 .shape-figs svg{{display:block;background:#f3f7f4;border-radius:6px;margin-bottom:.2rem}}
-</style></head><body><header><h1>🌱 FarmBot Vision</h1><nav><a href="./">Analysis</a><a href="soil-height">Soil height</a><a href="settings">Calibration</a><a href="weed-settings">Weed settings</a><a href="canopy-settings">Canopy fusion</a><a href="zones">Boundaries &amp; zones</a><a href="api/health">Health JSON</a></nav></header>
+</style></head><body><header><h1>🌱 FarmBot Vision</h1><nav><a href="./">Analysis</a><a href="soil-height">Soil height</a><a href="settings">Calibration</a><a href="weed-settings">Weed settings</a><a href="canopy-settings">Canopy fusion</a><a href="zones">Boundaries &amp; zones</a></nav></header>
 <main>{body}</main></body></html>"""
     )
 
@@ -3697,27 +4040,104 @@ async def dashboard(request: Request) -> HTMLResponse:
     weed_rows = "".join(_weed_row(w) for w in pending_weeds)
     resolution = settings.resolution
     if photo_grid_record is None:
-        photo_grid_summary = "No calibrated grid has been captured yet"
-        photo_grid_details = "Save calibration, then start the first reliable whole-bed grid."
         photo_grid_view_disabled = " disabled"
     else:
-        photo_grid_summary = escape(photo_grid_record.message or photo_grid_record.status)
-        photo_grid_details = (
-            f"{len(photo_grid_record.frames)} of {len(photo_grid_record.targets)} verified photos"
-            f" · started "
-            f"{escape(photo_grid_record.started_at.astimezone().strftime('%d %b %Y %H:%M'))}"
-        )
         photo_grid_view_disabled = "" if photo_grid_record.frames else " disabled"
     photo_grid_running = photo_grid_task is not None and not photo_grid_task.done()
     photo_grid_start_disabled = " disabled" if photo_grid_running else ""
-    photo_grid_message = escape(request.query_params.get("photo_grid", ""))
-    grid_cells = "".join(
-        f'<span class="grid-status-cell {escape(str(cell["state"]))}" '
-        f'data-index="{cell["index"]}" role=gridcell '
-        f'aria-label="Photo {cell["index"] + 1}: {escape(str(cell["state"]))}"></span>'
-        for cell in grid_status["cells"]
+    photo_grid_quality_checked = (
+        " checked"
+        if photo_grid_record is None or photo_grid_record.quality_repair_enabled
+        else ""
     )
+    photo_grid_message = escape(request.query_params.get("photo_grid", ""))
+    grid_issue_labels = {
+        "blurry": "blurry",
+        "washed_out": "washed out",
+        "leaf_obstruction": "blocked by a close leaf",
+    }
+
+    def _count_label(count: int, singular: str, plural: str | None = None) -> str:
+        return f"{count} {singular if count == 1 else (plural or singular + 's')}"
+
+    def _grid_cell_markup(cell: dict[str, object]) -> str:
+        issue = cell["issue"]
+        description = f"Photo {int(cell['index']) + 1}: {cell['state']}"
+        if issue:
+            label = grid_issue_labels.get(str(issue), str(issue))
+            description += f", {label} (awaiting a clear retake)"
+        if cell["weed_candidates"]:
+            description += f" · {_count_label(int(cell['weed_candidates']), 'possible weed')}"
+        if cell["fully_framed_plants"]:
+            description += (
+                f" · {_count_label(int(cell['fully_framed_plants']), 'fully framed plant')}"
+            )
+        classes = f"grid-status-cell {cell['state']}" + (" flagged" if issue else "")
+        return (
+            f'<span class="{escape(classes)}" data-index="{cell["index"]}" role=gridcell '
+            f'aria-label="{escape(description)}" title="{escape(description)}"></span>'
+        )
+
+    grid_cells = "".join(_grid_cell_markup(cell) for cell in grid_status["cells"])
     grid_columns = max(1, int(grid_status["columns"]))
+    grid_analysis_parts: list[str] = []
+    if grid_status["analysed"]:
+        grid_analysis_parts.append(f"{grid_status['analysed']} checked while capturing")
+    if grid_status["flagged"]:
+        flagged = int(grid_status["flagged"])
+        grid_analysis_parts.append(f"{flagged} need{'s' if flagged == 1 else ''} a clear retake")
+    if grid_status["missing"]:
+        grid_analysis_parts.append(f"{grid_status['missing']} with no photo")
+    if grid_status["weed_candidates"]:
+        grid_analysis_parts.append(
+            _count_label(int(grid_status["weed_candidates"]), "possible weed")
+        )
+    if grid_status["fully_framed_plants"]:
+        fully_framed = int(grid_status["fully_framed_plants"])
+        grid_analysis_parts.append(
+            f"{_count_label(fully_framed, 'plant')} fully framed",
+        )
+    grid_analysis_summary = escape(" · ".join(grid_analysis_parts))
+
+    current_status = str(jobs.current.get("status") or "idle")
+    farmbot_status = "busy" if jobs.lock.locked() else current_status
+    manual_queue_count = len(jobs.queued_image_ids)
+    current_progress = str(jobs.current.get("progress") or "Working through the analysis pipeline")
+    if jobs.lock.locked():
+        processed = jobs.current.get("images_processed")
+        total = jobs.current.get("images_total")
+        if isinstance(processed, int) and isinstance(total, int):
+            pipeline_detail = f"{processed} of {total} images processed in this run."
+        else:
+            pipeline_detail = "Preparing the inventory and analysis resources for this run."
+        pipeline_summary = "FarmBot Vision is processing the current analysis run."
+    elif manual_queue_count:
+        pipeline_summary = (
+            f"{_count_label(manual_queue_count, 'image')} waiting in the manual analysis queue."
+        )
+        pipeline_detail = (
+            "Select Analyse queue to process these images. New FarmBot image events are "
+            "analysed automatically when they arrive."
+        )
+    else:
+        pipeline_summary = "No images are waiting in the manual analysis queue."
+        pipeline_detail = (
+            "New FarmBot image events are analysed automatically; use Add to queue to "
+            "select specific images for a later run."
+        )
+    if jobs.last:
+        last_pipeline = (
+            f"Last run: {jobs.last.get('status', 'unknown')} · "
+            f"{jobs.last.get('images_processed', 0)} images processed · "
+            f"{jobs.last.get('plants_measured', 0)} plants measured."
+        )
+    else:
+        last_pipeline = "No analysis run has completed yet."
+    timing = (
+        f"Duration {jobs.last.get('duration_seconds', '—')} s · "
+        f"CPU {jobs.last.get('cpu_seconds', '—')} s · "
+        f"peak {jobs.last.get('peak_memory_mb', '—')} MB"
+    )
 
     # Legacy detector values are retained only while old persisted settings
     # migrate; they no longer trigger inventory inspection or dashboard UI.
@@ -3810,6 +4230,14 @@ async def dashboard(request: Request) -> HTMLResponse:
         else "<li class=muted>None</li>"
     )
     skip_reasons = last.get("skip_reasons") or {}
+    # The old overview template below still supplies the review modals; its
+    # first section is replaced with the consolidated cards after assembly.
+    photo_grid_summary = ""
+    photo_grid_details = ""
+    # The legacy template is assembled before its overview is replaced, so
+    # keep its grid interpolation inputs immediately adjacent to the template.
+    grid_cells = "".join(_grid_cell_markup(cell) for cell in grid_status["cells"])
+    grid_columns = max(1, int(grid_status["columns"]))
     skip_html = (
         "".join(
             f"<li>Plant {escape(str(pid))}: {escape(str(reason))}</li>"
@@ -3827,7 +4255,7 @@ async def dashboard(request: Request) -> HTMLResponse:
 <section class="card photo-grid-card"><h2>Photo grid</h2>
 <p><b>{photo_grid_summary}</b></p><p class=muted>{photo_grid_details}</p>
 <div class=button-row>
-<form method=post action="photo-grid/start"><button{photo_grid_start_disabled}>Start photo grid</button></form>
+<form method=post action="photo-grid/start"><label class=photo-grid-quality-option><input type=checkbox name=quality_repair_enabled value=true{photo_grid_quality_checked}> Retry photos with washed-out, blurry or close-leaf views</label><button{photo_grid_start_disabled}>Start photo grid</button></form>
 <button id=photo-grid-open type=button{photo_grid_view_disabled}>View most recent grid</button>
 </div>
 <small class=action-message>{photo_grid_message}</small>
@@ -3842,8 +4270,11 @@ aria-label="Photo grid status" style="--grid-columns:{grid_columns}">{grid_cells
 <div class=grid-status-legend aria-label="Grid status legend">
 <span><i class="grid-status-cell verified"></i> Verified</span>
 <span><i class="grid-status-cell active"></i> Current or retrying</span>
+<span><i class="grid-status-cell missing"></i> No photo</span>
+<span><i class="grid-status-cell verified flagged"></i> Blurred, washed out or obstructed</span>
 <span><i class="grid-status-cell unattempted"></i> Not attempted</span></div>
 <p id=grid-status-count class=muted>{grid_status["verified"]} of {grid_status["total"]} photos verified</p>
+<p id=grid-status-analysis>{grid_analysis_summary}</p>
 <p id=grid-status-message>{escape(str(grid_status["message"]))}</p></section>
 <section class=card><h2>Analysis</h2><p><span id=queue-count>{len(jobs.queued_image_ids)}</span> queued</p>
 <div class=button-row><form method=post action="analyse"><button>Analyse queue</button></form>
@@ -3868,9 +4299,14 @@ aria-label="Photo grid status" style="--grid-columns:{grid_columns}">{grid_cells
 </div>
 <p><b>Calibration warnings</b></p><ul>{warning_html}</ul>
 <p><b>Skip reasons</b></p><ul>{skip_html}</ul></section>
-<section class=card><h2>Measurements</h2><table><thead><tr><th>Crop</th><th>Coordinates (x, y)</th><th>Current</th><th>Max leaf</th><th>Recommended</th><th>Confidence</th><th>Decision</th><th>Reason</th><th>Actions</th></tr></thead><tbody>{measurement_rows or "<tr><td colspan=9>No measurements yet</td></tr>"}</tbody></table></section>
+<section class=card><div class=section-heading><h2>Measurements</h2><div class=header-actions>
+<form method=post action="analysis/clear-measurements" onsubmit="return confirm('Clear all pending measurements?');"><button type=submit class=clear-button>Clear all measurements</button></form>
+<form method=post action="analysis/clear-recommendations" onsubmit="return confirm('Clear all pending recommendations?');"><button type=submit class=clear-button>Clear all recommendations</button></form>
+</div></div><table><thead><tr><th>Crop</th><th>Coordinates (x, y)</th><th>Current</th><th>Max leaf</th><th>Recommended</th><th>Confidence</th><th>Decision</th><th>Reason</th><th>Actions</th></tr></thead><tbody>{measurement_rows or "<tr><td colspan=9>No measurements yet</td></tr>"}</tbody></table></section>
 <section class=card><h2>Removed / missing plants</h2><table><thead><tr><th>Crop</th><th>Recorded center (X, Y mm)</th><th>Move center to (X, Y mm)</th><th>Absent looks</th><th>Confidence</th><th>Reason</th><th>Diagnostic</th><th>Review</th></tr></thead><tbody>{removal_rows or "<tr><td colspan=8>No confirmed missing plants</td></tr>"}</tbody></table></section>
-<section class=card><h2>Detected weeds</h2><p class=muted>Unowned vegetation outside known plant protection areas.</p>
+<section class=card><div class=section-heading><h2>Weeds</h2><div class=header-actions>
+<form method=post action="analysis/clear-weeds" onsubmit="return confirm('Clear all pending weed recommendations?');"><button type=submit class=clear-button>Clear all weeds</button></form>
+</div></div><p class=muted>Unowned vegetation outside known plant protection areas.</p>
 <table><thead><tr><th>Image</th><th>Coordinates</th><th>Area mm²</th><th>Looks</th>
 <th>Heuristic</th><th>Verifier</th><th>View</th></tr></thead>
 <tbody>{weed_rows or "<tr><td colspan=7>No weed recommendations</td></tr>"}</tbody></table></section>
@@ -3949,19 +4385,79 @@ open and moves on to the next weed.</small></p>
 <div id=photo-grid-modal class=overlay-modal hidden role=dialog aria-modal=true aria-label="Most recent photo grid">
 <figure class=photo-grid-dialog><button id=photo-grid-close class=modal-close type=button aria-label=Close>&times;</button>
 <h2>Most recent photo grid</h2>
+<div class=button-row aria-label="Photo grid zoom controls">
+<button type=button id=photo-grid-zoom-out aria-label="Zoom out">−</button>
+<button type=button id=photo-grid-zoom-in aria-label="Zoom in">+</button>
+<button type=button id=photo-grid-zoom-reset>Reset zoom</button>
+<span id=photo-grid-zoom-value class=muted>100%</span></div>
+<div id=photo-grid-viewport class=photo-grid-viewport>
 <canvas id=photo-grid-canvas width=900 height=420 aria-label="Birds-eye photo grid"></canvas>
+</div>
 <p id=photo-grid-status class=muted>Loading the verified grid…</p>
 <p class=muted><small>The canvas uses the same calibrated garden-coordinate transform as
 analysis. Green circles are FarmBot plants, red circles show each FarmBot weed's radius,
 and the dark labels identify the points.</small></p>
 </figure></div><script>{_DASHBOARD_JS}</script>"""  # noqa: S608 - HTML template
+    overview_html = f"""<div class=dashboard-overview>
+<section class="card info-card" aria-labelledby=info-heading>
+<h2 id=info-heading>Info</h2>
+<div class=info-grid>
+<div class=info-item><span class=muted>FarmBot status</span><strong>{escape(farmbot_status)}</strong></div>
+<div class=info-item><span class=muted>Analysis resolution</span><strong>{escape(resolution.label)}</strong><span class=muted>{resolution.pixel_count:,} px</span></div>
+<div class=info-item><span class=muted>Timing</span><strong>{escape(timing)}</strong></div>
+<div class=info-item><span class=muted>Mode</span><strong>{escape(settings.mode.value)}</strong></div>
+<div class=info-item><span class=muted>FarmBot ID</span><strong>{escape(settings.selected_config_entry_id or "Not selected")}</strong></div>
+</div></section>
+<section class="card analysis-card" aria-labelledby=photo-analysis-heading>
+<h2 id=photo-analysis-heading>Photo analysis</h2>
+<div class=analysis-layout>
+<div class=analysis-grid-panel>
+<div class=grid-status-heading><h3 id=grid-status-heading>Grid status</h3>
+<strong id=grid-status-percentage>{grid_status["percentage"]}%</strong></div>
+<div id=grid-status-cells class=grid-status-cells role=grid
+aria-label="Photo grid status" style="--grid-columns:{grid_columns}">{grid_cells}</div>
+<div class=button-row>
+<form method=post action="photo-grid/start"><label class=photo-grid-quality-option><input type=checkbox name=quality_repair_enabled value=true{photo_grid_quality_checked}> Retry photos with washed-out, blurry or close-leaf views</label><button{photo_grid_start_disabled}>Start photo grid</button></form>
+<button id=photo-grid-open type=button{photo_grid_view_disabled}>View most recent grid</button>
+</div>
+<small class=action-message>{photo_grid_message}</small>
+</div>
+<div class=analysis-grid-details>
+<h3>Grid details</h3>
+<div class=grid-status-legend aria-label="Grid status legend">
+<span><i class="grid-status-cell verified"></i> Verified</span>
+<span><i class="grid-status-cell active"></i> Current or retrying</span>
+<span><i class="grid-status-cell missing"></i> No photo</span>
+<span><i class="grid-status-cell verified flagged"></i> Blurred, washed out or obstructed</span>
+<span><i class="grid-status-cell unattempted"></i> Not attempted</span></div>
+<p id=grid-status-count class=muted>{grid_status["verified"]} of {grid_status["total"]} photos verified</p>
+<p id=grid-status-analysis>{grid_analysis_summary}</p>
+<p id=grid-status-message>{escape(str(grid_status["message"]))}</p>
+</div>
+<div class=analysis-actions>
+<h3>Analysis</h3>
+<div class=analysis-pipeline aria-live=polite>
+<p><strong>{escape(pipeline_summary)}</strong></p>
+<p class=muted>{escape(current_progress)}</p>
+<p class=muted>{escape(pipeline_detail)}</p>
+<p class=muted>{escape(last_pipeline)}</p>
+</div>
+<p class=muted><span id=queue-count>{manual_queue_count}</span> images in the manual queue.</p>
+<div class=button-row><form method=post action="analyse"><button>Analyse queue</button></form>
+<button id=queue-open type=button>Add to queue</button></div>
+</div>
+</div></section></div>"""
+    last_job_marker = "<section class=card><h2>Last job</h2>"
+    body = overview_html + body[body.index(last_job_marker) :]
     return layout(request, body)
 
 
 @app.post("/photo-grid/start")
-async def run_calibrated_photo_grid() -> RedirectResponse:
+async def run_calibrated_photo_grid(
+    quality_repair_enabled: bool = Form(False),
+) -> RedirectResponse:
     try:
-        record = await start_calibrated_photo_grid()
+        record = await start_calibrated_photo_grid(quality_repair_enabled)
         message = record.message
     except (HomeAssistantError, ValueError) as exc:
         message = f"Could not start photo grid: {exc}"
@@ -3998,8 +4494,18 @@ async def latest_calibrated_photo_grid() -> JSONResponse:
         ]
     except HomeAssistantError:
         # The verified mosaic remains viewable while FarmBot is temporarily
-        # offline; live plant/weed markers are supplementary.
-        pass
+        # offline. Use the inventory snapshotted with the grid so its map
+        # markers do not disappear with the connection.
+        plants = [
+            point.model_dump(mode="json")
+            for point in record.known_points
+            if point.kind == "plant"
+        ]
+        weeds = [
+            point.model_dump(mode="json")
+            for point in record.known_points
+            if point.kind == "weed"
+        ]
     return JSONResponse({"grid": record.model_dump(mode="json"), "plants": plants, "weeds": weeds})
 
 

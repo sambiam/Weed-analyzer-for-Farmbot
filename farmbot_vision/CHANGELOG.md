@@ -1,5 +1,62 @@
 # Changelog
 
+## 3.12.2 - 2026-07-31
+
+- Fixed the most-recent photo grid losing all plant and weed circles whenever
+  Home Assistant's live inventory was temporarily unavailable. The grid now
+  falls back to the map points snapshotted when capture began, including each
+  weed's stored radius and centre dot.
+- The missing live weed inventory was traced to the companion integration;
+  FarmBot integration 2.5.1 now supplies those Weed map points to both the
+  calibration and most-recent grid APIs.
+
+## 3.12.1 - 2026-07-31
+
+- Removed the "Health JSON" link from the app's navigation bar. The
+  `/api/health` and `/health` endpoints still work as before; this only
+  removes the visible tab.
+
+## 3.12.0 - 2026-07-31
+
+- The photo grid now assesses each photo **while the grid is still running**,
+  in the time the bot spends driving to the next coordinate, rather than only
+  after the whole route finishes. The blur / washed-out / close-leaf check is
+  the same single inspection the post-grid pass always did — it has simply
+  moved earlier, and its result is cached and reused, so no image is fetched or
+  decoded twice. The OpenCV work runs on a worker thread so it can never delay
+  a capture, and any frame the scout cannot reach mid-run falls back to the
+  post-grid pass unchanged.
+- While it is there, the scout reports two further signals at no extra cost:
+  **possible weeds** (vegetation components the quality check had already found,
+  mapped into garden coordinates and filtered against the plants FarmBot knows
+  about) and **fully framed plants** (pure calibration geometry — which cells
+  can measure a whole plant on their own). Confirmed weed detection and plant
+  radius measurement are untouched and still run in the post-grid analysis
+  pipeline, because a plant spanning several cells needs the composite.
+- Grid status now distinguishes a cell with **no photo** (solid red) from a cell
+  whose photo has a **quality problem** (green interior, red border). A flagged
+  cell turns blue inside while it is being retried but keeps its red border
+  until a repair actually completes. The card also summarises how many photos
+  were checked during capture, how many need a retake, and how many possible
+  weeds and fully framed plants were seen; each cell's tooltip gives its own
+  detail.
+
+## 3.11.0 - 2026-07-31
+
+- Consolidated the Analysis page overview into full-width Info and Photo
+  analysis cards, with clearer FarmBot, resolution, timing, grid and queue
+  status details. Moved review-queue clear actions beside their table headers.
+
+## 3.10.1 - 2026-07-31
+
+- Fixed settings-page labels rendering one row out of alignment with their
+  inputs (e.g. calibration page). `<label>` elements had no explicit
+  `display`, so the browser's default inline flow let each label's caption
+  and following `<input>` bleed onto the same visual line as the previous
+  field, shifting every caption up by one row. Labels are now `display:block`
+  site-wide, which fixes this across every settings form, not just
+  calibration.
+
 ## 3.10.0 - 2026-07-30
 
 - Fixed weed candidate generation starving the learned verifier. Weeds plainly
