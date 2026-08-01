@@ -97,6 +97,44 @@ async def test_inventory_accepts_flat_image_coordinates():
 
 
 @pytest.mark.asyncio
+async def test_inventory_accepts_null_weed_radius():
+    """FarmBot may return an explicit null for a weed's optional radius."""
+
+    async def handler(_request):
+        return httpx.Response(
+            200,
+            json={
+                "changed_states": [],
+                "service_response": {
+                    "device_id": "device_28660",
+                    "generated_at": "2026-08-01T00:00:00+00:00",
+                    "plants": [],
+                    "images": [],
+                    "curves": [],
+                    "camera_calibration": {"available": False},
+                    "weeds": [
+                        {
+                            "id": 94,
+                            "name": None,
+                            "x": 2600,
+                            "y": 230,
+                            "z": 0,
+                            "radius": None,
+                        }
+                    ],
+                },
+            },
+        )
+
+    client = HomeAssistantClient(token="test", base_url="http://test")
+    await client._http.aclose()
+    client._http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    inventory = await client.inventory(InventoryRequest(config_entry_id="entry"))
+    assert inventory.weeds[0].radius == 0
+    await client.close()
+
+
+@pytest.mark.asyncio
 async def test_grid_repair_400_surfaces_the_integration_response():
     """A 400 from ``start_vision_grid_repair`` must not be guessed as an
     outdated integration -- ``web._require_grid_repair_capability`` already

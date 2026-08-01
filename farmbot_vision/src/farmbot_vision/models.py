@@ -74,6 +74,10 @@ class WeedPoint(StrictModel):
     ``name`` is optional because FarmBot weeds are often unnamed. The list
     defaults to empty on :class:`Inventory`, so a companion integration that
     does not yet emit ``weeds`` still validates.
+
+    Some FarmBot API records explicitly return ``null`` for a weed radius.
+    That has the same meaning for this app as an omitted radius: the point has
+    no usable exclusion radius, so retain the existing zero-radius default.
     """
 
     id: int
@@ -82,6 +86,11 @@ class WeedPoint(StrictModel):
     y: float
     z: float = 0
     radius: float = Field(default=0, ge=0)
+
+    @field_validator("radius", mode="before")
+    @classmethod
+    def _normalize_null_radius(cls, value: object) -> object:
+        return 0 if value is None else value
 
 
 class ImageMeta(StrictModel):

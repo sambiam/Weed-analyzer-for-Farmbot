@@ -1,8 +1,8 @@
-﻿# FarmBot Vision 3.15.0
+﻿# FarmBot Vision 3.15.1
 
 Lightweight, experimental canopy measurement and safe FarmBot plant-radius recommendations. Open the app through Home Assistant Ingress after installation.
 
-Set **Analysis resolution** (`640x480`, `960x720` default, or `1280x960`) in the app options; 960Ã—720 is recommended for a 4 GB Raspberry Pi 4. Changing it requires an app restart.
+Set **Analysis resolution** (`640x480`, `960x720` default, or `1280x960`) in the app options; 960x720 is recommended for a 4 GB Raspberry Pi 4. Changing it requires an app restart.
 
 The companion FarmBot integration must implement the service and event contract (`farmbot-vision-v2`) documented at repository level; the minimum compatible companion integration version is **2.2.0**. No FarmBot credential is accepted or stored by this app.
 
@@ -21,7 +21,7 @@ The **Weed settings** page controls each stage independently:
 The Analysis page stores reviews as local training labels. Accepting a weed supplies a positive
 example; **Crop**, **Reject as mulch/soil**, **Fungus/moss**, and **Hardware/other** supply hard
 negative examples. Candidate crops, extracted visual features, labels and the trained JSON model
-stay under the app's `/data` directory. Training runs locally from **Weed settings â†’ Train verifier
+stay under the app's `/data` directory. Training runs locally from **Weed settings -> Train verifier
 now** and can optionally run after every new label once the configured minimum number of positive
 and negative examples has been reached.
 

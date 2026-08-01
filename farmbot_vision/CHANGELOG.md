@@ -1,5 +1,10 @@
 # Changelog
 
+## 3.15.1 - 2026-08-01
+
+- Fixed photo-grid startup when FarmBot returns an explicit `null` radius for
+  a weed point. These points now use the existing zero-radius fallback.
+
 ## 3.15.0 - 2026-08-01
 
 - Made weed discovery recall-first before verification: the candidate mask now
