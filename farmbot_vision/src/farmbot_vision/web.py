@@ -2882,6 +2882,151 @@ _DASHBOARD_JS = r"""
     const useOverlay=withOverlay&&plantComposite.overlay;
     modalImg.src=useOverlay?plantComposite.overlay:plantComposite.clean;
   }
+  const measurementModal=document.getElementById('measurement-modal');
+  const measurementImg=document.getElementById('measurement-modal-img');
+  const measurementCrop=document.getElementById('measurement-modal-crop');
+  const measurementRecommendation=document.getElementById('measurement-modal-recommendation');
+  const measurementCenter=document.getElementById('measurement-modal-center');
+  const measurementConfidence=document.getElementById('measurement-modal-confidence');
+  const measurementMessage=document.getElementById('measurement-modal-message');
+  const measurementApprove=document.getElementById('measurement-modal-approve');
+  const measurementReject=document.getElementById('measurement-modal-reject');
+  const measurementPrevious=document.getElementById('measurement-modal-prev');
+  const measurementNext=document.getElementById('measurement-modal-next');
+  const measurementCounter=document.getElementById('measurement-modal-counter');
+  const measurementStandard=document.getElementById('measurement-modal-standard');
+  const measurementDiagnostic=document.getElementById('measurement-modal-diagnostic');
+  let measurementData=null, measurementReturnFocus=null, measurementViewers=[];
+  let measurementIndex=0, measurementViewMode='standard';
+  function parseMeasurementViewer(viewer){
+    try{return JSON.parse(viewer.dataset.measurement||'null');}catch(_){return null;}
+  }
+  function refreshMeasurementNavigation(){
+    measurementViewers=[...document.querySelectorAll('.measurement-view')];
+  }
+  function updateMeasurementNavigation(){
+    measurementCounter.textContent=measurementViewers.length
+      ?(measurementIndex+1)+' / '+measurementViewers.length:'0 / 0';
+    measurementPrevious.disabled=measurementIndex<=0;
+    measurementNext.disabled=measurementIndex<0||measurementIndex>=measurementViewers.length-1;
+  }
+  function setMeasurementMessage(text,isError){
+    measurementMessage.textContent=text||'';
+    measurementMessage.classList.toggle('notice',Boolean(text)&&!isError);
+  }
+  function formatMillimetres(value){return Number(value).toFixed(1)+' mm';}
+  function showMeasurementImage(){
+    if(!measurementData) return;
+    const fallback=(measurementData.artifacts||[])[0]||'';
+    const image=measurementViewMode==='diagnostic'&&measurementData.overlay
+      ?measurementData.overlay
+      :(measurementData.clean||measurementData.overlay||fallback);
+    if(image) measurementImg.src=image; else measurementImg.removeAttribute('src');
+    measurementStandard.setAttribute('aria-pressed',String(measurementViewMode==='standard'));
+    measurementDiagnostic.setAttribute('aria-pressed',String(measurementViewMode==='diagnostic'));
+    measurementDiagnostic.disabled=!measurementData.overlay;
+  }
+  function showMeasurementDetails(data){
+    measurementCrop.textContent=data.crop;
+    const current=Number(data.currentRadius)||0;
+    const recommended=Number(data.recommendedRadius)||0;
+    const direction=recommended>current?'Increase':recommended<current?'Decrease':'Keep';
+    measurementRecommendation.textContent=direction+' from '+formatMillimetres(current)
+      +' to '+formatMillimetres(recommended);
+    measurementCenter.textContent=data.centerX==null||data.centerY==null
+      ?'Unavailable':'('+Number(data.centerX).toFixed(1)+', '+Number(data.centerY).toFixed(1)+')';
+    measurementConfidence.textContent=(Number(data.confidence)||0).toFixed(2);
+    measurementApprove.textContent=data.approveLabel||'Approve';
+    measurementApprove.disabled=!data.calibrated;
+    measurementApprove.title=data.calibrated?'':'Calibration is required before a radius can be approved';
+    measurementReject.disabled=false;
+    showMeasurementImage();
+    updateMeasurementNavigation();
+  }
+  function openMeasurementModal(data,trigger,keepFocus){
+    measurementData=data;
+    if(!keepFocus) measurementReturnFocus=trigger;
+    refreshMeasurementNavigation();
+    measurementIndex=Math.max(0,measurementViewers.findIndex(function(viewer){
+      const viewerData=parseMeasurementViewer(viewer);
+      return viewerData&&String(viewerData.measurementId)===String(data.measurementId);
+    }));
+    setMeasurementMessage('',true);
+    showMeasurementDetails(data);
+    const wasHidden=measurementModal.hidden;
+    measurementModal.hidden=false;
+    if(wasHidden) measurementModal.querySelector('.modal-close').focus();
+  }
+  function closeMeasurementModal(){
+    measurementModal.hidden=true; measurementImg.removeAttribute('src'); measurementData=null;
+    if(measurementReturnFocus) measurementReturnFocus.focus();
+  }
+  function showMeasurementEmptyState(){
+    measurementData=null; measurementImg.removeAttribute('src');
+    measurementCrop.textContent='No pending measurements';
+    measurementRecommendation.textContent='All measurements have been reviewed.';
+    measurementCenter.textContent='—'; measurementConfidence.textContent='—';
+    [measurementPrevious,measurementNext,measurementApprove,measurementReject,
+      measurementStandard,measurementDiagnostic].forEach(function(button){button.disabled=true;});
+    measurementCounter.textContent='0 / 0';
+    setMeasurementMessage('Nothing left to review. Close this dialog when you are ready.',false);
+    measurementModal.querySelector('.modal-close').focus();
+  }
+  function advanceAfterMeasurementReview(){
+    const previousIndex=measurementIndex;
+    refreshMeasurementNavigation();
+    if(!measurementViewers.length){showMeasurementEmptyState();return;}
+    const target=measurementViewers[Math.min(previousIndex,measurementViewers.length-1)];
+    const data=parseMeasurementViewer(target);
+    if(data) openMeasurementModal(data,measurementReturnFocus,true);
+    else showMeasurementEmptyState();
+  }
+  async function postMeasurementAction(id,action){
+    try{
+      const response=await fetch('recommendations/'+id+'/'+action,
+        {method:'POST',headers:{Accept:'application/json'}});
+      const result=await response.json().catch(function(){return {};});
+      const ok=response.ok&&(result.status==='applied'||result.status==='rejected');
+      if(ok){const row=document.getElementById('measurement-'+id);if(row) row.remove();}
+      return {ok:ok,result:result};
+    }catch(error){return {ok:false,result:{message:'Request failed: '+error.message}};}
+  }
+  async function reviewCurrentMeasurement(button,action,failureMessage){
+    if(!measurementData) return;
+    measurementApprove.disabled=true; measurementReject.disabled=true;
+    const result=await postMeasurementAction(measurementData.measurementId,action);
+    if(result.ok) advanceAfterMeasurementReview();
+    else{
+      showMeasurementDetails(measurementData);
+      setMeasurementMessage(result.result.message||failureMessage,true);
+    }
+  }
+  measurementStandard.addEventListener('click',function(){
+    measurementViewMode='standard';showMeasurementImage();
+  });
+  measurementDiagnostic.addEventListener('click',function(){
+    measurementViewMode='diagnostic';showMeasurementImage();
+  });
+  measurementPrevious.addEventListener('click',function(){
+    const target=measurementViewers[measurementIndex-1];
+    const data=target&&parseMeasurementViewer(target);
+    if(data) openMeasurementModal(data,measurementReturnFocus,true);
+  });
+  measurementNext.addEventListener('click',function(){
+    const target=measurementViewers[measurementIndex+1];
+    const data=target&&parseMeasurementViewer(target);
+    if(data) openMeasurementModal(data,measurementReturnFocus,true);
+  });
+  measurementApprove.addEventListener('click',function(){
+    reviewCurrentMeasurement(measurementApprove,'approve','Could not approve measurement');
+  });
+  measurementReject.addEventListener('click',function(){
+    reviewCurrentMeasurement(measurementReject,'reject','Could not reject measurement');
+  });
+  document.getElementById('measurement-modal-close').addEventListener('click',closeMeasurementModal);
+  measurementModal.addEventListener('click',function(event){
+    if(event.target===measurementModal) closeMeasurementModal();
+  });
   const weedModal=document.getElementById('weed-modal');
   const weedImg=document.getElementById('weed-modal-img');
   const weedMarker=document.getElementById('weed-modal-marker');
@@ -3178,6 +3323,12 @@ _DASHBOARD_JS = r"""
   plantPhotoTab.addEventListener('click',function(){showPlantPhotoTab(true);});
   plantDiagnosticTab.addEventListener('click',function(){showPlantPhotoTab(false);});
   document.addEventListener('click',async function(event){
+    const measurementViewer=event.target.closest('.measurement-view');
+    if(measurementViewer){
+      const data=parseMeasurementViewer(measurementViewer);
+      if(data) openMeasurementModal(data,measurementViewer);
+      return;
+    }
     const weedViewer=event.target.closest('.weed-view');
     if(weedViewer){
       const data=parseWeedViewer(weedViewer);
@@ -3194,7 +3345,7 @@ _DASHBOARD_JS = r"""
           overlay:plantViewer.dataset.compositeOverlay||null
         };
         artifactControls.hidden=true;
-        overlayLegend.textContent='White cross = selected plant center; cyan = current radius; red = proposed radius. Diagnostic mode only adds this plant\'s accepted mask.';
+        overlayLegend.textContent='';
         if(plantComposite.clean) showPlantComposite(false); else modalImg.removeAttribute('src');
       } else {
         try{artifacts=JSON.parse(artifactViewer.dataset.artifacts||'[]');}catch(_){artifacts=[];}
@@ -3263,6 +3414,7 @@ _DASHBOARD_JS = r"""
   });
   document.addEventListener('keydown',function(event){
     if(event.key!=='Escape') return;
+    if(!measurementModal.hidden) closeMeasurementModal();
     if(!modal.hidden) closeModal();
     if(!weedModal.hidden) closeWeedModal();
   });
@@ -3879,7 +4031,7 @@ def layout(request: Request, body: str, title: str = "FarmBot Vision") -> HTMLRe
         f"""<!doctype html><html lang=en><head><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1"><base href="{base}">
 <title>{escape(title)}</title><style>
-:root{{--green:#52b788;--dark:#17221b;--muted:#74817a}}*{{box-sizing:border-box}}
+:root{{--green:#166534;--green-hover:#14532d;--dark:#17221b;--muted:#53665a;--focus:#0b5cad}}*{{box-sizing:border-box}}
 body{{font:15px system-ui;margin:0;background:#f3f7f4;color:var(--dark)}}header{{background:#173f2c;color:white;padding:1rem 4vw}}
 main{{max-width:1100px;margin:auto;padding:1.2rem}}nav a{{color:white;margin-right:1rem}}.grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:1rem}}
 .calibration-grid{{grid-template-columns:minmax(240px,320px) minmax(0,1fr)}}@media(max-width:760px){{.calibration-grid{{grid-template-columns:1fr}}}}
@@ -3903,7 +4055,7 @@ main{{max-width:1100px;margin:auto;padding:1.2rem}}nav a{{color:white;margin-rig
 @media(max-width:900px){{.info-grid{{grid-template-columns:repeat(3,minmax(0,1fr))}}.analysis-layout{{grid-template-columns:minmax(250px,1.2fr) minmax(170px,.8fr)}}.analysis-actions{{grid-column:1/-1;border-left:0;border-top:1px solid #dbe5de;padding:1rem 0 0}}}}
 @media(max-width:600px){{.info-grid{{grid-template-columns:repeat(2,minmax(0,1fr))}}.analysis-layout{{display:block}}.analysis-grid-details,.analysis-actions{{border-left:0;border-top:1px solid #dbe5de;padding:1rem 0 0;margin-top:1rem}}}}
 .card{{background:white;border-radius:10px;padding:1rem;box-shadow:0 1px 4px #0002;overflow:auto}}table{{width:100%;border-collapse:collapse}}td,th{{padding:.5rem;text-align:left;border-bottom:1px solid #ddd}}
-button{{background:var(--green);border:0;border-radius:6px;padding:.65rem 1rem;cursor:pointer}}.warn{{color:#9b4b00}}.muted{{color:var(--muted)}}input,select{{padding:.5rem;max-width:100%}}img{{max-width:100%}}
+button{{background:var(--green);color:#fff;border:0;border-radius:6px;padding:.65rem 1rem;cursor:pointer;font-weight:600}}button:hover{{background:var(--green-hover)}}button:focus-visible{{outline:3px solid var(--focus);outline-offset:2px}}button:disabled{{background:#cbd5cf;color:#53665a;cursor:not-allowed}}.warn{{color:#9b4b00}}.muted{{color:var(--muted)}}input,select{{padding:.5rem;max-width:100%}}img{{max-width:100%}}
 label{{display:block;margin-bottom:.6rem}}
 .photo-grid-quality-options{{margin:0 0 .8rem;padding:.55rem .7rem;border:1px solid #dbe5de;border-radius:6px}}
 .photo-grid-quality-options legend{{padding:0 .25rem;font-size:.85rem;color:var(--muted)}}
@@ -3949,16 +4101,21 @@ width:100%;height:auto;max-width:none}}
 button.clear-button{{background:#a40000;color:white}}
 .training-crop{{width:96px;height:96px;object-fit:contain;background:#181d19;border-radius:6px}}
 .weed-dialog{{width:min(95vw,900px)}}.weed-navigation{{justify-content:space-between}}
+.measurement-dialog{{width:min(95vw,720px)}}.measurement-navigation{{justify-content:space-between}}
+.measurement-details-table{{margin-top:.8rem;border:1px solid #d5ded8;border-radius:6px;overflow:hidden}}
+.measurement-details-table th,.measurement-details-table td{{padding:.45rem .65rem}}
+.measurement-details-table th{{width:34%;background:#f0f5f1;color:#243b2d}}
+.measurement-actions{{justify-content:flex-end;margin-top:.8rem}}
+.measurement-actions .reject-button{{background:#a61b1b}}.measurement-actions .reject-button:hover{{background:#841616}}
 .weed-actions fieldset{{border:1px solid #d5ded8;border-radius:6px;margin-top:.7rem}}
 .weed-image-wrap{{position:relative;display:inline-block;margin:auto}}
 .weed-image-wrap.closeup{{overflow:hidden;background:#111}}
 .weed-image-wrap.closeup img{{transform-origin:0 0;image-rendering:auto}}
 .weed-zoom[hidden]{{display:none}}.weed-zoom input[type=range]{{flex:1;max-width:16rem}}
-button.unknown-button{{background:#e4ede7;color:var(--dark);box-shadow:inset 0 0 0 1px #b6c6bb}}
+button.unknown-button{{background:#475569;color:#fff;box-shadow:inset 0 0 0 1px #334155}}
 .weed-marker{{position:absolute;width:34px;height:34px;margin-left:-17px;margin-top:-17px;pointer-events:none;
 border-radius:50%;border:3px solid #168cff;box-shadow:0 0 0 1px #001b3d}}
-.weed-view-toggle button[aria-pressed=true]{{background:#1672c4;color:white;box-shadow:inset 0 0 0 2px #0b4779}}
-.plant-view-toggle button[aria-pressed=true]{{background:#1672c4;color:white;box-shadow:inset 0 0 0 2px #0b4779}}
+.weed-view-toggle button[aria-pressed=true],.plant-view-toggle button[aria-pressed=true],.measurement-view-toggle button[aria-pressed=true]{{background:#0f4c81;color:white;box-shadow:inset 0 0 0 2px #082f52}}
 @media (max-width:600px){{.overlay-modal{{padding:.35rem;align-items:flex-start}}.overlay-modal figure{{width:99vw;max-width:99vw;padding:.55rem;margin-top:.35rem}}.overlay-modal img{{max-height:68vh}}.modal-controls{{flex-wrap:wrap}}}}
 td.actions{{min-width:9rem}}.actions-group{{display:flex;flex-direction:column;align-items:stretch;gap:.4rem}}
 .actions-group form{{margin:0}}.actions-group button{{width:100%;padding:.45rem .8rem;font-size:.9rem}}
@@ -4100,7 +4257,7 @@ async def health() -> JSONResponse:
 async def dashboard(request: Request) -> HTMLResponse:
     photo_grid_record = photo_grid_store.load()
     grid_status = _photo_grid_status(photo_grid_record)
-    rows = database.pending_measurements()
+    rows = database.pending_measurements(minimum_confidence=settings.minimum_review_confidence)
     crop_slugs = sorted({row["crop_slug"] for row in rows})
     curves = {
         slug: fit_monotonic_curve(
@@ -4236,6 +4393,83 @@ async def dashboard(request: Request) -> HTMLResponse:
             return "<span class=muted>Unavailable</span>"
         return f"({float(x):.1f}, {float(y):.1f})"
 
+    def _measurement_view_button(r: dict) -> str:
+        """Build the one control exposed by the measurements table.
+
+        Measurement review belongs in the modal so the table stays scannable.
+        Keep the image manifest on the button because the consolidated row can
+        represent either a stitched plant view or a set of individual frames.
+        """
+        clean_url = None
+        overlay_url = None
+        if r.get("composite_path"):
+            clean_url = f"artifact/{Path(r['composite_path']).name}"
+            if r.get("composite_overlay_path"):
+                overlay_url = f"artifact/{Path(r['composite_overlay_path']).name}"
+
+        artifact_urls: list[str] = []
+        if not clean_url and r.get("source_image_path"):
+            fallback_paths = [r["source_image_path"]]
+            fallback_paths.extend(r.get("artifact_paths") or [])
+            for raw_path in fallback_paths:
+                if not raw_path:
+                    continue
+                name = Path(str(raw_path)).name
+                url = f"artifact/{name}"
+                if name and "mask" not in name.lower() and url not in artifact_urls:
+                    artifact_urls.append(url)
+
+        plant_attrs = ""
+        if (
+            r.get("plant_id") is not None
+            and r.get("recorded_center_x") is not None
+            and r.get("recorded_center_y") is not None
+        ):
+            plant_entry_id = r.get("config_entry_id") or settings.selected_config_entry_id
+            unlinked = sorted(database.unlinked_image_ids(plant_entry_id, int(r["plant_id"])))
+            unlinked_json = escape(json.dumps(unlinked, separators=(",", ":")), quote=True)
+            plant_attrs = (
+                f' data-plant-id="{int(r["plant_id"])}" '
+                f'data-plant-x="{float(r["recorded_center_x"])}" '
+                f'data-plant-y="{float(r["recorded_center_y"])}" '
+                f'data-plant-radius="{float(r.get("current_radius_mm") or 0)}" '
+                f'data-unlinked-images="{unlinked_json}"'
+            )
+
+        if r["recommended_protection_radius_mm"] > r["current_radius_mm"]:
+            approve_label = "Approve — Apply radius"
+        elif r["recommended_protection_radius_mm"] < r["current_radius_mm"]:
+            approve_label = "Approve — Use smaller radius"
+        else:
+            approve_label = "Approve — Keep current radius"
+
+        data = {
+            "measurementId": str(r["measurement_id"]),
+            "crop": str(r.get("crop_slug") or "Unknown crop"),
+            "currentRadius": float(r.get("current_radius_mm") or 0),
+            "recommendedRadius": float(r.get("recommended_protection_radius_mm") or 0),
+            "confidence": float(r.get("confidence") or 0),
+            "centerX": r.get("recorded_center_x"),
+            "centerY": r.get("recorded_center_y"),
+            "calibrated": bool(r.get("calibrated", 1)),
+            "approveLabel": approve_label,
+            "clean": clean_url,
+            "overlay": overlay_url,
+            "artifacts": artifact_urls,
+        }
+        data_json = escape(json.dumps(data, separators=(",", ":")), quote=True)
+        legacy_image_attrs = ""
+        if clean_url:
+            legacy_image_attrs = f' data-composite-clean="{clean_url}"'
+            if overlay_url:
+                legacy_image_attrs += f' data-composite-overlay="{overlay_url}"'
+        else:
+            legacy_image_attrs = ' data-artifacts="[]"'
+        return (
+            f'<button type=button class=measurement-view data-measurement="{data_json}"'
+            f"{legacy_image_attrs}{plant_attrs}>View</button>"
+        )
+
     def _review_controls(r: dict) -> str:
         # Approval is impossible without a valid calibration (Part 6, Part 10).
         if not r.get("calibrated", 1):
@@ -4274,7 +4508,7 @@ async def dashboard(request: Request) -> HTMLResponse:
         f"<td>{r['maximum_accepted_canopy_radius_mm']:.1f}</td><td>{r['recommended_protection_radius_mm']:.1f}</td>"
         f"<td>{r['confidence']:.2f}</td>"
         f"<td>{escape(r['decision'])}</td><td>{escape(r['reason'])}</td>"
-        f"<td class=actions><div class=actions-group>{_artifact_button(r)}{_review_controls(r)}</div></td></tr>"
+        f"<td class=actions>{_measurement_view_button(r)}</td></tr>"
         for r in rows
         if not r.get("vegetation_absent")
     )
@@ -4650,6 +4884,30 @@ aria-label="Photo grid status" style="--grid-columns:{grid_columns}">{grid_cells
 <th>Original radius</th><th>Current radius</th><th>Decision method</th><th>Confidence</th></tr></thead>
 <tbody>{change_rows or "<tr><td colspan=8>No changes yet</td></tr>"}</tbody></table></section>
 <section class=card><h2>Safety warning</h2><p class=warn>Early experimental vision results must not be the sole basis for destructive automatic weeding.</p></section>
+<div id=measurement-modal class=overlay-modal hidden role=dialog aria-modal=true aria-label="Measurement review"><figure class=measurement-dialog>
+<button id=measurement-modal-close class=modal-close type=button aria-label=Close>&times;</button>
+<div class="modal-controls measurement-view-toggle" role=group aria-label="Measurement image view">
+<button id=measurement-modal-standard type=button aria-pressed=true>Standard view</button>
+<button id=measurement-modal-diagnostic type=button aria-pressed=false>Diagnostic mask</button>
+</div>
+<img id=measurement-modal-img alt="Plant measurement review">
+<table class=measurement-details-table aria-label="Measurement details"><tbody>
+<tr><th scope=row>Crop</th><td id=measurement-modal-crop></td></tr>
+<tr><th scope=row>Recommendation</th><td id=measurement-modal-recommendation></td></tr>
+<tr><th scope=row>Plant center</th><td id=measurement-modal-center></td></tr>
+<tr><th scope=row>Confidence</th><td id=measurement-modal-confidence></td></tr>
+</tbody></table>
+<div class="modal-controls measurement-navigation" aria-label="Navigate measurements">
+<button id=measurement-modal-prev type=button>Previous</button>
+<span>Measurement <span id=measurement-modal-counter>0 / 0</span></span>
+<button id=measurement-modal-next type=button>Next</button>
+</div>
+<div class="button-row measurement-actions">
+<button id=measurement-modal-approve type=button>Approve</button>
+<button id=measurement-modal-reject type=button class=reject-button>Reject</button>
+</div>
+<small id=measurement-modal-message class=action-message></small>
+</figure></div>
 <div id=overlay-modal class=overlay-modal hidden role=dialog aria-modal=true aria-label="Analysis diagnostic"><figure>
 <button id=overlay-modal-close class=modal-close type=button aria-label=Close>&times;</button>
 <div id=plant-photo-mode class="modal-controls plant-view-toggle" role=group aria-label="View mode" hidden>
@@ -5490,12 +5748,12 @@ async def weed_settings_page(request: Request) -> HTMLResponse:
         # to transcribe it into the field above.
         threshold_html = ""
         if suggested is not None:
-            matches = abs(suggested - values.visual_verifier_minimum_confidence) < 5e-3
+            matches = abs(suggested - values.visual_verifier_acceptance_confidence) < 5e-3
             threshold_html = (
                 f"<p>Suggested verifier threshold for "
                 f"{float(model.get('target_precision', 0.95)):.0%} precision: "
                 f"<b>{suggested:.2f}</b> — currently set to "
-                f"{values.visual_verifier_minimum_confidence:.2f}."
+                f"{values.visual_verifier_acceptance_confidence:.2f}."
                 + (
                     " Already applied.</p>"
                     if matches
@@ -5542,7 +5800,7 @@ async def weed_settings_page(request: Request) -> HTMLResponse:
     # Labelling a candidate the model is already sure about teaches it nothing.
     # Rank the unlabelled backlog by how close each one sits to the operating
     # threshold and offer the most ambiguous handful first.
-    boundary = weed_verifier.suggested_threshold or values.visual_verifier_minimum_confidence
+    boundary = weed_verifier.suggested_threshold or values.visual_verifier_acceptance_confidence
     uncertain: list[tuple[float, dict, list[dict[str, object]]]] = []
     if weed_verifier.available:
         for candidate in database.unlabelled_weed_detections():
@@ -5718,10 +5976,39 @@ but cannot be created automatically. A mature dandelion rosette is roughly 60&nb
                 ),
                 minimum=10,
                 maximum=100_000,
-                slider_maximum=10_000,
+                slider_maximum=40_000,
                 step=10,
                 unit="mm²",
                 extra=size_preview,
+            ),
+            slider_field(
+                "candidate_grouping_gap_mm",
+                "Maximum gap between leaves of one weed",
+                values.candidate_grouping_gap_mm,
+                tip=(
+                    "Separate green islands closer than this are grouped as leaves of "
+                    "one weed. Raise it when one rosette appears as several leaf-only "
+                    "candidates; lower it when neighbouring weeds are merged. Grouping "
+                    "never fills the soil gap and therefore does not add it to area."
+                ),
+                minimum=1,
+                maximum=75,
+                step=1,
+                unit="mm",
+            ),
+            slider_field(
+                "candidate_maximum_span_mm",
+                "Maximum whole-weed span",
+                values.candidate_maximum_span_mm,
+                tip=(
+                    "Stops a chain of nearby green fragments crossing the bed from "
+                    "becoming one weed. Keep this at least as wide as the largest mature "
+                    "weed you want centred as a single plant."
+                ),
+                minimum=20,
+                maximum=500,
+                step=5,
+                unit="mm",
             ),
         )
     )
@@ -5836,6 +6123,86 @@ but cannot be created automatically. A mature dandelion rosette is roughly 60&nb
                 maximum=510,
                 step=1,
                 note="Negative values accept brown and grey pixels — rarely what you want.",
+            ),
+            slider_field(
+                "candidate_minimum_saturation",
+                "Candidate discovery minimum saturation",
+                values.candidate_minimum_saturation,
+                tip=(
+                    "The permissive first pass uses this lower saturation floor to find "
+                    "pale, shaded and sun-bleached leaves. It only proposes pixels for "
+                    "verification; it does not measure weed radius. Lower catches more "
+                    "of the pale weeds in difficult photos but proposes more soil."
+                ),
+                minimum=0,
+                maximum=255,
+                step=1,
+            ),
+            slider_field(
+                "candidate_minimum_excess_green",
+                "Candidate discovery minimum excess green",
+                values.candidate_minimum_excess_green,
+                tip=(
+                    "Green-channel advantage required by the permissive discovery pass. "
+                    "A low value finds muted leaves; the strict extent controls below "
+                    "still prevent those broad pixels from inflating the weed radius."
+                ),
+                minimum=-255,
+                maximum=510,
+                step=1,
+            ),
+            slider_field(
+                "candidate_hue_padding",
+                "Candidate hue padding",
+                values.candidate_hue_padding,
+                tip=(
+                    "Widens each end of the strong-green hue band for candidate discovery "
+                    "only. Raise it for yellowing or bluish shaded leaves; strict extent "
+                    "measurement continues to use the unpadded band."
+                ),
+                minimum=0,
+                maximum=60,
+                step=1,
+            ),
+            slider_field(
+                "extent_minimum_saturation",
+                "Measured weed extent minimum saturation",
+                values.extent_minimum_saturation,
+                tip=(
+                    "Only pixels at or above this stricter saturation may change measured "
+                    "weed area or radius. Raise it if pale soil is enlarging weeds; lower "
+                    "it cautiously if genuine pale leaf tips are clipped."
+                ),
+                minimum=0,
+                maximum=255,
+                step=1,
+            ),
+            slider_field(
+                "extent_minimum_excess_green",
+                "Measured weed extent minimum excess green",
+                values.extent_minimum_excess_green,
+                tip=(
+                    "The stricter green-channel advantage required for a pixel to affect "
+                    "weed size. This is the main soil-exclusion control for radius "
+                    "measurement and is intentionally higher than discovery."
+                ),
+                minimum=-255,
+                maximum=510,
+                step=1,
+            ),
+            slider_field(
+                "extent_radial_percentile",
+                "Measured weed radius percentile",
+                values.extent_radial_percentile,
+                tip=(
+                    "Radius is this percentile of strict green-pixel distances from the "
+                    "whole-weed centre, instead of the single farthest pixel. Lower is "
+                    "more resistant to soil specks; 95–98 normally retains real tips."
+                ),
+                minimum=80,
+                maximum=100,
+                step=0.5,
+                unit="%",
             ),
             slider_field(
                 "minimum_green_purity",
@@ -6125,16 +6492,27 @@ round disc">
                 ),
             ),
             slider_field(
-                "visual_verifier_minimum_confidence",
-                "Verifier confidence threshold",
-                values.visual_verifier_minimum_confidence,
+                "visual_verifier_rejection_confidence",
+                "Weed automatic rejection threshold",
+                values.visual_verifier_rejection_confidence,
                 tip=(
-                    "The score the verifier must give a candidate for it to be treated "
-                    "as a weed, once shadow mode is off. This is the setting that "
-                    "actually decides what counts as a weed. LOW (0.5) catches nearly "
-                    "everything with more false alarms; HIGH (0.95) only the clearest "
-                    "cases. The training panel below suggests a threshold measured from "
-                    "your own labels — prefer that number to guessing."
+                    "Candidates below this verifier score are discarded automatically "
+                    "and never enter the review queue. Candidates between this value "
+                    "and the acceptance threshold remain available for human review."
+                ),
+                minimum=0,
+                maximum=1,
+                step=0.01,
+            ),
+            slider_field(
+                "visual_verifier_acceptance_confidence",
+                "Weed automatic acceptance threshold",
+                values.visual_verifier_acceptance_confidence,
+                tip=(
+                    "Candidates at or above this verifier score are approved as weeds. "
+                    "They may be created automatically only when every independent "
+                    "automation, observation, crop-protection and size guard also passes. "
+                    "The training panel below suggests a value from your own labels."
                 ),
                 minimum=0,
                 maximum=1,
@@ -6154,7 +6532,7 @@ round disc">
             ),
             slider_field(
                 "boundary_crop_minimum_confidence",
-                "Boundary crop confirmation",
+                "Plant-growth automatic acceptance threshold",
                 values.boundary_crop_minimum_confidence,
                 tip=(
                     "Minimum crop-category confidence needed to confirm new foliage as "
@@ -6168,7 +6546,7 @@ round disc">
             ),
             slider_field(
                 "boundary_noncrop_minimum_confidence",
-                "Boundary non-crop rejection",
+                "Plant-growth automatic rejection threshold",
                 values.boundary_noncrop_minimum_confidence,
                 tip=(
                     "Minimum category confidence for soil, moss, hardware or another "
@@ -6277,6 +6655,34 @@ round disc">
                 minimum=0,
                 maximum=1,
                 step=0.01,
+            ),
+            slider_field(
+                "maximum_radius_growth_mm_per_day",
+                "Maximum weed-radius growth per 24 hours",
+                values.maximum_radius_growth_mm_per_day,
+                tip=(
+                    "Absolute cap on automatic widening of a known weed over a rolling "
+                    "24-hour window. The first radius in that window is the baseline, so "
+                    "several same-day photos cannot each consume the full allowance."
+                ),
+                minimum=0,
+                maximum=250,
+                step=1,
+                unit="mm",
+            ),
+            slider_field(
+                "maximum_radius_growth_percent_per_day",
+                "Maximum weed-radius growth per 24 hours",
+                values.maximum_radius_growth_percent_per_day,
+                tip=(
+                    "Percentage cap applied with the millimetre cap above; the smaller "
+                    "allowed radius wins. This prevents a small weed from doubling when "
+                    "one permissive mask includes nearby soil."
+                ),
+                minimum=0,
+                maximum=200,
+                step=1,
+                unit="%",
             ),
             toggle_field(
                 "automatic_removal",
@@ -6443,6 +6849,8 @@ async def save_weed_settings(
     automatic_creation: bool = Form(False),
     automatic_radius_adjustment: bool = Form(False),
     radius_adjustment_confidence: float = Form(0.55),
+    maximum_radius_growth_mm_per_day: float = Form(20),
+    maximum_radius_growth_percent_per_day: float = Form(40),
     automatic_removal: bool = Form(False),
     removal_confidence: float = Form(0.6),
     removal_min_consecutive_absent: int = Form(1),
@@ -6457,6 +6865,14 @@ async def save_weed_settings(
     green_hue_max: int = Form(100),
     strong_green_minimum_saturation: int = Form(45),
     strong_green_minimum_excess_green: int = Form(20),
+    candidate_minimum_saturation: int = Form(15),
+    candidate_minimum_excess_green: int = Form(2),
+    candidate_hue_padding: int = Form(8),
+    candidate_grouping_gap_mm: float = Form(18),
+    candidate_maximum_span_mm: float = Form(240),
+    extent_minimum_saturation: int = Form(28),
+    extent_minimum_excess_green: int = Form(10),
+    extent_radial_percentile: float = Form(97),
     minimum_green_purity: float = Form(0.10),
     minimum_solidity: float = Form(0.08),
     minimum_circularity: float = Form(0.01),
@@ -6471,7 +6887,8 @@ async def save_weed_settings(
     visual_verifier_enabled: bool = Form(False),
     visual_verifier_shadow_mode: bool = Form(False),
     visual_verifier_required_for_automatic: bool = Form(False),
-    visual_verifier_minimum_confidence: float = Form(0.85),
+    visual_verifier_rejection_confidence: float = Form(0.45),
+    visual_verifier_acceptance_confidence: float = Form(0.85),
     boundary_verifier_enabled: bool = Form(False),
     boundary_crop_minimum_confidence: float = Form(0.60),
     boundary_noncrop_minimum_confidence: float = Form(0.80),
@@ -6488,6 +6905,8 @@ async def save_weed_settings(
             automatic_creation=automatic_creation,
             automatic_radius_adjustment=automatic_radius_adjustment,
             radius_adjustment_confidence=radius_adjustment_confidence,
+            maximum_radius_growth_mm_per_day=maximum_radius_growth_mm_per_day,
+            maximum_radius_growth_percent_per_day=(maximum_radius_growth_percent_per_day),
             automatic_removal=automatic_removal,
             removal_confidence=removal_confidence,
             removal_min_consecutive_absent=removal_min_consecutive_absent,
@@ -6502,6 +6921,14 @@ async def save_weed_settings(
             green_hue_max=green_hue_max,
             strong_green_minimum_saturation=strong_green_minimum_saturation,
             strong_green_minimum_excess_green=strong_green_minimum_excess_green,
+            candidate_minimum_saturation=candidate_minimum_saturation,
+            candidate_minimum_excess_green=candidate_minimum_excess_green,
+            candidate_hue_padding=candidate_hue_padding,
+            candidate_grouping_gap_mm=candidate_grouping_gap_mm,
+            candidate_maximum_span_mm=candidate_maximum_span_mm,
+            extent_minimum_saturation=extent_minimum_saturation,
+            extent_minimum_excess_green=extent_minimum_excess_green,
+            extent_radial_percentile=extent_radial_percentile,
             minimum_green_purity=minimum_green_purity,
             minimum_solidity=minimum_solidity,
             minimum_circularity=minimum_circularity,
@@ -6516,7 +6943,8 @@ async def save_weed_settings(
             visual_verifier_enabled=visual_verifier_enabled,
             visual_verifier_shadow_mode=visual_verifier_shadow_mode,
             visual_verifier_required_for_automatic=visual_verifier_required_for_automatic,
-            visual_verifier_minimum_confidence=visual_verifier_minimum_confidence,
+            visual_verifier_rejection_confidence=visual_verifier_rejection_confidence,
+            visual_verifier_acceptance_confidence=visual_verifier_acceptance_confidence,
             boundary_verifier_enabled=boundary_verifier_enabled,
             boundary_crop_minimum_confidence=boundary_crop_minimum_confidence,
             boundary_noncrop_minimum_confidence=boundary_noncrop_minimum_confidence,
@@ -6533,6 +6961,16 @@ async def save_weed_settings(
         raise HTTPException(422, "Minimum weed area cannot exceed maximum weed area")
     if values.green_hue_min > values.green_hue_max:
         raise HTTPException(422, "Minimum green hue cannot exceed maximum green hue")
+    if values.candidate_minimum_saturation > values.extent_minimum_saturation:
+        raise HTTPException(
+            422,
+            "Candidate discovery saturation cannot exceed measured extent saturation",
+        )
+    if values.candidate_minimum_excess_green > values.extent_minimum_excess_green:
+        raise HTTPException(
+            422,
+            "Candidate discovery excess green cannot exceed measured extent excess green",
+        )
     if values.recommendation_min_observations > values.automatic_min_observations:
         raise HTTPException(
             422, "Looks before recommendation cannot exceed looks before automatic creation"
@@ -6628,7 +7066,7 @@ async def apply_suggested_threshold() -> RedirectResponse:
         )
     values = weed_settings_store.load()
     weed_settings_store.save(
-        values.model_copy(update={"visual_verifier_minimum_confidence": suggested})
+        values.model_copy(update={"visual_verifier_acceptance_confidence": suggested})
     )
     message = f"Verifier threshold set to {suggested:.2f}"
     return RedirectResponse(f"../weed-settings?training={quote(message)}", status_code=303)

@@ -4,7 +4,7 @@ import os
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class WeedSettings(BaseModel):
@@ -14,6 +14,11 @@ class WeedSettings(BaseModel):
     automatic_creation: bool = False
     automatic_radius_adjustment: bool = False
     radius_adjustment_confidence: float = Field(default=0.55, ge=0, le=1)
+    # A single permissive mask must never be allowed to double the radius of a
+    # known weed.  Both limits are measured against the first radius recorded
+    # in the previous 24 hours; the smaller allowance wins.
+    maximum_radius_growth_mm_per_day: float = Field(default=20, ge=0, le=250)
+    maximum_radius_growth_percent_per_day: float = Field(default=40, ge=0, le=200)
     automatic_removal: bool = False
     removal_confidence: float = Field(default=0.6, ge=0, le=1)
     removal_min_consecutive_absent: int = Field(default=1, ge=1, le=10)
@@ -34,6 +39,17 @@ class WeedSettings(BaseModel):
     green_hue_max: int = Field(default=100, ge=0, le=179)
     strong_green_minimum_saturation: int = Field(default=45, ge=0, le=255)
     strong_green_minimum_excess_green: int = Field(default=20, ge=-255, le=510)
+    # Candidate discovery is intentionally more permissive than geometry
+    # measurement.  It catches pale/shaded leaves for the verifier, while the
+    # stricter extent thresholds below keep soil out of the reported radius.
+    candidate_minimum_saturation: int = Field(default=15, ge=0, le=255)
+    candidate_minimum_excess_green: int = Field(default=2, ge=-255, le=510)
+    candidate_hue_padding: int = Field(default=8, ge=0, le=60)
+    candidate_grouping_gap_mm: float = Field(default=18, ge=1, le=75)
+    candidate_maximum_span_mm: float = Field(default=240, ge=20, le=500)
+    extent_minimum_saturation: int = Field(default=28, ge=0, le=255)
+    extent_minimum_excess_green: int = Field(default=10, ge=-255, le=510)
+    extent_radial_percentile: float = Field(default=97, ge=80, le=100)
     # Measured against real photographs rather than synthetic discs: a genuine
     # weed leaf reaches only ~0.1-0.45 strong-green purity and ~0.2-0.6 solidity
     # once shadow, glare and soil show through the gaps between its leaves. The
@@ -54,7 +70,13 @@ class WeedSettings(BaseModel):
     visual_verifier_enabled: bool = False
     visual_verifier_shadow_mode: bool = True
     visual_verifier_required_for_automatic: bool = True
-    visual_verifier_minimum_confidence: float = Field(default=0.85, ge=0, le=1)
+    # Three-way verifier triage: below rejection is hidden automatically,
+    # between the thresholds remains reviewable, and at/above acceptance may
+    # authorise automation when the independent automation guards also pass.
+    visual_verifier_rejection_confidence: float = Field(default=0.45, ge=0, le=1)
+    visual_verifier_acceptance_confidence: float = Field(default=0.85, ge=0, le=1)
+    # The pre-validator below accepts the old one-threshold JSON key and copies
+    # it to both bounds, preserving behaviour until these controls are saved.
     # The same local model can provide a second opinion on vegetation newly
     # extending a known plant. It never predicts a radius; it only accepts,
     # rejects, or holds the new boundary evidence before geometry measures it.
@@ -70,6 +92,38 @@ class WeedSettings(BaseModel):
     retrain_after_label_count: int = Field(default=1, ge=1, le=500)
     candidate_crop_storage_enabled: bool = True
     weed_radius_mm: float = Field(default=15, ge=1, le=250)
+
+    @model_validator(mode="before")
+    @classmethod
+    def migrate_verifier_thresholds(cls, value: object) -> object:
+        if not isinstance(value, dict):
+            return value
+        values = dict(value)
+        legacy = values.get("visual_verifier_minimum_confidence")
+        if legacy is not None:
+            values.setdefault("visual_verifier_rejection_confidence", legacy)
+            values.setdefault("visual_verifier_acceptance_confidence", legacy)
+        return values
+
+    @model_validator(mode="after")
+    def ordered_confidence_thresholds(self) -> WeedSettings:
+        if self.visual_verifier_rejection_confidence > self.visual_verifier_acceptance_confidence:
+            raise ValueError("Verifier rejection confidence cannot exceed acceptance confidence")
+        if self.candidate_minimum_saturation > self.extent_minimum_saturation:
+            raise ValueError(
+                "Candidate discovery saturation cannot exceed measured extent saturation"
+            )
+        if self.candidate_minimum_excess_green > self.extent_minimum_excess_green:
+            raise ValueError(
+                "Candidate discovery excess green cannot exceed measured extent excess green"
+            )
+        return self
+
+    @property
+    def visual_verifier_minimum_confidence(self) -> float:
+        """Compatibility name used before verifier triage gained two thresholds."""
+
+        return self.visual_verifier_acceptance_confidence
 
 
 class WeedSettingsStore:

@@ -4,7 +4,7 @@ import json
 import os
 from pathlib import Path
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from .models import OperatingMode
 from .resolution import DEFAULT_RESOLUTION, AnalysisResolution, Resolution
@@ -21,6 +21,9 @@ class Settings(BaseModel):
     schedule_time: str = "03:00"
     safety_margin_mm: float = Field(default=20, ge=0)
     calibration_uncertainty_mm: float = Field(default=10, ge=0)
+    # Results below this confidence remain in the audit trail but are
+    # automatically rejected from the human review queue.
+    minimum_review_confidence: float = Field(default=0.35, ge=0, le=1)
     minimum_auto_confidence: float = Field(default=0.90, ge=0, le=1)
     maximum_daily_radius_growth_mm: float = Field(default=50, gt=0)
     maximum_plant_radius_mm: float = Field(default=500, gt=0)
@@ -64,6 +67,14 @@ class Settings(BaseModel):
     @property
     def analysis_height(self) -> int:
         return self.resolution.height
+
+    @model_validator(mode="after")
+    def ordered_confidence_thresholds(self) -> Settings:
+        if self.minimum_review_confidence > self.minimum_auto_confidence:
+            raise ValueError(
+                "plant-radius rejection confidence cannot exceed acceptance confidence"
+            )
+        return self
 
     @classmethod
     def load(cls) -> Settings:

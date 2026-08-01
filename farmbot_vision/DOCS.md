@@ -41,6 +41,11 @@ FarmBot Vision requires Home Assistant Core 2026.7 or newer and companion FarmBo
 - **Auto radius** writes only high-confidence increases that pass all configured limits, plus small high-confidence decreases within `maximum_automatic_radius_reduction_percent` (10% by default). Larger decreases remain reviewable with reduced confidence and are never automatic.
 - **Auto curve** is a future advanced mode and is intentionally unavailable in 0.1.0. Curve proposals never modify or replace a user-created curve.
 
+Plant-radius confidence uses two app options. Measurements below
+`minimum_review_confidence` are retained in diagnostics but automatically
+omitted from the review queue; `minimum_auto_confidence` is the independent
+acceptance bar for automatic writes. Values between them remain reviewable.
+
 ## Analysis resolution
 
 The `analysis_resolution` option selects the processed image size: `640x480`,
@@ -239,11 +244,21 @@ its distance and overlap recorded; it is review/training evidence only and
 cannot be created automatically. The confidence thresholds are what actually
 decide whether something is a weed. Tune those first.
 
-The weed candidate mask honours the configured hue, saturation and excess-green
-controls before verification. It also avoids the crop mask's 3 mm opening,
-which used to erase narrow leaves and stems. Nearby disconnected leaves are
-grouped into a proposal, but the grouping is span-bounded so a chain of weeds
-cannot collapse into one bed-wide blob.
+The weed candidate mask has two explicitly different jobs. A recall-first
+discovery layer uses adjustable pale-leaf saturation, excess-green and hue
+padding controls so muted, shaded and sun-bleached weeds still reach the
+verifier. It also avoids the crop mask's 3 mm opening, which used to erase
+narrow leaves and stems. Nearby disconnected leaves are grouped into a proposal
+over an adjustable physical gap, but grouping is span-bounded so a chain of
+weeds cannot collapse into one bed-wide blob. The grouped leaf layout supplies
+the centre even when only one leaf is strongly green.
+
+A second, stricter extent layer measures area and radius. Its independent
+saturation and excess-green thresholds keep permissive discovery pixels and
+soil out of the size estimate. Radius is a configurable supported radial
+percentile across directions rather than the single farthest pixel. Geometry
+that has no strict support stays reviewable but is marked unsafe for automatic
+creation or automatic growth of a known weed.
 
 Each analysed image logs how many candidates were found and why any were
 dropped (`size`, `colour/shape`, `low score`), plus how many crop-protected and
@@ -254,8 +269,11 @@ The **learned verifier** is a small logistic model trained on your own labels.
 It sees sixteen visual features the heuristic ignores (hue, saturation,
 texture, edge density, and what surrounds the candidate: mulch orange, bare
 neutral soil, neighbouring canopy) plus the distance to the nearest known
-plant. Once it is trained and enforcing, its score *is* the weed confidence and
-the **verifier confidence threshold** is the gate.
+plant. Once it is trained and enforcing, its score *is* the weed confidence.
+Scores below the **automatic rejection threshold** are omitted from review,
+scores between rejection and acceptance remain reviewable, and scores at or
+above the **automatic acceptance threshold** may authorise automation only when
+all independent safety guards pass.
 
 The intended path:
 
@@ -270,12 +288,17 @@ The intended path:
    with a 90% lower confidence bound so a small label set is not flattered.
 4. Apply the **suggested threshold**, which is the highest-recall operating
    point whose precision is confidently at or above 95%.
-5. Turn shadow mode off so the verifier's own threshold decides. The
+5. Turn shadow mode off so the verifier's rejection/acceptance band decides. The
    **candidate recall boost** relaxes the colour/shape gates by its factor
    from the moment a trained verifier starts scoring — shadow mode included,
    since that is exactly the stage meant to be gathering examples to label.
 6. Only then consider automatic creation, which can additionally require
    verifier approval and several independent looks.
+
+Known-weed radius growth has two further rolling 24-hour caps: a maximum number
+of millimetres and a maximum percentage of the first radius in the window. The
+smaller ceiling wins, so repeated same-day images cannot compound a permissive
+measurement into a doubled radius.
 
 During review the dialog shows the verifier's **best guess** at what the object
 is — "moss 71% · fallen leaf 18%" — from per-category heads trained on the same

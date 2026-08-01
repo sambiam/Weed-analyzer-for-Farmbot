@@ -1,5 +1,5 @@
 ﻿name: FarmBot Vision
-version: "3.15.1"
+version: "3.17.0"
 slug: farmbot_vision
 description: Lightweight canopy analysis and safe FarmBot plant-radius recommendations
 url: https://github.com/sambiam/Weed-analyzer-for-Farmbot
@@ -32,6 +32,7 @@ options:
   schedule_time: "03:00"
   safety_margin_mm: 20.0
   calibration_uncertainty_mm: 10.0
+  minimum_review_confidence: 0.35
   minimum_auto_confidence: 0.90
   maximum_daily_radius_growth_mm: 50.0
   maximum_plant_radius_mm: 500.0
@@ -56,6 +57,7 @@ schema:
   schedule_time: str
   safety_margin_mm: float(0,200)
   calibration_uncertainty_mm: float(0,100)
+  minimum_review_confidence: float(0,1)
   minimum_auto_confidence: float(0.5,1)
   maximum_daily_radius_growth_mm: float(1,500)
   maximum_plant_radius_mm: float(1,2000)

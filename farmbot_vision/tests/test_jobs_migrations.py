@@ -40,6 +40,18 @@ def _measurement(**kwargs) -> Measurement:
     return Measurement(**base)
 
 
+def test_low_confidence_plant_radius_results_are_omitted_from_review_only(tmp_path):
+    database = Database(tmp_path / "vision.sqlite")
+    low = _measurement(plant_id=1, image_id=10, confidence=0.2)
+    high = _measurement(plant_id=2, image_id=11, confidence=0.8)
+    database.save_measurements([low, high])
+
+    assert {row["plant_id"] for row in database.pending_measurements()} == {1, 2}
+    assert {row["plant_id"] for row in database.pending_measurements(minimum_confidence=0.35)} == {
+        2
+    }
+
+
 def test_automatic_application_impossible_without_calibration():
     # An uncalibrated measurement can never become APPLIED or RECOMMENDED.
     uncalibrated = _measurement(calibrated=False)

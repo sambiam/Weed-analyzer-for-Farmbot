@@ -45,14 +45,9 @@ MORPH_CLOSE_MM = 5.0
 # them.  A small closing repairs JPEG holes without inventing foreground.
 WEED_CANDIDATE_CLOSE_MM = 2.0
 # Weed leaves and thin stems often separate during colour segmentation even
-# though they belong to one plant. Group nearby vegetation over this physical
-# gap while retaining only the original vegetation pixels for area/features.
-WEED_GROUP_MAX_GAP_MM = 12.0
-# Proximity grouping must not chain across a weedy bed.  Disconnected leaves
-# can form one proposal, but a chain of neighbouring plants is split once its
-# bounding span reaches this limit.  A genuinely connected large rosette is
-# kept intact; the bound applies only while merging separate islands.
-WEED_GROUP_MAX_SPAN_MM = 120.0
+# though they belong to one plant. The adjustable grouping gap/span in
+# ``WeedSettings`` joins their proposals while retaining only original
+# vegetation pixels for features and strict extent measurement.
 # Pale leaves are often separated from the darker canopy by glare or a
 # colour-temperature shift. Only recover such pixels when they are close to
 # an already detected vegetation island; this prevents pale mulch from becoming
@@ -62,8 +57,8 @@ PALE_LEAF_MIN_VALUE = 35
 PALE_LEAF_MIN_EXCESS_GREEN = 2
 PALE_LEAF_SUPPORT_GAP_MM = 10.0
 # A vegetation island that touches a crop's exclusion zone is protected only
-# this far beyond it. The grouping pass joins islands up to
-# WEED_GROUP_MAX_GAP_MM apart, and without a reach limit those joins chain
+# this far beyond it. The grouping pass joins islands over the configured
+# physical gap, and without a reach limit those joins chain
 # transitively: one weed near a crop protected an entire connected network of
 # weeds right across the frame, which measured at ~70% of all vegetation in a
 # weedy bed. The reach is comfortably wider than one grouping hop, so a crop
@@ -404,7 +399,24 @@ def weed_candidate_vegetation_mask(
         & (excess_green >= settings.strong_green_minimum_excess_green)
         & (value > 20)
     )
-    combined = configured
+
+    # Pale, shaded and slightly yellow leaves in the field examples can have
+    # too little saturation to enter ``configured`` at all.  Candidate recall
+    # gets its own, deliberately wider colour band.  A green-channel bias is
+    # still required so brown soil and neutral stones do not become global
+    # foreground merely because the verifier is permissive.
+    padded_min = max(0, settings.green_hue_min - settings.candidate_hue_padding)
+    padded_max = min(179, settings.green_hue_max + settings.candidate_hue_padding)
+    recall_hue = (hue >= padded_min) & (hue <= padded_max)
+    green_bias = (g >= r - 4) & (g >= b - 4)
+    recall = (
+        recall_hue
+        & (saturation >= settings.candidate_minimum_saturation)
+        & (excess_green >= settings.candidate_minimum_excess_green)
+        & (value > 20)
+        & green_bias
+    )
+    combined = configured | recall
     if canopy_mask is not None and canopy_mask.shape == configured.shape:
         combined = combined | (canopy_mask > 0)
     close_radius = max(1, round((WEED_CANDIDATE_CLOSE_MM * params.mean_ppm) / 2))
@@ -413,6 +425,124 @@ def weed_candidate_vegetation_mask(
         (close_radius * 2 + 1, close_radius * 2 + 1),
     )
     return cv2.morphologyEx(combined.astype(np.uint8) * 255, cv2.MORPH_CLOSE, kernel)
+
+
+@dataclass(frozen=True)
+class WeedGeometry:
+    """Strict weed extent measured inside a recall-first candidate group."""
+
+    center_px: tuple[float, float]
+    area_mm2: float
+    radius_mm: float
+    extent: np.ndarray
+    strict_support_fraction: float
+    permissive_fallback: bool
+
+
+def _measure_weed_geometry(
+    image: np.ndarray,
+    component: np.ndarray,
+    calibration: Calibration,
+    settings: WeedSettings,
+) -> WeedGeometry | None:
+    """Measure centre and radius without letting the recall mask measure soil.
+
+    The broad component supplies whole-plant layout, so several disconnected
+    rosette leaves can locate the centre even when only one is strongly green.
+    Area and radius use a second, stricter colour mask.  The radial percentile
+    removes isolated soil/JPEG pixels that made the old farthest-pixel radius
+    jump between same-day photographs.
+    """
+
+    support_y, support_x = np.where(component)
+    if not len(support_x):
+        return None
+    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+    hue = hsv[:, :, 0]
+    saturation = hsv[:, :, 1]
+    value = hsv[:, :, 2]
+    b, g, r = cv2.split(image.astype(np.int16))
+    excess_green = 2 * g - r - b
+    if settings.green_hue_min <= settings.green_hue_max:
+        hue_matches = (hue >= settings.green_hue_min) & (hue <= settings.green_hue_max)
+    else:
+        hue_matches = (hue >= settings.green_hue_min) | (hue <= settings.green_hue_max)
+    extent = (
+        component
+        & hue_matches
+        & (saturation >= settings.extent_minimum_saturation)
+        & (excess_green >= settings.extent_minimum_excess_green)
+        & (value > 20)
+    )
+
+    # Ignore one-pixel JPEG flecks in the strict layer, but retain every real
+    # leaf island.  Two pixels is deliberately below the physical candidate
+    # floor so thin grass blades survive.
+    strict_count, strict_labels, strict_stats, _ = cv2.connectedComponentsWithStats(
+        extent.astype(np.uint8), 8
+    )
+    cleaned = np.zeros_like(extent)
+    largest_strict_island = max(
+        (int(strict_stats[label, cv2.CC_STAT_AREA]) for label in range(1, strict_count)),
+        default=0,
+    )
+    strict_island_floor = max(2, round(largest_strict_island * 0.05))
+    for label in range(1, strict_count):
+        if int(strict_stats[label, cv2.CC_STAT_AREA]) >= strict_island_floor:
+            cleaned[strict_labels == label] = True
+    extent = cleaned
+    strict_support_fraction = float(np.count_nonzero(extent) / len(support_x))
+    permissive_fallback = not np.any(extent)
+    if permissive_fallback:
+        # Keep a completely pale genuine weed reviewable, but mark the geometry
+        # unsafe for automatic creation or radius growth downstream.
+        extent = component.copy()
+
+    # A trimmed bounding midpoint is stable for a rosette with uneven leaf
+    # areas and resistant to a small remote speck.  Unlike a foreground
+    # centroid it can fall in the empty centre between several leaves, which is
+    # precisely where FarmBot needs the weed point.
+    trim = 2.0 if len(support_x) >= 50 else 0.0
+    x0, x1 = np.percentile(support_x, [trim, 100.0 - trim])
+    y0, y1 = np.percentile(support_y, [trim, 100.0 - trim])
+    box_center_x = (x0 + x1) / 2.0
+    box_center_y = (y0 + y1) / 2.0
+    # Blend the rosette-friendly box centre with the highly outlier-resistant
+    # coordinate median. A small remote green island can otherwise move both
+    # sides of a bounding circle even though it represents almost no foliage.
+    center_x = float((box_center_x + np.median(support_x)) / 2.0)
+    center_y = float((box_center_y + np.median(support_y)) / 2.0)
+
+    extent_y, extent_x = np.where(extent)
+    dx_mm, dy_mm = _pixel_offsets_to_world_mm(extent_x - center_x, extent_y - center_y, calibration)
+    distances_mm = np.hypot(dx_mm, dy_mm)
+    if not len(distances_mm):
+        return None
+    # Measure a supported outer edge per direction, then take a percentile
+    # across directions. This retains the tips of several real leaves without
+    # allowing one isolated distant pixel to define the entire weed.
+    angles = np.mod(np.arctan2(dy_mm, dx_mm), 2 * math.pi)
+    sector_indexes = np.floor(angles / (2 * math.pi) * 36).astype(np.int32)
+    sector_outer = []
+    for sector in np.unique(sector_indexes):
+        sector_distances = distances_mm[sector_indexes == sector]
+        if len(sector_distances) >= 2:
+            sector_outer.append(float(np.percentile(sector_distances, 98)))
+    radius_mm = float(
+        np.percentile(
+            sector_outer if len(sector_outer) >= 4 else distances_mm,
+            settings.extent_radial_percentile,
+        )
+    )
+    area_scale = calibration.pixels_per_mm_x * calibration.pixels_per_mm_y
+    return WeedGeometry(
+        center_px=(center_x, center_y),
+        area_mm2=float(len(extent_x) / area_scale),
+        radius_mm=radius_mm,
+        extent=extent,
+        strict_support_fraction=strict_support_fraction,
+        permissive_fallback=permissive_fallback,
+    )
 
 
 def _core_radius_px(seed: PlantSeed, params: ScaleParams) -> float:
@@ -794,7 +924,7 @@ def _verify_new_boundary(
             stats["shadow_scored"] += 1
             continue
         if weed_probability is not None and (
-            weed_probability >= weed_settings.visual_verifier_minimum_confidence
+            weed_probability >= weed_settings.visual_verifier_acceptance_confidence
         ):
             accepted[component] = False
             verified_weed[component] = True
@@ -1647,7 +1777,7 @@ class ClassicalVisionEngine(ImageAnalysisEngine):
                         (prior == 0).astype(np.uint8), cv2.DIST_L2, 5
                     )
                     exclusion[distance_from_prior <= prior_margin_px] = 255
-            group_gap_px = WEED_GROUP_MAX_GAP_MM * params.mean_ppm
+            group_gap_px = weed_settings.candidate_grouping_gap_mm * params.mean_ppm
 
             # Protect a complete vegetation cluster when any part of it belongs
             # to a crop or crosses a known crop's exclusion area, so the
@@ -1692,7 +1822,7 @@ class ClassicalVisionEngine(ImageAnalysisEngine):
             count, candidate_labels = _bounded_nearby_component_labels(
                 candidate_mask,
                 group_gap_px,
-                WEED_GROUP_MAX_SPAN_MM * params.mean_ppm,
+                weed_settings.candidate_maximum_span_mm * params.mean_ppm,
             )
             area_scale = calibration.pixels_per_mm_x * calibration.pixels_per_mm_y
             # Counted so an operator can see whether the heuristic is starving
@@ -1713,15 +1843,19 @@ class ClassicalVisionEngine(ImageAnalysisEngine):
                 if not len(xs):
                     continue
                 candidate_stats["blobs"] += 1
-                area_mm2 = float(len(xs) / area_scale)
-                points = np.column_stack((xs, ys)).astype(np.float32).reshape(-1, 1, 2)
-                (wx, wy), _ = cv2.minEnclosingCircle(points)
+                candidate_area_mm2 = float(len(xs) / area_scale)
+                geometry = _measure_weed_geometry(image, component, calibration, weed_settings)
+                if geometry is None:
+                    candidate_stats["size"] += 1
+                    continue
+                area_mm2 = geometry.area_mm2
+                wx, wy = geometry.center_px
                 protection_overlap = float(np.mean(crop_protected[component]))
                 if protection_overlap > 0:
                     candidate_stats["protected_scored"] += 1
                 if area_mm2 > weed_settings.maximum_area_mm2:
                     candidate_stats["oversized_scored"] += 1
-                if not (gates.min_area_mm2 <= area_mm2 <= gates.max_area_mm2):
+                if not (gates.min_area_mm2 <= candidate_area_mm2 <= gates.max_area_mm2):
                     candidate_stats["size"] += 1
                     continue
                 # Distance to the nearest known crop separates an interrow weed
@@ -1756,6 +1890,8 @@ class ClassicalVisionEngine(ImageAnalysisEngine):
                 features["configured_maximum_area_exceeded"] = float(
                     area_mm2 > weed_settings.maximum_area_mm2
                 )
+                features["extent_strict_support_fraction"] = geometry.strict_support_fraction
+                features["extent_permissive_fallback"] = float(geometry.permissive_fallback)
                 if gates.rejects(features):
                     candidate_stats["shape"] += 1
                     continue
@@ -1789,7 +1925,7 @@ class ClassicalVisionEngine(ImageAnalysisEngine):
                     # which made the verifier threshold the only real gate
                     # while the reported confidence said otherwise.
                     confidence = verifier_confidence
-                    if verifier_confidence < weed_settings.visual_verifier_minimum_confidence:
+                    if verifier_confidence < weed_settings.visual_verifier_rejection_confidence:
                         candidate_stats["score"] += 1
                         continue
                 else:
@@ -1797,14 +1933,6 @@ class ClassicalVisionEngine(ImageAnalysisEngine):
                     if confidence < weed_settings.minimum_confidence:
                         candidate_stats["score"] += 1
                         continue
-                component_radius_mm = float(
-                    np.max(
-                        np.sqrt(
-                            ((xs - wx) / calibration.pixels_per_mm_x) ** 2
-                            + ((ys - wy) / calibration.pixels_per_mm_y) ** 2
-                        )
-                    )
-                )
                 weed_detections.append(
                     WeedDetection(
                         detection_id=uuid4(),
@@ -1812,7 +1940,7 @@ class ClassicalVisionEngine(ImageAnalysisEngine):
                         image_timestamp=image_timestamp,
                         center_px=(float(wx), float(wy)),
                         area_mm2=area_mm2,
-                        radius_mm=max(weed_settings.weed_radius_mm, component_radius_mm),
+                        radius_mm=max(weed_settings.weed_radius_mm, geometry.radius_mm),
                         confidence=confidence,
                         heuristic_confidence=heuristic_confidence,
                         verifier_confidence=verifier_confidence,
@@ -1828,7 +1956,11 @@ class ClassicalVisionEngine(ImageAnalysisEngine):
                 # equivalent-area circle around only its densest leaf.
                 weed_radius_px = max(
                     10,
-                    round(np.max(np.sqrt((xs - wx) ** 2 + (ys - wy) ** 2)) * 1.12),
+                    round(
+                        max(weed_settings.weed_radius_mm, geometry.radius_mm)
+                        * params.mean_ppm
+                        * 1.08
+                    ),
                 )
                 cv2.circle(
                     overlay,

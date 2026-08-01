@@ -10,7 +10,7 @@ import pytest
 from conftest import vision_image_dict
 
 from farmbot_vision.database import Database
-from farmbot_vision.jobs import JobManager
+from farmbot_vision.jobs import JobManager, limit_weed_radius_growth
 from farmbot_vision.models import (
     AnalysisResult,
     Decision,
@@ -25,6 +25,25 @@ from farmbot_vision.zones import Zone, ZoneKind, ZoneShape, ZoneStore
 
 IMAGE_WIDTH, IMAGE_HEIGHT = 96, 72
 TIMESTAMP = datetime(2026, 2, 1, tzinfo=UTC)
+
+
+def test_known_weed_radius_growth_uses_smaller_rolling_24_hour_cap():
+    target, ceiling = limit_weed_radius_growth(
+        current_radius_mm=18,
+        measured_radius_mm=60,
+        rolling_baseline_radius_mm=15,
+        maximum_growth_mm=20,
+        maximum_growth_percent=40,
+    )
+
+    assert ceiling == pytest.approx(21)
+    assert target == pytest.approx(21)
+
+    # A second same-day view starts from the already widened radius but cannot
+    # consume another 40%; the original rolling baseline still controls it.
+    repeated, repeated_ceiling = limit_weed_radius_growth(21, 65, 15, 20, 40)
+    assert repeated_ceiling == pytest.approx(21)
+    assert repeated == pytest.approx(21)
 
 
 def _image_payload() -> dict:

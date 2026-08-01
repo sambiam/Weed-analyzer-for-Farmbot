@@ -6,7 +6,7 @@ import json
 import logging
 import math
 import time
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import UUID, uuid4
 
@@ -54,6 +54,27 @@ from .zones import Zone, ZoneAspect, ZoneStore, evaluate
 
 LOGGER = logging.getLogger(__name__)
 ANALYSIS_COOPERATIVE_PAUSE_SECONDS = 0.1
+
+
+def limit_weed_radius_growth(
+    current_radius_mm: float,
+    measured_radius_mm: float,
+    rolling_baseline_radius_mm: float,
+    maximum_growth_mm: float,
+    maximum_growth_percent: float,
+) -> tuple[float, float]:
+    """Return a safe automatic radius and the rolling-window ceiling."""
+
+    baseline = max(0.0, float(rolling_baseline_radius_mm))
+    ceiling = min(
+        baseline + max(0.0, float(maximum_growth_mm)),
+        baseline * (1.0 + max(0.0, float(maximum_growth_percent)) / 100.0),
+    )
+    target = max(
+        float(current_radius_mm),
+        min(float(measured_radius_mm), ceiling),
+    )
+    return target, ceiling
 
 
 def build_plant_composite(
@@ -857,13 +878,37 @@ class JobManager:
                     )
                     if known_weed is not None:
                         matched_known_weed_ids.add(known_weed.id)
-                        target_radius = max(float(known_weed.radius), float(weed.radius_mm))
+                        measured_radius = max(float(known_weed.radius), float(weed.radius_mm))
+                        baseline_radius = self.db.radius_growth_baseline(
+                            entity_type="weed",
+                            entity_id=known_weed.id,
+                            since=datetime.now(UTC) - timedelta(hours=24),
+                            current_radius_mm=known_weed.radius,
+                        )
+                        target_radius, maximum_radius = limit_weed_radius_growth(
+                            known_weed.radius,
+                            measured_radius,
+                            baseline_radius,
+                            weed_settings.maximum_radius_growth_mm_per_day,
+                            weed_settings.maximum_radius_growth_percent_per_day,
+                        )
                         status = "matched"
+                        verifier_allows_radius = bool(
+                            not weed_settings.visual_verifier_enabled
+                            or weed_settings.visual_verifier_shadow_mode
+                            or (
+                                weed.verifier_confidence is not None
+                                and weed.verifier_confidence
+                                >= weed_settings.visual_verifier_acceptance_confidence
+                            )
+                        )
                         if (
                             weed_settings
                             and weed_settings.automatic_radius_adjustment
                             and target_radius > float(known_weed.radius) + 0.5
                             and weed.confidence >= weed_settings.radius_adjustment_confidence
+                            and verifier_allows_radius
+                            and not bool(weed.features.get("extent_permissive_fallback", 0.0))
                         ):
                             try:
                                 update_result = await self.client.update_weed_radius(
@@ -892,7 +937,12 @@ class JobManager:
                                         ),
                                         decision_method="auto",
                                         confidence=weed.confidence,
-                                        details=update_result,
+                                        details={
+                                            **update_result,
+                                            "measured_radius_mm": measured_radius,
+                                            "rolling_baseline_radius_mm": baseline_radius,
+                                            "maximum_allowed_radius_mm": maximum_radius,
+                                        },
                                     )
                             except HomeAssistantError as exc:
                                 LOGGER.warning("Automatic weed radius adjustment failed: %s", exc)
@@ -918,7 +968,7 @@ class JobManager:
                             y=weed_y,
                             z=response.meta.z,
                             area_mm2=weed.area_mm2,
-                            radius_mm=target_radius,
+                            radius_mm=weed.radius_mm,
                             confidence=weed.confidence,
                             overlay_path=str(overlay_path) if result.overlay_jpeg else None,
                             review_path=(
@@ -983,7 +1033,7 @@ class JobManager:
                         or (
                             weed.verifier_confidence is not None
                             and weed.verifier_confidence
-                            >= weed_settings.visual_verifier_minimum_confidence
+                            >= weed_settings.visual_verifier_acceptance_confidence
                         )
                     )
                     if (
@@ -998,6 +1048,7 @@ class JobManager:
                         # create a FarmBot weed on or beside a known crop.
                         and not bool(weed.features.get("crop_protection_overlap", 0.0))
                         and not bool(weed.features.get("configured_maximum_area_exceeded", 0.0))
+                        and not bool(weed.features.get("extent_permissive_fallback", 0.0))
                     ):
                         try:
                             create_result = await self.client.create_weed(

@@ -20,11 +20,17 @@ configuration:
     name: Safety margin (mm)
   calibration_uncertainty_mm:
     name: Calibration uncertainty (mm)
-  minimum_auto_confidence:
-    name: Automatic decision confidence threshold
+  minimum_review_confidence:
+    name: Plant-radius automatic rejection threshold
     description: >-
-      Minimum confidence required for automatic radius, removal, and weed
-      changes. This never prevents a user from approving or rejecting a result.
+      Radius measurements below this confidence stay in diagnostics but are
+      automatically removed from the review queue. Set it below the automatic
+      acceptance threshold.
+  minimum_auto_confidence:
+    name: Plant-radius automatic acceptance threshold
+    description: >-
+      Minimum confidence required for automatic plant-radius and plant-removal
+      changes. Results between rejection and acceptance remain reviewable.
   maximum_daily_radius_growth_mm:
     name: Maximum daily growth (mm)
   maximum_plant_radius_mm:

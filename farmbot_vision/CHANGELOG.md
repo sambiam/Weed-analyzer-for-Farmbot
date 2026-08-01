@@ -1,5 +1,30 @@
 # Changelog
 
+## 3.17.0 - 2026-08-01
+
+- Split weed discovery from weed extent measurement: pale and shaded leaves
+  now reach the verifier through a permissive mask, while stricter adjustable
+  saturation/excess-green controls keep soil out of measured area and radius.
+- Group nearby leaves into a span-bounded whole-weed proposal, infer the weed
+  centre from the complete leaf layout, and replace farthest-pixel radius with
+  a supported configurable radial percentile.
+- Added separate verifier rejection and acceptance thresholds for weeds and
+  clearly labelled plant-growth boundary thresholds. Low-confidence plant
+  radius results are retained for diagnostics but omitted from review.
+- Capped automatic known-weed radius increases against both millimetre and
+  percentage limits over a rolling 24-hour baseline, preventing repeated
+  same-day views from compounding an oversized mask.
+- Increased the maximum-weed-area slider range from 10,000 to 40,000 mm² while
+  retaining the 100,000 mm² typed-input limit.
+
+## 3.16.0 - 2026-08-01
+
+- Added a focused measurements review modal with accessible approve/reject
+  actions, previous/next navigation, automatic advance after review, and a
+  compact plant summary.
+- Removed measurement-table review controls and improved action contrast for
+  mobile and desktop use.
+
 ## 3.15.1 - 2026-08-01
 
 - Fixed photo-grid startup when FarmBot returns an explicit `null` radius for

@@ -1558,7 +1558,15 @@ class Database:
         )
         return representative
 
-    def pending_measurements(self, limit: int = 100) -> list[dict]:
+    def pending_measurements(
+        self, limit: int = 100, *, minimum_confidence: float = 0.0
+    ) -> list[dict]:
+        """Return consolidated review rows above the configured rejection floor.
+
+        Low-confidence measurements remain persisted for diagnostics and future
+        re-analysis, but callers rendering a review queue can omit them without
+        destroying their evidence or manufacturing a human decision.
+        """
         rows = self.connection.execute(
             """SELECT m.* FROM measurements m
             WHERE NOT EXISTS (
@@ -1589,9 +1597,10 @@ class Database:
             for row in group:
                 by_image.setdefault(int(row["image_id"]), row)
             consolidated.append(self._consolidate_measurement_rows(list(by_image.values())))
-        return sorted(consolidated, key=lambda row: str(row["image_timestamp"]), reverse=True)[
-            :limit
+        reviewable = [
+            row for row in consolidated if float(row.get("confidence") or 0) >= minimum_confidence
         ]
+        return sorted(reviewable, key=lambda row: str(row["image_timestamp"]), reverse=True)[:limit]
 
     def pending_plant_measurements(
         self,
@@ -2021,6 +2030,25 @@ class Database:
                     json.dumps(details or {}, separators=(",", ":")),
                 ),
             )
+
+    def radius_growth_baseline(
+        self,
+        *,
+        entity_type: str,
+        entity_id: object,
+        since: datetime,
+        current_radius_mm: float,
+    ) -> float:
+        """Return the radius before the first increase inside a rolling window."""
+
+        row = self.connection.execute(
+            """SELECT original_radius_mm FROM change_log
+            WHERE entity_type=? AND entity_id=? AND change_type='radius increased'
+              AND datetime(created_at)>=datetime(?)
+            ORDER BY datetime(created_at),id LIMIT 1""",
+            (entity_type, str(entity_id), since.astimezone(UTC).isoformat()),
+        ).fetchone()
+        return float(row[0]) if row is not None else float(current_radius_mm)
 
     def recent_changes(self, limit: int = 100) -> list[dict]:
         """Return applied changes newest first for the dashboard log."""

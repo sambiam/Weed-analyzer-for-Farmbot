@@ -805,6 +805,70 @@ def test_configured_colour_mask_recovers_muted_weed_for_verifier(calibration):
     assert verifier.seen, "muted configured foliage must reach verification"
 
 
+def test_default_discovery_recovers_pale_rosette_and_centres_from_all_leaves(calibration):
+    """One strong leaf should pull the rest of a pale rosette into one candidate."""
+    from farmbot_vision.weed_settings import WeedSettings
+
+    image = np.zeros((220, 320, 3), np.uint8)
+    strong = tuple(
+        int(value) for value in cv2.cvtColor(np.uint8([[[60, 130, 150]]]), cv2.COLOR_HSV2BGR)[0, 0]
+    )
+    pale = tuple(
+        int(value) for value in cv2.cvtColor(np.uint8([[[60, 20, 130]]]), cv2.COLOR_HSV2BGR)[0, 0]
+    )
+    cv2.circle(image, (245, 105), 7, strong, -1)
+    for center in ((263, 105), (254, 90), (254, 120)):
+        cv2.circle(image, center, 7, pale, -1)
+    settings = WeedSettings(
+        enabled=True,
+        minimum_confidence=0.3,
+        visual_verifier_enabled=True,
+        visual_verifier_shadow_mode=False,
+        visual_verifier_rejection_confidence=0.4,
+        visual_verifier_acceptance_confidence=0.8,
+    )
+
+    result = ClassicalVisionEngine(weed_verifier=_StubVerifier(0.9)).analyse(
+        encode_jpeg(image), 9, NOW, [], calibration, {}, settings
+    )
+
+    assert len(result.weeds) == 1
+    weed = result.weeds[0]
+    assert 251 <= weed.center_px[0] <= 257
+    assert 101 <= weed.center_px[1] <= 109
+    assert weed.radius_mm >= 15
+
+
+def test_single_remote_green_speck_does_not_define_weed_radius(calibration):
+    """The supported radial envelope must ignore one grouped soil-like outlier."""
+    from farmbot_vision.weed_settings import WeedSettings
+
+    image = np.zeros((220, 320, 3), np.uint8)
+    cv2.circle(image, (160, 110), 12, (20, 210, 30), -1)
+    # Within the grouping gap, so this exercises radius robustness rather than
+    # merely proving that connected-component labelling keeps it separate.
+    cv2.circle(image, (188, 110), 2, (20, 210, 30), -1)
+    settings = WeedSettings(enabled=True, minimum_confidence=0.3)
+
+    result = ClassicalVisionEngine().analyse(
+        encode_jpeg(image), 9, NOW, [], calibration, {}, settings
+    )
+
+    assert len(result.weeds) == 1
+    assert result.weeds[0].radius_mm < 18
+
+
+def test_verifier_keeps_only_the_review_band_and_acceptance_band():
+    shared = {
+        "visual_verifier_rejection_confidence": 0.45,
+        "visual_verifier_acceptance_confidence": 0.85,
+    }
+
+    assert _weed_scene(_StubVerifier(0.3), **shared).weeds == []
+    assert len(_weed_scene(_StubVerifier(0.6), **shared).weeds) == 1
+    assert len(_weed_scene(_StubVerifier(0.9), **shared).weeds) == 1
+
+
 def test_verifier_scores_unclaimed_weed_inside_crop_protection(seed, calibration):
     """Crop proximity is model context, not an invisible candidate veto."""
     from farmbot_vision.weed_settings import WeedSettings
