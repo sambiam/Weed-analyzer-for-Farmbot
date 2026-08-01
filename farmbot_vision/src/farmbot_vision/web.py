@@ -5677,9 +5677,9 @@ async def weed_settings_page(request: Request) -> HTMLResponse:
 <figure><div class=size-blob id=size-blob-min style="width:{min(120, max(3, min_diameter * 1.6)):.0f}px;height:{min(120, max(3, min_diameter * 1.6)):.0f}px"></div>
 <figcaption>smallest kept<br><b id=size-min-mm>{min_diameter:.0f}</b> mm across</figcaption></figure>
 <figure><div class=size-blob id=size-blob-max style="width:{min(150, max(4, max_diameter * 1.6)):.0f}px;height:{min(150, max(4, max_diameter * 1.6)):.0f}px"></div>
-<figcaption>largest kept<br><b id=size-max-mm>{max_diameter:.0f}</b> mm across</figcaption></figure>
-<figcaption>Blobs are drawn to relative scale. A first-true-leaf seedling is roughly
-5&nbsp;mm across; a mature dandelion rosette 60&nbsp;mm.</figcaption></div>"""
+<figcaption>automatic limit<br><b id=size-max-mm>{max_diameter:.0f}</b> mm across</figcaption></figure>
+<figcaption>Blobs are drawn to relative scale. Oversized blobs are still shown for review
+but cannot be created automatically. A mature dandelion rosette is roughly 60&nbsp;mm.</figcaption></div>"""
 
     size_fields = "".join(
         (
@@ -5710,11 +5710,11 @@ async def weed_settings_page(request: Request) -> HTMLResponse:
                 "Maximum weed area",
                 values.maximum_area_mm2,
                 tip=(
-                    "Green patches larger than this are assumed to be a crop, not a "
-                    "weed, and are ignored. This is the one size judgement the verifier "
-                    "cannot make for you, so it is always honoured. Set it comfortably "
-                    "above the biggest weed you expect but below your smallest mature "
-                    "crop, so an unrecorded crop plant is never proposed for removal."
+                    "Green patches larger than this are still submitted for verification "
+                    "and human review, because silently hiding a mature rosette makes the "
+                    "verifier impossible to improve. They are marked oversized and can "
+                    "never be created automatically. Measured area is retained as a model "
+                    "input, so large crops and weeds can still be learned correctly."
                 ),
                 minimum=10,
                 maximum=100_000,
@@ -6140,6 +6140,46 @@ round disc">
                 maximum=1,
                 step=0.01,
             ),
+            toggle_field(
+                "boundary_verifier_enabled",
+                "Verify new plant-radius growth",
+                values.boundary_verifier_enabled,
+                tip=(
+                    "Checks only vegetation newly extending beyond a plant's previous "
+                    "canopy edge. Confirmed crop foliage may grow the radius; confirmed "
+                    "weeds and non-crop material are removed from the plant mask; "
+                    "uncertain growth waits for another observation. Requires the learned "
+                    "verifier above and honours shadow mode."
+                ),
+            ),
+            slider_field(
+                "boundary_crop_minimum_confidence",
+                "Boundary crop confirmation",
+                values.boundary_crop_minimum_confidence,
+                tip=(
+                    "Minimum crop-category confidence needed to confirm new foliage as "
+                    "plant growth. HIGH prevents false radius increases but may hold real "
+                    "growth for another image. This uses crop examples labelled in the "
+                    "Analysis review workflow."
+                ),
+                minimum=0,
+                maximum=1,
+                step=0.01,
+            ),
+            slider_field(
+                "boundary_noncrop_minimum_confidence",
+                "Boundary non-crop rejection",
+                values.boundary_noncrop_minimum_confidence,
+                tip=(
+                    "Minimum category confidence for soil, moss, hardware or another "
+                    "non-crop class to be removed from new radius evidence. Lower values "
+                    "reject more aggressively; keep this high until field labels are "
+                    "representative."
+                ),
+                minimum=0,
+                maximum=1,
+                step=0.01,
+            ),
             slider_field(
                 "candidate_recall_boost",
                 "Candidate recall boost while the verifier scores",
@@ -6407,7 +6447,7 @@ async def save_weed_settings(
     removal_confidence: float = Form(0.6),
     removal_min_consecutive_absent: int = Form(1),
     minimum_area_mm2: float = Form(20),
-    maximum_area_mm2: float = Form(2500),
+    maximum_area_mm2: float = Form(10_000),
     plant_exclusion_margin_mm: float = Form(35),
     crop_protection_enabled: bool = Form(False),
     crop_support_radius_multiplier: float = Form(1.2),
@@ -6432,6 +6472,9 @@ async def save_weed_settings(
     visual_verifier_shadow_mode: bool = Form(False),
     visual_verifier_required_for_automatic: bool = Form(False),
     visual_verifier_minimum_confidence: float = Form(0.85),
+    boundary_verifier_enabled: bool = Form(False),
+    boundary_crop_minimum_confidence: float = Form(0.60),
+    boundary_noncrop_minimum_confidence: float = Form(0.80),
     candidate_recall_boost: float = Form(0.6),
     training_minimum_per_class: int = Form(10),
     automatic_retraining: bool = Form(False),
@@ -6474,6 +6517,9 @@ async def save_weed_settings(
             visual_verifier_shadow_mode=visual_verifier_shadow_mode,
             visual_verifier_required_for_automatic=visual_verifier_required_for_automatic,
             visual_verifier_minimum_confidence=visual_verifier_minimum_confidence,
+            boundary_verifier_enabled=boundary_verifier_enabled,
+            boundary_crop_minimum_confidence=boundary_crop_minimum_confidence,
+            boundary_noncrop_minimum_confidence=boundary_noncrop_minimum_confidence,
             candidate_recall_boost=candidate_recall_boost,
             training_minimum_per_class=training_minimum_per_class,
             automatic_retraining=automatic_retraining,

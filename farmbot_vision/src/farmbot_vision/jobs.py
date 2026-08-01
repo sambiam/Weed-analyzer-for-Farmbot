@@ -33,6 +33,7 @@ from .models import (
     CreateWeedRequest,
     Decision,
     InventoryRequest,
+    KnownWeedSeed,
     OperatingMode,
     PlantSeed,
     RemoveWeedRequest,
@@ -618,6 +619,22 @@ class JobManager:
                     # when the caller requested measurements for a subset.
                     for plant in inventory.plants
                 ]
+                known_weed_seeds = [
+                    KnownWeedSeed(
+                        weed_id=weed.id,
+                        center_px=garden_to_pixel(
+                            weed.x,
+                            weed.y,
+                            response.meta.x,
+                            response.meta.y,
+                            response.width,
+                            response.height,
+                            calibration,
+                        ),
+                        radius_mm=weed.radius,
+                    )
+                    for weed in inventory.weeds
+                ]
                 previous_masks = {}
                 for seed in seeds:
                     prior = decode_previous_mask(self.db.latest_mask_path(seed.plant_id))
@@ -634,6 +651,7 @@ class JobManager:
                             calibration,
                             previous_masks,
                             weed_settings,
+                            known_weed_seeds,
                         ),
                         timeout=60,
                     )
@@ -792,14 +810,22 @@ class JobManager:
                     stats = result.weed_candidate_stats
                     LOGGER.info(
                         "Image %s weed candidates: %s found, %s detected "
-                        "(dropped: %s crop-supported, %s size, %s colour/shape, %s low score)",
+                        "(%s crop-protected and %s oversized scored; dropped: %s size, "
+                        "%s colour/shape, %s low score)",
                         response.image_id,
                         stats.get("blobs", 0),
                         len(result.weeds),
-                        stats.get("crop_supported", 0),
+                        stats.get("protected_scored", 0),
+                        stats.get("oversized_scored", 0),
                         stats.get("size", 0),
                         stats.get("shape", 0),
                         stats.get("score", 0),
+                    )
+                if result.boundary_verifier_stats:
+                    LOGGER.info(
+                        "Image %s plant-boundary checks: %s",
+                        response.image_id,
+                        json.dumps(result.boundary_verifier_stats, separators=(",", ":")),
                     )
                 matched_known_weed_ids: set[int] = set()
                 for weed in result.weeds:
@@ -966,6 +992,12 @@ class JobManager:
                         and weed.confidence >= weed_settings.automatic_creation_confidence
                         and observations >= automatic_observations
                         and verifier_allows_automatic
+                        # Verifier-enabled candidates are intentionally visible
+                        # inside crop protection so misses can be reviewed and
+                        # labelled.  Visibility does not grant authority to
+                        # create a FarmBot weed on or beside a known crop.
+                        and not bool(weed.features.get("crop_protection_overlap", 0.0))
+                        and not bool(weed.features.get("configured_maximum_area_exceeded", 0.0))
                     ):
                         try:
                             create_result = await self.client.create_weed(

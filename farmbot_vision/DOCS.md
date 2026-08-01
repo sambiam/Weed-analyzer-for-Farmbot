@@ -192,6 +192,31 @@ can judge candidates outside the accepted plant mask, the app no longer needs
 an oversized exclusion circle to hide uncertain vegetation. A separate
 90th-percentile value remains the typical canopy measurement.
 
+### Learned boundary confirmation and known weeds
+
+The optional boundary verifier does not predict a radius. After ordinary plant
+ownership, it inspects only connected vegetation newly extending beyond the
+previous foliage edge. It reuses the local weed verifier and its per-category
+heads:
+
+- a high-confidence `crop` region remains available to the sector estimator;
+- a high-confidence weed is removed from plant ownership and sent through the
+  ordinary weed review and temporal-confirmation workflow;
+- confident soil, moss, hardware or other non-crop material is removed; and
+- an uncertain region is held out for another observation and caps the plant
+  measurement below automatic-write confidence.
+
+The learned check runs only when weed detection, the learned verifier and
+**Verify new plant-radius growth** are enabled. Shadow mode scores boundary
+regions without changing ownership. If the model has not learned a crop
+category head yet, geometry remains authoritative rather than freezing growth.
+
+Known FarmBot weeds do not require the learned verifier. Their calibrated
+centre and stored radius identify affected radial sectors, and new evidence in
+those directions is removed before measurement. Evidence inside the previous
+canopy edge remains protected so a slightly inaccurate weed point cannot cut a
+hole through established crop foliage.
+
 ## Weed detection and the learned verifier
 
 Weed detection runs in two stages, and it matters which one is doing what.
@@ -206,15 +231,24 @@ Because of that, the size, colour and shape settings are treated as *recall
 floors* rather than as decisions. A candidate rejected at this stage is never
 scored, stored, reviewed or labelled, so the mistake is invisible and
 self-reinforcing: you cannot notice or correct a weed the app never mentioned.
-Every one of those thresholds is therefore clamped to an absolute ceiling, and
-while a trained verifier is scoring the padding around known crops is capped
-too — the verifier is given each candidate's distance to the nearest crop and
-judges that far better than a fixed circle can. The confidence thresholds are
-what actually decide whether something is a weed. Tune those first.
+Every one of those thresholds is therefore clamped to an absolute ceiling. The
+configured maximum area is recorded as evidence and blocks automatic creation,
+but no longer hides an oversized proposal from review. When the verifier is
+enabled, unowned foliage inside a crop-protection zone is also submitted with
+its distance and overlap recorded; it is review/training evidence only and
+cannot be created automatically. The confidence thresholds are what actually
+decide whether something is a weed. Tune those first.
+
+The weed candidate mask honours the configured hue, saturation and excess-green
+controls before verification. It also avoids the crop mask's 3 mm opening,
+which used to erase narrow leaves and stems. Nearby disconnected leaves are
+grouped into a proposal, but the grouping is span-bounded so a chain of weeds
+cannot collapse into one bed-wide blob.
 
 Each analysed image logs how many candidates were found and why any were
-dropped (`crop-supported`, `size`, `colour/shape`, `low score`), so a starved
-verifier shows up in the add-on log rather than only as missing weeds.
+dropped (`size`, `colour/shape`, `low score`), plus how many crop-protected and
+oversized proposals were still scored. A starved verifier therefore shows up in
+the add-on log rather than only as missing weeds.
 
 The **learned verifier** is a small logistic model trained on your own labels.
 It sees sixteen visual features the heuristic ignores (hue, saturation,

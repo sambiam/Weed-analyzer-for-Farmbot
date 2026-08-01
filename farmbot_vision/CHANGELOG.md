@@ -1,5 +1,41 @@
 # Changelog
 
+## 3.15.0 - 2026-08-01
+
+- Made weed discovery recall-first before verification: the candidate mask now
+  honours the configured hue, saturation, and excess-green controls and keeps
+  narrow foliage that the crop mask's 3 mm opening previously erased.
+- Oversized blobs are now sent through verification and review with their area
+  retained as evidence instead of being silently discarded. The default soft
+  maximum rises from 2,500 to 10,000 mm²; exceeding it still blocks automatic
+  FarmBot weed creation.
+- Unowned vegetation inside crop-protection zones can now reach the enabled
+  verifier for review and training, while crop ownership remains protected and
+  the persisted overlap flag prevents automatic creation near a known crop.
+- Bounded nearby-leaf grouping now prevents a chain of adjacent weeds from
+  collapsing into one bed-spanning candidate that the verifier cannot classify
+  usefully.
+- Added a lightweight learned second opinion for plant-radius growth. Only new
+  vegetation beyond the previous canopy edge is scored; crop-confirmed evidence
+  may extend the geometric radius, verifier-confirmed weeds and non-crop
+  material are removed, and uncertain evidence holds the old boundary with a
+  confidence cap that prevents automatic writes.
+- Reused the existing locally trained weed/crop/category model instead of
+  adding a full-frame neural network. Boundary checks run only on a few new
+  connected regions, honour verifier shadow mode, and fall back to the
+  72-sector geometric estimator when the model or a trained crop head is not
+  available.
+- Mapped known FarmBot weed centres and radii into each processed image before
+  final plant measurement. Their complete outward radial sectors are removed
+  from new plant ownership, while established canopy inside the previous edge
+  remains protected.
+- Verifier-confirmed boundary weeds now bypass the old circular crop-exclusion
+  stage and enter the normal weed review/confirmation workflow instead of being
+  hidden by the plant mask.
+- Added boundary-verifier settings, per-image statistics, measurement
+  diagnostics, and regression coverage for crop acceptance, uncertainty,
+  known-weed exclusion, and weed-workflow handoff.
+
 ## 3.14.0 - 2026-07-31
 
 - Added an experimental **Draw shape** tab that traces a shape on the XY plane

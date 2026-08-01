@@ -6,7 +6,7 @@ import cv2
 import numpy as np
 from conftest import encode_jpeg, jpeg
 
-from farmbot_vision.models import Calibration, Decision, PlantSeed
+from farmbot_vision.models import Calibration, Decision, KnownWeedSeed, PlantSeed
 from farmbot_vision.vision import (
     ClassicalVisionEngine,
     _absence_confidence,
@@ -21,6 +21,23 @@ def analyse(shapes, seed, calibration, previous=None, seeds=None):
     return ClassicalVisionEngine().analyse(
         jpeg(shapes), 9, NOW, seeds or [seed], calibration, previous or {}
     )
+
+
+class _BoundaryVerifier:
+    """Small tri-state verifier fixture with a trained crop category head."""
+
+    available = True
+    model = {"class_heads": {"crop": {"weights": [1]}}}
+
+    def __init__(self, weed_probability: float, explanations: list[tuple[str, float]]):
+        self.weed_probability = weed_probability
+        self.explanations = explanations
+
+    def predict(self, _features: dict[str, float]) -> float:
+        return self.weed_probability
+
+    def explain(self, _features: dict[str, float]) -> list[tuple[str, float]]:
+        return self.explanations
 
 
 def test_circular_plant_without_weeds(seed, calibration):
@@ -168,6 +185,119 @@ def test_clean_mask_can_reduce_a_previously_overestimated_radius(calibration):
 
     assert 33 <= measurement.maximum_accepted_canopy_radius_mm <= 37
     assert measurement.recommended_protection_radius_mm < 70
+
+
+def test_known_weed_is_removed_from_new_plant_boundary(calibration):
+    from farmbot_vision.weed_settings import WeedSettings
+
+    seed = PlantSeed(
+        plant_id=1,
+        crop_slug="lettuce",
+        center_px=(160, 120),
+        current_radius_mm=60,
+    )
+    image = jpeg(
+        [
+            ("circle", ((160, 120), 25)),
+            ("line", ((160, 120), (250, 120), 10)),
+            ("circle", ((250, 120), 12)),
+        ]
+    )
+    result = ClassicalVisionEngine().analyse(
+        image,
+        9,
+        NOW,
+        [seed],
+        calibration,
+        {},
+        WeedSettings(enabled=False),
+        [KnownWeedSeed(weed_id=91, center_px=(250, 120), radius_mm=15)],
+    )
+    ownership = cv2.imdecode(np.frombuffer(result.ownership_mask, np.uint8), cv2.IMREAD_UNCHANGED)
+
+    assert result.measurements[0].maximum_accepted_canopy_radius_mm < 35
+    assert ownership[120, 250] == 0
+    assert result.boundary_verifier_stats["known_weed_regions"] == 1
+
+
+def test_boundary_verifier_accepts_confirmed_crop_growth(seed, calibration):
+    from farmbot_vision.weed_settings import WeedSettings
+
+    verifier = _BoundaryVerifier(0.05, [("crop", 0.9), ("weed", 0.1)])
+    settings = WeedSettings(
+        enabled=True,
+        visual_verifier_enabled=True,
+        visual_verifier_shadow_mode=False,
+    )
+    result = ClassicalVisionEngine(weed_verifier=verifier).analyse(
+        jpeg([("circle", ((160, 120), 40))]),
+        9,
+        NOW,
+        [seed],
+        calibration,
+        {},
+        settings,
+    )
+
+    assert 38 <= result.measurements[0].maximum_accepted_canopy_radius_mm <= 42
+    assert result.boundary_verifier_stats["crop_accepted"] == 1
+
+
+def test_boundary_verifier_holds_uncertain_growth(seed, calibration):
+    from farmbot_vision.weed_settings import WeedSettings
+
+    verifier = _BoundaryVerifier(0.4, [("crop", 0.55), ("soil", 0.45)])
+    settings = WeedSettings(
+        enabled=True,
+        visual_verifier_enabled=True,
+        visual_verifier_shadow_mode=False,
+    )
+    result = ClassicalVisionEngine(weed_verifier=verifier).analyse(
+        jpeg([("circle", ((160, 120), 40))]),
+        9,
+        NOW,
+        [seed],
+        calibration,
+        {},
+        settings,
+    )
+    measurement = result.measurements[0]
+
+    assert measurement.maximum_accepted_canopy_radius_mm < 35
+    assert measurement.confidence <= 0.74
+    assert result.boundary_verifier_stats["uncertain_held"] == 1
+
+
+def test_boundary_weed_reaches_weed_workflow_despite_crop_exclusion(seed, calibration):
+    from farmbot_vision.weed_settings import WeedSettings
+
+    verifier = _BoundaryVerifier(0.97, [("weed", 0.95), ("crop", 0.05)])
+    settings = WeedSettings(
+        enabled=True,
+        maximum_area_mm2=10_000,
+        minimum_confidence=0.4,
+        visual_verifier_enabled=True,
+        visual_verifier_shadow_mode=False,
+    )
+    result = ClassicalVisionEngine(weed_verifier=verifier).analyse(
+        jpeg(
+            [
+                ("circle", ((160, 120), 25)),
+                ("line", ((160, 120), (250, 120), 10)),
+                ("circle", ((250, 120), 12)),
+            ]
+        ),
+        9,
+        NOW,
+        [seed],
+        calibration,
+        {},
+        settings,
+    )
+
+    assert result.measurements[0].maximum_accepted_canopy_radius_mm < 35
+    assert result.boundary_verifier_stats["weed_rejected"] == 1
+    assert result.weeds, "a verifier-confirmed boundary weed must remain reviewable"
 
 
 def test_overlapping_crops_keep_reviewable_nearest_seed_ownership(calibration):
@@ -625,11 +755,84 @@ def test_shadow_mode_also_hands_every_candidate_to_the_verifier():
     assert result.weeds[0].confidence == result.weeds[0].heuristic_confidence
 
 
-def test_a_strict_maximum_area_is_still_honoured():
-    """The one size judgement a verifier cannot make from a cropped image."""
-    result = _weed_scene(_StubVerifier(0.9), maximum_area_mm2=10)
+def test_candidate_above_configured_maximum_area_is_still_reviewable():
+    """Area is evidence and an auto guard, never a pre-review veto."""
+    verifier = _StubVerifier(0.9)
 
-    assert result.weeds == []
+    result = _weed_scene(verifier, maximum_area_mm2=10)
+
+    assert len(result.weeds) == 1
+    assert verifier.seen
+    assert result.weed_candidate_stats["oversized_scored"] >= 1
+    assert result.weeds[0].features["configured_maximum_area_exceeded"] == 1
+
+
+def test_oversized_candidate_is_reviewable_before_verifier_is_trained():
+    result = _weed_scene(_StubVerifier(None, available=False), maximum_area_mm2=10)
+
+    assert len(result.weeds) == 1
+    assert result.weeds[0].features["configured_maximum_area_exceeded"] == 1
+
+
+def test_configured_colour_mask_recovers_muted_weed_for_verifier(calibration):
+    """The UI colour settings must act before candidate verification."""
+    from farmbot_vision.weed_settings import WeedSettings
+
+    image = np.zeros((240, 320, 3), np.uint8)
+    # HSV(60, 20, 100): green-biased, but too desaturated for the established
+    # crop mask's fixed saturation >22 rule.  It represents shaded/washed leaf
+    # pixels like those in the field photos.
+    muted_green = tuple(
+        int(value) for value in cv2.cvtColor(np.uint8([[[60, 20, 100]]]), cv2.COLOR_HSV2BGR)[0, 0]
+    )
+    cv2.circle(image, (250, 100), 12, muted_green, -1)
+    verifier = _StubVerifier(0.9)
+    settings = WeedSettings(
+        enabled=True,
+        minimum_confidence=0.3,
+        visual_verifier_enabled=True,
+        visual_verifier_shadow_mode=False,
+        visual_verifier_minimum_confidence=0.6,
+        strong_green_minimum_saturation=18,
+        strong_green_minimum_excess_green=10,
+    )
+
+    result = ClassicalVisionEngine(weed_verifier=verifier).analyse(
+        encode_jpeg(image), 9, NOW, [], calibration, {}, settings
+    )
+
+    assert len(result.weeds) == 1
+    assert verifier.seen, "muted configured foliage must reach verification"
+
+
+def test_verifier_scores_unclaimed_weed_inside_crop_protection(seed, calibration):
+    """Crop proximity is model context, not an invisible candidate veto."""
+    from farmbot_vision.weed_settings import WeedSettings
+
+    verifier = _StubVerifier(0.9)
+    settings = WeedSettings(
+        enabled=True,
+        plant_exclusion_margin_mm=35,
+        minimum_confidence=0.3,
+        visual_verifier_enabled=True,
+        visual_verifier_shadow_mode=False,
+        visual_verifier_minimum_confidence=0.6,
+    )
+    # The separate weed is 70 mm from a crop recorded with a 60 mm radius: it
+    # lies inside the old compounded no-candidate circle but is not crop-owned.
+    result = ClassicalVisionEngine(weed_verifier=verifier).analyse(
+        jpeg([("circle", ((160, 120), 25)), ("circle", ((230, 120), 9))]),
+        9,
+        NOW,
+        [seed],
+        calibration,
+        {},
+        settings,
+    )
+
+    assert len(result.weeds) == 1
+    assert result.weed_candidate_stats["protected_scored"] >= 1
+    assert result.weeds[0].features["crop_protection_overlap"] > 0
 
 
 def test_crop_support_does_not_chain_across_the_frame(calibration):
@@ -660,8 +863,8 @@ def test_crop_support_does_not_chain_across_the_frame(calibration):
     assert max(weed.center_px[0] for weed in result.weeds) > 200
 
 
-def test_candidate_stats_explain_why_candidates_were_dropped(seed, calibration):
-    """Starvation has to be observable, not inferred from absent weeds."""
+def test_candidate_stats_explain_oversized_candidates_without_hiding_them(seed, calibration):
+    """Oversize safety must be observable without starving review."""
     from farmbot_vision.weed_settings import WeedSettings
 
     result = ClassicalVisionEngine().analyse(
@@ -674,9 +877,9 @@ def test_candidate_stats_explain_why_candidates_were_dropped(seed, calibration):
         WeedSettings(enabled=True, plant_exclusion_margin_mm=10, maximum_area_mm2=11),
     )
 
-    assert result.weeds == []
+    assert len(result.weeds) == 1
     assert result.weed_candidate_stats["blobs"] >= 1
-    assert result.weed_candidate_stats["size"] >= 1
+    assert result.weed_candidate_stats["oversized_scored"] >= 1
 
 
 def test_candidate_stats_are_empty_when_weed_detection_is_off(seed, calibration):

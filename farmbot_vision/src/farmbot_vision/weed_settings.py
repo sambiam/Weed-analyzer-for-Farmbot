@@ -21,7 +21,10 @@ class WeedSettings(BaseModel):
     # silently discarded every weed worth catching early. Pixel noise is already
     # rejected by the vegetation mask's own area floor.
     minimum_area_mm2: float = Field(default=20, ge=5, le=10_000)
-    maximum_area_mm2: float = Field(default=2_500, ge=10, le=100_000)
+    # 10,000 mm2 is about a 113 mm circular rosette.  The old 2,500 mm2 default
+    # was already smaller than a mature 60 mm dandelion once segmentation and
+    # nearby leaf grouping were included.
+    maximum_area_mm2: float = Field(default=10_000, ge=10, le=100_000)
     plant_exclusion_margin_mm: float = Field(default=35, ge=0, le=500)
     crop_protection_enabled: bool = True
     crop_support_radius_multiplier: float = Field(default=1.2, ge=0.5, le=5)
@@ -52,6 +55,12 @@ class WeedSettings(BaseModel):
     visual_verifier_shadow_mode: bool = True
     visual_verifier_required_for_automatic: bool = True
     visual_verifier_minimum_confidence: float = Field(default=0.85, ge=0, le=1)
+    # The same local model can provide a second opinion on vegetation newly
+    # extending a known plant. It never predicts a radius; it only accepts,
+    # rejects, or holds the new boundary evidence before geometry measures it.
+    boundary_verifier_enabled: bool = True
+    boundary_crop_minimum_confidence: float = Field(default=0.60, ge=0, le=1)
+    boundary_noncrop_minimum_confidence: float = Field(default=0.80, ge=0, le=1)
     # Applied to the three shape gates only while the verifier is scoring. The
     # heuristic's job then is recall -- finding every candidate worth judging --
     # and the verifier decides. Set to 1 to keep the gates identical either way.

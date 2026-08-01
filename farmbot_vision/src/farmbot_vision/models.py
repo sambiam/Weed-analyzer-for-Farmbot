@@ -735,6 +735,14 @@ class PlantSeed(StrictModel):
     planted_at: datetime | None = None
 
 
+class KnownWeedSeed(StrictModel):
+    """A known FarmBot weed mapped into the processed image."""
+
+    weed_id: int
+    center_px: tuple[float, float]
+    radius_mm: float = Field(default=0, ge=0)
+
+
 class Measurement(StrictModel):
     measurement_id: UUID
     config_entry_id: str | None = None
@@ -817,6 +825,9 @@ class AnalysisResult(StrictModel):
     # detection. Empty when weed detection is off. Logged per image so a
     # starved verifier is visible instead of only showing up as missing weeds.
     weed_candidate_stats: dict[str, int] = Field(default_factory=dict)
+    # Known-weed exclusions and optional learned checks performed only on new
+    # plant-boundary evidence. Logged per image for safe field calibration.
+    boundary_verifier_stats: dict[str, int] = Field(default_factory=dict)
 
 
 class WeedDetection(StrictModel):

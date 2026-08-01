@@ -33,6 +33,17 @@ class CanopyRadiusEstimate:
     broad_overreach: bool
 
 
+def previous_canopy_edge_mm(
+    current_radius_mm: float, protection_margin_mm: float
+) -> tuple[float, bool]:
+    """Return the prior foliage edge and whether configured margins were removable."""
+
+    current = max(0.0, float(current_radius_mm))
+    margin = max(0.0, float(protection_margin_mm))
+    margin_aware = current > margin + 5.0
+    return max(5.0, current - margin if margin_aware else current), margin_aware
+
+
 def _circular_true_runs(flags: np.ndarray) -> list[np.ndarray]:
     """Return circular runs of true indexes without splitting the 0-degree run."""
 
@@ -100,10 +111,9 @@ def estimate_canopy_radius(
     if not np.any(observed):
         return None
 
-    current = max(0.0, float(current_radius_mm))
-    margin = max(0.0, float(protection_margin_mm))
-    has_margin_aware_prior = current > margin + 5.0
-    prior_edge = max(5.0, current - margin if has_margin_aware_prior else current)
+    prior_edge, has_margin_aware_prior = previous_canopy_edge_mm(
+        current_radius_mm, protection_margin_mm
+    )
     # Twenty millimetres tolerates calibration jitter and ordinary growth.  A
     # larger established canopy receives a proportional, but bounded, band.
     growth_band = (

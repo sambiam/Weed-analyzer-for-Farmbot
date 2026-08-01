@@ -18,4 +18,6 @@ def test_weed_settings_expose_independent_detection_training_and_automation_guar
     assert values.visual_verifier_enabled is False
     assert values.visual_verifier_shadow_mode is True
     assert values.visual_verifier_required_for_automatic is True
+    assert values.boundary_verifier_enabled is True
+    assert values.boundary_crop_minimum_confidence < values.boundary_noncrop_minimum_confidence
     assert values.minimum_confidence < values.automatic_creation_confidence

@@ -1,4 +1,4 @@
-﻿# FarmBot Vision 3.14.0
+﻿# FarmBot Vision 3.15.0
 
 Lightweight, experimental canopy measurement and safe FarmBot plant-radius recommendations. Open the app through Home Assistant Ingress after installation.
 
@@ -48,6 +48,14 @@ narrow supported leaf can still establish the true outer edge. The resulting
 protection radius slightly overestimates the accepted foliage edge by the
 configured safety and calibration margins, which is useful for watering and
 crop protection without turning nearby soil into plant canopy.
+
+When the learned verifier is enabled, it also checks only newly extending
+boundary regions. A trained crop category confirms growth; confident weed,
+soil, moss and other non-crop results are removed; and uncertainty holds the
+previous boundary for another observation. Known FarmBot weed points are
+removed from new plant ownership before this check. This reuses the small local
+logistic model and falls back to sector geometry when no suitable model exists,
+so it remains practical on a Raspberry Pi 4.
 
 The **Canopy fusion** page controls activation, minimum views, time window,
 source-edge weighting, corroboration, radial percentile, angular coverage,

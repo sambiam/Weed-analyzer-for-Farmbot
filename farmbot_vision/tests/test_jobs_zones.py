@@ -126,7 +126,9 @@ def _measurement() -> Measurement:
     )
 
 
-def _analysis_result(weed_center_px: tuple[float, float]) -> AnalysisResult:
+def _analysis_result(
+    weed_center_px: tuple[float, float], features: dict[str, float] | None = None
+) -> AnalysisResult:
     return AnalysisResult(
         measurements=[_measurement()],
         weeds=[
@@ -138,12 +140,20 @@ def _analysis_result(weed_center_px: tuple[float, float]) -> AnalysisResult:
                 "area_mm2": 150.0,
                 "radius_mm": 12.0,
                 "confidence": 0.99,
+                "features": features or {},
             }
         ],
     )
 
 
-def _manager(tmp_path, monkeypatch, *, zones: list[Zone], weed_center_px) -> JobManager:
+def _manager(
+    tmp_path,
+    monkeypatch,
+    *,
+    zones: list[Zone],
+    weed_center_px,
+    weed_features: dict[str, float] | None = None,
+) -> JobManager:
     from farmbot_vision import jobs as jobs_module
 
     store = ZoneStore(tmp_path / "zones.json")
@@ -173,7 +183,7 @@ def _manager(tmp_path, monkeypatch, *, zones: list[Zone], weed_center_px) -> Job
     monkeypatch.setattr(
         jobs_module.ClassicalVisionEngine,
         "analyse",
-        lambda *args, **kwargs: _analysis_result(weed_center_px),
+        lambda *args, **kwargs: _analysis_result(weed_center_px, weed_features),
     )
     monkeypatch.setattr(jobs_module, "decide", lambda item, *args, **kwargs: item)
     return manager
@@ -219,6 +229,28 @@ async def test_weed_outside_the_exclusion_zone_is_still_created_automatically(
     assert result["zone_blocked_weeds"] == 0
     assert len(manager.client.created_weeds) == 1
     assert manager.client.created_weeds[0].x == pytest.approx(-20.0)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "safety_feature",
+    ["crop_protection_overlap", "configured_maximum_area_exceeded"],
+)
+async def test_recall_only_candidate_is_reviewable_but_never_created_automatically(
+    tmp_path, monkeypatch, safety_feature
+):
+    manager = _manager(
+        tmp_path,
+        monkeypatch,
+        zones=[],
+        weed_center_px=(28.0, 36.0),
+        weed_features={safety_feature: 1.0},
+    )
+
+    await manager.run(entry_id="bot", mode=OperatingMode.RECOMMEND)
+
+    assert manager.client.created_weeds == []
+    assert len(manager.db.pending_weed_detections()) == 1
 
 
 @pytest.mark.asyncio

@@ -1748,6 +1748,7 @@ async def test_weed_settings_page_exposes_pipeline_training_and_automation_contr
     assert "Known crop protection" in html
     assert "Multi-image confirmation" in html
     assert "Learned visual verifier" in html
+    assert "Verify new plant-radius growth" in html
     assert 'name="automatic_creation_confidence"' in html
     assert 'action="weed-model/train"' in html
     assert 'action="weed-model/clear"' in html
