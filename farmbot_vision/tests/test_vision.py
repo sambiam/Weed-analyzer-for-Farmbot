@@ -300,6 +300,39 @@ def test_boundary_weed_reaches_weed_workflow_despite_crop_exclusion(seed, calibr
     assert result.weeds, "a verifier-confirmed boundary weed must remain reviewable"
 
 
+def test_shadow_boundary_verifier_surfaces_weed_without_changing_crop(seed, calibration):
+    """Shadow mode may rescue review evidence while leaving crop geometry untouched."""
+
+    from farmbot_vision.weed_settings import WeedSettings
+
+    verifier = _BoundaryVerifier(0.97, [("weed", 0.95), ("crop", 0.05)])
+    settings = WeedSettings(
+        enabled=True,
+        minimum_confidence=0.79,
+        visual_verifier_enabled=True,
+        visual_verifier_shadow_mode=True,
+    )
+    result = ClassicalVisionEngine(weed_verifier=verifier).analyse(
+        jpeg(
+            [
+                ("circle", ((160, 120), 25)),
+                ("line", ((160, 120), (250, 120), 10)),
+                ("circle", ((250, 120), 12)),
+            ]
+        ),
+        9,
+        NOW,
+        [seed],
+        calibration,
+        {},
+        settings,
+    )
+
+    assert result.boundary_verifier_stats["shadow_scored"] == 1
+    assert result.measurements[0].maximum_accepted_canopy_radius_mm > 80
+    assert result.weeds, "a high-confidence crop-owned weed must reach review in shadow mode"
+
+
 def test_overlapping_crops_keep_reviewable_nearest_seed_ownership(calibration):
     seeds = [
         PlantSeed(plant_id=1, crop_slug="lettuce", center_px=(135, 120), current_radius_mm=50),
@@ -688,6 +721,77 @@ def test_shadow_mode_scores_without_deciding():
     # Scored and recorded, but the heuristic still owns the decision.
     assert weed.verifier_confidence == 0.05
     assert weed.confidence == weed.heuristic_confidence
+
+
+def test_shadow_verifier_rescues_pale_seedling_hidden_by_high_review_threshold(calibration):
+    """A review-band verifier result must not be discarded by the heuristic."""
+
+    from farmbot_vision.weed_settings import WeedSettings
+
+    image = np.zeros((220, 320, 3), np.uint8)
+    pale = tuple(
+        int(value) for value in cv2.cvtColor(np.uint8([[[60, 15, 130]]]), cv2.COLOR_HSV2BGR)[0, 0]
+    )
+    cv2.circle(image, (245, 105), 5, pale, -1)
+    verifier = _StubVerifier(0.70)
+    settings = WeedSettings(
+        enabled=True,
+        minimum_confidence=0.79,
+        visual_verifier_enabled=True,
+        visual_verifier_shadow_mode=True,
+        visual_verifier_rejection_confidence=0.45,
+        visual_verifier_acceptance_confidence=0.85,
+        strong_green_minimum_saturation=20,
+        strong_green_minimum_excess_green=15,
+        candidate_minimum_saturation=15,
+        candidate_minimum_excess_green=2,
+    )
+
+    result = ClassicalVisionEngine(weed_verifier=verifier).analyse(
+        encode_jpeg(image), 9, NOW, [], calibration, {}, settings
+    )
+
+    assert len(result.weeds) == 1
+    assert verifier.seen, "the pale seedling must reach the verifier"
+    assert result.weeds[0].heuristic_confidence < settings.minimum_confidence
+    assert result.weeds[0].confidence == 0.70
+    assert result.weed_candidate_stats["verifier_rescued"] == 1
+
+
+def test_verifier_shape_gates_do_not_veto_uniformly_pale_rosette(calibration):
+    """Strong-green purity is a verifier feature, never a pre-verifier veto."""
+
+    from farmbot_vision.weed_settings import WeedSettings
+
+    image = np.zeros((220, 320, 3), np.uint8)
+    pale = tuple(
+        int(value) for value in cv2.cvtColor(np.uint8([[[60, 15, 130]]]), cv2.COLOR_HSV2BGR)[0, 0]
+    )
+    for center in ((245, 105), (263, 105), (254, 90), (254, 120)):
+        cv2.circle(image, center, 7, pale, -1)
+    verifier = _StubVerifier(0.90)
+
+    result = ClassicalVisionEngine(weed_verifier=verifier).analyse(
+        encode_jpeg(image),
+        9,
+        NOW,
+        [],
+        calibration,
+        {},
+        WeedSettings(
+            enabled=True,
+            minimum_confidence=0.79,
+            visual_verifier_enabled=True,
+            visual_verifier_shadow_mode=False,
+            strong_green_minimum_saturation=45,
+            strong_green_minimum_excess_green=20,
+            minimum_green_purity=0.10,
+        ),
+    )
+
+    assert len(result.weeds) == 1
+    assert verifier.seen, "pale leaves must be scored instead of silently shape-rejected"
+    assert result.weed_candidate_stats["shape"] == 0
 
 
 def test_untrained_verifier_falls_back_to_the_heuristic():

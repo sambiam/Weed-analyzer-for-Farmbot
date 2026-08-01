@@ -5863,68 +5863,25 @@ async def weed_settings_page(request: Request) -> HTMLResponse:
                     "nothing on this page has any effect."
                 ),
             ),
-            toggle_field(
-                "automatic_creation",
-                "Automatically create detected weeds in FarmBot",
-                values.automatic_creation,
-                tip=(
-                    "When off, detections are only recommendations you approve on the "
-                    "Analysis page. When on, a detection that clears every automatic "
-                    "threshold below is written into FarmBot without asking. Leave this "
-                    "off until you have watched the recommendations for a few days and "
-                    "agree with them."
-                ),
-            ),
             slider_field(
                 "minimum_confidence",
-                "Review/recommendation confidence",
+                "Fallback heuristic review threshold (not verifier)",
                 values.minimum_confidence,
                 tip=(
-                    "How sure the app must be before a candidate is shown to you as a "
-                    "suspected weed. LOW (0.3) surfaces almost everything green that is "
-                    "not a known crop, so you see every weed but also more mulch and "
-                    "moss. HIGH (0.8) shows only obvious weeds and will silently miss "
-                    "small seedlings. To calibrate: start low, look at what appears on "
-                    "the Analysis page, and raise it only if the list is too noisy to "
-                    "work through. Once the learned verifier is enforcing, its own "
-                    "threshold replaces this one."
+                    "This is confidence from the built-in plant-like heuristic, not the "
+                    "learned verifier. It controls review only when no trained verifier "
+                    "is enforcing and remains a fallback in shadow mode. LOW (0.3) "
+                    "surfaces more pale and small weeds plus false alarms; HIGH (0.8) "
+                    "silently misses seedlings. It is ignored for enforced verifier "
+                    "decisions and can never authorise automatic creation."
                 ),
                 minimum=0,
                 maximum=1,
                 step=0.01,
                 note=(
-                    "Lower = more weeds found and more false alarms. Higher = a cleaner "
-                    "list that misses small weeds."
+                    "Heuristic review fallback only. Start near 0.3-0.45 for recall; "
+                    "the learned-verifier thresholds are configured separately below."
                 ),
-            ),
-            slider_field(
-                "automatic_creation_confidence",
-                "Automatic creation confidence",
-                values.automatic_creation_confidence,
-                tip=(
-                    "The much stricter bar a detection must clear before it is written "
-                    "into FarmBot on its own. Keep it well above the review confidence "
-                    "above — creating a weed on top of a crop is a real cost, whereas a "
-                    "missed weed is caught on the next pass."
-                ),
-                minimum=0,
-                maximum=1,
-                step=0.01,
-            ),
-            slider_field(
-                "weed_radius_mm",
-                "Created weed radius",
-                values.weed_radius_mm,
-                tip=(
-                    "The radius given to a weed created in FarmBot, used as a floor: a "
-                    "weed measured larger than this keeps its measured size. FarmBot "
-                    "avoids this circle when watering and seeding, so a larger value is "
-                    "safer for neighbours but blocks more bed area."
-                ),
-                minimum=1,
-                maximum=250,
-                step=1,
-                unit="mm",
             ),
         )
     )
@@ -6411,19 +6368,6 @@ round disc">
                 step=1,
             ),
             slider_field(
-                "automatic_min_observations",
-                "Looks before automatic creation",
-                values.automatic_min_observations,
-                tip=(
-                    "How many sightings are needed before a weed may be created in "
-                    "FarmBot automatically. Must be at least the review count above. "
-                    "Three is a reasonable balance."
-                ),
-                minimum=1,
-                maximum=20,
-                step=1,
-            ),
-            slider_field(
                 "temporal_match_distance_mm",
                 "Position matching distance",
                 values.temporal_match_distance_mm,
@@ -6475,20 +6419,10 @@ round disc">
                 values.visual_verifier_shadow_mode,
                 tip=(
                     "While on, the verifier's score is recorded next to each detection "
-                    "but the simple rules still decide. Use it to check the model agrees "
-                    "with you before letting it act. Turn it off to let the verifier's "
-                    "own confidence threshold make the decision."
-                ),
-            ),
-            toggle_field(
-                "visual_verifier_required_for_automatic",
-                "Require verifier approval for automatic creation",
-                values.visual_verifier_required_for_automatic,
-                tip=(
-                    "Blocks automatic creation of any weed the trained verifier has not "
-                    "approved. Keep this on: the simple rules measure how plant-like "
-                    "something is, not whether it is a weed, so they should never "
-                    "authorise a change to your garden on their own."
+                    "and may rescue a likely weed for human review, but it cannot reject "
+                    "a rule-approved candidate, change a crop radius, or authorise an "
+                    "automatic action. Turn it off to let the verifier's own confidence "
+                    "thresholds make decisions."
                 ),
             ),
             slider_field(
@@ -6506,13 +6440,14 @@ round disc">
             ),
             slider_field(
                 "visual_verifier_acceptance_confidence",
-                "Weed automatic acceptance threshold",
+                "Verifier weed acceptance threshold",
                 values.visual_verifier_acceptance_confidence,
                 tip=(
-                    "Candidates at or above this verifier score are approved as weeds. "
-                    "They may be created automatically only when every independent "
-                    "automation, observation, crop-protection and size guard also passes. "
-                    "The training panel below suggests a value from your own labels."
+                    "Candidates at or above this learned-verifier score are approved as "
+                    "weeds and become eligible for automation. Creation still requires "
+                    "the separate automatic-creation threshold plus every observation, "
+                    "crop-protection and size guard below. The higher confidence "
+                    "threshold wins."
                 ),
                 minimum=0,
                 maximum=1,
@@ -6629,6 +6564,74 @@ round disc">
                     "They are tiny (a few kB each) — leave this on."
                 ),
             ),
+        )
+    )
+
+    effective_creation_confidence = max(
+        values.visual_verifier_acceptance_confidence,
+        values.automatic_creation_confidence,
+    )
+    automatic_creation_fields = (
+        "<p class=setting-note><b>Safety invariant:</b> the heuristic can never create a "
+        "FarmBot weed. Automatic creation requires a trained verifier, verifier enforcement "
+        "(shadow mode off), and every guard in this section. "
+        f"The current effective verifier threshold is <b>{effective_creation_confidence:.2f}</b> "
+        "because the higher of the verifier acceptance and creation thresholds wins.</p>"
+        + "".join(
+            (
+                toggle_field(
+                    "automatic_creation",
+                    "Automatically create verifier-approved weeds in FarmBot",
+                    values.automatic_creation,
+                    tip=(
+                        "When off, detections remain recommendations for you to approve. "
+                        "When on, only an enforcing trained verifier may authorise a write. "
+                        "The fallback heuristic and shadow-mode scores are review-only and "
+                        "can never create a FarmBot weed."
+                    ),
+                ),
+                slider_field(
+                    "automatic_creation_confidence",
+                    "Verifier confidence required for automatic creation",
+                    values.automatic_creation_confidence,
+                    tip=(
+                        "This is learned-verifier confidence only. It is an additional bar "
+                        "above the verifier acceptance threshold; the higher value applies. "
+                        "It never reads or trusts the fallback heuristic confidence."
+                    ),
+                    minimum=0,
+                    maximum=1,
+                    step=0.01,
+                ),
+                slider_field(
+                    "automatic_min_observations",
+                    "Separate sightings required before automatic creation",
+                    values.automatic_min_observations,
+                    tip=(
+                        "How many sightings are needed before a verifier-approved weed may "
+                        "be created in FarmBot. This must be at least the review count in "
+                        "Multi-image matching. Three is a reasonable balance."
+                    ),
+                    minimum=1,
+                    maximum=20,
+                    step=1,
+                ),
+                slider_field(
+                    "weed_radius_mm",
+                    "Minimum radius assigned to an automatically created weed",
+                    values.weed_radius_mm,
+                    tip=(
+                        "The radius given to a created FarmBot weed as a floor; a strictly "
+                        "measured larger weed keeps its measured size. FarmBot avoids this "
+                        "circle when watering and seeding, so larger values protect more "
+                        "space but block more bed area."
+                    ),
+                    minimum=1,
+                    maximum=250,
+                    step=1,
+                    unit="mm",
+                ),
+            )
         )
     )
 
@@ -6798,18 +6801,19 @@ title="Hover or focus a question mark like this one to read what the setting doe
 and low values mean, and how to calibrate it.">?</span> explaining what it does. Start in
 review/shadow mode, label real examples, train the local verifier, then enable enforcement or
 automatic FarmBot creation when its validation results and field behaviour are satisfactory.</p>
-<p class=setting-note>Finding candidates and deciding which are weeds are separate stages. The
-size, colour and shape rules only decide <em>what gets looked at</em>, and are deliberately
-generous — a candidate rejected there is never scored, stored or shown, so a mistake made there
-is invisible. The confidence thresholds decide <em>what counts as a weed</em>. Tune those first.</p>
+<p class=setting-note>Finding candidates, deciding which are weeds, and authorising FarmBot writes
+are three separate stages. Candidate size/colour/shape settings decide <em>what gets looked at</em>.
+The fallback heuristic can only order or filter human review. The learned verifier decides whether
+a candidate is a weed, and <b>only an enforcing trained verifier can authorise automatic creation</b>.</p>
 <form method=post action="weed-settings">
-<fieldset><legend>Operation</legend>{operation_fields}</fieldset>
+<fieldset><legend>Detection and fallback review</legend>{operation_fields}</fieldset>
 <fieldset><legend>How big a weed to look for</legend>{size_fields}</fieldset>
 <fieldset><legend>What counts as green foliage</legend>{colour_fields}</fieldset>
 <fieldset><legend>What shape a weed may be</legend>{shape_fields}</fieldset>
 <fieldset><legend>Known crop protection</legend>{crop_fields}</fieldset>
-<fieldset><legend>Multi-image confirmation</legend>{temporal_fields}</fieldset>
-<fieldset><legend>Learned visual verifier</legend>{verifier_fields}</fieldset>
+<fieldset><legend>Multi-image matching and review timing</legend>{temporal_fields}</fieldset>
+<fieldset><legend>Learned verifier decisions</legend>{verifier_fields}</fieldset>
+<fieldset><legend>Automatic weed creation</legend>{automatic_creation_fields}</fieldset>
 <fieldset><legend>Existing weed maintenance</legend>{maintenance_fields}</fieldset>
 <button>Save all weed settings</button></form>{settings_script}</section>
 <section class=card><h2>Verifier training</h2>{training_notice_html}<p>{model_status}</p>
@@ -6886,7 +6890,6 @@ async def save_weed_settings(
     temporal_max_gap_hours: int = Form(168),
     visual_verifier_enabled: bool = Form(False),
     visual_verifier_shadow_mode: bool = Form(False),
-    visual_verifier_required_for_automatic: bool = Form(False),
     visual_verifier_rejection_confidence: float = Form(0.45),
     visual_verifier_acceptance_confidence: float = Form(0.85),
     boundary_verifier_enabled: bool = Form(False),
@@ -6942,7 +6945,6 @@ async def save_weed_settings(
             temporal_max_gap_hours=temporal_max_gap_hours,
             visual_verifier_enabled=visual_verifier_enabled,
             visual_verifier_shadow_mode=visual_verifier_shadow_mode,
-            visual_verifier_required_for_automatic=visual_verifier_required_for_automatic,
             visual_verifier_rejection_confidence=visual_verifier_rejection_confidence,
             visual_verifier_acceptance_confidence=visual_verifier_acceptance_confidence,
             boundary_verifier_enabled=boundary_verifier_enabled,

@@ -484,7 +484,7 @@ def test_removal_artifacts_migrate_persist_and_count_distinct_images(tmp_path):
     assert database.absent_streak("bot-1", 1) == 1
 
 
-def test_rejected_weed_position_suppresses_future_detections_after_restart(tmp_path):
+def test_rejected_weed_suppresses_same_image_but_not_future_photos_after_restart(tmp_path):
     path = tmp_path / "db.sqlite"
     database = Database(path)
     rejected_id = str(uuid4())
@@ -517,12 +517,70 @@ def test_rejected_weed_position_suppresses_future_detections_after_restart(tmp_p
     database.connection.close()
 
     restarted = Database(path)
-    assert restarted.has_weed_detection_near("bot-1", 103, 202, 20) is True
+    assert (
+        restarted.has_terminal_weed_detection_near("bot-1", 103, 202, 20, source_image_id=10)
+        is True
+    )
     # The stored rejected radius extends the suppression area beyond the
-    # current detection's duplicate tolerance.
-    assert restarted.has_weed_detection_near("bot-1", 140, 200, 20) is True
-    assert restarted.has_weed_detection_near("bot-1", 151, 200, 20) is False
-    assert restarted.has_weed_detection_near("bot-2", 103, 202, 20) is False
+    # current detection's duplicate tolerance, but only for the reviewed image.
+    assert (
+        restarted.has_terminal_weed_detection_near("bot-1", 140, 200, 20, source_image_id=10)
+        is True
+    )
+    assert (
+        restarted.has_terminal_weed_detection_near("bot-1", 151, 200, 20, source_image_id=10)
+        is False
+    )
+    assert (
+        restarted.has_terminal_weed_detection_near("bot-1", 103, 202, 20, source_image_id=11)
+        is False
+    )
+    assert (
+        restarted.has_terminal_weed_detection_near("bot-2", 103, 202, 20, source_image_id=10)
+        is False
+    )
+
+
+def test_created_weed_record_only_guards_inventory_sync_window(tmp_path):
+    database = Database(tmp_path / "db.sqlite")
+    created_at = datetime(2026, 7, 23, tzinfo=UTC)
+    database.save_weed_detection(
+        detection_id=str(uuid4()),
+        config_entry_id="bot-1",
+        image_id=10,
+        image_timestamp=created_at,
+        x=100,
+        y=200,
+        z=0,
+        area_mm2=100,
+        radius_mm=30,
+        confidence=0.9,
+        overlay_path=None,
+        status="created",
+    )
+
+    assert (
+        database.has_terminal_weed_detection_near(
+            "bot-1",
+            103,
+            202,
+            20,
+            source_image_id=11,
+            source_image_timestamp=created_at + timedelta(hours=12),
+        )
+        is True
+    )
+    assert (
+        database.has_terminal_weed_detection_near(
+            "bot-1",
+            103,
+            202,
+            20,
+            source_image_id=12,
+            source_image_timestamp=created_at + timedelta(hours=25),
+        )
+        is False
+    )
 
 
 def test_weed_candidate_tracking_and_training_labels_survive_restart(tmp_path):

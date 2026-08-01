@@ -831,13 +831,14 @@ class JobManager:
                     stats = result.weed_candidate_stats
                     LOGGER.info(
                         "Image %s weed candidates: %s found, %s detected "
-                        "(%s crop-protected and %s oversized scored; dropped: %s size, "
-                        "%s colour/shape, %s low score)",
+                        "(%s crop-protected, %s oversized, and %s shadow-rescued scored; "
+                        "dropped: %s size, %s colour/shape, %s low score)",
                         response.image_id,
                         stats.get("blobs", 0),
                         len(result.weeds),
                         stats.get("protected_scored", 0),
                         stats.get("oversized_scored", 0),
+                        stats.get("verifier_rescued", 0),
                         stats.get("size", 0),
                         stats.get("shape", 0),
                         stats.get("score", 0),
@@ -895,9 +896,9 @@ class JobManager:
                         status = "matched"
                         verifier_allows_radius = bool(
                             not weed_settings.visual_verifier_enabled
-                            or weed_settings.visual_verifier_shadow_mode
                             or (
-                                weed.verifier_confidence is not None
+                                not weed_settings.visual_verifier_shadow_mode
+                                and weed.verifier_confidence is not None
                                 and weed.verifier_confidence
                                 >= weed_settings.visual_verifier_acceptance_confidence
                             )
@@ -986,7 +987,12 @@ class JobManager:
                         )
                         continue
                     if self.db.has_terminal_weed_detection_near(
-                        entry_id, weed_x, weed_y, duplicate_distance
+                        entry_id,
+                        weed_x,
+                        weed_y,
+                        duplicate_distance,
+                        source_image_id=weed.image_id,
+                        source_image_timestamp=weed.image_timestamp,
                     ):
                         continue
                     # Zones decide where a weed may exist at all: a position the
@@ -1029,8 +1035,9 @@ class JobManager:
                         else 1
                     )
                     verifier_allows_automatic = (
-                        not weed_settings.visual_verifier_required_for_automatic
-                        or (
+                        weed_settings.visual_verifier_enabled
+                        and not weed_settings.visual_verifier_shadow_mode
+                        and (
                             weed.verifier_confidence is not None
                             and weed.verifier_confidence
                             >= weed_settings.visual_verifier_acceptance_confidence
@@ -1039,9 +1046,10 @@ class JobManager:
                     if (
                         weed_settings
                         and weed_settings.automatic_creation
-                        and weed.confidence >= weed_settings.automatic_creation_confidence
-                        and observations >= automatic_observations
                         and verifier_allows_automatic
+                        and weed.verifier_confidence is not None
+                        and weed.verifier_confidence >= weed_settings.automatic_creation_confidence
+                        and observations >= automatic_observations
                         # Verifier-enabled candidates are intentionally visible
                         # inside crop protection so misses can be reviewed and
                         # labelled.  Visibility does not grant authority to

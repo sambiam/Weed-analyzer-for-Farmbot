@@ -146,7 +146,9 @@ def _measurement() -> Measurement:
 
 
 def _analysis_result(
-    weed_center_px: tuple[float, float], features: dict[str, float] | None = None
+    weed_center_px: tuple[float, float],
+    features: dict[str, float] | None = None,
+    verifier_confidence: float | None = 0.99,
 ) -> AnalysisResult:
     return AnalysisResult(
         measurements=[_measurement()],
@@ -159,6 +161,8 @@ def _analysis_result(
                 "area_mm2": 150.0,
                 "radius_mm": 12.0,
                 "confidence": 0.99,
+                "heuristic_confidence": 0.99,
+                "verifier_confidence": verifier_confidence,
                 "features": features or {},
             }
         ],
@@ -172,6 +176,8 @@ def _manager(
     zones: list[Zone],
     weed_center_px,
     weed_features: dict[str, float] | None = None,
+    verifier_confidence: float | None = 0.99,
+    verifier_enabled: bool = True,
 ) -> JobManager:
     from farmbot_vision import jobs as jobs_module
 
@@ -186,7 +192,8 @@ def _manager(
             enabled=True,
             automatic_creation=True,
             temporal_confirmation_enabled=False,
-            visual_verifier_required_for_automatic=False,
+            visual_verifier_enabled=verifier_enabled,
+            visual_verifier_shadow_mode=False,
         )
     )
     manager = JobManager(
@@ -202,7 +209,9 @@ def _manager(
     monkeypatch.setattr(
         jobs_module.ClassicalVisionEngine,
         "analyse",
-        lambda *args, **kwargs: _analysis_result(weed_center_px, weed_features),
+        lambda *args, **kwargs: _analysis_result(
+            weed_center_px, weed_features, verifier_confidence
+        ),
     )
     monkeypatch.setattr(jobs_module, "decide", lambda item, *args, **kwargs: item)
     return manager
@@ -248,6 +257,35 @@ async def test_weed_outside_the_exclusion_zone_is_still_created_automatically(
     assert result["zone_blocked_weeds"] == 0
     assert len(manager.client.created_weeds) == 1
     assert manager.client.created_weeds[0].x == pytest.approx(-20.0)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("verifier_enabled", "verifier_confidence"),
+    [(False, None), (True, None), (True, 0.99)],
+)
+async def test_heuristic_never_authorises_automatic_weed_creation(
+    tmp_path, monkeypatch, verifier_enabled, verifier_confidence
+):
+    manager = _manager(
+        tmp_path,
+        monkeypatch,
+        zones=[],
+        weed_center_px=(28.0, 36.0),
+        verifier_enabled=verifier_enabled,
+        verifier_confidence=verifier_confidence,
+    )
+    if verifier_confidence is not None:
+        manager.weed_settings_store.save(
+            manager.weed_settings_store.load().model_copy(
+                update={"visual_verifier_shadow_mode": True}
+            )
+        )
+
+    await manager.run(entry_id="bot", mode=OperatingMode.RECOMMEND)
+
+    assert manager.client.created_weeds == []
+    assert len(manager.db.pending_weed_detections()) == 1
 
 
 @pytest.mark.asyncio

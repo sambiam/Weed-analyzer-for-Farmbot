@@ -69,7 +69,6 @@ class WeedSettings(BaseModel):
     temporal_max_gap_hours: int = Field(default=168, ge=1, le=8_760)
     visual_verifier_enabled: bool = False
     visual_verifier_shadow_mode: bool = True
-    visual_verifier_required_for_automatic: bool = True
     # Three-way verifier triage: below rejection is hidden automatically,
     # between the thresholds remains reviewable, and at/above acceptance may
     # authorise automation when the independent automation guards also pass.

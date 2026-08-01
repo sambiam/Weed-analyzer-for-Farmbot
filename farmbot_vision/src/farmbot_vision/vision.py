@@ -173,10 +173,30 @@ class CandidateGates:
             # with every review item.  A configured maximum is an automatic
             # action guard, not permission to make a large rosette invisible.
             max_area_mm2=math.inf,
-            green_purity=min(settings.minimum_green_purity * boost, CANDIDATE_GREEN_PURITY_CEILING),
+            # Once a verifier is available, these values are evidence for it,
+            # not admission rules. Even the old recall ceilings still rejected
+            # uniformly pale seedlings whose strong-green fraction was below
+            # 0.05, so the verifier never got the chance to recover them.
+            green_purity=(
+                0.0
+                if verifier_scoring
+                else min(
+                    settings.minimum_green_purity * boost,
+                    CANDIDATE_GREEN_PURITY_CEILING,
+                )
+            ),
+            # Keep only the absolute noise ceilings for geometry. They reject
+            # JPEG fringe fragments around a known crop, while remaining far
+            # below the shape values of narrow or disconnected real weeds.
             solidity=min(settings.minimum_solidity * boost, CANDIDATE_SOLIDITY_CEILING),
-            circularity=min(settings.minimum_circularity * boost, CANDIDATE_CIRCULARITY_CEILING),
-            aspect_ratio=max(settings.maximum_aspect_ratio / boost, CANDIDATE_ASPECT_RATIO_FLOOR),
+            circularity=min(
+                settings.minimum_circularity * boost,
+                CANDIDATE_CIRCULARITY_CEILING,
+            ),
+            aspect_ratio=max(
+                settings.maximum_aspect_ratio / boost,
+                CANDIDATE_ASPECT_RATIO_FLOOR,
+            ),
             shape_filter_enabled=settings.shape_filter_enabled,
             # The crop's own footprint is never clamped -- a 60 mm plant really
             # does occupy 60 mm. Only the padding *beyond* it is, and only while
@@ -922,6 +942,14 @@ def _verify_new_boundary(
         stats["components_checked"] += 1
         if weed_settings.visual_verifier_shadow_mode:
             stats["shadow_scored"] += 1
+            # Shadow mode must not alter the crop measurement, but it may copy
+            # an especially strong weed prediction into the review pipeline.
+            # Previously it threw the score away, making crop-owned weeds
+            # invisible even though the verifier had identified them.
+            if weed_probability is not None and (
+                weed_probability >= weed_settings.visual_verifier_acceptance_confidence
+            ):
+                verified_weed[component] = True
             continue
         if weed_probability is not None and (
             weed_probability >= weed_settings.visual_verifier_acceptance_confidence
@@ -1835,6 +1863,7 @@ class ClassicalVisionEngine(ImageAnalysisEngine):
                     "size": 0,
                     "shape": 0,
                     "score": 0,
+                    "verifier_rescued": 0,
                 }
             )
             for label in range(1, count):
@@ -1928,6 +1957,19 @@ class ClassicalVisionEngine(ImageAnalysisEngine):
                     if verifier_confidence < weed_settings.visual_verifier_rejection_confidence:
                         candidate_stats["score"] += 1
                         continue
+                elif verifier_scoring and verifier_confidence is not None:
+                    # Shadow mode cannot reject a candidate, but a verifier
+                    # score inside its configured review band may rescue a
+                    # pale/sparse weed that the heuristic would hide. This is
+                    # review-only: shadow mode remains barred from automatic
+                    # creation and radius changes in jobs.py.
+                    confidence = heuristic_confidence
+                    if confidence < weed_settings.minimum_confidence:
+                        if verifier_confidence < weed_settings.visual_verifier_rejection_confidence:
+                            candidate_stats["score"] += 1
+                            continue
+                        confidence = verifier_confidence
+                        candidate_stats["verifier_rescued"] += 1
                 else:
                     confidence = heuristic_confidence
                     if confidence < weed_settings.minimum_confidence:

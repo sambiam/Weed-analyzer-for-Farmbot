@@ -20,6 +20,7 @@ from .models import (
 from .plant_measurement import select_measurement_evidence, selection_diagnostics
 
 LOGGER = logging.getLogger(__name__)
+CREATED_WEED_SYNC_GUARD_HOURS = 24
 
 MIGRATIONS = [
     """
@@ -839,18 +840,33 @@ class Database:
             )
 
     def has_terminal_weed_detection_near(
-        self, config_entry_id: str, x: float, y: float, tolerance_mm: float
+        self,
+        config_entry_id: str,
+        x: float,
+        y: float,
+        tolerance_mm: float,
+        *,
+        source_image_id: int | None = None,
+        source_image_timestamp: datetime | None = None,
     ) -> bool:
         for row in self.connection.execute(
-            """SELECT x,y,radius_mm,status FROM weed_detections
+            """SELECT x,y,radius_mm,status,image_id,image_timestamp FROM weed_detections
             WHERE config_entry_id=? AND status IN ('created','rejected','dismissed')""",
             (config_entry_id,),
         ):
-            # A rejection is a position suppression, not just a decision on
-            # one UUID. Keep using the rejected detection's radius as a floor
-            # so a later, slightly shifted detection cannot be surfaced again.
-            # "dismissed" (the reviewer could not tell) suppresses the position
-            # the same way, but without asserting the position is not a weed.
+            # A rejection judges one photograph, not this soil coordinate
+            # forever. Suppress reruns of that same source image so the reviewed
+            # item does not immediately return, but let later photos discover a
+            # newly emerged weed or correct an earlier mistake.
+            if row[3] in ("rejected", "dismissed") and (
+                source_image_id is None or int(row[4]) != source_image_id
+            ):
+                continue
+            if row[3] == "created" and source_image_timestamp is not None:
+                created_at = datetime.fromisoformat(str(row[5]))
+                age_hours = (source_image_timestamp - created_at).total_seconds() / 3600
+                if age_hours > CREATED_WEED_SYNC_GUARD_HOURS:
+                    continue
             rejected_radius = float(row[2] or 0) * 1.5 if row[3] in ("rejected", "dismissed") else 0
             if math.hypot(float(row[0]) - x, float(row[1]) - y) <= max(
                 tolerance_mm, 20.0, rejected_radius
@@ -1084,11 +1100,11 @@ class Database:
             )
 
     def reject_weed_detection(self, detection_id: str, tolerance_mm: float) -> bool:
-        """Permanently suppress a rejected weed position.
+        """Reject matching views while allowing later photos to reassess the position.
 
         Detection UUIDs change on every analysis. Keep the rejected row as a
-        coordinate-based suppression marker and also clear any already-pending
-        duplicates at the same position.
+        coordinate-based marker for this review batch and also clear any
+        already-pending duplicates at the same position.
         """
         target = self.connection.execute(
             "SELECT config_entry_id,x,y,candidate_track_id FROM weed_detections WHERE detection_id=?",
@@ -1122,14 +1138,7 @@ class Database:
         return True
 
     def dismiss_weed_detection(self, detection_id: str, tolerance_mm: float) -> bool:
-        """Discard an ambiguous detection without judging it either way.
-
-        Mirrors :meth:`reject_weed_detection` as a coordinate-based
-        suppression — detection UUIDs change on every analysis, so the row is
-        kept as a marker rather than deleted — but records no training label
-        and never claims the position is weed-free. The reviewer simply could
-        not tell, so the position stops being offered for review.
-        """
+        """Discard this ambiguous view without judging later photos of the position."""
         target = self.connection.execute(
             "SELECT config_entry_id,x,y,candidate_track_id FROM weed_detections WHERE detection_id=?",
             (detection_id,),
@@ -1206,13 +1215,27 @@ class Database:
         return None if row is None else dict(row)
 
     def has_weed_detection_near(
-        self, config_entry_id: str, x: float, y: float, tolerance_mm: float
+        self,
+        config_entry_id: str,
+        x: float,
+        y: float,
+        tolerance_mm: float,
+        *,
+        source_image_id: int | None = None,
+        source_image_timestamp: datetime | None = None,
     ) -> bool:
         for row in self.connection.execute(
-            """SELECT x,y,radius_mm,status FROM weed_detections
+            """SELECT x,y,radius_mm,status,image_id,image_timestamp FROM weed_detections
             WHERE config_entry_id=? AND status IN ('recommended','created','rejected')""",
             (config_entry_id,),
         ):
+            if row[3] == "rejected" and (source_image_id is None or int(row[4]) != source_image_id):
+                continue
+            if row[3] == "created" and source_image_timestamp is not None:
+                created_at = datetime.fromisoformat(str(row[5]))
+                age_hours = (source_image_timestamp - created_at).total_seconds() / 3600
+                if age_hours > CREATED_WEED_SYNC_GUARD_HOURS:
+                    continue
             rejected_radius = float(row[2] or 0) * 1.5 if row[3] == "rejected" else 0
             if math.hypot(float(row[0]) - x, float(row[1]) - y) <= max(
                 tolerance_mm, 20.0, rejected_radius

@@ -1719,14 +1719,25 @@ async def test_dismiss_weed_suppresses_position_without_recording_a_label():
 
     assert status == 200
     assert json.loads(body)["status"] == "dismissed"
-    # Neither accepted nor rejected: it leaves the queue, teaches the verifier
-    # nothing, and never comes back at the same position.
+    # Neither accepted nor rejected: it leaves this image's queue and teaches
+    # the verifier nothing. A later photo can provide clearer evidence.
     assert web.database.weed_detection(detection_id)["status"] == "dismissed"
     assert detection_id not in {
         row["detection_id"] for row in web.database.pending_weed_detections()
     }
     assert web.database.weed_training_samples() == []
-    assert web.database.has_terminal_weed_detection_near("unknown-bot", 100, 200, 20) is True
+    assert (
+        web.database.has_terminal_weed_detection_near(
+            "unknown-bot", 100, 200, 20, source_image_id=11
+        )
+        is True
+    )
+    assert (
+        web.database.has_terminal_weed_detection_near(
+            "unknown-bot", 100, 200, 20, source_image_id=12
+        )
+        is False
+    )
 
 
 @pytest.mark.asyncio
@@ -1746,10 +1757,27 @@ async def test_weed_settings_page_exposes_pipeline_training_and_automation_contr
     assert "What counts as green foliage" in html
     assert "What shape a weed may be" in html
     assert "Known crop protection" in html
-    assert "Multi-image confirmation" in html
-    assert "Learned visual verifier" in html
+    assert "Detection and fallback review" in html
+    assert "Multi-image matching and review timing" in html
+    assert "Learned verifier decisions" in html
+    assert "Automatic weed creation" in html
     assert "Verify new plant-radius growth" in html
     assert 'name="automatic_creation_confidence"' in html
+    assert "Fallback heuristic review threshold (not verifier)" in html
+    assert "the heuristic can never create a FarmBot weed" in html
+    assert 'name="visual_verifier_required_for_automatic"' not in html
+    verifier_start = html.index("<legend>Learned verifier decisions</legend>")
+    automatic_start = html.index("<legend>Automatic weed creation</legend>")
+    maintenance_start = html.index("<legend>Existing weed maintenance</legend>")
+    assert verifier_start < automatic_start < maintenance_start
+    automatic_section = html[automatic_start:maintenance_start]
+    for setting in (
+        "automatic_creation",
+        "automatic_creation_confidence",
+        "automatic_min_observations",
+        "weed_radius_mm",
+    ):
+        assert f'name="{setting}"' in automatic_section
     assert 'action="weed-model/train"' in html
     assert 'action="weed-model/clear"' in html
     assert 'action="weed-model/export"' in html

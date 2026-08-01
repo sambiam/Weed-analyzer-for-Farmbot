@@ -292,8 +292,10 @@ The intended path:
    **candidate recall boost** relaxes the colour/shape gates by its factor
    from the moment a trained verifier starts scoring — shadow mode included,
    since that is exactly the stage meant to be gathering examples to label.
-6. Only then consider automatic creation, which can additionally require
-   verifier approval and several independent looks.
+6. Only then consider automatic creation. It always requires an enforcing
+   trained verifier, its separate creation-confidence threshold, and the
+   configured number of independent looks; the heuristic can never authorise
+   a FarmBot write.
 
 Known-weed radius growth has two further rolling 24-hour caps: a maximum number
 of millimetres and a maximum percentage of the first radius in the window. The

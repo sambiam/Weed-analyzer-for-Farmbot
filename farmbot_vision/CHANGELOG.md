@@ -1,5 +1,24 @@
 # Changelog
 
+## 3.18.0 - 2026-08-01
+
+- Removed the remaining strong-green pre-verifier veto, so pale seedlings and
+  multi-leaf rosettes reach the learned verifier instead of disappearing as a
+  colour/shape rejection.
+- Let shadow-mode verifier results rescue review candidates, including
+  high-confidence weeds provisionally owned by a crop, without changing crop
+  geometry or granting authority for automatic creation or radius growth.
+- Replaced permanent rejected/dismissed coordinate dead zones with same-image
+  deduplication, and limited stale created-record suppression to the 24-hour
+  FarmBot inventory-sync window. Later photos can surface newly emerged
+  vegetation or correct an earlier classification.
+- Added explicit candidate rescue statistics and field-like regressions using
+  the reported 0.79 review threshold and pale-foliage settings.
+- Made an enforcing trained verifier mandatory for every automatic weed
+  creation. Heuristic confidence is now review-only, and the settings page
+  clearly separates fallback review, verifier decisions and automatic-creation
+  controls.
+
 ## 3.17.0 - 2026-08-01
 
 - Split weed discovery from weed extent measurement: pale and shaded leaves
