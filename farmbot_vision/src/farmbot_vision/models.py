@@ -578,7 +578,9 @@ class SoilStereoCalibration(StrictModel):
     calibration_id: int | None = None
     version: int = Field(default=1, ge=1)
     config_entry_id: str
-    point_id: int = Field(gt=0)
+    # Zero identifies an anchor-free custom-coordinate calibration. Positive
+    # values retain the FarmBot point used by calculated-site calibrations.
+    point_id: int = Field(ge=0)
     capture_z: float
     baseline_mm: float = Field(ge=5, le=30)
     reference_distance_mm: float = Field(gt=0)

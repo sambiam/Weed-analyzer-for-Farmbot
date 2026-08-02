@@ -14,6 +14,7 @@ from farmbot_vision.models import (
     SoilPointInventory,
     SoilStereoCalibration,
 )
+from farmbot_vision.soil_height import SoilHeightError
 from farmbot_vision.soil_jobs import SoilJobManager
 from farmbot_vision.zones import ZoneStore
 
@@ -133,3 +134,54 @@ async def test_calibration_rechecks_clear_site_immediately_before_capture(tmp_pa
     assert captured is False
     assert manager.current["status"] == "failed"
     assert "plant- and weed-free" in manager.current["message"]
+
+
+@pytest.mark.asyncio
+async def test_custom_calibration_does_not_resolve_a_soil_point(tmp_path, monkeypatch):
+    database = Database(tmp_path / "vision.db")
+    manager = SoilJobManager(
+        database,
+        object(),
+        tmp_path,
+        asyncio.Lock(),
+        ZoneStore(tmp_path / "zones.json"),
+    )
+    inventory = SoilPointInventory(
+        device_id="42",
+        generated_at=datetime.now(UTC),
+        points=[],
+        motion=SoilMotionState(
+            connected=True,
+            busy=False,
+            locked=False,
+            position={"x": 0, "y": 0, "z": 0},
+            z_direction=-1,
+            axis_bounds={"x": (0, 1000), "y": (0, 1000), "z": (-500, 0)},
+        ),
+    )
+    captured = {}
+
+    async def safe_sites(_entry_id, _baseline, *, clear_soil_margin_mm=75):
+        return inventory, []
+
+    async def capture_frames(**kwargs):
+        captured.update(kwargs)
+        raise SoilHeightError("capture path reached")
+
+    monkeypatch.setattr(manager, "safe_sites", safe_sites)
+    monkeypatch.setattr(manager, "_capture_frames", capture_frames)
+    await manager._run_calibration(
+        job_id="custom-calibration-job",
+        config_entry_id="bot-soil",
+        point_id=None,
+        capture_x=320,
+        capture_y=450,
+        capture_z=0,
+        baseline_mm=15,
+        reference_distance_mm=400,
+    )
+
+    assert captured["point_id"] is None
+    assert captured["capture_x"] == 320
+    assert captured["capture_y"] == 450
+    assert manager.current["message"] == "capture path reached"

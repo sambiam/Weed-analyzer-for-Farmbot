@@ -337,14 +337,19 @@ class SoilJobManager:
         *,
         job_id: str,
         config_entry_id: str,
-        point_id: int,
+        point_id: int | None,
         capture_z: float,
         baseline_mm: float,
         reference_distance_mm: float,
         capture_x: float | None = None,
         capture_y: float | None = None,
     ) -> None:
-        self.db.start_soil_job(job_id, config_entry_id, "calibration", [point_id])
+        self.db.start_soil_job(
+            job_id,
+            config_entry_id,
+            "calibration",
+            [point_id] if point_id is not None else [],
+        )
         try:
             async with self.shared_lock:
                 self.invalidate_safe_sites(config_entry_id, baseline_mm)
@@ -364,14 +369,7 @@ class SoilJobManager:
                         )
                     target_x, target_y = site.capture_x, site.capture_y
                 else:
-                    anchor = next((item for item in inventory.points if item.id == point_id), None)
-                    if anchor is None:
-                        raise SoilHeightError("selected custom-coordinate soil point was not found")
                     target_x, target_y = capture_x, capture_y
-                    if math.hypot(target_x - anchor.x, target_y - anchor.y) >= 200:
-                        raise SoilHeightError(
-                            "custom calibration coordinates must be less than 200 mm from the soil point"
-                        )
                 self.current.update(
                     status="running",
                     message=(f"Capturing calibration images at ({target_x:.0f}, {target_y:.0f})"),
@@ -388,7 +386,7 @@ class SoilJobManager:
                 calibration = await asyncio.to_thread(
                     fit_calibration,
                     config_entry_id=config_entry_id,
-                    point_id=point_id,
+                    point_id=point_id if point_id is not None else 0,
                     capture_z=capture_z,
                     baseline_mm=baseline_mm,
                     reference_distance_mm=reference_distance_mm,
