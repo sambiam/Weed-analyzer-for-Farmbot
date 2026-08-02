@@ -1378,6 +1378,40 @@ async def test_normal_path_is_unchanged_and_query_string_survives():
 
 
 @pytest.mark.asyncio
+async def test_review_queue_api_returns_only_current_recommendations():
+    measurement = _review_measurement(confidence=0.9)
+    web.database.save_measurements([measurement])
+    weed_id = str(uuid4())
+    web.database.save_weed_detection(
+        detection_id=weed_id,
+        config_entry_id="review-bot",
+        image_id=19,
+        image_timestamp=datetime.now(UTC),
+        x=100,
+        y=200,
+        z=0,
+        area_mm2=120,
+        radius_mm=15,
+        confidence=0.9,
+        overlay_path=None,
+    )
+
+    status, headers, body = await asgi_request("/api/review-queue")
+    assert status == 200
+    assert headers[b"cache-control"] == b"no-store"
+    payload = json.loads(body)
+    assert str(measurement.measurement_id) in payload["measurement_ids"]
+    assert weed_id in payload["weed_detection_ids"]
+
+    web.database.record_decision(str(measurement.measurement_id), "applied", {})
+    web.database.update_weed_detection(weed_id, "created")
+    _, _, body = await asgi_request("/api/review-queue")
+    payload = json.loads(body)
+    assert str(measurement.measurement_id) not in payload["measurement_ids"]
+    assert weed_id not in payload["weed_detection_ids"]
+
+
+@pytest.mark.asyncio
 async def test_post_duplicate_path_works(monkeypatch: pytest.MonkeyPatch):
     async def fake_run(*args, **kwargs):
         return {"accepted": True}

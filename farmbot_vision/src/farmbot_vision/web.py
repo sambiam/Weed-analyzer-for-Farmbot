@@ -2910,6 +2910,8 @@ _DASHBOARD_JS = r"""
   const measurementDiagnostic=document.getElementById('measurement-modal-diagnostic');
   let measurementData=null, measurementReturnFocus=null, measurementViewers=[];
   let measurementIndex=0, measurementViewMode='standard';
+  const locallyHandledReviewIds={measurements:new Set(),weeds:new Set()};
+  let reviewQueueReloadPending=false, reviewQueueReloadTimer=null;
   function parseMeasurementViewer(viewer){
     try{return JSON.parse(viewer.dataset.measurement||'null');}catch(_){return null;}
   }
@@ -2972,6 +2974,7 @@ _DASHBOARD_JS = r"""
   function closeMeasurementModal(){
     measurementModal.hidden=true; measurementImg.removeAttribute('src'); measurementData=null;
     if(measurementReturnFocus) measurementReturnFocus.focus();
+    maybeReloadReviewQueue();
   }
   function showMeasurementEmptyState(){
     measurementData=null; measurementImg.removeAttribute('src');
@@ -2999,7 +3002,7 @@ _DASHBOARD_JS = r"""
         {method:'POST',headers:{Accept:'application/json'}});
       const result=await response.json().catch(function(){return {};});
       const ok=response.ok&&(result.status==='applied'||result.status==='rejected');
-      return {ok:ok,result:result};
+      return {ok:ok,stale:reviewActionIsStale(result),result:result};
     }catch(error){return {ok:false,result:{message:'Request failed: '+error.message}};}
   }
   function restoreMeasurementRow(snapshot){
@@ -3013,6 +3016,11 @@ _DASHBOARD_JS = r"""
   async function finishBackgroundMeasurementAction(request,id,snapshot,data){
     const result=await request;
     if(result.ok) return;
+    locallyHandledReviewIds.measurements.delete(String(id));
+    if(result.stale){
+      requestReviewQueueReload(true);
+      return;
+    }
     restoreMeasurementRow(snapshot);
     refreshMeasurementNavigation();
     if(measurementData&&String(measurementData.measurementId)===String(id)){
@@ -3026,6 +3034,7 @@ _DASHBOARD_JS = r"""
     if(!measurementData) return;
     const data=measurementData;
     const id=data.measurementId;
+    locallyHandledReviewIds.measurements.add(String(id));
     const row=document.getElementById('measurement-'+id);
     const snapshot=row
       ?{id:row.id,html:row.innerHTML,parent:row.parentNode,next:row.nextSibling}
@@ -3183,6 +3192,7 @@ _DASHBOARD_JS = r"""
     weedModal.hidden=true; weedImg.removeAttribute('src'); weedImg.style.transform='';
     weedImageWrap.classList.remove('closeup'); weedZoomRow.hidden=true; weedData=null;
     if(weedReturnFocus) weedReturnFocus.focus();
+    maybeReloadReviewQueue();
   }
   function showWeedEmptyState(){
     /* The dialog only closes when the reviewer says so, so an exhausted queue
@@ -3279,7 +3289,8 @@ _DASHBOARD_JS = r"""
       const ok=response.ok&&(result.status==='applied'||result.status==='rejected'
         ||result.status==='dismissed');
       if(ok){const row=document.getElementById('weed-'+id); if(row) row.remove();}
-      return {ok:ok,result:result};
+      const stale=!ok&&(response.status===404||result.status==='not_found');
+      return {ok:ok,stale:stale,result:result};
     }catch(error){return {ok:false,result:{message:'Request failed: '+error.message}};}
   }
   async function reviewCurrentWeed(button,action,failureMessage){
@@ -3291,6 +3302,7 @@ _DASHBOARD_JS = r"""
       /* Advance rather than close: reviewing a long list should not cost a
          dialog dismissal and a fresh "View" click for every single weed. */
       if(result.ok){advanced=true; advanceAfterReview();}
+      else if(result.stale){advanced=true; requestReviewQueueReload(true);}
       else setWeedMessage(result.result.message||failureMessage,true);
     }finally{
       /* advanceAfterReview() owns the button state from here -- re-enabled for
@@ -3420,6 +3432,10 @@ _DASHBOARD_JS = r"""
         const result=await response.json();
         const explicitReject=/\/(reject|keep)$/.test(action.dataset.url);
         if(response.ok&&(result.status==='applied'||(result.status==='rejected'&&explicitReject))) row.remove();
+        else if(reviewActionIsStale(result)){
+          if(row) row.remove();
+          requestReviewQueueReload(false);
+        }
         else if(message) message.textContent=result.message||('HTTP '+response.status);
       }catch(error){if(message) message.textContent='Request failed: '+error.message;}
       finally{action.disabled=false;}
@@ -3507,6 +3523,76 @@ _DASHBOARD_JS = r"""
     if(response.ok){document.getElementById('queue-count').textContent=data.queue_length;
       queueMessage.textContent=ids.length+' images added';}
     else queueMessage.textContent=data.detail||'Could not add images';
+  });
+  function requestReviewQueueReload(force){
+    reviewQueueReloadPending=true;
+    if(force){
+      [measurementApprove,measurementReject,weedAccept,weedAcceptAll,weedUnknown]
+        .forEach(function(button){if(button) button.disabled=true;});
+      weedRejectButtons.forEach(function(button){button.disabled=true;});
+      if(reviewQueueReloadTimer===null){
+        reviewQueueReloadTimer=window.setTimeout(function(){window.location.reload();},350);
+      }
+      return;
+    }
+    maybeReloadReviewQueue();
+  }
+  function maybeReloadReviewQueue(){
+    if(!reviewQueueReloadPending||!measurementModal.hidden||!weedModal.hidden) return;
+    reviewQueueReloadPending=false;
+    window.location.reload();
+  }
+  function reviewActionIsStale(result){
+    const message=String((result&&result.message)||'');
+    return result&&result.status==='conflict'&&/already reviewed|no longer active|superseded/i.test(message);
+  }
+  async function pollReviewQueue(){
+    if(document.hidden) return;
+    try{
+      const response=await fetch('api/review-queue',{
+        headers:{Accept:'application/json'},cache:'no-store'
+      });
+      if(!response.ok) return;
+      const data=await response.json();
+      const pendingMeasurements=new Set((data.measurement_ids||[]).map(String));
+      const pendingWeeds=new Set((data.weed_detection_ids||[]).map(String));
+      const staleMeasurement=measurementData
+        && !pendingMeasurements.has(String(measurementData.measurementId));
+      const staleWeed=weedData
+        && !pendingWeeds.has(String(weedData.detectionId));
+      let removed=false;
+      document.querySelectorAll('tr[id^="measurement-"]').forEach(function(row){
+        const id=row.id.slice('measurement-'.length);
+        if(!pendingMeasurements.has(id)&&!locallyHandledReviewIds.measurements.has(id)){
+          row.remove();removed=true;
+        }
+      });
+      document.querySelectorAll('tr[id^="weed-"]').forEach(function(row){
+        const id=row.id.slice('weed-'.length);
+        if(!pendingWeeds.has(id)) {row.remove();removed=true;}
+      });
+      const missingMeasurement=[...pendingMeasurements].some(function(id){
+        return !document.getElementById('measurement-'+id)
+          && !locallyHandledReviewIds.measurements.has(id);
+      });
+      const missingWeed=[...pendingWeeds].some(function(id){
+        return !document.getElementById('weed-'+id);
+      });
+      if(staleMeasurement||staleWeed){
+        if(staleMeasurement) setMeasurementMessage('This recommendation was updated; refreshing the review list.',false);
+        if(staleWeed) setWeedMessage('This recommendation was updated; refreshing the review list.',false);
+        requestReviewQueueReload(true);
+      }else if(removed||missingMeasurement||missingWeed){
+        requestReviewQueueReload(false);
+      }else{
+        maybeReloadReviewQueue();
+      }
+    }catch(_){/* A transient poll failure must not interrupt review actions. */}
+  }
+  pollReviewQueue();
+  window.setInterval(pollReviewQueue,3000);
+  document.addEventListener('visibilitychange',function(){
+    if(!document.hidden) pollReviewQueue();
   });
 })();
 """
@@ -4292,6 +4378,22 @@ async def health() -> JSONResponse:
             "database": database.stats(),
             "artifact_bytes": artifact_bytes,
         }
+    )
+
+
+@app.get("/api/review-queue")
+async def review_queue_api() -> JSONResponse:
+    """Return the current review IDs so an open dashboard can reconcile itself."""
+    measurements = database.pending_measurements(
+        minimum_confidence=settings.minimum_review_confidence
+    )
+    weeds = database.pending_weed_detections()
+    return JSONResponse(
+        {
+            "measurement_ids": [str(row["measurement_id"]) for row in measurements],
+            "weed_detection_ids": [str(row["detection_id"]) for row in weeds],
+        },
+        headers={"Cache-Control": "no-store"},
     )
 
 
