@@ -5,6 +5,7 @@ import math
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from datetime import datetime
+from typing import cast
 from uuid import uuid4
 
 import cv2
@@ -16,6 +17,7 @@ from .models import (
     AnalysisResult,
     Calibration,
     Decision,
+    KnownWeedObservation,
     KnownWeedSeed,
     Measurement,
     OriginLocation,
@@ -1763,6 +1765,7 @@ class ClassicalVisionEngine(ImageAnalysisEngine):
                 cv2.LINE_AA,
             )
         weed_detections: list[WeedDetection] = []
+        known_weed_observations: list[KnownWeedObservation] = []
         candidate_stats: dict[str, int] = {}
         if weed_settings and weed_settings.enabled:
             # When the learned verifier is doing the accepting and rejecting,
@@ -1845,6 +1848,37 @@ class ClassicalVisionEngine(ImageAnalysisEngine):
             )
             candidate_mask = (candidate_pixels | boundary_verified_weed).astype(np.uint8) * 255
 
+            # Known weeds need their own explicit tri-state observation.  A
+            # missing item from ``weed_detections`` is not absence evidence:
+            # the candidate may have been clipped, shape-gated, or left in the
+            # verifier's uncertainty band.  Each state below is resolved only
+            # after every nearby candidate has been considered.
+            known_states: dict[int, dict[str, object]] = {}
+            yy, xx = np.ogrid[:height, :width]
+            for known in known_weeds:
+                radius_px = (
+                    max(
+                        weed_settings.weed_radius_mm,
+                        float(known.radius_mm),
+                    )
+                    * params.mean_ppm
+                )
+                region = (xx - known.center_px[0]) ** 2 + (yy - known.center_px[1]) ** 2 <= (
+                    radius_px**2
+                )
+                crop_overlap = float(np.mean(crop_protected[region])) if np.any(region) else 1.0
+                known_states[known.weed_id] = {
+                    "seed": known,
+                    "associated": 0,
+                    "accepted": [],
+                    "rejected": [],
+                    "inconclusive": False,
+                    # Claimed crop pixels can hide a nearby weed from the
+                    # candidate stream, so an empty protected region is never
+                    # sufficient evidence for removal.
+                    "crop_overlap": crop_overlap,
+                }
+
             # Label on a proximity-expanded support mask so the leaves and
             # stem fragments of one continuous weed produce one detection.
             count, candidate_labels = _bounded_nearby_component_labels(
@@ -1871,10 +1905,24 @@ class ClassicalVisionEngine(ImageAnalysisEngine):
                 ys, xs = np.where(component)
                 if not len(xs):
                     continue
+                associated_states: list[dict[str, object]] = []
+                for state in known_states.values():
+                    known = cast(KnownWeedSeed, state["seed"])
+                    dx_mm = (xs - known.center_px[0]) / calibration.pixels_per_mm_x
+                    dy_mm = (ys - known.center_px[1]) / calibration.pixels_per_mm_y
+                    association_radius = (
+                        max(float(known.radius_mm), weed_settings.weed_radius_mm)
+                        + weed_settings.candidate_grouping_gap_mm / 2
+                    )
+                    if float(np.min(np.hypot(dx_mm, dy_mm))) <= association_radius:
+                        state["associated"] = int(state["associated"]) + 1
+                        associated_states.append(state)
                 candidate_stats["blobs"] += 1
                 candidate_area_mm2 = float(len(xs) / area_scale)
                 geometry = _measure_weed_geometry(image, component, calibration, weed_settings)
                 if geometry is None:
+                    for state in associated_states:
+                        state["inconclusive"] = True
                     candidate_stats["size"] += 1
                     continue
                 area_mm2 = geometry.area_mm2
@@ -1885,6 +1933,8 @@ class ClassicalVisionEngine(ImageAnalysisEngine):
                 if area_mm2 > weed_settings.maximum_area_mm2:
                     candidate_stats["oversized_scored"] += 1
                 if not (gates.min_area_mm2 <= candidate_area_mm2 <= gates.max_area_mm2):
+                    for state in associated_states:
+                        state["inconclusive"] = True
                     candidate_stats["size"] += 1
                     continue
                 # Distance to the nearest known crop separates an interrow weed
@@ -1922,6 +1972,8 @@ class ClassicalVisionEngine(ImageAnalysisEngine):
                 features["extent_strict_support_fraction"] = geometry.strict_support_fraction
                 features["extent_permissive_fallback"] = float(geometry.permissive_fallback)
                 if gates.rejects(features):
+                    for state in associated_states:
+                        state["inconclusive"] = True
                     candidate_stats["shape"] += 1
                     continue
                 # The heuristic score measures plant-ness, not weed-ness: every
@@ -1947,6 +1999,26 @@ class ClassicalVisionEngine(ImageAnalysisEngine):
                 verifier_confidence = (
                     self.weed_verifier.predict(features) if verifier_scoring else None
                 )
+                for state in associated_states:
+                    if not verifier_authoritative or verifier_confidence is None:
+                        state["inconclusive"] = True
+                    elif verifier_confidence >= weed_settings.visual_verifier_acceptance_confidence:
+                        cast(list[float], state["accepted"]).append(verifier_confidence)
+                    elif verifier_confidence < weed_settings.visual_verifier_rejection_confidence:
+                        cast(list[float], state["rejected"]).append(verifier_confidence)
+                    else:
+                        state["inconclusive"] = True
+                if associated_states:
+                    # Exact association is safer downstream than trying to
+                    # rediscover it from two independently measured centres.
+                    nearest = min(
+                        associated_states,
+                        key=lambda state: math.hypot(
+                            geometry.center_px[0] - cast(KnownWeedSeed, state["seed"]).center_px[0],
+                            geometry.center_px[1] - cast(KnownWeedSeed, state["seed"]).center_px[1],
+                        ),
+                    )
+                    features["known_weed_id"] = float(cast(KnownWeedSeed, nearest["seed"]).weed_id)
                 if verifier_authoritative and verifier_confidence is not None:
                     # A trained verifier is the score. Blending it with the
                     # heuristic used to compress its calibrated range into
@@ -2018,6 +2090,75 @@ class ClassicalVisionEngine(ImageAnalysisEngine):
                     (0, 0, 255),
                     3,
                 )
+            for weed_id, state in known_states.items():
+                accepted = cast(list[float], state["accepted"])
+                rejected = cast(list[float], state["rejected"])
+                associated = int(state["associated"])
+                crop_overlap = float(state["crop_overlap"])
+                if accepted:
+                    score = max(accepted)
+                    known_weed_observations.append(
+                        KnownWeedObservation(
+                            weed_id=weed_id,
+                            status="present",
+                            confidence=score,
+                            verifier_confidence=score,
+                            verifier_evaluated=True,
+                            reason="learned verifier confirmed weed-like vegetation in its region",
+                        )
+                    )
+                elif bool(state["inconclusive"]):
+                    known_weed_observations.append(
+                        KnownWeedObservation(
+                            weed_id=weed_id,
+                            status="inconclusive",
+                            confidence=0,
+                            verifier_confidence=max(rejected, default=None),
+                            verifier_evaluated=bool(rejected),
+                            reason="nearby visual evidence was not safe to accept or reject",
+                        )
+                    )
+                elif crop_overlap > 0.05:
+                    known_weed_observations.append(
+                        KnownWeedObservation(
+                            weed_id=weed_id,
+                            status="inconclusive",
+                            confidence=0,
+                            verifier_confidence=max(rejected, default=None),
+                            verifier_evaluated=bool(rejected),
+                            reason="crop-owned pixels obscure the known weed region",
+                        )
+                    )
+                elif associated and rejected:
+                    score = max(rejected)
+                    known_weed_observations.append(
+                        KnownWeedObservation(
+                            weed_id=weed_id,
+                            status="absent",
+                            confidence=1.0 - score,
+                            verifier_confidence=score,
+                            verifier_evaluated=True,
+                            reason="learned verifier rejected all vegetation in the weed region",
+                        )
+                    )
+                elif verifier_authoritative:
+                    known_weed_observations.append(
+                        KnownWeedObservation(
+                            weed_id=weed_id,
+                            status="absent",
+                            confidence=0.95,
+                            reason="no candidate vegetation is visible in the unobscured weed region",
+                        )
+                    )
+                else:
+                    known_weed_observations.append(
+                        KnownWeedObservation(
+                            weed_id=weed_id,
+                            status="inconclusive",
+                            confidence=0,
+                            reason="an enforcing learned verifier is required",
+                        )
+                    )
         _draw_legend(overlay)
         ok_mask, encoded_mask = cv2.imencode(".png", mask)
         ok_ownership, encoded_ownership = cv2.imencode(".png", ownership.astype(np.uint16))
@@ -2039,6 +2180,7 @@ class ClassicalVisionEngine(ImageAnalysisEngine):
             weeds=weed_detections,
             weed_candidate_stats=candidate_stats,
             boundary_verifier_stats=boundary_stats,
+            known_weed_observations=known_weed_observations,
         )
 
 

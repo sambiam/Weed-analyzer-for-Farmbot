@@ -13,15 +13,14 @@ class WeedSettings(BaseModel):
     enabled: bool = False
     automatic_creation: bool = False
     automatic_radius_adjustment: bool = False
-    radius_adjustment_confidence: float = Field(default=0.55, ge=0, le=1)
+    radius_min_consecutive_present: int = Field(default=2, ge=1, le=10)
     # A single permissive mask must never be allowed to double the radius of a
     # known weed.  Both limits are measured against the first radius recorded
     # in the previous 24 hours; the smaller allowance wins.
     maximum_radius_growth_mm_per_day: float = Field(default=20, ge=0, le=250)
     maximum_radius_growth_percent_per_day: float = Field(default=40, ge=0, le=200)
     automatic_removal: bool = False
-    removal_confidence: float = Field(default=0.6, ge=0, le=1)
-    removal_min_consecutive_absent: int = Field(default=1, ge=1, le=10)
+    removal_min_consecutive_absent: int = Field(default=2, ge=1, le=10)
     # A first-true-leaf seedling covers roughly 30 mm2, so the old 75 mm2 floor
     # silently discarded every weed worth catching early. Pixel noise is already
     # rejected by the vegetation mask's own area floor.

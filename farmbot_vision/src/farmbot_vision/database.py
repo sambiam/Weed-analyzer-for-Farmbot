@@ -339,6 +339,18 @@ MIGRATIONS = [
     CREATE INDEX IF NOT EXISTS idx_change_log_created
       ON change_log(created_at DESC,id DESC);
     """,
+    # Migration 21: consecutive verifier-confirmed sightings are required
+    # before a known weed may be widened automatically.
+    """
+    ALTER TABLE weed_tracks ADD COLUMN present_observations INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE weed_tracks ADD COLUMN last_observation_image_id INTEGER;
+    CREATE TABLE IF NOT EXISTS known_weed_observations(
+      config_entry_id TEXT NOT NULL, weed_id INTEGER NOT NULL, image_id INTEGER NOT NULL,
+      status TEXT NOT NULL, confidence REAL NOT NULL,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY(config_entry_id,weed_id,image_id)
+    );
+    """,
 ]
 
 
@@ -1182,16 +1194,21 @@ class Database:
         seen_at: datetime | None,
         status: str = "active",
         absent_observations: int = 0,
+        present_observations: int = 0,
+        observation_image_id: int | None = None,
     ) -> None:
         with self.connection:
             self.connection.execute(
                 """INSERT INTO weed_tracks(
                 config_entry_id,weed_id,x,y,radius_mm,last_seen_at,absent_observations,
-                confidence,status,updated_at) VALUES(?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP)
+                confidence,status,present_observations,last_observation_image_id,updated_at)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP)
                 ON CONFLICT(config_entry_id,weed_id) DO UPDATE SET
                 x=excluded.x,y=excluded.y,radius_mm=excluded.radius_mm,
                 last_seen_at=COALESCE(excluded.last_seen_at,weed_tracks.last_seen_at),
                 absent_observations=excluded.absent_observations,
+                present_observations=excluded.present_observations,
+                last_observation_image_id=excluded.last_observation_image_id,
                 confidence=excluded.confidence,status=excluded.status,
                 updated_at=CURRENT_TIMESTAMP""",
                 (
@@ -1204,6 +1221,8 @@ class Database:
                     absent_observations,
                     confidence,
                     status,
+                    present_observations,
+                    observation_image_id,
                 ),
             )
 
@@ -1213,6 +1232,31 @@ class Database:
             (config_entry_id, weed_id),
         ).fetchone()
         return None if row is None else dict(row)
+
+    def has_known_weed_observation(self, config_entry_id: str, weed_id: int, image_id: int) -> bool:
+        return (
+            self.connection.execute(
+                "SELECT 1 FROM known_weed_observations "
+                "WHERE config_entry_id=? AND weed_id=? AND image_id=?",
+                (config_entry_id, weed_id, image_id),
+            ).fetchone()
+            is not None
+        )
+
+    def record_known_weed_observation(
+        self,
+        config_entry_id: str,
+        weed_id: int,
+        image_id: int,
+        status: str,
+        confidence: float,
+    ) -> None:
+        with self.connection:
+            self.connection.execute(
+                "INSERT OR IGNORE INTO known_weed_observations("
+                "config_entry_id,weed_id,image_id,status,confidence) VALUES(?,?,?,?,?)",
+                (config_entry_id, weed_id, image_id, status, confidence),
+            )
 
     def has_weed_detection_near(
         self,
@@ -1582,7 +1626,12 @@ class Database:
         return representative
 
     def pending_measurements(
-        self, limit: int = 100, *, minimum_confidence: float = 0.0
+        self,
+        limit: int = 100,
+        *,
+        minimum_confidence: float = 0.0,
+        minimum_radius_increase_mm: float = 0.0,
+        minimum_radius_reduction_mm: float = 0.0,
     ) -> list[dict]:
         """Return consolidated review rows above the configured rejection floor.
 
@@ -1620,6 +1669,16 @@ class Database:
             for row in group:
                 by_image.setdefault(int(row["image_id"]), row)
             consolidated.append(self._consolidate_measurement_rows(list(by_image.values())))
+        for row in consolidated:
+            if row.get("vegetation_absent"):
+                continue
+            current = float(row.get("current_radius_mm") or 0)
+            recommended = float(row.get("recommended_protection_radius_mm") or 0)
+            delta = recommended - current
+            minimum = minimum_radius_increase_mm if delta > 0 else minimum_radius_reduction_mm
+            if delta and abs(delta) < minimum:
+                row["confidence"] = 0.05
+                row["reason"] = f"radius change is below the configured minimum of {minimum:g} mm"
         reviewable = [
             row for row in consolidated if float(row.get("confidence") or 0) >= minimum_confidence
         ]

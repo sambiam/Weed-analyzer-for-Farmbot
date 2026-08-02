@@ -4385,7 +4385,9 @@ async def health() -> JSONResponse:
 async def review_queue_api() -> JSONResponse:
     """Return the current review IDs so an open dashboard can reconcile itself."""
     measurements = database.pending_measurements(
-        minimum_confidence=settings.minimum_review_confidence
+        minimum_confidence=settings.minimum_review_confidence,
+        minimum_radius_increase_mm=settings.minimum_radius_increase_mm,
+        minimum_radius_reduction_mm=settings.minimum_radius_reduction_mm,
     )
     weeds = database.pending_weed_detections()
     return JSONResponse(
@@ -4401,7 +4403,11 @@ async def review_queue_api() -> JSONResponse:
 async def dashboard(request: Request) -> HTMLResponse:
     photo_grid_record = photo_grid_store.load()
     grid_status = _photo_grid_status(photo_grid_record)
-    rows = database.pending_measurements(minimum_confidence=settings.minimum_review_confidence)
+    rows = database.pending_measurements(
+        minimum_confidence=settings.minimum_review_confidence,
+        minimum_radius_increase_mm=settings.minimum_radius_increase_mm,
+        minimum_radius_reduction_mm=settings.minimum_radius_reduction_mm,
+    )
     crop_slugs = sorted({row["crop_slug"] for row in rows})
     curves = {
         slug: fit_monotonic_curve(
@@ -5457,8 +5463,15 @@ async def soil_height_page(request: Request) -> HTMLResponse:
 
     point_rows = ""
     point_options = ""
+    soil_point_options = ""
     retry_ids: list[int] = []
     if inventory:
+        for point in inventory.points:
+            updated = point.updated_at.date().isoformat() if point.updated_at else "unknown date"
+            soil_point_options += (
+                f'<option value="{point.id}">{escape(point.name)} '
+                f"({point.x:.1f}, {point.y:.1f}; updated {updated})</option>"
+            )
         for site in sites:
             measurement = latest_by_point.get(site.point_id)
             status = measurement["status"] if measurement else "not measured"
@@ -5588,11 +5601,20 @@ locations and, after review, replace the assigned stale point.</p>
 </section>
 <section class=card>
  <h3>Guided calibration</h3>
- <p>Choose one of the calculated clear-soil sites. Enter the manually measured
-camera-to-soil distance at the capture Z, then confirm that a 50 mm movement
-toward the soil is safe.</p>
- <form method=post action=soil/calibrate>
-  <label>Clear soil site <select name=point_id required>{point_options}</select></label>
+ <p>Choose a calculated clear-soil site, or enter a manually verified clear
+coordinate. Custom coordinates still use a FarmBot soil point as the safety
+anchor for the capture service.</p>
+ <form id=calibration-form method=post action=soil/calibrate>
+  <fieldset><legend>Capture location</legend>
+   <label><input type=radio name=location_mode value=site checked> Clear soil site</label>
+   <select id=cal-site name=point_id required>{point_options or '<option value="">No calculated clear-soil sites</option>'}</select>
+   <label><input type=radio name=location_mode value=custom> Custom coordinates</label>
+   <div id=cal-custom-fields hidden>
+    <label>Safety anchor soil point <select id=cal-anchor name=anchor_point_id>{soil_point_options or '<option value="">No soil points available</option>'}</select></label>
+    <label>Custom X (mm) <input id=cal-x type=number step=0.1 name=custom_x></label>
+    <label>Custom Y (mm) <input id=cal-y type=number step=0.1 name=custom_y></label>
+   </div>
+  </fieldset>
   <label>Camera-to-soil distance (mm) <input type=number min=1 step=0.1
    name=reference_distance_mm required></label>
   <label>Capture Z (mm){capture_z_hint} <input type=number step=0.1 name=capture_z value=0 required></label>
@@ -5600,8 +5622,25 @@ toward the soil is safe.</p>
    name=baseline_mm value=15 required></label>
   <label><input type=checkbox name=safety_confirm required> I confirm the automated
    50 mm movement toward the soil is safe</label>
-  <button type=submit>Calibrate</button>
+ <button type=submit>Calibrate</button>
  </form>
+ <script>
+  (() => {{
+   const form=document.getElementById('calibration-form');
+   const site=form.querySelector('#cal-site');
+   const custom=form.querySelector('#cal-custom-fields');
+   const anchor=form.querySelector('#cal-anchor');
+   const x=form.querySelector('#cal-x');
+   const y=form.querySelector('#cal-y');
+   const sync=() => {{
+    const isCustom=form.querySelector('input[name=location_mode]:checked').value==='custom';
+    custom.hidden=!isCustom; site.required=!isCustom; anchor.required=isCustom;
+    x.required=isCustom; y.required=isCustom;
+   }};
+   form.querySelectorAll('input[name=location_mode]').forEach(input=>input.addEventListener('change',sync));
+   sync();
+  }})();
+ </script>
 </section>
 <section class=card>
  <h3>Clear-soil replacements ({site_count} from {point_count} existing points)</h3>
@@ -5620,7 +5659,23 @@ points without a trustworthy update date are not replaced.</p>
  <form method=post action=soil/measure>{retry_values}
   <input type=hidden name=capture_z value="{default_capture_z:g}">
   <input type=hidden name=baseline_mm value="{default_baseline:g}">
-  <button type=submit name=mode value=retry {"disabled" if not retry_ids else ""}>Retry failed</button>
+ <button type=submit name=mode value=retry {"disabled" if not retry_ids else ""}>Retry failed</button>
+ </form>
+ <hr>
+ <h4>Measure at custom coordinates</h4>
+ <p>Use this when the planner has no valid clear-soil site. Select the soil
+point whose height should be replaced, then enter a manually verified clear
+capture location.</p>
+ <form method=post action=soil/measure>
+  <input type=hidden name=mode value=custom>
+  <label>Soil point to update <select name=custom_point_id required>{soil_point_options or '<option value="">No soil points available</option>'}</select></label>
+  <label>Custom X (mm) <input type=number step=0.1 name=custom_x required></label>
+  <label>Custom Y (mm) <input type=number step=0.1 name=custom_y required></label>
+  <label>Capture Z (mm){capture_z_hint} <input type=number step=0.1 name=capture_z
+   value="{default_capture_z:g}" required></label>
+  <label>Baseline (mm){baseline_hint} <input type=number min=5 max=30 step=0.1 name=baseline_mm
+   value="{default_baseline:g}" required></label>
+  <button type=submit>Measure custom coordinate</button>
  </form>
  <table><thead><tr><th>Select</th><th>ID</th><th>Replaces</th><th>Old X, Y</th>
  <th>Clear X, Y</th><th>Move</th><th>Last updated</th><th>Current Z</th>
@@ -5666,7 +5721,11 @@ async def soil_job_api() -> JSONResponse:
 
 @app.post("/soil/calibrate")
 async def start_soil_calibration(
-    point_id: int = Form(...),
+    location_mode: str = Form("site"),
+    point_id: int | None = Form(None),
+    anchor_point_id: int | None = Form(None),
+    custom_x: float | None = Form(None),
+    custom_y: float | None = Form(None),
     reference_distance_mm: float = Form(...),
     capture_z: float = Form(0),
     baseline_mm: float = Form(15),
@@ -5677,14 +5736,26 @@ async def start_soil_calibration(
         raise HTTPException(409, "No FarmBot config entry is selected")
     if not safety_confirm:
         raise HTTPException(422, "Confirm that the 50 mm calibration movement is safe")
-    _inventory, sites = await soil_jobs.safe_sites(entry_id, baseline_mm)
-    site = next((item for item in sites if item.point_id == point_id), None)
-    if site is None:
-        raise HTTPException(404, "Clear-soil calibration site not found")
+    if location_mode == "custom":
+        if anchor_point_id is None or custom_x is None or custom_y is None:
+            raise HTTPException(422, "Enter a safety anchor and both custom coordinates")
+        inventory, _sites = await soil_jobs.safe_sites(entry_id, baseline_mm)
+        if not any(point.id == anchor_point_id for point in inventory.points):
+            raise HTTPException(404, "Custom-coordinate safety anchor not found")
+        point_id = anchor_point_id
+    else:
+        if point_id is None:
+            raise HTTPException(422, "Choose a clear-soil calibration site")
+        _inventory, sites = await soil_jobs.safe_sites(entry_id, baseline_mm)
+        site = next((item for item in sites if item.point_id == point_id), None)
+        if site is None:
+            raise HTTPException(404, "Clear-soil calibration site not found")
     try:
         soil_jobs.start_calibration(
             config_entry_id=entry_id,
             point_id=point_id,
+            capture_x=custom_x if location_mode == "custom" else None,
+            capture_y=custom_y if location_mode == "custom" else None,
             capture_z=capture_z,
             baseline_mm=baseline_mm,
             reference_distance_mm=reference_distance_mm,
@@ -5698,13 +5769,20 @@ async def start_soil_calibration(
 async def start_soil_measurement(
     point_ids: Annotated[list[int] | None, Form()] = None,
     mode: str = Form("selected"),
+    custom_point_id: int | None = Form(None),
+    custom_x: float | None = Form(None),
+    custom_y: float | None = Form(None),
     capture_z: float = Form(0),
     baseline_mm: float = Form(15),
 ) -> RedirectResponse:
     entry_id = settings.selected_config_entry_id
     if not entry_id:
         raise HTTPException(409, "No FarmBot config entry is selected")
-    if mode == "all":
+    if mode == "custom":
+        if custom_point_id is None or custom_x is None or custom_y is None:
+            raise HTTPException(422, "Choose a soil point and enter both custom coordinates")
+        point_ids = []
+    elif mode == "all":
         _inventory, sites = await soil_jobs.safe_sites(entry_id, baseline_mm)
         point_ids = [site.point_id for site in sites]
     point_ids = point_ids or []
@@ -5712,6 +5790,9 @@ async def start_soil_measurement(
         soil_jobs.start_measurements(
             config_entry_id=entry_id,
             point_ids=point_ids,
+            custom_point_id=custom_point_id if mode == "custom" else None,
+            custom_x=custom_x if mode == "custom" else None,
+            custom_y=custom_y if mode == "custom" else None,
             capture_z=capture_z,
             baseline_mm=baseline_mm,
         )
@@ -6854,21 +6935,21 @@ round disc">
                 values.automatic_radius_adjustment,
                 tip=(
                     "When a weed already in FarmBot is seen to have grown, widen its "
-                    "recorded radius without asking. Only ever increases it."
+                    "recorded radius without asking. An enforcing learned verifier must "
+                    "confirm the weed in repeated photos. Only ever increases it."
                 ),
             ),
             slider_field(
-                "radius_adjustment_confidence",
-                "Radius adjustment confidence",
-                values.radius_adjustment_confidence,
+                "radius_min_consecutive_present",
+                "Confirmed images before widening",
+                values.radius_min_consecutive_present,
                 tip=(
-                    "Confidence needed to widen an existing weed automatically. This "
-                    "can be lower than the creation threshold because growing a weed "
-                    "you already agreed about is a small, reversible change."
+                    "How many different photos in a row must contain verifier-approved "
+                    "weed evidence before its FarmBot radius may grow automatically."
                 ),
-                minimum=0,
-                maximum=1,
-                step=0.01,
+                minimum=1,
+                maximum=10,
+                step=1,
             ),
             slider_field(
                 "maximum_radius_growth_mm_per_day",
@@ -6903,30 +6984,18 @@ round disc">
                 "Automatically remove known weeds that disappear",
                 values.automatic_removal,
                 tip=(
-                    "Delete a weed from FarmBot once photos show it is no longer there, "
-                    "for example after you pulled it. Keeps the map honest."
+                    "Delete a weed from FarmBot only after repeated, fully visible photos "
+                    "produce explicit absent results. Uncertain or crop-obscured evidence "
+                    "resets the streak, and an enforcing learned verifier is required."
                 ),
-            ),
-            slider_field(
-                "removal_confidence",
-                "Removal confidence",
-                values.removal_confidence,
-                tip=(
-                    "How sure the app must be that a weed is genuinely gone, rather than "
-                    "hidden by a shadow or out of frame, before deleting it."
-                ),
-                minimum=0,
-                maximum=1,
-                step=0.01,
             ),
             slider_field(
                 "removal_min_consecutive_absent",
                 "Absent images before removal",
                 values.removal_min_consecutive_absent,
                 tip=(
-                    "How many photos in a row must show the spot empty before the weed "
-                    "is deleted. Raise it if weeds are being deleted and then found "
-                    "again."
+                    "How many different photos in a row must explicitly confirm absence "
+                    "before the weed is deleted."
                 ),
                 minimum=1,
                 maximum=10,
@@ -7066,12 +7135,11 @@ async def save_weed_settings(
     enabled: bool = Form(False),
     automatic_creation: bool = Form(False),
     automatic_radius_adjustment: bool = Form(False),
-    radius_adjustment_confidence: float = Form(0.55),
+    radius_min_consecutive_present: int = Form(2),
     maximum_radius_growth_mm_per_day: float = Form(20),
     maximum_radius_growth_percent_per_day: float = Form(40),
     automatic_removal: bool = Form(False),
-    removal_confidence: float = Form(0.6),
-    removal_min_consecutive_absent: int = Form(1),
+    removal_min_consecutive_absent: int = Form(2),
     minimum_area_mm2: float = Form(20),
     maximum_area_mm2: float = Form(10_000),
     plant_exclusion_margin_mm: float = Form(35),
@@ -7123,11 +7191,10 @@ async def save_weed_settings(
             enabled=enabled,
             automatic_creation=automatic_creation,
             automatic_radius_adjustment=automatic_radius_adjustment,
-            radius_adjustment_confidence=radius_adjustment_confidence,
+            radius_min_consecutive_present=radius_min_consecutive_present,
             maximum_radius_growth_mm_per_day=maximum_radius_growth_mm_per_day,
             maximum_radius_growth_percent_per_day=(maximum_radius_growth_percent_per_day),
             automatic_removal=automatic_removal,
-            removal_confidence=removal_confidence,
             removal_min_consecutive_absent=removal_min_consecutive_absent,
             minimum_area_mm2=minimum_area_mm2,
             maximum_area_mm2=maximum_area_mm2,
@@ -8439,6 +8506,24 @@ def _radius_growth_blocked(row: dict) -> str | None:
     return f"The recommended radius is not allowed to extend there: {verdict.reason}"
 
 
+def _radius_change_below_minimum(row: dict) -> str | None:
+    """Prevent stale or directly-addressed rows bypassing the review filter."""
+
+    if row.get("vegetation_absent"):
+        return None
+    current = float(row.get("current_radius_mm") or 0)
+    recommended = float(row.get("recommended_protection_radius_mm") or 0)
+    delta = recommended - current
+    if not delta:
+        return None
+    minimum = (
+        settings.minimum_radius_increase_mm if delta > 0 else settings.minimum_radius_reduction_mm
+    )
+    if abs(delta) >= minimum:
+        return None
+    return f"The radius change is below the configured minimum of {minimum:g} mm"
+
+
 def _action_response(
     request: Request, status: str, message: str, *, error_status: int | None = None
 ) -> Response:
@@ -8545,6 +8630,9 @@ async def recommendation(request: Request, measurement_id: str, action: str) -> 
             return _action_response(
                 request, "applied", "Observation approved; no radius change was needed"
             )
+        below_minimum = _radius_change_below_minimum(row)
+        if below_minimum is not None:
+            return _action_response(request, "conflict", below_minimum, error_status=409)
         blocked = _radius_growth_blocked(row)
         if blocked is not None:
             return _action_response(request, "conflict", blocked, error_status=409)

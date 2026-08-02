@@ -900,6 +900,11 @@ class JobManager:
                         json.dumps(result.boundary_verifier_stats, separators=(",", ":")),
                     )
                 matched_known_weed_ids: set[int] = set()
+                known_weeds_by_id = {weed.id: weed for weed in inventory.weeds}
+                known_observations = {
+                    observation.weed_id: observation
+                    for observation in result.known_weed_observations
+                }
                 for weed in result.weeds:
                     crop_path = artifacts / (
                         f"{job_id}-{response.image_id}-weed-{weed.detection_id}-crop.jpg"
@@ -917,16 +922,21 @@ class JobManager:
                         calibration,
                     )
                     duplicate_distance = max(20.0, weed.radius_mm * 1.5)
-                    known_weed = min(
-                        (
-                            existing
-                            for existing in inventory.weeds
-                            if math.hypot(existing.x - weed_x, existing.y - weed_y)
-                            <= max(duplicate_distance, existing.radius)
-                        ),
-                        key=lambda existing: math.hypot(existing.x - weed_x, existing.y - weed_y),
-                        default=None,
-                    )
+                    associated_known_id = int(weed.features.get("known_weed_id", 0))
+                    known_weed = known_weeds_by_id.get(associated_known_id)
+                    if known_weed is None:
+                        known_weed = min(
+                            (
+                                existing
+                                for existing in inventory.weeds
+                                if math.hypot(existing.x - weed_x, existing.y - weed_y)
+                                <= max(duplicate_distance, existing.radius)
+                            ),
+                            key=lambda existing: math.hypot(
+                                existing.x - weed_x, existing.y - weed_y
+                            ),
+                            default=None,
+                        )
                     if known_weed is not None:
                         matched_known_weed_ids.add(known_weed.id)
                         measured_radius = max(float(known_weed.radius), float(weed.radius_mm))
@@ -944,21 +954,33 @@ class JobManager:
                             weed_settings.maximum_radius_growth_percent_per_day,
                         )
                         status = "matched"
+                        observation = known_observations.get(known_weed.id)
                         verifier_allows_radius = bool(
-                            not weed_settings.visual_verifier_enabled
-                            or (
-                                not weed_settings.visual_verifier_shadow_mode
-                                and weed.verifier_confidence is not None
-                                and weed.verifier_confidence
-                                >= weed_settings.visual_verifier_acceptance_confidence
-                            )
+                            weed_settings.visual_verifier_enabled
+                            and not weed_settings.visual_verifier_shadow_mode
+                            and weed.verifier_confidence is not None
+                            and weed.verifier_confidence
+                            >= weed_settings.visual_verifier_acceptance_confidence
+                            and observation is not None
+                            and observation.status == "present"
+                        )
+                        prior_track = self.db.weed_track(entry_id, known_weed.id)
+                        already_observed = self.db.has_known_weed_observation(
+                            entry_id, known_weed.id, weed.image_id
+                        )
+                        present_observations = (
+                            int((prior_track or {}).get("present_observations") or 0)
+                            + (0 if already_observed else 1)
+                            if verifier_allows_radius
+                            else 0
                         )
                         if (
                             weed_settings
                             and weed_settings.automatic_radius_adjustment
                             and target_radius > float(known_weed.radius) + 0.5
-                            and weed.confidence >= weed_settings.radius_adjustment_confidence
                             and verifier_allows_radius
+                            and not already_observed
+                            and present_observations >= weed_settings.radius_min_consecutive_present
                             and not bool(weed.features.get("extent_permissive_fallback", 0.0))
                         ):
                             try:
@@ -1023,6 +1045,15 @@ class JobManager:
                             seen_at=weed.image_timestamp,
                             status=status,
                             absent_observations=0,
+                            present_observations=present_observations,
+                            observation_image_id=weed.image_id,
+                        )
+                        self.db.record_known_weed_observation(
+                            entry_id,
+                            known_weed.id,
+                            weed.image_id,
+                            observation.status if observation is not None else "inconclusive",
+                            observation.confidence if observation is not None else 0,
                         )
                         self.db.save_weed_detection(
                             detection_id=str(weed.detection_id),
@@ -1219,16 +1250,57 @@ class JobManager:
                         )
                         if not fully_visible or known_weed.id in matched_known_weed_ids:
                             continue
+                        observation = known_observations.get(known_weed.id)
+                        if observation is None:
+                            # Older/custom engines that do not return explicit
+                            # known-weed evidence must never imply absence.
+                            continue
                         prior_track = self.db.weed_track(entry_id, known_weed.id)
-                        absent_observations = (
-                            int((prior_track or {}).get("absent_observations") or 0) + 1
+                        already_observed = self.db.has_known_weed_observation(
+                            entry_id, known_weed.id, response.image_id
                         )
-                        absence_confidence = min(0.95, 0.58 + 0.12 * absent_observations)
+                        if already_observed:
+                            continue
+                        if observation.status != "absent":
+                            self.db.upsert_weed_track(
+                                config_entry_id=entry_id,
+                                weed_id=known_weed.id,
+                                x=known_weed.x,
+                                y=known_weed.y,
+                                radius_mm=known_weed.radius,
+                                confidence=observation.confidence,
+                                seen_at=None,
+                                status=observation.status,
+                                absent_observations=0,
+                                present_observations=0,
+                                observation_image_id=response.image_id,
+                            )
+                            self.db.record_known_weed_observation(
+                                entry_id,
+                                known_weed.id,
+                                response.image_id,
+                                observation.status,
+                                observation.confidence,
+                            )
+                            continue
+                        absent_observations = int(
+                            (prior_track or {}).get("absent_observations") or 0
+                        ) + (0 if already_observed else 1)
+                        prior_confidence = (
+                            float((prior_track or {}).get("confidence") or 1.0)
+                            if int((prior_track or {}).get("absent_observations") or 0)
+                            else 1.0
+                        )
+                        # Repeated observations add safety through the streak
+                        # gate; they must not manufacture a larger probability.
+                        absence_confidence = min(prior_confidence, observation.confidence)
                         track_status = "removal_recommended"
                         if (
                             weed_settings.automatic_removal
+                            and weed_settings.visual_verifier_enabled
+                            and not weed_settings.visual_verifier_shadow_mode
+                            and not already_observed
                             and absent_observations >= weed_settings.removal_min_consecutive_absent
-                            and absence_confidence >= weed_settings.removal_confidence
                         ):
                             try:
                                 removal_result = await self.client.remove_weed(
@@ -1282,6 +1354,15 @@ class JobManager:
                             seen_at=None,
                             status=track_status,
                             absent_observations=absent_observations,
+                            present_observations=0,
+                            observation_image_id=response.image_id,
+                        )
+                        self.db.record_known_weed_observation(
+                            entry_id,
+                            known_weed.id,
+                            response.image_id,
+                            observation.status,
+                            observation.confidence,
                         )
                 skip_reasons = self.current.setdefault("skip_reasons", {})
                 for plant_id, reason in result.skipped.items():

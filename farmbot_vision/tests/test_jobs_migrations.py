@@ -52,6 +52,32 @@ def test_low_confidence_plant_radius_results_are_omitted_from_review_only(tmp_pa
     }
 
 
+def test_consolidated_radius_thresholds_are_applied_after_fusion(tmp_path):
+    database = Database(tmp_path / "vision.sqlite")
+    fused = _measurement(
+        plant_id=3,
+        image_id=12,
+        current_radius_mm=100,
+        recommended_protection_radius_mm=140,
+        fused_canopy=True,
+        fused_typical_radius_mm=100,
+        fused_maximum_radius_mm=110,
+        fused_recommended_radius_mm=102,
+        fused_confidence=0.8,
+        fusion_reliable=True,
+    )
+    database.save_measurements([fused])
+
+    assert (
+        database.pending_measurements(
+            minimum_confidence=0.35,
+            minimum_radius_increase_mm=3,
+            minimum_radius_reduction_mm=30,
+        )
+        == []
+    )
+
+
 def test_automatic_application_impossible_without_calibration():
     # An uncalibrated measurement can never become APPLIED or RECOMMENDED.
     uncalibrated = _measurement(calibrated=False)

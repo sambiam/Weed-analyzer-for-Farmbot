@@ -1282,6 +1282,8 @@ async def test_soil_height_page_lists_points_and_warns_below_three(monkeypatch):
     assert status == 200
     assert b"Clear soil" in body
     assert b"Measure selected" in body
+    assert b"Custom coordinates" in body
+    assert b"Measure custom coordinate" in body
     assert b"Fewer than three stale soil points" in body
     assert b"replace the assigned stale point" in body
 
@@ -1585,7 +1587,7 @@ async def test_uncertain_measurement_is_manually_reviewable_and_applicable(monke
 async def test_manual_approval_can_apply_a_radius_reduction(monkeypatch):
     measurement = _review_measurement(
         current_radius_mm=100,
-        recommended_protection_radius_mm=90,
+        recommended_protection_radius_mm=60,
         confidence=0.5,
         decision=Decision.UNCERTAIN,
         reason="large radius reduction requires human review",
@@ -1606,7 +1608,7 @@ async def test_manual_approval_can_apply_a_radius_reduction(monkeypatch):
 
     assert status == 200
     assert json.loads(body)["status"] == "applied"
-    assert calls[0].recommended_radius_mm == 90
+    assert calls[0].recommended_radius_mm == 60
     assert calls[0].human_approved is True
 
 

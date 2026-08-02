@@ -1,4 +1,4 @@
-﻿# FarmBot Vision 3.20.0
+﻿# FarmBot Vision 3.21.0
 
 Lightweight, experimental canopy measurement and safe FarmBot plant-radius recommendations. Open the app through Home Assistant Ingress after installation.
 
@@ -17,7 +17,7 @@ The **Weed settings** page controls each stage independently:
 - the number of position-matched image observations required for review and automatic creation;
 - independent automatic rejection and acceptance confidence thresholds;
 - learned verifier shadow mode, enforcement, weighting and automatic-action requirements; and
-- automatic FarmBot creation, rolling 24-hour known-weed radius-growth caps and disappearance removal.
+- automatic FarmBot creation, verifier-confirmed repeated evidence for known-weed radius growth/removal, and rolling 24-hour radius-growth caps.
 
 The Analysis page stores reviews as local training labels. Accepting a weed supplies a positive
 example; **Crop**, **Reject as mulch/soil**, **Fungus/moss**, and **Hardware/other** supply hard

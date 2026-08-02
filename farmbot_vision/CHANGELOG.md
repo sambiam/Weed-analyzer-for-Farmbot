@@ -1,5 +1,31 @@
 # Changelog
 
+## 3.21.0 - 2026-08-02
+
+- Replaced missing-detection weed removal confidence with explicit per-known-weed
+  visual results: present, absent, or inconclusive. Automatic removal now
+  requires consecutive fully visible absent observations from an enforcing
+  learned-verifier pipeline; uncertain and crop-obscured evidence cannot remove
+  a weed.
+- Require repeated learned-verifier acceptance before automatically widening a
+  known weed, while retaining the strict extent and rolling 24-hour growth
+  limits. Heuristic confidence and verifier shadow mode can no longer authorise
+  a radius write.
+- Prevent reprocessing the same image from advancing known-weed presence or
+  absence streaks.
+
+- Added custom-coordinate soil calibration with a FarmBot soil-point safety
+  anchor as an alternative to a calculated clear-soil site.
+- Added custom-coordinate soil measurement for manually verified locations when
+  no calculated clear-soil site is available.
+- Removed the redundant removal-confidence and radius-adjustment-confidence
+  settings, and added a consecutive confirmed-image control for weed radius
+  widening.
+
+## 3.20.1 - 2026-08-02
+
+- Reapply minimum radius-change thresholds after multi-image consolidation so below-threshold recommendations do not reappear in the review queue.
+
 ## 3.20.0 - 2026-08-02
 
 - Added live plant and weed review-queue reconciliation so reviewed or

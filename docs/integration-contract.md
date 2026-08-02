@@ -217,7 +217,8 @@ concurrency, and never reduces the existing radius.
 `farmbot.remove_vision_weed` accepts `config_entry_id`, `weed_id`, `confidence`,
 `apply`, and `human_approved`. It verifies that the point is a Weed before
 removal. The app only calls it after the user enables automatic weed removal
-and the configured lower-confidence disappearance threshold is met.
+and consecutive fully visible images produce explicit verifier-backed absence
+results. A missing final weed detection by itself never authorises removal.
 
 ## `farmbot.report_vision_status`
 

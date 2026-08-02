@@ -711,6 +711,69 @@ def test_verifier_rejection_drops_the_candidate():
     assert result.weeds == []
 
 
+def _known_weed_scene(score: float, *, shadow: bool = False, vegetation: bool = True):
+    from farmbot_vision.weed_settings import WeedSettings
+
+    image = np.zeros((220, 320, 3), np.uint8)
+    if vegetation:
+        cv2.circle(image, (250, 105), 12, (20, 210, 30), -1)
+    calibration = Calibration(
+        source="manual", pixels_per_mm_x=1, pixels_per_mm_y=1, uncertainty_mm=0
+    )
+    return ClassicalVisionEngine(weed_verifier=_StubVerifier(score)).analyse(
+        encode_jpeg(image),
+        9,
+        NOW,
+        [],
+        calibration,
+        {},
+        WeedSettings(
+            enabled=True,
+            minimum_confidence=0.3,
+            visual_verifier_enabled=True,
+            visual_verifier_shadow_mode=shadow,
+            visual_verifier_rejection_confidence=0.45,
+            visual_verifier_acceptance_confidence=0.85,
+        ),
+        [KnownWeedSeed(weed_id=91, center_px=(250, 105), radius_mm=20)],
+    )
+
+
+def test_known_weed_presence_comes_from_the_enforcing_verifier():
+    result = _known_weed_scene(0.91)
+
+    assert len(result.weeds) == 1
+    assert result.weeds[0].features["known_weed_id"] == 91
+    observation = result.known_weed_observations[0]
+    assert observation.status == "present"
+    assert observation.confidence == 0.91
+    assert observation.verifier_evaluated is True
+
+
+def test_rejected_known_weed_candidate_is_explicit_absence_evidence():
+    result = _known_weed_scene(0.12)
+
+    assert result.weeds == []
+    observation = result.known_weed_observations[0]
+    assert observation.status == "absent"
+    assert observation.confidence == 0.88
+    assert observation.verifier_evaluated is True
+
+
+def test_shadow_verifier_cannot_declare_a_known_weed_absent():
+    observation = _known_weed_scene(0.12, shadow=True).known_weed_observations[0]
+
+    assert observation.status == "inconclusive"
+
+
+def test_empty_unobscured_known_weed_region_is_explicit_visual_absence():
+    observation = _known_weed_scene(0.91, vegetation=False).known_weed_observations[0]
+
+    assert observation.status == "absent"
+    assert observation.confidence == 0.95
+    assert observation.verifier_evaluated is False
+
+
 def test_shadow_mode_scores_without_deciding():
     verifier = _StubVerifier(0.05)
 

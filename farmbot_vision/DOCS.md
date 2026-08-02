@@ -297,10 +297,21 @@ The intended path:
    configured number of independent looks; the heuristic can never authorise
    a FarmBot write.
 
-Known-weed radius growth has two further rolling 24-hour caps: a maximum number
-of millimetres and a maximum percentage of the first radius in the window. The
-smaller ceiling wins, so repeated same-day images cannot compound a permissive
-measurement into a doubled radius.
+Known-weed maintenance uses the same learned authority. Automatic radius growth
+requires an enforcing verifier to accept the weed in the configured number of
+different consecutive photos; the heuristic and shadow mode can never widen a
+weed. Two further rolling 24-hour caps apply: a maximum number of millimetres
+and a maximum percentage of the first radius in the window. The smaller ceiling
+wins, so repeated same-day images cannot compound a permissive measurement into
+a doubled radius.
+
+Automatic removal no longer treats a missing final detection as evidence that a
+known weed disappeared. Each fully visible known-weed region receives an
+explicit `present`, `absent`, or `inconclusive` result. Verifier-accepted
+vegetation is present, verifier-rejected vegetation or a genuinely empty and
+unobscured region can be absent, and uncertain, gated, shadow-mode, or
+crop-obscured evidence is inconclusive. Only consecutive explicit absent
+results may remove the FarmBot weed; inconclusive evidence resets the streak.
 
 During review the dialog shows the verifier's **best guess** at what the object
 is — "moss 71% · fallen leaf 18%" — from per-category heads trained on the same

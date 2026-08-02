@@ -83,6 +83,8 @@ class SoilJobManager:
         *,
         config_entry_id: str,
         point_id: int,
+        capture_x: float | None = None,
+        capture_y: float | None = None,
         capture_z: float,
         baseline_mm: float,
         reference_distance_mm: float,
@@ -92,6 +94,8 @@ class SoilJobManager:
                 job_id=job_id,
                 config_entry_id=config_entry_id,
                 point_id=point_id,
+                capture_x=capture_x,
+                capture_y=capture_y,
                 capture_z=capture_z,
                 baseline_mm=baseline_mm,
                 reference_distance_mm=reference_distance_mm,
@@ -104,16 +108,26 @@ class SoilJobManager:
         *,
         config_entry_id: str,
         point_ids: list[int],
+        custom_point_id: int | None = None,
+        custom_x: float | None = None,
+        custom_y: float | None = None,
         capture_z: float,
         baseline_mm: float,
     ) -> str:
-        if not point_ids:
+        if custom_point_id is None and not point_ids:
             raise ValueError("select at least one soil point")
+        if (custom_x is None) != (custom_y is None):
+            raise ValueError("custom measurement X and Y must be supplied together")
+        if custom_point_id is not None and custom_x is None:
+            raise ValueError("custom measurement requires both coordinates")
         return self._start(
             lambda job_id: self._run_measurements(
                 job_id=job_id,
                 config_entry_id=config_entry_id,
                 point_ids=list(dict.fromkeys(point_ids)),
+                custom_point_id=custom_point_id,
+                custom_x=custom_x,
+                custom_y=custom_y,
                 capture_z=capture_z,
                 baseline_mm=baseline_mm,
             ),
@@ -299,29 +313,39 @@ class SoilJobManager:
         capture_z: float,
         baseline_mm: float,
         reference_distance_mm: float,
+        capture_x: float | None = None,
+        capture_y: float | None = None,
     ) -> None:
         self.db.start_soil_job(job_id, config_entry_id, "calibration", [point_id])
         try:
             async with self.shared_lock:
                 self.invalidate_safe_sites(config_entry_id, baseline_mm)
                 inventory, sites = await self.safe_sites(config_entry_id, baseline_mm)
-                site = next((item for item in sites if item.point_id == point_id), None)
-                if site is None:
-                    raise SoilHeightError(
-                        "selected calibration point no longer has a plant- and weed-free site"
-                    )
+                if capture_x is None or capture_y is None:
+                    site = next((item for item in sites if item.point_id == point_id), None)
+                    if site is None:
+                        raise SoilHeightError(
+                            "selected calibration point no longer has a plant- and weed-free site"
+                        )
+                    target_x, target_y = site.capture_x, site.capture_y
+                else:
+                    anchor = next((item for item in inventory.points if item.id == point_id), None)
+                    if anchor is None:
+                        raise SoilHeightError("selected custom-coordinate soil point was not found")
+                    target_x, target_y = capture_x, capture_y
+                    if math.hypot(target_x - anchor.x, target_y - anchor.y) >= 200:
+                        raise SoilHeightError(
+                            "custom calibration coordinates must be less than 200 mm from the soil point"
+                        )
                 self.current.update(
                     status="running",
-                    message=(
-                        "Capturing calibration images on clear soil at "
-                        f"({site.capture_x:.0f}, {site.capture_y:.0f})"
-                    ),
+                    message=(f"Capturing calibration images at ({target_x:.0f}, {target_y:.0f})"),
                 )
                 capture_id, frames, signature = await self._capture_frames(
                     config_entry_id=config_entry_id,
                     point_id=point_id,
-                    capture_x=site.capture_x,
-                    capture_y=site.capture_y,
+                    capture_x=target_x,
+                    capture_y=target_y,
                     capture_z=capture_z,
                     baseline_mm=baseline_mm,
                     z_offsets_mm=[0, 25, 50],
@@ -369,6 +393,9 @@ class SoilJobManager:
         job_id: str,
         config_entry_id: str,
         point_ids: list[int],
+        custom_point_id: int | None,
+        custom_x: float | None,
+        custom_y: float | None,
         capture_z: float,
         baseline_mm: float,
     ) -> None:
@@ -378,16 +405,59 @@ class SoilJobManager:
             async with self.shared_lock:
                 self.invalidate_safe_sites(config_entry_id, baseline_mm)
                 inventory, sites = await self.safe_sites(config_entry_id, baseline_mm)
-                wanted = [site for site in sites if site.point_id in set(point_ids)]
-                if len(wanted) != len(set(point_ids)):
-                    raise SoilHeightError(
-                        "one or more selected points are no longer stale or clear"
+                if custom_point_id is not None:
+                    point = next(
+                        (item for item in inventory.points if item.id == custom_point_id), None
                     )
+                    if point is None or custom_x is None or custom_y is None:
+                        raise SoilHeightError(
+                            "custom measurement soil point or coordinates are invalid"
+                        )
+                    relocation_distance = math.hypot(custom_x - point.x, custom_y - point.y)
+                    if relocation_distance >= 200:
+                        raise SoilHeightError(
+                            "custom measurement coordinates must be less than 200 mm from the soil point"
+                        )
+                    capture_targets = [
+                        {
+                            "point_id": point.id,
+                            "point_name": point.name,
+                            "expected_x": point.x,
+                            "expected_y": point.y,
+                            "expected_z": point.z,
+                            "point_updated_at": point.updated_at,
+                            "capture_x": custom_x,
+                            "capture_y": custom_y,
+                            "relocation_distance_mm": relocation_distance,
+                        }
+                    ]
+                else:
+                    wanted = [site for site in sites if site.point_id in set(point_ids)]
+                    if len(wanted) != len(set(point_ids)):
+                        raise SoilHeightError(
+                            "one or more selected points are no longer stale or clear"
+                        )
+                    capture_targets = [
+                        {
+                            "point_id": site.point_id,
+                            "point_name": site.point_name,
+                            "expected_x": site.expected_x,
+                            "expected_y": site.expected_y,
+                            "expected_z": site.expected_z,
+                            "point_updated_at": site.point_updated_at,
+                            "capture_x": site.capture_x,
+                            "capture_y": site.capture_y,
+                            "relocation_distance_mm": site.relocation_distance_mm,
+                        }
+                        for site in wanted
+                    ]
                 position = inventory.motion.position
-                ordered = self._nearest_site_order(
-                    wanted,
-                    float(position.get("x") or 0),
-                    float(position.get("y") or 0),
+                ordered = sorted(
+                    capture_targets,
+                    key=lambda item: math.hypot(
+                        item["capture_x"] - float(position.get("x") or 0),
+                        item["capture_y"] - float(position.get("y") or 0),
+                    ),
                 )
                 calibration = self.db.active_soil_calibration(config_entry_id)
                 if calibration is None:
@@ -398,19 +468,20 @@ class SoilJobManager:
                     raise SoilHeightError(
                         "FarmBot Z direction changed; recalibrate before measuring"
                     )
-                for site in ordered:
+                for target in ordered:
                     if self.stop_requested:
                         break
                     self.current.update(
                         status="running",
-                        current_point_id=site.point_id,
+                        current_point_id=target["point_id"],
                         message=(
-                            f"Measuring clear soil at ({site.capture_x:.0f}, {site.capture_y:.0f})"
+                            f"Measuring soil at ({target['capture_x']:.0f}, "
+                            f"{target['capture_y']:.0f})"
                         ),
                     )
                     self.db.update_soil_job(
                         job_id,
-                        current_point_id=site.point_id,
+                        current_point_id=target["point_id"],
                         completed_count=completed,
                         failed_count=failed,
                         message=self.current["message"],
@@ -418,9 +489,9 @@ class SoilJobManager:
                     try:
                         capture_id, frames, signature = await self._capture_frames(
                             config_entry_id=config_entry_id,
-                            point_id=site.point_id,
-                            capture_x=site.capture_x,
-                            capture_y=site.capture_y,
+                            point_id=target["point_id"],
+                            capture_x=target["capture_x"],
+                            capture_y=target["capture_y"],
                             capture_z=capture_z,
                             baseline_mm=baseline_mm,
                             z_offsets_mm=[0],
@@ -437,15 +508,15 @@ class SoilJobManager:
                         measurement = SoilMeasurement(
                             measurement_id=analysis.measurement_id,
                             config_entry_id=config_entry_id,
-                            point_id=site.point_id,
-                            point_name=site.point_name,
-                            expected_x=site.expected_x,
-                            expected_y=site.expected_y,
-                            old_z_mm=site.expected_z,
-                            point_updated_at=site.point_updated_at,
-                            capture_x=site.capture_x,
-                            capture_y=site.capture_y,
-                            relocation_distance_mm=site.relocation_distance_mm,
+                            point_id=target["point_id"],
+                            point_name=target["point_name"],
+                            expected_x=target["expected_x"],
+                            expected_y=target["expected_y"],
+                            old_z_mm=target["expected_z"],
+                            point_updated_at=target["point_updated_at"],
+                            capture_x=target["capture_x"],
+                            capture_y=target["capture_y"],
+                            relocation_distance_mm=target["relocation_distance_mm"],
                             proposed_z_mm=analysis.proposed_z_mm,
                             confidence=analysis.confidence,
                             uncertainty_mm=analysis.uncertainty_mm,
@@ -467,15 +538,15 @@ class SoilJobManager:
                         measurement = SoilMeasurement(
                             measurement_id=uuid4(),
                             config_entry_id=config_entry_id,
-                            point_id=site.point_id,
-                            point_name=site.point_name,
-                            expected_x=site.expected_x,
-                            expected_y=site.expected_y,
-                            old_z_mm=site.expected_z,
-                            point_updated_at=site.point_updated_at,
-                            capture_x=site.capture_x,
-                            capture_y=site.capture_y,
-                            relocation_distance_mm=site.relocation_distance_mm,
+                            point_id=target["point_id"],
+                            point_name=target["point_name"],
+                            expected_x=target["expected_x"],
+                            expected_y=target["expected_y"],
+                            old_z_mm=target["expected_z"],
+                            point_updated_at=target["point_updated_at"],
+                            capture_x=target["capture_x"],
+                            capture_y=target["capture_y"],
+                            relocation_distance_mm=target["relocation_distance_mm"],
                             status="failed",
                             reason=str(err)[:240] or "Soil measurement failed",
                             calibration_id=calibration.calibration_id,

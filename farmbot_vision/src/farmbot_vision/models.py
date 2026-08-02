@@ -822,6 +822,15 @@ class Measurement(StrictModel):
     contract_version: str | None = None
 
 
+class KnownWeedObservation(StrictModel):
+    weed_id: int
+    status: Literal["present", "absent", "inconclusive"]
+    confidence: float = Field(ge=0, le=1)
+    verifier_confidence: float | None = Field(default=None, ge=0, le=1)
+    verifier_evaluated: bool = False
+    reason: str
+
+
 class AnalysisResult(StrictModel):
     measurements: list[Measurement]
     mask: bytes | None = None
@@ -837,6 +846,10 @@ class AnalysisResult(StrictModel):
     # Known-weed exclusions and optional learned checks performed only on new
     # plant-boundary evidence. Logged per image for safe field calibration.
     boundary_verifier_stats: dict[str, int] = Field(default_factory=dict)
+    # Explicit visual evidence for known FarmBot weeds.  Jobs must use this
+    # tri-state result instead of interpreting a missing final detection as
+    # proof that a weed disappeared.
+    known_weed_observations: list[KnownWeedObservation] = Field(default_factory=list)
 
 
 class WeedDetection(StrictModel):
