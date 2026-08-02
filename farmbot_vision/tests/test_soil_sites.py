@@ -129,15 +129,32 @@ def test_latest_vision_canopy_is_an_obstacle():
 
 def test_reduced_clear_soil_margin_exposes_a_closer_candidate():
     plant = Plant(
-        id=1, name="Tomato", openfarm_slug="tomato", x=300, y=300,
-        radius=40, plant_stage="planted",
+        id=1,
+        name="Tomato",
+        openfarm_slug="tomato",
+        x=300,
+        y=300,
+        radius=40,
+        plant_stage="planted",
     )
     conservative = plan_safe_soil_sites(
-        _soil(_point(70, 300, 300)), _garden(plants=[plant]), [], [], [],
-        baseline_mm=15, clear_soil_margin_mm=75, now=NOW,
+        _soil(_point(70, 300, 300)),
+        _garden(plants=[plant]),
+        [],
+        [],
+        [],
+        baseline_mm=15,
+        clear_soil_margin_mm=75,
+        now=NOW,
     )
     relaxed = plan_safe_soil_sites(
-        _soil(_point(70, 300, 300)), _garden(plants=[plant]), [], [], [],
-        baseline_mm=15, clear_soil_margin_mm=10, now=NOW,
+        _soil(_point(70, 300, 300)),
+        _garden(plants=[plant]),
+        [],
+        [],
+        [],
+        baseline_mm=15,
+        clear_soil_margin_mm=10,
+        now=NOW,
     )
     assert relaxed[0].relocation_distance_mm < conservative[0].relocation_distance_mm

@@ -177,8 +177,12 @@ class SoilJobManager:
         return ordered
 
     async def safe_sites(
-        self, config_entry_id: str, baseline_mm: float, *, clear_soil_margin_mm: float = 75,
-        refresh: bool = False
+        self,
+        config_entry_id: str,
+        baseline_mm: float,
+        *,
+        clear_soil_margin_mm: float = 75,
+        refresh: bool = False,
     ) -> tuple[SoilPointInventory, list[SoilSite]]:
         key = (config_entry_id, round(float(baseline_mm), 3), round(float(clear_soil_margin_mm), 3))
         cached = self._safe_site_cache.get(key)
@@ -346,7 +350,8 @@ class SoilJobManager:
                 self.invalidate_safe_sites(config_entry_id, baseline_mm)
                 margin = (
                     self.soil_settings_store.load().clear_soil_margin_mm
-                    if self.soil_settings_store is not None else 75
+                    if self.soil_settings_store is not None
+                    else 75
                 )
                 inventory, sites = await self.safe_sites(
                     config_entry_id, baseline_mm, clear_soil_margin_mm=margin
@@ -436,7 +441,8 @@ class SoilJobManager:
                 self.invalidate_safe_sites(config_entry_id, baseline_mm)
                 margin = (
                     self.soil_settings_store.load().clear_soil_margin_mm
-                    if self.soil_settings_store is not None else 75
+                    if self.soil_settings_store is not None
+                    else 75
                 )
                 inventory, sites = await self.safe_sites(
                     config_entry_id, baseline_mm, clear_soil_margin_mm=margin

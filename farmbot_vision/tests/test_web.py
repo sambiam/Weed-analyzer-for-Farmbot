@@ -1313,7 +1313,9 @@ async def test_soil_height_page_uses_last_plan_during_slow_refresh(monkeypatch):
         return inventory, []
 
     monkeypatch.setattr(web.soil_jobs, "safe_sites", slow_safe_sites)
-    monkeypatch.setattr(web.soil_jobs, "cached_safe_sites", lambda *_args, **_kwargs: (inventory, []))
+    monkeypatch.setattr(
+        web.soil_jobs, "cached_safe_sites", lambda *_args, **_kwargs: (inventory, [])
+    )
     status, _, body = await asgi_request("/soil-height")
     assert status == 200
     assert b"connected=True" in body

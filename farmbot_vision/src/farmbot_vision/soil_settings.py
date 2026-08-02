@@ -27,7 +27,9 @@ class SoilSettingsStore:
 
     def save(self, values: SoilSettings) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        with NamedTemporaryFile("w", encoding="utf-8", dir=self.path.parent, delete=False) as handle:
+        with NamedTemporaryFile(
+            "w", encoding="utf-8", dir=self.path.parent, delete=False
+        ) as handle:
             handle.write(values.model_dump_json(indent=2))
             temp = Path(handle.name)
         os.replace(temp, self.path)
