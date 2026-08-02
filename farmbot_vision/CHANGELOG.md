@@ -1,5 +1,13 @@
 # Changelog
 
+## 3.20.0 - 2026-08-02
+
+- Added live plant and weed review-queue reconciliation so reviewed or
+  superseded recommendations no longer remain stale in the dashboard.
+- Automatically refresh the review page when new recommendations arrive and
+  handle last-second already-reviewed actions without showing a stale-item
+  error.
+
 ## 3.19.0 - 2026-08-02
 
 - Optimistically advance plant-radius reviews while approvals complete in the background.
