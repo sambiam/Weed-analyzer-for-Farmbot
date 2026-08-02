@@ -1243,6 +1243,16 @@ class Database:
             is not None
         )
 
+    def known_weed_observation(
+        self, config_entry_id: str, weed_id: int, image_id: int
+    ) -> dict | None:
+        row = self.connection.execute(
+            "SELECT status,confidence FROM known_weed_observations "
+            "WHERE config_entry_id=? AND weed_id=? AND image_id=?",
+            (config_entry_id, weed_id, image_id),
+        ).fetchone()
+        return None if row is None else dict(row)
+
     def record_known_weed_observation(
         self,
         config_entry_id: str,

@@ -101,6 +101,7 @@ from .photo_quality import (
 from .radius_change_settings import RadiusChangeSettings, RadiusChangeSettingsStore
 from .settings import Settings
 from .soil_jobs import SoilJobManager
+from .soil_settings import SoilSettings, SoilSettingsStore
 from .vision import (
     CANDIDATE_EXCLUSION_REACH_CEILING_MM,
     CANDIDATE_MIN_AREA_CEILING_MM2,
@@ -114,6 +115,8 @@ from .weed_verifier import (
     LABEL_DESCRIPTIONS,
     WeedVisualVerifier,
 )
+from .weeding import estimate_soil_height, plan_cut_path, recent_soil_samples
+from .weeding_jobs import WeedingJobManager
 from .zones import (
     Zone,
     ZoneAspect,
@@ -179,8 +182,12 @@ weed_verifier = WeedVisualVerifier(
     bundled_path=Path(__file__).with_name("bundled_weed_model.json"),
 )
 zone_store = ZoneStore(settings.data_dir / "zones.json")
+soil_settings_store = SoilSettingsStore(settings.data_dir / "soil_settings.json")
 jobs = JobManager(settings, database, client, weed_settings_store, zone_store)
-soil_jobs = SoilJobManager(database, client, settings.data_dir, jobs.lock, zone_store)
+soil_jobs = SoilJobManager(
+    database, client, settings.data_dir, jobs.lock, zone_store, soil_settings_store
+)
+weeding_jobs = WeedingJobManager(database, client, jobs, soil_jobs)
 image_file_cache = ImageFileCache(settings.data_dir / "image_cache")
 _vision_image_locks: dict[tuple[str, int, int, int], asyncio.Lock] = {}
 grid_repair_state: dict[str, object] = {
@@ -4136,6 +4143,7 @@ async def lifespan(_: FastAPI):
         await asyncio.gather(photo_grid_task, return_exceptions=True)
     await asyncio.gather(*tasks, return_exceptions=True)
     await soil_jobs.close()
+    await weeding_jobs.close()
     await client.close()
 
 
@@ -4282,7 +4290,7 @@ background:#f3f7f4;border-radius:6px;padding:.6rem}}
 .shape-figs{{display:flex;gap:.9rem;flex-wrap:wrap;margin-top:.45rem}}
 .shape-figs figure{{margin:0;text-align:center;font-size:.71rem;color:var(--muted);max-width:5.5rem}}
 .shape-figs svg{{display:block;background:#f3f7f4;border-radius:6px;margin-bottom:.2rem}}
-</style></head><body><header><h1>🌱 FarmBot Vision</h1><nav><a href="./">Analysis</a><a href="soil-height">Soil height</a><a href="settings">Calibration</a><a href="weed-settings">Settings</a><a href="canopy-settings">Canopy fusion</a><a href="zones">Boundaries &amp; zones</a><a href="draw-shape">Draw shape</a></nav></header>
+</style></head><body><header><h1>🌱 FarmBot Vision</h1><nav><a href="./">Analysis</a><a href="weeding">Weeding</a><a href="soil-height">Soil height</a><a href="settings">Calibration</a><a href="weed-settings">Settings</a><a href="canopy-settings">Canopy fusion</a><a href="zones">Boundaries &amp; zones</a><a href="draw-shape">Draw shape</a></nav></header>
 <main>{body}</main></body></html>"""
     )
 
@@ -5421,38 +5429,284 @@ def _soil_artifacts(paths: list[str]) -> str:
     return " ".join(links) or "<span class=muted>None</span>"
 
 
+@app.get("/weeding", response_class=HTMLResponse)
+async def weeding_page(request: Request) -> HTMLResponse:
+    """Preview and launch adaptive rotary-tool mowing."""
+    entry_id = settings.selected_config_entry_id
+    rows, warning = "", ""
+    capability = False
+    tool_name, tool_id = "Rotary Tool", ""
+    tool_x, tool_y, tool_z = 4.2, 576.8, -386.0
+    tool_direction, tool_slot_from_bot = 1, False
+    if entry_id:
+        try:
+            bots, inventory, soil = await asyncio.gather(
+                client.list_bots(),
+                client.inventory(
+                    InventoryRequest(config_entry_id=entry_id, image_lookback_hours=720)
+                ),
+                client.soil_points(entry_id),
+            )
+            bot = next((item for item in bots.bots if item.config_entry_id == entry_id), None)
+            capability = bool(bot and bot.supports("adaptive_rotary_weeding"))
+            rotary_slot = next(
+                (
+                    slot
+                    for slot in soil.tool_slots
+                    if "rotary" in slot.tool_name.casefold() and not slot.gantry_mounted
+                ),
+                None,
+            )
+            if rotary_slot is not None:
+                tool_name, tool_id = rotary_slot.tool_name, str(rotary_slot.tool_id)
+                tool_x, tool_y, tool_z = rotary_slot.x, rotary_slot.y, rotary_slot.z
+                tool_direction = rotary_slot.pullout_direction or 1
+                tool_slot_from_bot = rotary_slot.pullout_direction in {1, 2, 3, 4}
+            samples = recent_soil_samples(
+                soil.points, database.recent_soil_measurements(entry_id, 500)
+            )
+            x_bounds = soil.motion.axis_bounds.get("x")
+            y_bounds = soil.motion.axis_bounds.get("y")
+            for weed in inventory.weeds:
+                estimate = estimate_soil_height(weed.x, weed.y, samples)
+                plan_text, clearance = "Will measure clear soil before mowing", "—"
+                if estimate is not None and x_bounds is not None and y_bounds is not None:
+                    try:
+                        path = plan_cut_path(
+                            weed,
+                            inventory.plants,
+                            estimate,
+                            x_bounds=x_bounds,
+                            y_bounds=y_bounds,
+                        )
+                        plan_text = (
+                            f"{path.length_mm:.0f} mm at {path.angle_degrees:.0f}° · "
+                            f"soil Z {path.soil_z:.1f} ({escape(path.soil_method)})"
+                        )
+                        clearance = f"{path.minimum_plant_clearance_mm:.0f} mm"
+                    except ValueError as err:
+                        plan_text = escape(str(err))
+                rows += (
+                    f'<tr><td><input type=checkbox form=weeding-form name=weed_ids value="{weed.id}" checked></td>'
+                    f"<td>{weed.id}</td><td>{escape(weed.name or 'Weed')}</td>"
+                    f"<td>({weed.x:.0f}, {weed.y:.0f})</td><td>{weed.radius:.0f} mm</td>"
+                    f"<td>{plan_text}</td><td>{clearance}</td></tr>"
+                )
+            if not inventory.weeds:
+                rows = "<tr><td colspan=7>No FarmBot weeds are currently recorded.</td></tr>"
+        except HomeAssistantError as err:
+            warning = escape(str(err))
+    else:
+        warning = "Select a FarmBot on the Calibration tab first."
+    capability_warning = (
+        ""
+        if capability
+        else (
+            "<p class=warn>The selected FarmBot integration does not advertise adaptive rotary "
+            "weeding. Install/update the companion integration to V2.7.0 and restart Home Assistant.</p>"
+        )
+    )
+    running_script = (
+        "<script>setTimeout(()=>location.reload(),3000)</script>" if weeding_jobs.running else ""
+    )
+    state = weeding_jobs.current
+    results = "".join(
+        f"<li>Weed {escape(str(item.get('weed_id')))}: "
+        f"{escape(str(item.get('verification') or item.get('status') or item.get('reason') or 'updated'))}</li>"
+        for item in state.get("results", [])[-20:]
+    )
+    disabled = " disabled" if not capability or weeding_jobs.running or not entry_id else ""
+    body = f"""<section class=card><h2>Adaptive rotary weeding</h2>
+<p>Plans a straight cut through each weed against every plant protection circle. It uses
+soil heights recorded in the last 30 days and within 500 mm, measuring a nearby clear patch
+when no trustworthy height exists.</p>
+<p class=warn><b>This operates a cutting tool.</b> Inspect the proposed paths, clear people
+and animals from the machine, keep the emergency stop within reach, and supervise the run.</p>
+{capability_warning}<p class=warn>{warning}</p></section>
+<section class=card><h2>Weeds and proposed paths</h2>
+<table><thead><tr><th>Run</th><th>ID</th><th>Name</th><th>Location</th><th>Radius</th>
+<th>Plan</th><th>Plant clearance</th></tr></thead><tbody>{rows}</tbody></table></section>
+<section class=card><h2>Rotary tool and recovery</h2>
+<form id=weeding-form method=post action=weeding/start><div class=grid>
+<label>Motor pin <input type=number name=motor_pin min=0 max=1000 value=2 required></label>
+<label>Current pin <input type=number name=current_pin min=0 max=1000 value=60 required></label>
+<label>Maximum load <input type=number name=max_load min=1 max=1023 value=115 required></label>
+<label>Tool height above soil (mm) <input type=number name=tool_height_mm min=-200 max=300 value=80 required></label>
+<label>Maximum attempts <input type=number name=max_attempts min=1 max=5 value=3 required></label>
+<label>First-pass speed (%) <input type=number name=cut_speed_percent min=1 max=100 value=50 required></label>
+<label>Retry height step (mm) <input type=number name=height_step_mm min=1 max=50 value=10 required></label>
+</div><fieldset><legend>Optional automatic tool loading</legend>
+<label><input type=checkbox name=manage_tool value=true> Mount the rotary tool before
+weeding and return it to its slot after cutting, before photo verification</label>
+<p class=muted>When a rotary ToolSlot is available, FarmBot OS's standard
+<code>mount_tool()</code> and <code>dismount_tool()</code> helpers use it. Uncheck “Use the
+FarmBot slot record” to use the editable fallback coordinates.</p>
+<label><input type=checkbox name=tool_slot_from_bot value=true{" checked" if tool_slot_from_bot else ""}>
+Use the FarmBot slot record</label>
+<div class=grid>
+<label>Tool name <input type=text name=tool_name maxlength=100 value="{escape(tool_name, quote=True)}" required></label>
+<label>Tool ID (optional) <input type=number name=tool_id min=1 value="{tool_id}"></label>
+<label>Slot X (mm) <input type=number step=0.1 name=tool_slot_x value="{tool_x:g}" required></label>
+<label>Slot Y (mm) <input type=number step=0.1 name=tool_slot_y value="{tool_y:g}" required></label>
+<label>Slot Z (mm) <input type=number step=0.1 name=tool_slot_z value="{tool_z:g}" required></label>
+<label>Pullout direction <select name=tool_pullout_direction>
+<option value=1{" selected" if tool_direction == 1 else ""}>Positive X</option>
+<option value=2{" selected" if tool_direction == 2 else ""}>Negative X</option>
+<option value=3{" selected" if tool_direction == 3 else ""}>Positive Y</option>
+<option value=4{" selected" if tool_direction == 4 else ""}>Negative Y</option>
+</select></label></div></fieldset>
+<fieldset><legend>Mounted-tool plant clearance</legend>
+<label><input type=checkbox name=avoid_tall_plants value=true checked> Route around tall
+plants while the rotary tool is mounted</label>
+<label>Tall plant threshold (mm) <input type=number name=tall_plant_height_mm min=0
+max=5000 step=1 value=300 required></label>
+<p class=muted>Plants above this height are treated as obstacles during travel. Plants
+without recorded height data are also protected rather than assumed to be short.</p></fieldset>
+<p class=muted>On overload the motor switches off immediately. The next pass reverses
+at half speed; continued overload raises the cut. Contact while lowering raises the next
+attempt immediately. A failed weed does not stop the remaining batch.</p>
+<label><input type=checkbox name=acknowledge value=true required> I have inspected the paths,
+cleared the machine, and will supervise this rotary-tool run.</label><br><br>
+<button type=submit class=clear-button{disabled}>Start selected weeds</button></form></section>
+<section class=card><h2>Run status</h2><p><b>{escape(str(state.get("status", "idle")))}</b> —
+{escape(str(state.get("message", "Not run")))}</p><ul>{results}</ul>
+<form method=post action=weeding/stop><button type=submit{" disabled" if not weeding_jobs.running else ""}>Stop before next stage</button></form>
+</section>{running_script}"""
+    return layout(request, body, "Weeding · FarmBot Vision")
+
+
+@app.post("/weeding/start")
+async def start_weeding(
+    weed_ids: Annotated[list[int], Form()],
+    motor_pin: int = Form(2),
+    current_pin: int = Form(60),
+    max_load: float = Form(115),
+    tool_height_mm: float = Form(80),
+    max_attempts: int = Form(3),
+    cut_speed_percent: int = Form(50),
+    height_step_mm: float = Form(10),
+    manage_tool: bool = Form(False),
+    tool_name: str = Form("Rotary Tool"),
+    tool_id: int | None = Form(None),
+    tool_slot_x: float = Form(4.2),
+    tool_slot_y: float = Form(576.8),
+    tool_slot_z: float = Form(-386),
+    tool_pullout_direction: int = Form(1),
+    tool_slot_from_bot: bool = Form(False),
+    avoid_tall_plants: bool = Form(False),
+    tall_plant_height_mm: float = Form(300),
+    acknowledge: bool = Form(False),
+) -> RedirectResponse:
+    entry_id = settings.selected_config_entry_id
+    if not entry_id:
+        raise HTTPException(409, "No FarmBot is selected")
+    if not acknowledge:
+        raise HTTPException(422, "Rotary-tool safety acknowledgement is required")
+    if not weed_ids:
+        raise HTTPException(422, "Select at least one weed")
+    try:
+        weeding_jobs.start(
+            entry_id=entry_id,
+            weed_ids=list(dict.fromkeys(weed_ids)),
+            options={
+                "motor_pin": motor_pin,
+                "current_pin": current_pin,
+                "max_load": max_load,
+                "tool_height_mm": tool_height_mm,
+                "max_attempts": max_attempts,
+                "cut_speed_percent": cut_speed_percent,
+                "approach_speed_percent": 100,
+                "height_step_mm": height_step_mm,
+                "manage_tool": manage_tool,
+                "tool_name": tool_name,
+                "tool_id": tool_id,
+                "tool_slot_x": tool_slot_x,
+                "tool_slot_y": tool_slot_y,
+                "tool_slot_z": tool_slot_z,
+                "tool_pullout_direction": tool_pullout_direction,
+                "tool_slot_from_bot": tool_slot_from_bot,
+                "avoid_tall_plants": avoid_tall_plants,
+                "tall_plant_height_mm": tall_plant_height_mm,
+                "acknowledge_rotary_tool": True,
+            },
+        )
+    except ValueError as err:
+        raise HTTPException(409, str(err)) from err
+    return RedirectResponse("../weeding", status_code=303)
+
+
+@app.post("/weeding/stop")
+async def stop_weeding() -> RedirectResponse:
+    if weeding_jobs.running:
+        weeding_jobs.request_stop()
+    return RedirectResponse("../weeding", status_code=303)
+
+
+@app.get("/api/weeding/status")
+async def weeding_status() -> JSONResponse:
+    return JSONResponse(weeding_jobs.current)
+
+
 @app.get("/soil-height", response_class=HTMLResponse)
 async def soil_height_page(request: Request) -> HTMLResponse:
     entry_id = settings.selected_config_entry_id
     inventory = None
     sites = []
     inventory_error = ""
+    soil_planning_loading = False
     calibration = database.active_soil_calibration(entry_id) if entry_id else None
     planning_baseline = calibration.baseline_mm if calibration else 15
+    soil_values = soil_settings_store.load()
     if entry_id:
         sites_task = asyncio.create_task(
-            soil_jobs.safe_sites(entry_id, planning_baseline),
+            soil_jobs.safe_sites(
+                entry_id,
+                planning_baseline,
+                clear_soil_margin_mm=soil_values.clear_soil_margin_mm,
+            ),
             name="soil-sites-for-page",
         )
         try:
             inventory, sites = await asyncio.wait_for(asyncio.shield(sites_task), timeout=0.75)
         except TimeoutError:
-            inventory_error = (
-                "Live soil planning is still loading; the tab remains available "
-                "and the next refresh will use the cached result."
+            soil_planning_loading = True
+            cached_plan = soil_jobs.cached_safe_sites(
+                entry_id,
+                planning_baseline,
+                clear_soil_margin_mm=soil_values.clear_soil_margin_mm,
             )
+            if cached_plan is not None:
+                inventory, sites = cached_plan
+                inventory_error = (
+                    "Refreshing live soil planning; showing the last successful result."
+                )
+            else:
+                inventory_error = (
+                    "Live soil planning is still loading. This page will refresh automatically."
+                )
 
             def _finish_soil_sites(task: asyncio.Task) -> None:
                 if task.cancelled():
                     return
                 try:
                     task.result()
-                except HomeAssistantError as exc:
+                except Exception as exc:
                     LOGGER.warning("Background soil planning refresh failed: %s", exc)
 
             sites_task.add_done_callback(_finish_soil_sites)
         except HomeAssistantError as exc:
-            inventory_error = str(exc)
+            cached_plan = soil_jobs.cached_safe_sites(
+                entry_id,
+                planning_baseline,
+                clear_soil_margin_mm=soil_values.clear_soil_margin_mm,
+            )
+            if cached_plan is not None:
+                inventory, sites = cached_plan
+                inventory_error = (
+                    f"Live soil refresh failed ({exc}); showing the last successful result."
+                )
+            else:
+                inventory_error = str(exc)
     measurements = database.recent_soil_measurements(entry_id, 200)
     persisted_job = database.latest_soil_job(entry_id)
     current_job = soil_jobs.current if soil_jobs.running else (persisted_job or soil_jobs.current)
@@ -5583,7 +5837,9 @@ async def soil_height_page(request: Request) -> HTMLResponse:
         f'<input type=hidden name=point_ids value="{point_id}">' for point_id in retry_ids
     )
     live_refresh = (
-        "<script>setTimeout(()=>location.reload(),3000)</script>" if soil_jobs.running else ""
+        "<script>setTimeout(()=>location.reload(),3000)</script>"
+        if soil_jobs.running or soil_planning_loading
+        else ""
     )
     body = f"""
 <h2>Supplemental soil-height measurement</h2>
@@ -5602,15 +5858,14 @@ locations and, after review, replace the assigned stale point.</p>
 <section class=card>
  <h3>Guided calibration</h3>
  <p>Choose a calculated clear-soil site, or enter a manually verified clear
-coordinate. Custom coordinates still use a FarmBot soil point as the safety
-anchor for the capture service.</p>
+coordinate. Custom calibration coordinates are checked against the FarmBot's
+axis limits and do not need an existing soil point.</p>
  <form id=calibration-form method=post action=soil/calibrate>
   <fieldset><legend>Capture location</legend>
    <label><input type=radio name=location_mode value=site checked> Clear soil site</label>
    <select id=cal-site name=point_id required>{point_options or '<option value="">No calculated clear-soil sites</option>'}</select>
    <label><input type=radio name=location_mode value=custom> Custom coordinates</label>
    <div id=cal-custom-fields hidden>
-    <label>Safety anchor soil point <select id=cal-anchor name=anchor_point_id>{soil_point_options or '<option value="">No soil points available</option>'}</select></label>
     <label>Custom X (mm) <input id=cal-x type=number step=0.1 name=custom_x></label>
     <label>Custom Y (mm) <input id=cal-y type=number step=0.1 name=custom_y></label>
    </div>
@@ -5629,12 +5884,11 @@ anchor for the capture service.</p>
    const form=document.getElementById('calibration-form');
    const site=form.querySelector('#cal-site');
    const custom=form.querySelector('#cal-custom-fields');
-   const anchor=form.querySelector('#cal-anchor');
    const x=form.querySelector('#cal-x');
    const y=form.querySelector('#cal-y');
    const sync=() => {{
     const isCustom=form.querySelector('input[name=location_mode]:checked').value==='custom';
-    custom.hidden=!isCustom; site.required=!isCustom; anchor.required=isCustom;
+    custom.hidden=!isCustom; site.required=!isCustom;
     x.required=isCustom; y.required=isCustom;
    }};
    form.querySelectorAll('input[name=location_mode]').forEach(input=>input.addEventListener('change',sync));
@@ -5644,10 +5898,16 @@ anchor for the capture service.</p>
 </section>
 <section class=card>
  <h3>Clear-soil replacements ({site_count} from {point_count} existing points)</h3>
- <p class=muted>Each candidate has a 75 mm clear-soil margin, expanded for the
+ <form method=post action=soil/settings>
+  <label>Clear-soil margin (mm) <input type=number name=clear_soil_margin_mm
+   min=0 max=250 step=1 value="{soil_values.clear_soil_margin_mm:g}" required></label>
+  <button type=submit>Save margin</button>
+ </form>
+ <p class=muted>Each candidate has a {soil_values.clear_soil_margin_mm:g} mm clear-soil margin, expanded for the
 stereo movement, around all current FarmBot plants and weeds, the latest
 detected plant canopies, and pending or created Vision weeds. Fresh points and
-points without a trustworthy update date are not replaced.</p>
+points without a trustworthy update date are not replaced. Reducing this margin
+can expose lower-confidence sites when little clear soil is available.</p>
  <form id=measure-points method=post action=soil/measure>
   <label>Capture Z (mm){capture_z_hint} <input type=number step=0.1 name=capture_z
    value="{default_capture_z:g}" required></label>
@@ -5703,8 +5963,11 @@ async def soil_points_api() -> JSONResponse:
     if not entry_id:
         raise HTTPException(409, "No FarmBot config entry is selected")
     calibration = database.active_soil_calibration(entry_id)
+    soil_values = soil_settings_store.load()
     inventory, sites = await soil_jobs.safe_sites(
-        entry_id, calibration.baseline_mm if calibration else 15
+        entry_id,
+        calibration.baseline_mm if calibration else 15,
+        clear_soil_margin_mm=soil_values.clear_soil_margin_mm,
     )
     return JSONResponse(
         {
@@ -5723,7 +5986,6 @@ async def soil_job_api() -> JSONResponse:
 async def start_soil_calibration(
     location_mode: str = Form("site"),
     point_id: int | None = Form(None),
-    anchor_point_id: int | None = Form(None),
     custom_x: float | None = Form(None),
     custom_y: float | None = Form(None),
     reference_distance_mm: float = Form(...),
@@ -5737,16 +5999,16 @@ async def start_soil_calibration(
     if not safety_confirm:
         raise HTTPException(422, "Confirm that the 50 mm calibration movement is safe")
     if location_mode == "custom":
-        if anchor_point_id is None or custom_x is None or custom_y is None:
-            raise HTTPException(422, "Enter a safety anchor and both custom coordinates")
-        inventory, _sites = await soil_jobs.safe_sites(entry_id, baseline_mm)
-        if not any(point.id == anchor_point_id for point in inventory.points):
-            raise HTTPException(404, "Custom-coordinate safety anchor not found")
-        point_id = anchor_point_id
+        if custom_x is None or custom_y is None:
+            raise HTTPException(422, "Enter both custom coordinates")
+        point_id = None
     else:
         if point_id is None:
             raise HTTPException(422, "Choose a clear-soil calibration site")
-        _inventory, sites = await soil_jobs.safe_sites(entry_id, baseline_mm)
+        soil_values = soil_settings_store.load()
+        _inventory, sites = await soil_jobs.safe_sites(
+            entry_id, baseline_mm, clear_soil_margin_mm=soil_values.clear_soil_margin_mm
+        )
         site = next((item for item in sites if item.point_id == point_id), None)
         if site is None:
             raise HTTPException(404, "Clear-soil calibration site not found")
@@ -5762,6 +6024,19 @@ async def start_soil_calibration(
         )
     except ValueError as exc:
         raise HTTPException(409, str(exc)) from exc
+    return RedirectResponse("../soil-height", status_code=303)
+
+
+@app.post("/soil/settings")
+async def save_soil_settings(
+    clear_soil_margin_mm: float = Form(...),
+) -> RedirectResponse:
+    try:
+        values = SoilSettings(clear_soil_margin_mm=clear_soil_margin_mm)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    soil_settings_store.save(values)
+    soil_jobs._safe_site_cache.clear()
     return RedirectResponse("../soil-height", status_code=303)
 
 
@@ -5783,7 +6058,10 @@ async def start_soil_measurement(
             raise HTTPException(422, "Choose a soil point and enter both custom coordinates")
         point_ids = []
     elif mode == "all":
-        _inventory, sites = await soil_jobs.safe_sites(entry_id, baseline_mm)
+        soil_values = soil_settings_store.load()
+        _inventory, sites = await soil_jobs.safe_sites(
+            entry_id, baseline_mm, clear_soil_margin_mm=soil_values.clear_soil_margin_mm
+        )
         point_ids = [site.point_id for site in sites]
     point_ids = point_ids or []
     try:

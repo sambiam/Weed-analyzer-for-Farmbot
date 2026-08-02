@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -1260,7 +1261,7 @@ async def test_soil_height_page_lists_points_and_warns_below_three(monkeypatch):
 
     monkeypatch.setattr(web.settings, "selected_config_entry_id", "soil-entry")
 
-    async def safe_sites(_entry_id, _baseline):
+    async def safe_sites(_entry_id, _baseline, **_kwargs):
         inventory = await soil_points(_entry_id)
         return inventory, [
             SoilSite(
@@ -1283,9 +1284,71 @@ async def test_soil_height_page_lists_points_and_warns_below_three(monkeypatch):
     assert b"Clear soil" in body
     assert b"Measure selected" in body
     assert b"Custom coordinates" in body
+    assert b"Safety anchor soil point" not in body
+    assert b"Clear-soil margin" in body
     assert b"Measure custom coordinate" in body
     assert b"Fewer than three stale soil points" in body
     assert b"replace the assigned stale point" in body
+
+
+@pytest.mark.asyncio
+async def test_soil_height_page_uses_last_plan_during_slow_refresh(monkeypatch):
+    monkeypatch.setattr(web.settings, "selected_config_entry_id", "soil-entry")
+    inventory = SoilPointInventory(
+        device_id="42",
+        generated_at=datetime.now(UTC),
+        points=[],
+        motion=SoilMotionState(
+            connected=True,
+            busy=False,
+            locked=False,
+            position={"x": 1, "y": 2, "z": 3},
+            z_direction=-1,
+            axis_bounds={"x": (0, 1000), "y": (0, 1000), "z": (-500, 0)},
+        ),
+    )
+
+    async def slow_safe_sites(*_args, **_kwargs):
+        await asyncio.sleep(0.8)
+        return inventory, []
+
+    monkeypatch.setattr(web.soil_jobs, "safe_sites", slow_safe_sites)
+    monkeypatch.setattr(web.soil_jobs, "cached_safe_sites", lambda *_args, **_kwargs: (inventory, []))
+    status, _, body = await asgi_request("/soil-height")
+    assert status == 200
+    assert b"connected=True" in body
+    assert b"showing the last successful result" in body
+    assert b">unavailable<" not in body
+    assert b"setTimeout(()=>location.reload(),3000)" in body
+
+
+@pytest.mark.asyncio
+async def test_custom_soil_calibration_does_not_require_anchor(monkeypatch):
+    monkeypatch.setattr(web.settings, "selected_config_entry_id", "soil-entry")
+    received = {}
+
+    def start_calibration(**kwargs):
+        received.update(kwargs)
+
+    monkeypatch.setattr(web.soil_jobs, "start_calibration", start_calibration)
+    status, headers, _ = await asgi_request(
+        "/soil/calibrate",
+        method="POST",
+        form={
+            "location_mode": "custom",
+            "custom_x": "321.5",
+            "custom_y": "456.5",
+            "reference_distance_mm": "500",
+            "capture_z": "0",
+            "baseline_mm": "15",
+            "safety_confirm": "true",
+        },
+    )
+    assert status == 303
+    assert headers[b"location"] == b"../soil-height"
+    assert received["point_id"] is None
+    assert received["capture_x"] == 321.5
+    assert received["capture_y"] == 456.5
 
 
 @pytest.mark.asyncio

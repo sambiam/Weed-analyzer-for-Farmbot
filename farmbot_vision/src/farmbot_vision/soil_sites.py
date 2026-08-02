@@ -11,7 +11,7 @@ from .zones import Zone, ZoneAspect, evaluate
 STALE_AFTER = timedelta(days=14)
 MAX_RELOCATION_MM = 200.0
 GRID_SPACING_MM = 25.0
-SOIL_CLEARANCE_MM = 75.0
+DEFAULT_SOIL_CLEARANCE_MM = 75.0
 
 
 def _utc(value: datetime) -> datetime:
@@ -49,11 +49,12 @@ def plan_safe_soil_sites(
     zones: list[Zone],
     *,
     baseline_mm: float,
+    clear_soil_margin_mm: float = DEFAULT_SOIL_CLEARANCE_MM,
     now: datetime | None = None,
 ) -> list[SoilSite]:
     """Return one nearest clear site for each eligible stale soil point.
 
-    A 75 mm soil patch plus the worst-case one-sided stereo baseline must not
+    The configured soil patch margin plus the worst-case one-sided stereo baseline must not
     overlap any active FarmBot or Vision plant, FarmBot weed, Vision weed, or
     forbidden zone. Points without a trustworthy ``updated_at`` are not
     silently relocated.
@@ -67,7 +68,9 @@ def plan_safe_soil_sites(
         return []
     x_min, x_max = x_bounds
     y_min, y_max = y_bounds
-    safety_margin = SOIL_CLEARANCE_MM + 2 * baseline_mm
+    if not math.isfinite(clear_soil_margin_mm) or clear_soil_margin_mm < 0:
+        raise ValueError("clear-soil margin must be a finite non-negative number")
+    safety_margin = clear_soil_margin_mm + 2 * baseline_mm
 
     obstacles: list[tuple[float, float, float]] = [
         (plant.x, plant.y, max(0.0, plant.radius) + safety_margin) for plant in garden.plants

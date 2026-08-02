@@ -1,5 +1,29 @@
 # Changelog
 
+## 3.22.0 - 2026-08-02
+
+- Added a Weeding tab that previews and runs risk-scored straight rotary-tool
+  cuts for selected FarmBot weeds.
+- Use only soil heights recorded within 500 mm and 30 days, inverse-distance
+  interpolate multiple samples, and automatically measure a plant- and
+  weed-clear soil patch when recent evidence is unavailable. New measurements
+  are rejected when they differ unreasonably from nearby history.
+- Choose each cut against every plant protection circle, size it beyond the
+  weed extent, keep it inside configured axis bounds, and order weeds to reduce
+  non-cutting travel.
+- Added overload recovery that reverses at half speed, raises after repeated or
+  pre-cut contact, continues past individual failures, and always issues a
+  final motor-off command.
+- Added an illuminated post-run scan. Verification analyses only the attempted
+  weed points, cannot discover new weeds, removes points confirmed absent, and
+  retains present, inconclusive, or uncaptured weeds.
+- Added an optional rotary-tool mount/dismount stage. The Weeding tab uses a
+  detected FarmBot ToolSlot when available and provides editable fallback slot
+  coordinates (defaulting to X 4.2, Y 576.8, Z -386) and pullout direction.
+- Added mounted-tool, plant-height-aware routing. It is enabled by default with
+  a configurable 300 mm threshold, routes around protected plant canopies, and
+  conservatively protects plants whose height is unknown.
+
 ## 3.21.0 - 2026-08-02
 
 - Replaced missing-detection weed removal confidence with explicit per-known-weed

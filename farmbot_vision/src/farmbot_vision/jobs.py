@@ -977,6 +977,7 @@ class JobManager:
                         if (
                             weed_settings
                             and weed_settings.automatic_radius_adjustment
+                            and trigger != "weeding_verification"
                             and target_radius > float(known_weed.radius) + 0.5
                             and verifier_allows_radius
                             and not already_observed
@@ -1080,6 +1081,12 @@ class JobManager:
                             features=weed.features,
                             crop_path=stored_crop_path,
                         )
+                        continue
+                    # A post-weeding scan has one question only: is each weed
+                    # we deliberately mowed still present? Unknown vegetation
+                    # in those frames must not create, recommend, or train a
+                    # new weed as a side effect of verification.
+                    if trigger == "weeding_verification":
                         continue
                     if self.db.has_terminal_weed_detection_near(
                         entry_id,
@@ -1297,6 +1304,7 @@ class JobManager:
                         track_status = "removal_recommended"
                         if (
                             weed_settings.automatic_removal
+                            and trigger != "weeding_verification"
                             and weed_settings.visual_verifier_enabled
                             and not weed_settings.visual_verifier_shadow_mode
                             and not already_observed

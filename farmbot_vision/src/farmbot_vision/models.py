@@ -64,6 +64,7 @@ class Plant(StrictModel):
     plant_stage: str
     planted_at: datetime | None = None
     spread_curve_id: int | None = None
+    height_mm: float | None = Field(default=None, ge=0)
 
 
 class WeedPoint(StrictModel):
@@ -232,6 +233,17 @@ class SoilPoint(StrictModel):
     updated_at: datetime | None = None
 
 
+class ToolSlot(StrictModel):
+    id: int = Field(gt=0)
+    tool_id: int = Field(gt=0)
+    tool_name: str
+    x: float
+    y: float
+    z: float
+    pullout_direction: int = Field(ge=0, le=4)
+    gantry_mounted: bool = False
+
+
 class SoilMotionState(StrictModel):
     connected: bool
     busy: bool
@@ -315,10 +327,58 @@ class GcodeRunStatus(StrictModel):
     completed_at: datetime | None = None
 
 
+class WeedingTarget(StrictModel):
+    weed_id: int = Field(gt=0)
+    start: dict[Literal["x", "y"], float]
+    end: dict[Literal["x", "y"], float]
+    soil_z: float
+    travel_z: float
+    approach_waypoints: list[dict[Literal["x", "y"], float]] = Field(
+        default_factory=list, max_length=200
+    )
+
+
+class WeedingRunRequest(StrictModel):
+    config_entry_id: str
+    weeds: list[WeedingTarget] = Field(min_length=1, max_length=100)
+    motor_pin: int = Field(default=2, ge=0, le=1000)
+    current_pin: int = Field(default=60, ge=0, le=1000)
+    max_load: float = Field(default=115, gt=0, le=1023)
+    tool_height_mm: float = Field(default=80, ge=-200, le=300)
+    max_attempts: int = Field(default=3, ge=1, le=5)
+    cut_speed_percent: int = Field(default=50, ge=1, le=100)
+    approach_speed_percent: int = Field(default=100, ge=1, le=100)
+    height_step_mm: float = Field(default=10, ge=1, le=50)
+    manage_tool: bool = False
+    tool_name: str = Field(default="Rotary Tool", min_length=1, max_length=100)
+    tool_id: int | None = Field(default=None, gt=0)
+    tool_slot_x: float = 4.2
+    tool_slot_y: float = 576.8
+    tool_slot_z: float = -386
+    tool_pullout_direction: int = Field(default=1, ge=1, le=4)
+    tool_slot_from_bot: bool = False
+    avoid_tall_plants: bool = True
+    tall_plant_height_mm: float = Field(default=300, ge=0, le=5000)
+    acknowledge_rotary_tool: Literal[True] = True
+
+
+class WeedingRunStatus(StrictModel):
+    status: Literal["queued", "running", "complete", "failed", "rejected"]
+    message: str = ""
+    run_id: UUID | None = None
+    weeds_total: int | None = None
+    weeds_completed: int | None = None
+    weeds_failed: int | None = None
+    results: list[dict] = Field(default_factory=list)
+    created_at: datetime | None = None
+    completed_at: datetime | None = None
+
+
 class SoilPointInventory(StrictModel):
     device_id: str
     generated_at: datetime
     points: list[SoilPoint]
+    tool_slots: list[ToolSlot] = Field(default_factory=list)
     motion: SoilMotionState
 
 
@@ -339,7 +399,7 @@ class SoilSite(StrictModel):
 
 class SoilCaptureStartRequest(StrictModel):
     config_entry_id: str
-    point_id: int = Field(gt=0)
+    point_id: int | None = Field(default=None, gt=0)
     capture_x: float | None = None
     capture_y: float | None = None
     capture_z: float = 0

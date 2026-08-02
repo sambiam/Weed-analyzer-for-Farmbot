@@ -35,6 +35,8 @@ from .models import (
     VisionImageRequest,
     VisionRequestEvent,
     VisionStatus,
+    WeedingRunRequest,
+    WeedingRunStatus,
 )
 
 LOGGER = logging.getLogger(__name__)
@@ -283,7 +285,11 @@ class HomeAssistantClient:
     async def start_soil_capture(
         self, request: SoilCaptureStartRequest
     ) -> SoilCaptureStartResponse:
-        return await self._service("start_vision_soil_capture", request, SoilCaptureStartResponse)  # type: ignore[return-value]
+        return await self._service(
+            "start_vision_soil_capture",
+            request.model_dump(mode="json", exclude_none=True),
+            SoilCaptureStartResponse,
+        )  # type: ignore[return-value]
 
     async def soil_capture_status(self, config_entry_id: str, capture_id: str) -> SoilCaptureStatus:
         return await self._service(
@@ -315,6 +321,16 @@ class HomeAssistantClient:
             "get_vision_gcode",
             {"config_entry_id": config_entry_id, "run_id": run_id},
             GcodeRunStatus,
+        )  # type: ignore[return-value]
+
+    async def start_weeding(self, request: WeedingRunRequest) -> WeedingRunStatus:
+        return await self._service("start_vision_weeding", request, WeedingRunStatus)  # type: ignore[return-value]
+
+    async def weeding_status(self, config_entry_id: str, run_id: str) -> WeedingRunStatus:
+        return await self._service(
+            "get_vision_weeding",
+            {"config_entry_id": config_entry_id, "run_id": run_id},
+            WeedingRunStatus,
         )  # type: ignore[return-value]
 
     async def delete_image(self, config_entry_id: str, image_id: int) -> dict[str, Any]:

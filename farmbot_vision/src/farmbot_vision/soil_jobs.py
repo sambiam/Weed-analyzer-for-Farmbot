@@ -45,17 +45,19 @@ class SoilJobManager:
         data_dir: Path,
         shared_lock: asyncio.Lock,
         zone_store: ZoneStore,
+        soil_settings_store=None,
     ):
         self.db = database
         self.client = client
         self.data_dir = data_dir
         self.shared_lock = shared_lock
         self.zone_store = zone_store
+        self.soil_settings_store = soil_settings_store
         self.task: asyncio.Task | None = None
         self.stop_requested = False
         self.current: dict = {"status": "idle", "message": "Not run"}
         self._safe_site_cache: dict[
-            tuple[str, float], tuple[float, tuple[SoilPointInventory, list[SoilSite]]]
+            tuple[str, float, float], tuple[float, tuple[SoilPointInventory, list[SoilSite]]]
         ] = {}
         self._safe_site_lock = asyncio.Lock()
 
@@ -82,7 +84,7 @@ class SoilJobManager:
         self,
         *,
         config_entry_id: str,
-        point_id: int,
+        point_id: int | None,
         capture_x: float | None = None,
         capture_y: float | None = None,
         capture_z: float,
@@ -175,9 +177,10 @@ class SoilJobManager:
         return ordered
 
     async def safe_sites(
-        self, config_entry_id: str, baseline_mm: float, *, refresh: bool = False
+        self, config_entry_id: str, baseline_mm: float, *, clear_soil_margin_mm: float = 75,
+        refresh: bool = False
     ) -> tuple[SoilPointInventory, list[SoilSite]]:
-        key = (config_entry_id, round(float(baseline_mm), 3))
+        key = (config_entry_id, round(float(baseline_mm), 3), round(float(clear_soil_margin_mm), 3))
         cached = self._safe_site_cache.get(key)
         if not refresh and cached and time.monotonic() - cached[0] < SAFE_SITE_CACHE_SECONDS:
             return cached[1]
@@ -198,17 +201,38 @@ class SoilJobManager:
                     self.db.current_vision_weeds(config_entry_id),
                     self.zone_store.zones(),
                     baseline_mm=baseline_mm,
+                    clear_soil_margin_mm=clear_soil_margin_mm,
                 ),
             )
             self._safe_site_cache[key] = (time.monotonic(), result)
             return result
 
+    def cached_safe_sites(
+        self,
+        config_entry_id: str,
+        baseline_mm: float,
+        *,
+        clear_soil_margin_mm: float = 75,
+    ) -> tuple[SoilPointInventory, list[SoilSite]] | None:
+        """Return the last successful plan even when it is due for refresh.
+
+        This is for responsive, read-only UI rendering only. Job execution
+        continues to call ``safe_sites`` after invalidating its cache so stale
+        coordinates are never used for motion.
+        """
+        key = (
+            config_entry_id,
+            round(float(baseline_mm), 3),
+            round(float(clear_soil_margin_mm), 3),
+        )
+        cached = self._safe_site_cache.get(key)
+        return cached[1] if cached else None
+
     def invalidate_safe_sites(self, config_entry_id: str, baseline_mm: float) -> None:
         """Force the safety-critical job path to fetch a fresh live plan."""
-        self._safe_site_cache.pop(
-            (config_entry_id, round(float(baseline_mm), 3)),
-            None,
-        )
+        prefix = (config_entry_id, round(float(baseline_mm), 3))
+        for key in [key for key in self._safe_site_cache if key[:2] == prefix]:
+            self._safe_site_cache.pop(key, None)
 
     @staticmethod
     def _declared_camera_signature(images) -> str:
@@ -230,7 +254,7 @@ class SoilJobManager:
         self,
         *,
         config_entry_id: str,
-        point_id: int,
+        point_id: int | None,
         capture_x: float,
         capture_y: float,
         capture_z: float,
@@ -320,7 +344,13 @@ class SoilJobManager:
         try:
             async with self.shared_lock:
                 self.invalidate_safe_sites(config_entry_id, baseline_mm)
-                inventory, sites = await self.safe_sites(config_entry_id, baseline_mm)
+                margin = (
+                    self.soil_settings_store.load().clear_soil_margin_mm
+                    if self.soil_settings_store is not None else 75
+                )
+                inventory, sites = await self.safe_sites(
+                    config_entry_id, baseline_mm, clear_soil_margin_mm=margin
+                )
                 if capture_x is None or capture_y is None:
                     site = next((item for item in sites if item.point_id == point_id), None)
                     if site is None:
@@ -404,7 +434,13 @@ class SoilJobManager:
         try:
             async with self.shared_lock:
                 self.invalidate_safe_sites(config_entry_id, baseline_mm)
-                inventory, sites = await self.safe_sites(config_entry_id, baseline_mm)
+                margin = (
+                    self.soil_settings_store.load().clear_soil_margin_mm
+                    if self.soil_settings_store is not None else 75
+                )
+                inventory, sites = await self.safe_sites(
+                    config_entry_id, baseline_mm, clear_soil_margin_mm=margin
+                )
                 if custom_point_id is not None:
                     point = next(
                         (item for item in inventory.points if item.id == custom_point_id), None
