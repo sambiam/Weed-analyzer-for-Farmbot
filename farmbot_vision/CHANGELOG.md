@@ -1,5 +1,16 @@
 # Changelog
 
+## 3.22.1 - 2026-08-02
+
+- Removed the FarmBot soil-point anchor requirement from custom-coordinate
+  soil calibration while retaining axis and motion safety validation.
+- Added a persistent clear-soil margin control to the Soil height tab so users
+  can relax site selection when conservative margins find no usable soil.
+- Fixed slow soil planning repeatedly showing an unavailable/loading state by
+  retaining the last successful plan and refreshing it in the background.
+- Fixed anchor-free custom calibration jobs incorrectly trying to resolve a
+  missing soil point before capture.
+
 ## 3.22.0 - 2026-08-02
 
 - Added a Weeding tab that previews and runs risk-scored straight rotary-tool
