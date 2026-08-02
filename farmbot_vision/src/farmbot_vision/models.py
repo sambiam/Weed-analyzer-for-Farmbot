@@ -82,6 +82,7 @@ class WeedPoint(StrictModel):
     """
 
     id: int
+    pointer_type: Literal["Weed"] | None = None
     name: str | None = None
     x: float
     y: float
@@ -420,6 +421,11 @@ class SoilCaptureFrame(StrictModel):
     z: float
     lateral_offset_mm: float
     z_offset_mm: float
+    distance_from_target_mm: float | None = Field(default=None, ge=0)
+    capture_attempt: int | None = Field(default=None, ge=1, le=5)
+    quality: Literal["usable"] | None = None
+    contrast: float | None = Field(default=None, ge=0)
+    detail_score: float | None = Field(default=None, ge=0)
 
 
 class SoilCaptureStatus(StrictModel):
@@ -427,6 +433,9 @@ class SoilCaptureStatus(StrictModel):
     status: Literal["queued", "running", "waiting_images", "complete", "failed"]
     message: str = Field(max_length=240)
     frames: list[SoilCaptureFrame] = Field(default_factory=list)
+    attempts: list[dict] = Field(default_factory=list)
+    current_frame: int | None = Field(default=None, ge=1)
+    photo_attempt: int | None = Field(default=None, ge=1, le=5)
     created_at: datetime | None = None
     started_at: datetime | None = None
     completed_at: datetime | None = None

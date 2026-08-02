@@ -123,7 +123,15 @@ Recalibrate after any camera move, rotation, refocus, remount, resolution,
 baseline, source-geometry, Z-direction, or declared camera-setting change.
 
 Measurements capture three views 15 mm apart, or a validated one-sided triplet
-near a Y-axis edge. The pipeline rectifies roll and vertical offset, computes
+near a Y-axis edge. Calibration and measurement captures switch the standard
+lighting peripheral on for the run. For every view, the bot moves once,
+confirms its live position within 5 mm, waits 1.5 seconds, then takes and
+downloads the photo. Missing, coordinate-mismatched, undecodable, washed-out,
+or severely blurred images are retried in place up to five attempts. The bot
+advances only after accepting the current frame and returns to its original
+position once when the run completes or aborts.
+
+The pipeline rectifies roll and vertical offset, computes
 StereoSGBM disparities for both adjacent pairs and the outer pair, masks green
 vegetation and inconsistent pixels, and fits the dominant soil plane with
 RANSAC. A result remains diagnostic-only unless coverage, plane support,

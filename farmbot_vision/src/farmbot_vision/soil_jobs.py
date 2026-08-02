@@ -22,6 +22,7 @@ from .models import (
     SoilSite,
     VisionImageRequest,
 )
+from .photo_quality import inspect_photo_quality
 from .soil_height import (
     SoilFrame,
     SoilHeightError,
@@ -278,11 +279,17 @@ class SoilJobManager:
         )
         if started.status != "queued" or started.capture_id is None:
             raise SoilHeightError(started.message)
-        # The integration may legitimately use the full 120 s RPC, 180 s image
-        # processing and 60 s best-effort restoration windows.
-        for _ in range(190):
+        # Each frame is verified before the integration advances and can be
+        # retried five times. Allow 75 seconds per attempt plus a ten-minute
+        # floor for motion/restoration without timing out a valid calibration.
+        status_deadline = time.monotonic() + max(600, 3 * len(z_offsets_mm) * 5 * 75)
+        last_status_message = ""
+        while time.monotonic() < status_deadline:
             status = await self.client.soil_capture_status(config_entry_id, str(started.capture_id))
             self.current["message"] = status.message
+            if status.message != last_status_message:
+                LOGGER.info("Soil capture %s: %s", started.capture_id, status.message)
+                last_status_message = status.message
             if status.status == "failed":
                 raise SoilHeightError(status.message)
             if status.status == "complete":
@@ -314,6 +321,32 @@ class SoilJobManager:
                     "soil image does not meet the required 1280×960 processed contract"
                 )
             jpeg = base64.b64decode(response.image_base64)
+            coordinate_error = math.sqrt(
+                (response.meta.x - item.x) ** 2
+                + (response.meta.y - item.y) ** 2
+                + (response.meta.z - item.z) ** 2
+            )
+            if coordinate_error > 5:
+                raise SoilHeightError(
+                    f"soil image {response.image_id} coordinates missed the requested frame "
+                    f"by {coordinate_error:.1f} mm"
+                )
+            quality = await asyncio.to_thread(inspect_photo_quality, jpeg)
+            if quality.issue != "usable":
+                issue = quality.issue.replace("_", " ")
+                raise SoilHeightError(
+                    f"soil image {response.image_id} failed final quality validation: {issue}"
+                )
+            LOGGER.info(
+                "Accepted soil image %s at X %.1f Y %.1f Z %.1f "
+                "(coordinate error %.2f mm, integration attempt %s)",
+                response.image_id,
+                response.meta.x,
+                response.meta.y,
+                response.meta.z,
+                coordinate_error,
+                item.capture_attempt or "legacy",
+            )
             images.append(response)
             frames.append(
                 SoilFrame(

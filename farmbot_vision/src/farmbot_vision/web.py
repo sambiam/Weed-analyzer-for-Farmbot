@@ -115,7 +115,7 @@ from .weed_verifier import (
     LABEL_DESCRIPTIONS,
     WeedVisualVerifier,
 )
-from .weeding import estimate_soil_height, plan_cut_path, recent_soil_samples
+from .weeding import confirmed_weeds, estimate_soil_height, plan_cut_path, recent_soil_samples
 from .weeding_jobs import WeedingJobManager
 from .zones import (
     Zone,
@@ -5467,7 +5467,8 @@ async def weeding_page(request: Request) -> HTMLResponse:
             )
             x_bounds = soil.motion.axis_bounds.get("x")
             y_bounds = soil.motion.axis_bounds.get("y")
-            for weed in inventory.weeds:
+            candidate_weeds = confirmed_weeds(inventory.weeds)
+            for weed in candidate_weeds:
                 estimate = estimate_soil_height(weed.x, weed.y, samples)
                 plan_text, clearance = "Will measure clear soil before mowing", "—"
                 if estimate is not None and x_bounds is not None and y_bounds is not None:
@@ -5487,12 +5488,14 @@ async def weeding_page(request: Request) -> HTMLResponse:
                     except ValueError as err:
                         plan_text = escape(str(err))
                 rows += (
-                    f'<tr><td><input type=checkbox form=weeding-form name=weed_ids value="{weed.id}" checked></td>'
+                    f'<tr class=weed-candidate data-radius="{weed.radius:g}"><td>'
+                    f"<input class=weed-select type=checkbox form=weeding-form name=weed_ids "
+                    f'value="{weed.id}" checked></td>'
                     f"<td>{weed.id}</td><td>{escape(weed.name or 'Weed')}</td>"
                     f"<td>({weed.x:.0f}, {weed.y:.0f})</td><td>{weed.radius:.0f} mm</td>"
                     f"<td>{plan_text}</td><td>{clearance}</td></tr>"
                 )
-            if not inventory.weeds:
+            if not candidate_weeds:
                 rows = "<tr><td colspan=7>No FarmBot weeds are currently recorded.</td></tr>"
         except HomeAssistantError as err:
             warning = escape(str(err))
@@ -5503,7 +5506,7 @@ async def weeding_page(request: Request) -> HTMLResponse:
         if capability
         else (
             "<p class=warn>The selected FarmBot integration does not advertise adaptive rotary "
-            "weeding. Install/update the companion integration to V2.7.0 and restart Home Assistant.</p>"
+            "weeding. Install/update the companion integration to V2.8.0 and restart Home Assistant.</p>"
         )
     )
     running_script = (
@@ -5524,6 +5527,15 @@ when no trustworthy height exists.</p>
 and animals from the machine, keep the emergency stop within reach, and supervise the run.</p>
 {capability_warning}<p class=warn>{warning}</p></section>
 <section class=card><h2>Weeds and proposed paths</h2>
+<div class=grid id=weed-selection-tools>
+<label><input type=checkbox id=select-all-weeds checked> Select all shown weeds</label>
+<label>Minimum radius (mm) <input type=number id=weed-radius-min min=0 step=0.1
+placeholder="No minimum"></label>
+<label>Maximum radius (mm) <input type=number id=weed-radius-max min=0 step=0.1
+placeholder="No maximum"></label>
+</div>
+<p><button type=button id=clear-weed-selection>Clear selection</button>
+<span class=muted id=weed-filter-count></span></p>
 <table><thead><tr><th>Run</th><th>ID</th><th>Name</th><th>Location</th><th>Radius</th>
 <th>Plan</th><th>Plant clearance</th></tr></thead><tbody>{rows}</tbody></table></section>
 <section class=card><h2>Rotary tool and recovery</h2>
@@ -5572,6 +5584,46 @@ cleared the machine, and will supervise this rotary-tool run.</label><br><br>
 {escape(str(state.get("message", "Not run")))}</p><ul>{results}</ul>
 <form method=post action=weeding/stop><button type=submit{" disabled" if not weeding_jobs.running else ""}>Stop before next stage</button></form>
 </section>{running_script}"""
+    body += """<script>
+(() => {
+  const rows = [...document.querySelectorAll('tr.weed-candidate')];
+  const selectAll = document.getElementById('select-all-weeds');
+  const minimum = document.getElementById('weed-radius-min');
+  const maximum = document.getElementById('weed-radius-max');
+  const count = document.getElementById('weed-filter-count');
+  const visibleCheckboxes = () => rows.filter(row => !row.hidden)
+    .map(row => row.querySelector('.weed-select'));
+  const updateMaster = () => {
+    const shown = visibleCheckboxes();
+    const selected = shown.filter(box => box.checked).length;
+    selectAll.checked = shown.length > 0 && selected === shown.length;
+    selectAll.indeterminate = selected > 0 && selected < shown.length;
+    count.textContent = `${shown.length} of ${rows.length} weeds shown; ${selected} selected`;
+  };
+  const applyFilter = () => {
+    const low = minimum.value === '' ? -Infinity : Number(minimum.value);
+    const high = maximum.value === '' ? Infinity : Number(maximum.value);
+    rows.forEach(row => {
+      const visible = Number(row.dataset.radius) >= low && Number(row.dataset.radius) <= high;
+      row.hidden = !visible;
+      if (!visible) row.querySelector('.weed-select').checked = false;
+    });
+    updateMaster();
+  };
+  selectAll.addEventListener('change', () => {
+    visibleCheckboxes().forEach(box => { box.checked = selectAll.checked; });
+    updateMaster();
+  });
+  document.getElementById('clear-weed-selection').addEventListener('click', () => {
+    rows.forEach(row => { row.querySelector('.weed-select').checked = false; });
+    updateMaster();
+  });
+  rows.forEach(row => row.querySelector('.weed-select').addEventListener('change', updateMaster));
+  minimum.addEventListener('input', applyFilter);
+  maximum.addEventListener('input', applyFilter);
+  applyFilter();
+})();
+</script>"""
     return layout(request, body, "Weeding · FarmBot Vision")
 
 

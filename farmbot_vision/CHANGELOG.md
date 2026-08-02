@@ -1,5 +1,24 @@
 # Changelog
 
+## 3.23.1 - 2026-08-03
+
+- Soil calibration and measurement captures now surface per-frame movement,
+  retry, acceptance, and failure messages from the companion integration.
+- Added final processed-image checks for blur, washed-out exposure, and a
+  maximum 5 mm coordinate error before stereo analysis begins.
+- Allow sufficient job time for five independently verified capture attempts
+  at every stereo frame instead of timing out a valid retry sequence.
+- Require FarmBot integration 2.8.1 for the verified per-frame soil capture
+  contract.
+
+## 3.23.0 - 2026-08-03
+
+- Restrict the Weeding tab and execution pipeline to inventory records
+  explicitly identified as FarmBot Weed points; plants, soil points,
+  ToolSlots, and generic points cannot become weeding candidates.
+- Add radius-range filtering, a select-all-shown checkbox, clear-selection
+  control, and live shown/selected counts for efficient batch selection.
+
 ## 3.22.1 - 2026-08-02
 
 - Removed the FarmBot soil-point anchor requirement from custom-coordinate

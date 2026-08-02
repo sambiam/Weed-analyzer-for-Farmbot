@@ -7,6 +7,7 @@ import pytest
 from farmbot_vision.models import Plant, SoilPoint, WeedPoint
 from farmbot_vision.weeding import (
     SoilSample,
+    confirmed_weeds,
     estimate_soil_height,
     plan_cut_path,
     protected_tall_plants,
@@ -109,3 +110,9 @@ def test_unknown_height_is_protected_but_option_can_be_disabled():
     short = unknown.model_copy(update={"height_mm": 250})
     assert protected_tall_plants([unknown, short], enabled=True, minimum_height_mm=300) == [unknown]
     assert protected_tall_plants([unknown], enabled=False, minimum_height_mm=300) == []
+
+
+def test_candidates_require_an_explicit_farmbot_weed_type():
+    confirmed = WeedPoint(id=1, pointer_type="Weed", x=10, y=20, radius=5)
+    untyped = WeedPoint(id=2, x=30, y=40, radius=10)
+    assert confirmed_weeds([confirmed, untyped]) == [confirmed]

@@ -53,6 +53,11 @@ class CutPath:
     soil_method: str
 
 
+def confirmed_weeds(points: Iterable[WeedPoint]) -> list[WeedPoint]:
+    """Keep only inventory records explicitly typed as FarmBot Weed points."""
+    return [point for point in points if point.pointer_type == "Weed"]
+
+
 def _utc(value: datetime) -> datetime:
     return value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
 

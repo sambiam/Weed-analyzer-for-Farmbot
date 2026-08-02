@@ -23,6 +23,7 @@ from .soil_jobs import SoilJobManager
 from .weeding import (
     TRANSIT_MARGIN_MM,
     CutPath,
+    confirmed_weeds,
     estimate_soil_height,
     nearest_neighbour_order,
     plan_cut_path,
@@ -275,7 +276,8 @@ class WeedingJobManager:
                 ),
                 self.client.soil_points(entry_id),
             )
-            selected = [weed for weed in garden.weeds if weed.id in set(weed_ids)]
+            selected_ids = set(weed_ids)
+            selected = [weed for weed in confirmed_weeds(garden.weeds) if weed.id in selected_ids]
             if not selected:
                 raise RuntimeError("none of the selected weeds still exists on FarmBot")
             x_bounds = soil_inventory.motion.axis_bounds.get("x")
