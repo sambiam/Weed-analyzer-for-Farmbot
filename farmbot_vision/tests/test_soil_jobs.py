@@ -111,7 +111,7 @@ async def test_calibration_rechecks_clear_site_immediately_before_capture(tmp_pa
     )
     captured = False
 
-    async def safe_sites(_entry_id, _baseline):
+    async def safe_sites(_entry_id, _baseline, *, clear_soil_margin_mm=75):
         return inventory, []
 
     async def capture_frames(**_kwargs):
