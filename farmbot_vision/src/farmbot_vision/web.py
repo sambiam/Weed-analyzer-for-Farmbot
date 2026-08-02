@@ -98,6 +98,7 @@ from .photo_quality import (
     inspect_photo_quality,
     with_neighbor_blur,
 )
+from .radius_change_settings import RadiusChangeSettings, RadiusChangeSettingsStore
 from .settings import Settings
 from .soil_jobs import SoilJobManager
 from .vision import (
@@ -147,6 +148,17 @@ cv2.setNumThreads(1)
 database = Database(settings.data_dir / "farmbot_vision.db")
 calibration_store = CalibrationStore(settings.data_dir / "farmbot_calibration.json")
 client = HomeAssistantClient()
+radius_change_settings_store = RadiusChangeSettingsStore(
+    settings.data_dir / "radius_change_settings.json"
+)
+radius_change_settings = radius_change_settings_store.load(
+    RadiusChangeSettings(
+        minimum_radius_increase_mm=settings.minimum_radius_increase_mm,
+        minimum_radius_reduction_mm=settings.minimum_radius_reduction_mm,
+    )
+)
+settings.minimum_radius_increase_mm = radius_change_settings.minimum_radius_increase_mm
+settings.minimum_radius_reduction_mm = radius_change_settings.minimum_radius_reduction_mm
 weed_settings_store = WeedSettingsStore(settings.data_dir / "weed_settings.json")
 canopy_fusion_settings_store = CanopyFusionSettingsStore(
     settings.data_dir / "canopy_fusion_settings.json"
@@ -2987,19 +2999,49 @@ _DASHBOARD_JS = r"""
         {method:'POST',headers:{Accept:'application/json'}});
       const result=await response.json().catch(function(){return {};});
       const ok=response.ok&&(result.status==='applied'||result.status==='rejected');
-      if(ok){const row=document.getElementById('measurement-'+id);if(row) row.remove();}
       return {ok:ok,result:result};
     }catch(error){return {ok:false,result:{message:'Request failed: '+error.message}};}
   }
+  function restoreMeasurementRow(snapshot){
+    if(!snapshot||!snapshot.parent||document.getElementById(snapshot.id)) return;
+    const row=document.createElement('tr');
+    row.id=snapshot.id;
+    row.className='review-item';
+    row.innerHTML=snapshot.html;
+    snapshot.parent.insertBefore(row,snapshot.next||null);
+  }
+  async function finishBackgroundMeasurementAction(request,id,snapshot,data){
+    const result=await request;
+    if(result.ok) return;
+    restoreMeasurementRow(snapshot);
+    refreshMeasurementNavigation();
+    if(measurementData&&String(measurementData.measurementId)===String(id)){
+      setMeasurementMessage(result.result.message||'Could not complete the review action',true);
+    }else if(!measurementData){
+      openMeasurementModal(data,null,true);
+      setMeasurementMessage(result.result.message||'Could not complete the review action',true);
+    }
+  }
   async function reviewCurrentMeasurement(button,action,failureMessage){
     if(!measurementData) return;
-    measurementApprove.disabled=true; measurementReject.disabled=true;
-    const result=await postMeasurementAction(measurementData.measurementId,action);
-    if(result.ok) advanceAfterMeasurementReview();
-    else{
-      showMeasurementDetails(measurementData);
-      setMeasurementMessage(result.result.message||failureMessage,true);
-    }
+    const data=measurementData;
+    const id=data.measurementId;
+    const row=document.getElementById('measurement-'+id);
+    const snapshot=row
+      ?{id:row.id,html:row.innerHTML,parent:row.parentNode,next:row.nextSibling}
+      :null;
+    /* The review queue is intentionally optimistic: remove this plant and
+       advance immediately, while the FarmBot write and curve update finish
+       in the background. A failed request restores the row with its evidence. */
+    if(row) row.remove();
+    advanceAfterMeasurementReview();
+    finishBackgroundMeasurementAction(
+      postMeasurementAction(id,action),id,snapshot,data
+    ).catch(function(error){
+      restoreMeasurementRow(snapshot);
+      refreshMeasurementNavigation();
+      setMeasurementMessage(error.message||failureMessage,true);
+    });
   }
   measurementStandard.addEventListener('click',function(){
     measurementViewMode='standard';showMeasurementImage();
@@ -4154,7 +4196,7 @@ background:#f3f7f4;border-radius:6px;padding:.6rem}}
 .shape-figs{{display:flex;gap:.9rem;flex-wrap:wrap;margin-top:.45rem}}
 .shape-figs figure{{margin:0;text-align:center;font-size:.71rem;color:var(--muted);max-width:5.5rem}}
 .shape-figs svg{{display:block;background:#f3f7f4;border-radius:6px;margin-bottom:.2rem}}
-</style></head><body><header><h1>🌱 FarmBot Vision</h1><nav><a href="./">Analysis</a><a href="soil-height">Soil height</a><a href="settings">Calibration</a><a href="weed-settings">Weed settings</a><a href="canopy-settings">Canopy fusion</a><a href="zones">Boundaries &amp; zones</a><a href="draw-shape">Draw shape</a></nav></header>
+</style></head><body><header><h1>🌱 FarmBot Vision</h1><nav><a href="./">Analysis</a><a href="soil-height">Soil height</a><a href="settings">Calibration</a><a href="weed-settings">Settings</a><a href="canopy-settings">Canopy fusion</a><a href="zones">Boundaries &amp; zones</a><a href="draw-shape">Draw shape</a></nav></header>
 <main>{body}</main></body></html>"""
     )
 
@@ -4581,6 +4623,41 @@ async def dashboard(request: Request) -> HTMLResponse:
         z_text = f", Z {float(coordinates[2]):.1f}" if coordinates[2] is not None else ""
         return f"X {float(coordinates[0]):.1f}, Y {float(coordinates[1]):.1f}{z_text}"
 
+    def _change_view_button(change: dict) -> str:
+        """Expose the evidence behind automatic changes in the audit log."""
+
+        if change.get("decision_method") != "auto":
+            return "<span class=muted>—</span>"
+        try:
+            details = json.loads(change.get("details_json") or "{}")
+        except (TypeError, json.JSONDecodeError):
+            details = {}
+        paths = details.get("image_artifacts") or details.get("artifact_paths") or []
+        urls: list[str] = []
+        for path in paths:
+            if not path:
+                continue
+            url = f"artifact/{Path(str(path)).name}"
+            if url not in urls:
+                urls.append(url)
+        details_json = escape(
+            json.dumps(
+                {
+                    "formula": (
+                        f"Automatic {change['change_type']} decision; "
+                        f"confidence {float(change['confidence']):.2f}."
+                    )
+                },
+                separators=(",", ":"),
+            ),
+            quote=True,
+        )
+        artifacts_json = escape(json.dumps(urls, separators=(",", ":")), quote=True)
+        return (
+            f'<button type=button data-artifacts="{artifacts_json}" '
+            f'data-details="{details_json}">View</button>'
+        )
+
     change_rows = "".join(
         f"<tr><td>{escape(str(change['created_at']))}</td>"
         f"<td>{escape(str(change['crop_type']))}</td>"
@@ -4589,7 +4666,8 @@ async def dashboard(request: Request) -> HTMLResponse:
         f"<td>{float(change['original_radius_mm']):.1f} mm</td>"
         f"<td>{float(change['current_radius_mm']):.1f} mm</td>"
         f"<td>{escape(str(change['decision_method']))}</td>"
-        f"<td>{float(change['confidence']):.2f}</td></tr>"
+        f"<td>{float(change['confidence']):.2f}</td>"
+        f"<td>{_change_view_button(change)}</td></tr>"
         for change in database.recent_changes()
     )
     pending_weeds = database.pending_weed_detections()
@@ -4881,8 +4959,8 @@ aria-label="Photo grid status" style="--grid-columns:{grid_columns}">{grid_cells
 <section class=card><h2>Crop protection spread proposals</h2><p class=muted>Monotonic and limited to 10 points. FarmBot values are diameters; assignment requires approval.</p><table><tbody>{curve_rows or "<tr><td>No curve is ready</td></tr>"}</tbody></table></section>
 <section class=card><h2>Change log</h2><p class=muted>Applied changes to plants and weeds, newest first.</p>
 <table><thead><tr><th>Time</th><th>Crop / type</th><th>Location</th><th>Change</th>
-<th>Original radius</th><th>Current radius</th><th>Decision method</th><th>Confidence</th></tr></thead>
-<tbody>{change_rows or "<tr><td colspan=8>No changes yet</td></tr>"}</tbody></table></section>
+<th>Original radius</th><th>Current radius</th><th>Decision method</th><th>Confidence</th><th>View</th></tr></thead>
+<tbody>{change_rows or "<tr><td colspan=9>No changes yet</td></tr>"}</tbody></table></section>
 <section class=card><h2>Safety warning</h2><p class=warn>Early experimental vision results must not be the sole basis for destructive automatic weeding.</p></section>
 <div id=measurement-modal class=overlay-modal hidden role=dialog aria-modal=true aria-label="Measurement review"><figure class=measurement-dialog>
 <button id=measurement-modal-close class=modal-close type=button aria-label=Close>&times;</button>
@@ -5886,6 +5964,37 @@ async def weed_settings_page(request: Request) -> HTMLResponse:
         )
     )
 
+    radius_change_fields = "".join(
+        (
+            slider_field(
+                "minimum_radius_increase_mm",
+                "Minimum plant-radius increase",
+                radius_change_settings.minimum_radius_increase_mm,
+                tip=(
+                    "Only increases at least this many millimetres are recommended. "
+                    "Smaller changes are retained in the audit trail at 0.05 confidence."
+                ),
+                minimum=0,
+                maximum=100,
+                step=1,
+                unit="mm",
+            ),
+            slider_field(
+                "minimum_radius_reduction_mm",
+                "Minimum plant-radius reduction",
+                radius_change_settings.minimum_radius_reduction_mm,
+                tip=(
+                    "Only reductions at least this many millimetres are recommended. "
+                    "Smaller changes are retained in the audit trail at 0.05 confidence."
+                ),
+                minimum=0,
+                maximum=100,
+                step=1,
+                unit="mm",
+            ),
+        )
+    )
+
     min_diameter = _diameter_mm(values.minimum_area_mm2)
     max_diameter = _diameter_mm(values.maximum_area_mm2)
     size_preview = f"""<div class=size-preview>
@@ -6807,6 +6916,9 @@ The fallback heuristic can only order or filter human review. The learned verifi
 a candidate is a weed, and <b>only an enforcing trained verifier can authorise automatic creation</b>.</p>
 <form method=post action="weed-settings">
 <fieldset><legend>Detection and fallback review</legend>{operation_fields}</fieldset>
+<fieldset><legend>Plant radius recommendations</legend>
+<p class=muted>Changes smaller than these thresholds are treated as measurement noise and are not offered for review.</p>
+{radius_change_fields}</fieldset>
 <fieldset><legend>How big a weed to look for</legend>{size_fields}</fieldset>
 <fieldset><legend>What counts as green foliage</legend>{colour_fields}</fieldset>
 <fieldset><legend>What shape a weed may be</legend>{shape_fields}</fieldset>
@@ -6844,7 +6956,7 @@ review decision was wrong. Saving a tag does not change the detection review sta
 <p class=muted>These unlabelled candidates sit closest to the verifier's decision boundary, so each
 label here moves the model more than another obvious weed does.</p>
 {uncertain_html}</section>"""
-    return layout(request, body, "Weed settings")
+    return layout(request, body, "Settings")
 
 
 @app.post("/weed-settings")
@@ -6901,6 +7013,8 @@ async def save_weed_settings(
     retrain_after_label_count: int = Form(1),
     candidate_crop_storage_enabled: bool = Form(False),
     weed_radius_mm: float = Form(15),
+    minimum_radius_increase_mm: float = Form(3),
+    minimum_radius_reduction_mm: float = Form(30),
 ) -> RedirectResponse:
     try:
         values = WeedSettings(
@@ -6978,6 +7092,16 @@ async def save_weed_settings(
             422, "Looks before recommendation cannot exceed looks before automatic creation"
         )
     weed_settings_store.save(values)
+    try:
+        radius_values = RadiusChangeSettings(
+            minimum_radius_increase_mm=minimum_radius_increase_mm,
+            minimum_radius_reduction_mm=minimum_radius_reduction_mm,
+        )
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    radius_change_settings_store.save(radius_values)
+    settings.minimum_radius_increase_mm = radius_values.minimum_radius_increase_mm
+    settings.minimum_radius_reduction_mm = radius_values.minimum_radius_reduction_mm
     return RedirectResponse("weed-settings", status_code=303)
 
 

@@ -86,6 +86,23 @@ def decide(
         return measurement.model_copy(
             update={"decision": Decision.RETAIN, "reason": "observed radius matches current radius"}
         )
+    radius_delta = abs(proposed - current)
+    minimum_delta = (
+        settings.minimum_radius_reduction_mm
+        if proposed < current
+        else settings.minimum_radius_increase_mm
+    )
+    if radius_delta < minimum_delta:
+        # Keep the observation in the audit trail, but make it fall below the
+        # review floor so insignificant measurement noise is not recommended.
+        measurement = measurement.model_copy(
+            update={
+                "confidence": 0.05,
+                "reason": (
+                    f"radius change is below the configured minimum of {minimum_delta:g} mm"
+                ),
+            }
+        )
     if proposed < current:
         reduction_percent = 100 * (current - proposed) / max(current, 1)
         automatic_limit = settings.maximum_automatic_radius_reduction_percent

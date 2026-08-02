@@ -56,6 +56,55 @@ LOGGER = logging.getLogger(__name__)
 ANALYSIS_COOPERATIVE_PAUSE_SECONDS = 0.1
 
 
+def _measurement_image_artifacts(measurements: list) -> list[str]:
+    """Return the saved images that explain an automatic decision."""
+
+    paths: list[str] = []
+    for measurement in measurements:
+        for name in (
+            "source_image_path",
+            "overlay_path",
+            "composite_path",
+            "composite_overlay_path",
+            "fusion_diagnostic_path",
+        ):
+            path = getattr(measurement, name, None)
+            if path and path not in paths:
+                paths.append(str(path))
+        for path in getattr(measurement, "artifact_paths", []) or []:
+            if path and path not in paths:
+                paths.append(str(path))
+    return paths
+
+
+def _automatic_change_details(result: dict, measurements: list) -> dict:
+    """Keep the API result plus enough provenance for the dashboard View button."""
+
+    details = dict(result)
+    artifacts = _measurement_image_artifacts(measurements)
+    if artifacts:
+        details["image_artifacts"] = artifacts
+    if measurements:
+        details["measurement_id"] = str(measurements[0].measurement_id)
+    return details
+
+
+def curve_radius_after_measurement(measurement, curve_data: dict[str, float]) -> float:
+    """Keep a plant's curve from shrinking when a radius observation drops."""
+
+    proposed = float(measurement.recommended_protection_radius_mm)
+    if proposed >= float(measurement.current_radius_mm):
+        return proposed
+    age = measurement.plant_age_days
+    prior_diameters = (
+        [float(value) for day, value in curve_data.items() if int(day) < int(age)]
+        if age is not None
+        else []
+    )
+    previous_maximum = max(prior_diameters, default=0.0) / 2
+    return max(proposed, float(measurement.current_radius_mm), previous_maximum)
+
+
 def limit_weed_radius_growth(
     current_radius_mm: float,
     measured_radius_mm: float,
@@ -167,10 +216,11 @@ class JobManager:
             if curve is not None
             else {"0": radius_mm_to_diameter_mm(measurement.current_radius_mm)}
         )
+        curve_radius = curve_radius_after_measurement(measurement, base_curve_data)
         edit = propose_curve_point(
             base_curve_data,
             measurement.plant_age_days,
-            radius_mm_to_diameter_mm(measurement.recommended_protection_radius_mm),
+            radius_mm_to_diameter_mm(curve_radius),
             max_daily_growth_mm=self.settings.maximum_daily_radius_growth_mm,
             maximum_plant_radius_mm=self.settings.maximum_plant_radius_mm,
         )
@@ -326,7 +376,7 @@ class JobManager:
                     current_radius_mm=0,
                     decision_method="auto",
                     confidence=candidate.confidence,
-                    details=result,
+                    details=_automatic_change_details(result, measurements),
                 )
             return
         if candidate.decision != Decision.APPLIED or not candidate.calibrated:
@@ -384,7 +434,7 @@ class JobManager:
                 current_radius_mm=new_radius,
                 decision_method="auto",
                 confidence=candidate.confidence,
-                details=result,
+                details=_automatic_change_details(result, measurements),
             )
             await self._update_curve_after_radius(
                 entry_id, inventory, candidate, human_approved=False
@@ -943,6 +993,20 @@ class JobManager:
                                             "measured_radius_mm": measured_radius,
                                             "rolling_baseline_radius_mm": baseline_radius,
                                             "maximum_allowed_radius_mm": maximum_radius,
+                                            "image_artifacts": [
+                                                path
+                                                for path in (
+                                                    str(overlay_path)
+                                                    if result.overlay_jpeg
+                                                    else None,
+                                                    str(weed_review_path)
+                                                    if result.weed_review_jpeg
+                                                    else None,
+                                                    stored_crop_path,
+                                                )
+                                                if path
+                                            ],
+                                            "image_id": weed.image_id,
                                         },
                                     )
                             except HomeAssistantError as exc:
@@ -1085,7 +1149,21 @@ class JobManager:
                                     current_radius_mm=weed.radius_mm,
                                     decision_method="auto",
                                     confidence=weed.confidence,
-                                    details=create_result,
+                                    details={
+                                        **create_result,
+                                        "image_artifacts": [
+                                            path
+                                            for path in (
+                                                str(overlay_path) if result.overlay_jpeg else None,
+                                                str(weed_review_path)
+                                                if result.weed_review_jpeg
+                                                else None,
+                                                stored_crop_path,
+                                            )
+                                            if path
+                                        ],
+                                        "image_id": weed.image_id,
+                                    },
                                 )
                         except HomeAssistantError as exc:
                             LOGGER.warning(
@@ -1175,7 +1253,22 @@ class JobManager:
                                         current_radius_mm=0,
                                         decision_method="auto",
                                         confidence=absence_confidence,
-                                        details=removal_result,
+                                        details={
+                                            **removal_result,
+                                            "image_artifacts": [
+                                                path
+                                                for path in (
+                                                    str(overlay_path)
+                                                    if result.overlay_jpeg
+                                                    else None,
+                                                    str(weed_review_path)
+                                                    if result.weed_review_jpeg
+                                                    else None,
+                                                )
+                                                if path
+                                            ],
+                                            "image_id": response.image_id,
+                                        },
                                     )
                             except HomeAssistantError as exc:
                                 LOGGER.warning("Automatic weed removal failed: %s", exc)
@@ -1250,7 +1343,7 @@ class JobManager:
                                         current_radius_mm=0,
                                         decision_method="auto",
                                         confidence=item.confidence,
-                                        details=removal_result,
+                                        details=_automatic_change_details(removal_result, [item]),
                                     )
                             except StaleRadiusError:
                                 decided[item_index] = item.model_copy(
@@ -1376,7 +1469,7 @@ class JobManager:
                                     current_radius_mm=new_radius,
                                     decision_method="auto",
                                     confidence=item.confidence,
-                                    details=apply_result,
+                                    details=_automatic_change_details(apply_result, [item]),
                                 )
                             if radius_applied:
                                 await self._update_curve_after_radius(

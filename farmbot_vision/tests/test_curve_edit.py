@@ -1,10 +1,15 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
+from uuid import uuid4
+
 from farmbot_vision.curve_edit import (
     MAX_CURVE_CONTROL_POINTS,
     propose_curve_point,
     reasonableness_gate,
 )
+from farmbot_vision.jobs import curve_radius_after_measurement
+from farmbot_vision.models import Decision, Measurement
 
 
 def test_append_measurement_beyond_existing_max_day() -> None:
@@ -103,3 +108,24 @@ def test_empty_curve_is_a_valid_first_control_point() -> None:
 
     assert edit.data == {"0": 20.0}
     assert edit.max_day_changed is True
+
+
+def test_radius_reduction_keeps_previous_curve_maximum_at_current_day() -> None:
+    measurement = Measurement(
+        measurement_id=uuid4(),
+        plant_id=1,
+        crop_slug="lettuce",
+        image_id=1,
+        image_timestamp=datetime.now(UTC),
+        plant_age_days=115,
+        current_radius_mm=65,
+        typical_canopy_radius_mm=65,
+        maximum_accepted_canopy_radius_mm=65,
+        recommended_protection_radius_mm=40,
+        confidence=0.9,
+        decision=Decision.RECOMMENDED,
+        reason="test",
+        algorithm_version="test",
+    )
+
+    assert curve_radius_after_measurement(measurement, {"100": 400}) == 200

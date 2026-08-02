@@ -1,5 +1,11 @@
 # Changelog
 
+## 3.19.0 - 2026-08-02
+
+- Optimistically advance plant-radius reviews while approvals complete in the background.
+- Add configurable minimum increase/reduction thresholds and preserve curve maxima after reductions.
+- Rename the Weed settings tab to Settings and add evidence View buttons for automatic changes.
+
 ## 3.18.0 - 2026-08-01
 
 - Removed the remaining strong-green pre-verifier veto, so pale seedlings and
