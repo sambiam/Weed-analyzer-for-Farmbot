@@ -604,6 +604,8 @@ class SoilStereoCalibration(StrictModel):
     source_image_ids: list[int]
     camera_signature: str
     active: bool = True
+    quality_override: bool = False
+    quality_warnings: list[str] = Field(default_factory=list)
     created_at: datetime = Field(default_factory=lambda: datetime.now().astimezone())
 
 

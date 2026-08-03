@@ -1,5 +1,19 @@
 # Changelog
 
+## 3.24.0 - 2026-08-03
+
+- Soil-calibration quality-gate failures now report which gate failed on
+  which pair, at which Z level (coverage, plane support, L/R error, or plane
+  MAD, with the measured value and threshold), instead of a bare "failed
+  quality gates" message. The same diagnostics are logged for measurement
+  gate failures.
+- The Soil height tab shows the failing calibration job's full diagnostics
+  and, when the failure was a numeric quality gate rather than a broken
+  capture, offers an "Accept calibration anyway" override that recomputes
+  and saves the calibration from the already-captured images without another
+  50 mm capture movement. Overridden calibrations are flagged as such
+  wherever the active calibration is shown.
+
 ## 3.23.2 - 2026-08-03
 
 - Removed the hard-coded `1280x960` soil-image assertion. Guided calibration

@@ -5865,6 +5865,11 @@ async def soil_height_page(request: Request) -> HTMLResponse:
         f"soil image format {calibration.processed_width}×{calibration.processed_height}, "
         f"{calibration.baseline_mm:.0f} mm baseline, "
         f"{calibration.residual_mm:.1f} mm residual"
+        + (
+            " (accepted with a quality-gate override; measurements from it may be less accurate)"
+            if calibration.quality_override
+            else ""
+        )
         if calibration
         else "No active soil calibration. Complete the guided calibration before measuring."
     )
@@ -5885,6 +5890,27 @@ async def soil_height_page(request: Request) -> HTMLResponse:
     )
     job_message = escape(str(current_job.get("message", "Not run")))
     job_status = escape(str(current_job.get("status", "idle")))
+    job_detail = str(current_job.get("detail") or "")
+    job_detail_html = (
+        f"<details><summary>Quality-gate diagnostics</summary>"
+        f"<pre>{escape(job_detail)}</pre></details>"
+        if job_detail
+        else ""
+    )
+    override_job_id = escape(str(current_job.get("id") or ""), quote=True)
+    override_available = (
+        current_job.get("status") == "failed"
+        and soil_jobs.pending_override_job_id is not None
+        and soil_jobs.pending_override_job_id == current_job.get("id")
+    )
+    override_form = (
+        f"""<form method=post action=soil/calibrate/override
+   onsubmit="return confirm('Accept this calibration even though it failed a quality gate? Soil-height measurements using it may be less accurate.')">
+  <input type=hidden name=job_id value="{override_job_id}">
+  <button type=submit>Accept calibration anyway</button></form>"""
+        if override_available
+        else ""
+    )
     retry_values = "".join(
         f'<input type=hidden name=point_ids value="{point_id}">' for point_id in retry_ids
     )
@@ -5905,6 +5931,8 @@ locations and, after review, replace the assigned stale point.</p>
  <div class=card><h3>Calibration</h3><p>{escape(calibration_summary)}</p>
  <p class=warn>Recalibrate after moving, rotating, or refocusing the camera.</p></div>
  <div class=card><h3>Current job</h3><p><strong>{job_status}</strong>: {job_message}</p>
+ {job_detail_html}
+ {override_form}
  <form method=post action=soil/stop><button type=submit>Stop after current point</button></form></div>
 </section>
 <section class=card>
@@ -6074,6 +6102,22 @@ async def start_soil_calibration(
             baseline_mm=baseline_mm,
             reference_distance_mm=reference_distance_mm,
         )
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return RedirectResponse("../soil-height", status_code=303)
+
+
+@app.post("/soil/calibrate/override")
+async def override_soil_calibration(job_id: str = Form(...)) -> RedirectResponse:
+    entry_id = settings.selected_config_entry_id
+    if not entry_id:
+        raise HTTPException(409, "No FarmBot config entry is selected")
+    if soil_jobs.pending_override_job_id != job_id:
+        raise HTTPException(
+            409, "That calibration failure is no longer available to override; recalibrate"
+        )
+    try:
+        soil_jobs.start_calibration_override()
     except ValueError as exc:
         raise HTTPException(409, str(exc)) from exc
     return RedirectResponse("../soil-height", status_code=303)

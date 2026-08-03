@@ -4,7 +4,10 @@ import cv2
 import numpy as np
 import pytest
 
+import farmbot_vision.soil_height as soil_height
 from farmbot_vision.soil_height import (
+    PairEstimate,
+    SoilCalibrationQualityError,
     SoilFrame,
     SoilHeightError,
     analyse_soil_height,
@@ -174,3 +177,81 @@ def test_measurement_rejects_changed_source_geometry():
     result = analyse_soil_height(changed, calibration)
     assert not result.valid
     assert "recalibration" in result.reason
+
+
+def _minimal_frame(z_offset: float, image_id: int) -> SoilFrame:
+    return SoilFrame(
+        image_id=image_id,
+        jpeg=b"",
+        x=100,
+        y=200,
+        z=-z_offset,
+        lateral_offset_mm=0,
+        z_offset_mm=z_offset,
+        processed_width=640,
+        processed_height=480,
+        source_width=640,
+        source_height=480,
+    )
+
+
+def _fake_pair(normalized_disparity: float, coverage: float, support: float) -> PairEstimate:
+    return PairEstimate(
+        normalized_disparity=normalized_disparity,
+        disparity_px=normalized_disparity * 15,
+        baseline_mm=15,
+        valid_coverage=coverage,
+        plane_support=support,
+        lr_error_px=0.5,
+        plane_mad_px=0.5,
+        disparity_map=np.zeros((4, 4)),
+        valid_mask=np.zeros((4, 4), dtype=bool),
+        plane_mask=np.zeros((4, 4), dtype=bool),
+        rectification_overlay=np.zeros((4, 4, 3), dtype=np.uint8),
+    )
+
+
+def _patch_marginal_z0(monkeypatch):
+    """Only the Z=0 level has fewer than two pairs passing quality gates."""
+    by_z = {
+        0: [_fake_pair(2.0, 0.3, 0.6), _fake_pair(2.0, 0.05, 0.6), _fake_pair(2.0, 0.3, 0.2)],
+        25: [_fake_pair(600 / 275, 0.3, 0.6)] * 3,
+        50: [_fake_pair(600 / 250, 0.3, 0.6)] * 3,
+    }
+    monkeypatch.setattr(soil_height, "estimate_triplet", lambda group: by_z[group[0].z_offset_mm])
+    return [_minimal_frame(z, i) for i, z in enumerate((0, 25, 50), start=1)]
+
+
+def test_fit_calibration_reports_which_gates_failed_at_which_level(monkeypatch):
+    frames = _patch_marginal_z0(monkeypatch)
+    with pytest.raises(SoilCalibrationQualityError, match=r"at 0 mm \(1/3 pairs passed") as exc:
+        fit_calibration(
+            config_entry_id="bot",
+            point_id=70,
+            capture_z=0,
+            baseline_mm=15,
+            reference_distance_mm=300,
+            z_direction=-1,
+            frames=frames,
+        )
+    assert "coverage 0.05 < 0.15" in str(exc.value)
+    assert "plane support 0.20 < 0.50" in str(exc.value)
+
+
+def test_fit_calibration_force_overrides_the_gate_and_records_a_warning(monkeypatch):
+    frames = _patch_marginal_z0(monkeypatch)
+    calibration = fit_calibration(
+        config_entry_id="bot",
+        point_id=70,
+        capture_z=0,
+        baseline_mm=15,
+        reference_distance_mm=300,
+        z_direction=-1,
+        frames=frames,
+        force=True,
+    )
+    assert calibration.quality_override is True
+    assert len(calibration.quality_warnings) == 1
+    assert "at 0 mm" in calibration.quality_warnings[0]
+    assert "accepted by override" in calibration.quality_warnings[0]
+    assert calibration.residual_mm <= 5

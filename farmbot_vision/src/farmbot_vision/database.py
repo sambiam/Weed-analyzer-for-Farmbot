@@ -351,6 +351,15 @@ MIGRATIONS = [
       PRIMARY KEY(config_entry_id,weed_id,image_id)
     );
     """,
+    # Migration 22: surface soil-calibration quality-gate diagnostics in the
+    # job record (beyond the truncated summary message) and let an operator
+    # explicitly accept a calibration that failed a numeric quality gate,
+    # keeping a record that it was accepted under override.
+    """
+    ALTER TABLE soil_jobs ADD COLUMN detail TEXT;
+    ALTER TABLE soil_calibrations ADD COLUMN quality_override INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE soil_calibrations ADD COLUMN quality_warnings_json TEXT NOT NULL DEFAULT '[]';
+    """,
 ]
 
 
@@ -2170,8 +2179,9 @@ class Database:
                 config_entry_id,point_id,capture_z,baseline_mm,reference_distance_mm,
                 z_direction,inverse_depth_slope,inverse_depth_intercept,residual_mm,
                 processed_width,processed_height,source_width,source_height,
-                source_image_ids_json,camera_signature,active,created_at,version)
-                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                source_image_ids_json,camera_signature,active,created_at,version,
+                quality_override,quality_warnings_json)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     calibration.config_entry_id,
                     calibration.point_id,
@@ -2191,6 +2201,8 @@ class Database:
                     int(calibration.active),
                     calibration.created_at.isoformat(),
                     version,
+                    int(calibration.quality_override),
+                    json.dumps(calibration.quality_warnings, separators=(",", ":")),
                 ),
             )
         return calibration.model_copy(
@@ -2209,6 +2221,8 @@ class Database:
         data["calibration_id"] = data.pop("id")
         data["source_image_ids"] = json.loads(data.pop("source_image_ids_json"))
         data["active"] = bool(data["active"])
+        data["quality_override"] = bool(data.get("quality_override", 0))
+        data["quality_warnings"] = json.loads(data.pop("quality_warnings_json", "[]") or "[]")
         return SoilStereoCalibration.model_validate(data)
 
     def save_soil_measurement(self, measurement: SoilMeasurement) -> None:
@@ -2340,6 +2354,7 @@ class Database:
         failed_count: int | None = None,
         stop_requested: bool | None = None,
         message: str | None = None,
+        detail: str | None = None,
         complete: bool = False,
     ) -> None:
         updates, values = [], []
@@ -2350,6 +2365,7 @@ class Database:
             ("failed_count", failed_count),
             ("stop_requested", int(stop_requested) if stop_requested is not None else None),
             ("message", message),
+            ("detail", detail),
         ):
             if value is not None:
                 updates.append(f"{field}=?")

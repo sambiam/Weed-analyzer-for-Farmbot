@@ -33,6 +33,16 @@ class SoilHeightError(RuntimeError):
     """Expected, user-actionable failure of calibration or measurement."""
 
 
+class SoilCalibrationQualityError(SoilHeightError):
+    """Calibration math ran, but a numeric quality gate rejected the result.
+
+    Unlike other ``SoilHeightError`` cases (missing Z levels, non-monotonic
+    disparity, an unsafe movement), this is a tolerance judgment call rather
+    than a broken capture, so callers may retry ``fit_calibration`` with
+    ``force=True`` using the same frames to accept it anyway.
+    """
+
+
 @dataclass(slots=True)
 class SoilFrame:
     image_id: int
@@ -64,12 +74,32 @@ class PairEstimate:
 
     @property
     def passes_geometry(self) -> bool:
-        return (
-            self.valid_coverage >= MIN_VALID_COVERAGE
-            and self.plane_support >= MIN_PLANE_SUPPORT
-            and self.lr_error_px <= MAX_LR_ERROR_PX
-            and self.plane_mad_px <= MAX_PLANE_MAD_PX
+        return not self.failed_gates
+
+    @property
+    def failed_gates(self) -> list[str]:
+        failures = []
+        if self.valid_coverage < MIN_VALID_COVERAGE:
+            failures.append(f"coverage {self.valid_coverage:.2f} < {MIN_VALID_COVERAGE:.2f}")
+        if self.plane_support < MIN_PLANE_SUPPORT:
+            failures.append(f"plane support {self.plane_support:.2f} < {MIN_PLANE_SUPPORT:.2f}")
+        if self.lr_error_px > MAX_LR_ERROR_PX:
+            failures.append(f"L/R error {self.lr_error_px:.2f}px > {MAX_LR_ERROR_PX:.2f}px")
+        if self.plane_mad_px > MAX_PLANE_MAD_PX:
+            failures.append(f"plane MAD {self.plane_mad_px:.2f}px > {MAX_PLANE_MAD_PX:.2f}px")
+        return failures
+
+
+def _pair_gate_summary(estimates: list[PairEstimate]) -> str:
+    parts = []
+    for index, estimate in enumerate(estimates, start=1):
+        failures = estimate.failed_gates
+        parts.append(
+            f"pair {index} passed"
+            if not failures
+            else f"pair {index} failed ({', '.join(failures)})"
         )
+    return "; ".join(parts)
 
 
 @dataclass(slots=True)
@@ -321,21 +351,41 @@ def fit_calibration(
     z_direction: int,
     frames: list[SoilFrame],
     declared_camera_signature: str = "",
+    force: bool = False,
 ) -> SoilStereoCalibration:
+    """Fit the inverse-depth calibration curve from three Z-level triplets.
+
+    ``force`` accepts a calibration that fails a numeric quality gate
+    (too few pairs passing geometry at a Z level, or a high fit residual)
+    instead of raising ``SoilCalibrationQualityError``. It still requires the
+    underlying stereo math to succeed (three Z levels, monotonic disparity,
+    a valid slope) -- those remain hard failures because there is no data to
+    fall back on. Each bypassed gate is recorded in ``quality_warnings``.
+    """
     groups: dict[float, list[SoilFrame]] = {}
     for frame in frames:
         groups.setdefault(frame.z_offset_mm, []).append(frame)
     if len(groups) < 3:
         raise SoilHeightError("calibration requires three distinct Z levels")
     samples = []
+    warnings: list[str] = []
     for z_offset, group in sorted(groups.items()):
         distance = reference_distance_mm - z_offset
         if distance <= 0:
             raise SoilHeightError("calibration movement reaches or passes the soil")
-        estimates = [item for item in estimate_triplet(group) if item.passes_geometry]
-        if len(estimates) < 2:
-            raise SoilHeightError(f"calibration imagery failed quality gates at {z_offset:g} mm")
-        normalized = float(np.median([item.normalized_disparity for item in estimates]))
+        triplet_estimates = estimate_triplet(group)
+        passing = [item for item in triplet_estimates if item.passes_geometry]
+        if len(passing) < 2:
+            summary = _pair_gate_summary(triplet_estimates)
+            detail = (
+                f"calibration imagery failed quality gates at {z_offset:g} mm "
+                f"({len(passing)}/{len(triplet_estimates)} pairs passed: {summary})"
+            )
+            if not force:
+                raise SoilCalibrationQualityError(detail)
+            warnings.append(f"{detail} -- accepted by override")
+            passing = triplet_estimates
+        normalized = float(np.median([item.normalized_disparity for item in passing]))
         samples.append((normalized, 1.0 / distance, distance))
     disparities = np.array([sample[0] for sample in samples], dtype=np.float64)
     inverse_distances = np.array([sample[1] for sample in samples], dtype=np.float64)
@@ -347,7 +397,10 @@ def fit_calibration(
     predicted = 1.0 / (slope * disparities + intercept)
     residual = float(np.max(np.abs(predicted - np.array([sample[2] for sample in samples]))))
     if residual > 5:
-        raise SoilHeightError(f"calibration residual {residual:.1f} mm exceeds 5 mm")
+        detail = f"calibration residual {residual:.1f} mm exceeds 5 mm"
+        if not force:
+            raise SoilCalibrationQualityError(detail)
+        warnings.append(f"{detail} -- accepted by override")
     first = frames[0]
     return SoilStereoCalibration(
         config_entry_id=config_entry_id,
@@ -365,6 +418,8 @@ def fit_calibration(
         source_height=first.source_height,
         source_image_ids=[frame.image_id for frame in frames],
         camera_signature=camera_signature(frames, declared_camera_signature),
+        quality_override=bool(warnings),
+        quality_warnings=warnings,
     )
 
 
@@ -422,7 +477,11 @@ def analyse_soil_height(
         result.artifacts.update(_pair_artifacts(estimates))
         passing = [estimate for estimate in estimates if estimate.passes_geometry]
         if len(passing) < 2:
-            raise SoilHeightError("fewer than two stereo pairs passed the quality gates")
+            summary = _pair_gate_summary(estimates)
+            raise SoilHeightError(
+                f"fewer than two stereo pairs passed the quality gates "
+                f"({len(passing)}/{len(estimates)} passed: {summary})"
+            )
         converted = []
         for estimate in passing:
             inverse = (
