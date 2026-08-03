@@ -24,6 +24,9 @@ from .models import (
 )
 from .photo_quality import inspect_photo_quality
 from .soil_height import (
+    ALGORITHM_VERSION as SOIL_ALGORITHM_VERSION,
+)
+from .soil_height import (
     SoilCalibrationQualityError,
     SoilFrame,
     SoilHeightError,
@@ -737,6 +740,7 @@ class SoilJobManager:
                             frame_ids=[frame.image_id for frame in frames],
                             metrics=analysis.metrics,
                             artifact_paths=artifact_paths,
+                            algorithm_version=SOIL_ALGORITHM_VERSION,
                         )
                         self.db.save_soil_measurement(measurement)
                         if analysis.valid:
@@ -770,6 +774,7 @@ class SoilJobManager:
                             status="failed",
                             reason=str(err)[:240] or "Soil measurement failed",
                             calibration_id=calibration.calibration_id,
+                            algorithm_version=SOIL_ALGORITHM_VERSION,
                         )
                         self.db.save_soil_measurement(measurement)
                     self.current.update(completed_count=completed, failed_count=failed)

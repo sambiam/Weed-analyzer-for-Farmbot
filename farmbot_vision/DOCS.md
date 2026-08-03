@@ -135,10 +135,12 @@ or severely blurred images are retried in place up to five attempts. The bot
 advances only after accepting the current frame and returns to its original
 position once when the run completes or aborts.
 
-The pipeline rectifies roll and vertical offset, computes
-StereoSGBM disparities for both adjacent pairs and the outer pair, masks green
-vegetation and inconsistent pixels, and fits the dominant soil plane with
-RANSAC. A result remains diagnostic-only unless coverage, plane support,
+The pipeline rectifies roll and vertical offset, uses robust feature flow to
+limit StereoSGBM to the relevant disparity range for both adjacent pairs and
+the outer pair, masks green vegetation and inconsistent pixels, and fits the
+dominant soil plane with RANSAC. Coverage is measured over clear, overlapping,
+geometrically matchable soil rather than rotation borders or matcher search
+margins. A result remains diagnostic-only unless coverage, plane support,
 left/right consistency, plane residual, cross-pair agreement, and propagated
 uncertainty all pass their quality gates.
 

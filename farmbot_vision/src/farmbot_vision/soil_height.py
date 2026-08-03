@@ -20,8 +20,12 @@ import numpy as np
 from .models import SoilStereoCalibration
 from .vision import ScaleParams, vegetation_mask
 
-ALGORITHM_VERSION = "soil-stereo-v1"
-MIN_VALID_COVERAGE = 0.15
+ALGORITHM_VERSION = "soil-stereo-v2"
+# A few percent of a megapixel image still provides tens of thousands of
+# independently checked disparities.  The old 15% whole-frame threshold was
+# dominated by portrait rotation borders and SGBM's deliberately unmatchable
+# search margin, rather than by the amount of usable soil evidence.
+MIN_VALID_COVERAGE = 0.03
 MIN_PLANE_SUPPORT = 0.50
 MAX_LR_ERROR_PX = 1.5
 MAX_PLANE_MAD_PX = 2.0
@@ -131,6 +135,7 @@ def camera_signature(frames: list[SoilFrame], declared_signature: str = "") -> s
         raise SoilHeightError("soil image geometry changed within the capture")
     processed_width, processed_height, source_width, source_height = geometries.pop()
     payload = {
+        "algorithm": ALGORITHM_VERSION,
         "processed": [processed_width, processed_height],
         "source": [source_width, source_height],
         "declared": declared_signature,
@@ -165,7 +170,7 @@ def _green_mask(image: np.ndarray) -> np.ndarray:
 
 def _rectify_pair(
     left_color: np.ndarray, right_color: np.ndarray
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, float]:
     """Rotate both views so robust feature flow follows the horizontal epipolar axis."""
     left = _enhance_gray(left_color)
     right = _enhance_gray(right_color)
@@ -209,12 +214,51 @@ def _rectify_pair(
     right_rect = cv2.warpAffine(right, matrix, (width, height), flags=cv2.INTER_LINEAR)
     left_color_rect = cv2.warpAffine(left_color, matrix, (width, height), flags=cv2.INTER_LINEAR)
     right_color_rect = cv2.warpAffine(right_color, matrix, (width, height), flags=cv2.INTER_LINEAR)
-    return left_rect, right_rect, left_color_rect, right_color_rect
+    # Rotating a portrait frame into the horizontal epipolar direction creates
+    # large black triangles (and can crop the short side).  They are not failed
+    # matches and must not dilute the usable-coverage quality metric.
+    footprint = (
+        cv2.warpAffine(
+            np.full((height, width), 255, dtype=np.uint8),
+            matrix,
+            (width, height),
+            flags=cv2.INTER_NEAREST,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=0,
+        )
+        > 0
+    )
+    expected_disparity = math.hypot(float(dx), float(dy))
+    return (
+        left_rect,
+        right_rect,
+        left_color_rect,
+        right_color_rect,
+        footprint,
+        expected_disparity,
+    )
 
 
-def _stereo_maps(left: np.ndarray, right: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+def _disparity_search(width: int, expected: float) -> tuple[int, int]:
+    """Return a compact SGBM range containing the robust feature-flow estimate."""
+
+    maximum_supported = min(256, max(16, width // 3))
+    margin = max(12.0, expected * 0.45)
+    minimum = max(0, math.floor(expected - margin))
+    maximum = min(maximum_supported, math.ceil(expected + margin))
+    if minimum >= maximum_supported:
+        raise SoilHeightError("camera movement is too large for reliable stereo matching")
+    disparities = max(16, math.ceil((maximum - minimum) / 16) * 16)
+    if minimum + disparities > maximum_supported:
+        minimum = max(0, maximum_supported - disparities)
+    return minimum, disparities
+
+
+def _stereo_maps(
+    left: np.ndarray, right: np.ndarray, expected: float
+) -> tuple[np.ndarray, np.ndarray, int, int]:
     width = left.shape[1]
-    num = min(256, max(16, (width // 4 // 16) * 16))
+    minimum, num = _disparity_search(width, expected)
     block = 5
     common = dict(
         blockSize=block,
@@ -228,18 +272,18 @@ def _stereo_maps(left: np.ndarray, right: np.ndarray) -> tuple[np.ndarray, np.nd
         mode=cv2.STEREO_SGBM_MODE_SGBM_3WAY,
     )
     forward = (
-        cv2.StereoSGBM_create(minDisparity=0, numDisparities=num, **common)
+        cv2.StereoSGBM_create(minDisparity=minimum, numDisparities=num, **common)
         .compute(left, right)
         .astype(np.float32)
         / 16.0
     )
     reverse = (
-        cv2.StereoSGBM_create(minDisparity=-num, numDisparities=num, **common)
+        cv2.StereoSGBM_create(minDisparity=-(minimum + num), numDisparities=num, **common)
         .compute(right, left)
         .astype(np.float32)
         / 16.0
     )
-    return forward, reverse
+    return forward, reverse, minimum, num
 
 
 def _fit_plane(disparity: np.ndarray, valid: np.ndarray) -> tuple[np.ndarray, float, float, float]:
@@ -278,13 +322,22 @@ def _fit_plane(disparity: np.ndarray, valid: np.ndarray) -> tuple[np.ndarray, fl
     return plane_mask, support, mad, center_disparity
 
 
-def estimate_pair(first: SoilFrame, second: SoilFrame) -> PairEstimate:
+def estimate_pair(
+    first: SoilFrame,
+    second: SoilFrame,
+    *,
+    expected_disparity: float | None = None,
+) -> PairEstimate:
     baseline = abs(second.lateral_offset_mm - first.lateral_offset_mm)
     if baseline < 4.99:
         raise SoilHeightError("stereo baseline is too small")
     first_color, second_color = _decode(first), _decode(second)
-    left, right, left_color, right_color = _rectify_pair(first_color, second_color)
-    disparity, reverse = _stereo_maps(left, right)
+    left, right, left_color, right_color, footprint, expected = _rectify_pair(
+        first_color, second_color
+    )
+    disparity, reverse, minimum, num = _stereo_maps(
+        left, right, expected if expected_disparity is None else expected_disparity
+    )
     height, width = disparity.shape
     yy, xx = np.indices((height, width))
     xr = np.rint(xx - disparity).astype(np.int32)
@@ -292,19 +345,37 @@ def estimate_pair(first: SoilFrame, second: SoilFrame) -> PairEstimate:
     sampled_reverse = np.full_like(disparity, np.nan)
     sampled_reverse[in_bounds] = reverse[yy[in_bounds], xr[in_bounds]]
     lr_error = np.abs(disparity + sampled_reverse)
+    reverse_minimum = -(minimum + num)
+    forward_valid = disparity > max(0.5, minimum - 0.5)
+    reverse_valid = (sampled_reverse > reverse_minimum - 0.5) & (sampled_reverse < -minimum + 0.5)
     border = max(8, round(min(width, height) * 0.05))
+    usable = footprint & ~_green_mask(left_color) & ~_green_mask(right_color)
     valid = (
-        (disparity > 0.5)
+        forward_valid
         & np.isfinite(sampled_reverse)
+        & reverse_valid
         & (lr_error <= MAX_LR_ERROR_PX)
-        & ~_green_mask(left_color)
-        & ~_green_mask(right_color)
+        & usable
     )
     valid[:border] = False
     valid[-border:] = False
     valid[:, :border] = False
     valid[:, -border:] = False
-    coverage = float(np.count_nonzero(valid) / valid.size)
+    usable[:border] = False
+    usable[-border:] = False
+    usable[:, :border] = False
+    usable[:, -border:] = False
+    # SGBM cannot produce a forward match in its left search margin.  Count
+    # coverage only where a result is geometrically possible; otherwise a
+    # wider baseline appears lower quality merely because it needs a wider
+    # disparity range.
+    search_margin = min(width, minimum + num + 2)
+    usable[:, :search_margin] = False
+    valid &= usable
+    usable_pixels = int(np.count_nonzero(usable))
+    if usable_pixels < 500:
+        raise SoilHeightError("not enough clear overlapping soil for stereo matching")
+    coverage = float(np.count_nonzero(valid) / usable_pixels)
     plane_mask, support, mad, center = _fit_plane(disparity, valid)
     median_lr = float(np.median(lr_error[valid])) if np.any(valid) else math.inf
     rectification_overlay = cv2.addWeighted(left_color, 0.5, right_color, 0.5, 0)
@@ -329,13 +400,33 @@ def estimate_triplet(frames: list[SoilFrame]) -> list[PairEstimate]:
     if len(frames) != 3:
         raise SoilHeightError("each soil stereo set must contain exactly three images")
     ordered = sorted(frames, key=lambda frame: frame.lateral_offset_mm)
-    pairs = ((ordered[0], ordered[1]), (ordered[1], ordered[2]), (ordered[0], ordered[2]))
+    adjacent = ((ordered[0], ordered[1]), (ordered[1], ordered[2]))
     estimates, errors = [], []
-    for first, second in pairs:
+    for first, second in adjacent:
         try:
             estimates.append(estimate_pair(first, second))
         except SoilHeightError as err:
             errors.append(str(err))
+    # The outer pair can exceed pyramidal optical flow's reliable displacement
+    # on close portrait captures.  Adjacent-pair disparity scales linearly with
+    # the known baseline and gives it a much safer search hint.
+    outer_first, outer_second = ordered[0], ordered[2]
+    expected_outer = None
+    if estimates:
+        expected_outer = float(
+            np.median([item.normalized_disparity for item in estimates])
+            * abs(outer_second.lateral_offset_mm - outer_first.lateral_offset_mm)
+        )
+    try:
+        estimates.append(
+            estimate_pair(
+                outer_first,
+                outer_second,
+                expected_disparity=expected_outer,
+            )
+        )
+    except SoilHeightError as err:
+        errors.append(str(err))
     if len(estimates) < 2:
         raise SoilHeightError(errors[0] if errors else "fewer than two stereo pairs succeeded")
     return estimates

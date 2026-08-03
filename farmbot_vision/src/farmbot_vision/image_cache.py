@@ -109,11 +109,18 @@ class ImageFileCache:
         )
 
     def _trim(self) -> None:
-        images = sorted(
-            self.directory.glob("*.jpg"),
-            key=lambda path: path.stat().st_mtime,
-            reverse=True,
-        )
-        for path in images[self.maximum_files :]:
+        # Several FastAPI requests can populate and trim the cache in worker
+        # threads at once.  A glob result is only a snapshot: another trimmer
+        # may remove an entry before this thread calls stat().  Treat that as
+        # an already-completed eviction instead of turning an image request
+        # into a 500 response.
+        images: list[tuple[float, Path]] = []
+        for path in self.directory.glob("*.jpg"):
+            try:
+                images.append((path.stat().st_mtime, path))
+            except FileNotFoundError:
+                continue
+        images.sort(key=lambda item: item[0], reverse=True)
+        for _mtime, path in images[self.maximum_files :]:
             path.unlink(missing_ok=True)
             path.with_suffix(".json").unlink(missing_ok=True)

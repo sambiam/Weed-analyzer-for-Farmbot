@@ -1,5 +1,20 @@
 # Changelog
 
+## 3.24.1 - 2026-08-03
+
+- Made soil-height stereo matching robust to the supplied textured-mulch
+  portrait and landscape captures by guiding SGBM from feature flow, using the
+  adjacent views to guide the wider outer pair, and measuring coverage only
+  over clear overlap where matching is geometrically possible.
+- Accept consistent dense soil planes with at least 3% usable coverage. At the
+  supported resolutions this still requires thousands of left/right-checked
+  pixels, while avoiding the old false rejection of reliable 4-6% captures.
+- Include the soil algorithm version in calibration compatibility, so existing
+  v1 calibrations fail safely with a recalibration prompt instead of mixing old
+  calibration math with the revised measurement algorithm.
+- Fixed concurrent image-cache trimming raising `FileNotFoundError` and
+  returning HTTP 500 when another request had already evicted the same JPEG.
+
 ## 3.24.0 - 2026-08-03
 
 - Soil-calibration quality-gate failures now report which gate failed on

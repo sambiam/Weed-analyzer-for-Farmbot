@@ -214,7 +214,7 @@ def _fake_pair(normalized_disparity: float, coverage: float, support: float) -> 
 def _patch_marginal_z0(monkeypatch):
     """Only the Z=0 level has fewer than two pairs passing quality gates."""
     by_z = {
-        0: [_fake_pair(2.0, 0.3, 0.6), _fake_pair(2.0, 0.05, 0.6), _fake_pair(2.0, 0.3, 0.2)],
+        0: [_fake_pair(2.0, 0.3, 0.6), _fake_pair(2.0, 0.01, 0.6), _fake_pair(2.0, 0.3, 0.2)],
         25: [_fake_pair(600 / 275, 0.3, 0.6)] * 3,
         50: [_fake_pair(600 / 250, 0.3, 0.6)] * 3,
     }
@@ -234,7 +234,7 @@ def test_fit_calibration_reports_which_gates_failed_at_which_level(monkeypatch):
             z_direction=-1,
             frames=frames,
         )
-    assert "coverage 0.05 < 0.15" in str(exc.value)
+    assert "coverage 0.01 < 0.03" in str(exc.value)
     assert "plane support 0.20 < 0.50" in str(exc.value)
 
 
@@ -255,3 +255,11 @@ def test_fit_calibration_force_overrides_the_gate_and_records_a_warning(monkeypa
     assert "at 0 mm" in calibration.quality_warnings[0]
     assert "accepted by override" in calibration.quality_warnings[0]
     assert calibration.residual_mm <= 5
+
+
+def test_megapixel_pair_accepts_four_percent_consistent_dense_coverage():
+    """Mulch captures can be reliable without filling 15% of the whole frame."""
+
+    estimate = _fake_pair(2.0, 0.04, 0.8)
+    assert estimate.passes_geometry
+    assert estimate.failed_gates == []
