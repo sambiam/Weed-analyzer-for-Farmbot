@@ -1354,6 +1354,112 @@ async def test_custom_soil_calibration_does_not_require_anchor(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_soil_height_page_offers_override_after_quality_gate_failure(monkeypatch):
+    monkeypatch.setattr(web.settings, "selected_config_entry_id", "soil-entry")
+
+    async def safe_sites(_entry_id, _baseline, **_kwargs):
+        inventory = SoilPointInventory(
+            device_id="42",
+            generated_at=datetime.now(UTC),
+            points=[],
+            motion=SoilMotionState(
+                connected=True,
+                busy=False,
+                locked=False,
+                position={"x": 0, "y": 0, "z": 0},
+                z_direction=-1,
+                axis_bounds={"x": (0, 1000), "y": (0, 1000), "z": (-500, 0)},
+            ),
+        )
+        return inventory, []
+
+    monkeypatch.setattr(web.soil_jobs, "safe_sites", safe_sites)
+    monkeypatch.setattr(
+        web.soil_jobs,
+        "current",
+        {
+            "id": "cal-job-1",
+            "status": "failed",
+            "message": "calibration imagery failed quality gates at 0 mm (1/3 pairs passed)",
+            "detail": (
+                "calibration imagery failed quality gates at 0 mm (1/3 pairs passed: "
+                "pair 1 passed; pair 2 failed (coverage 0.05 < 0.15))"
+            ),
+        },
+    )
+    monkeypatch.setattr(web.soil_jobs, "_pending_calibration_override", {"job_id": "cal-job-1"})
+
+    status, _, body = await asgi_request("/soil-height")
+    assert status == 200
+    assert b"Accept calibration anyway" in body
+    assert b"coverage 0.05" in body
+    assert b'name=job_id value="cal-job-1"' in body
+
+
+@pytest.mark.asyncio
+async def test_soil_height_page_hides_override_once_it_no_longer_matches(monkeypatch):
+    monkeypatch.setattr(web.settings, "selected_config_entry_id", "soil-entry")
+
+    async def safe_sites(_entry_id, _baseline, **_kwargs):
+        inventory = SoilPointInventory(
+            device_id="42",
+            generated_at=datetime.now(UTC),
+            points=[],
+            motion=SoilMotionState(
+                connected=True,
+                busy=False,
+                locked=False,
+                position={"x": 0, "y": 0, "z": 0},
+                z_direction=-1,
+                axis_bounds={"x": (0, 1000), "y": (0, 1000), "z": (-500, 0)},
+            ),
+        )
+        return inventory, []
+
+    monkeypatch.setattr(web.soil_jobs, "safe_sites", safe_sites)
+    monkeypatch.setattr(
+        web.soil_jobs,
+        "current",
+        {"id": "cal-job-1", "status": "failed", "message": "failed", "detail": ""},
+    )
+    # No pending override recorded (e.g. it was cleared by a fresh calibration).
+    monkeypatch.setattr(web.soil_jobs, "_pending_calibration_override", None)
+
+    status, _, body = await asgi_request("/soil-height")
+    assert status == 200
+    assert b"Accept calibration anyway" not in body
+
+
+@pytest.mark.asyncio
+async def test_soil_calibration_override_route_rejects_a_stale_job_id(monkeypatch):
+    monkeypatch.setattr(web.settings, "selected_config_entry_id", "soil-entry")
+    monkeypatch.setattr(web.soil_jobs, "_pending_calibration_override", {"job_id": "cal-job-1"})
+    status, _, _ = await asgi_request(
+        "/soil/calibrate/override", method="POST", form={"job_id": "some-other-job"}
+    )
+    assert status == 409
+
+
+@pytest.mark.asyncio
+async def test_soil_calibration_override_route_starts_the_override_job(monkeypatch):
+    monkeypatch.setattr(web.settings, "selected_config_entry_id", "soil-entry")
+    monkeypatch.setattr(web.soil_jobs, "_pending_calibration_override", {"job_id": "cal-job-1"})
+    started = {}
+
+    def start_calibration_override():
+        started["called"] = True
+        return "override-job"
+
+    monkeypatch.setattr(web.soil_jobs, "start_calibration_override", start_calibration_override)
+    status, headers, _ = await asgi_request(
+        "/soil/calibrate/override", method="POST", form={"job_id": "cal-job-1"}
+    )
+    assert status == 303
+    assert headers[b"location"] == b"../soil-height"
+    assert started["called"] is True
+
+
+@pytest.mark.asyncio
 async def test_soil_apply_is_human_approved_and_audited(monkeypatch):
     measurement = SoilMeasurement(
         measurement_id=uuid4(),

@@ -24,6 +24,7 @@ from .models import (
 )
 from .photo_quality import inspect_photo_quality
 from .soil_height import (
+    SoilCalibrationQualityError,
     SoilFrame,
     SoilHeightError,
     analyse_soil_height,
@@ -57,6 +58,7 @@ class SoilJobManager:
         self.task: asyncio.Task | None = None
         self.stop_requested = False
         self.current: dict = {"status": "idle", "message": "Not run"}
+        self._pending_calibration_override: dict | None = None
         self._safe_site_cache: dict[
             tuple[str, float, float], tuple[float, tuple[SoilPointInventory, list[SoilSite]]]
         ] = {}
@@ -65,6 +67,15 @@ class SoilJobManager:
     @property
     def running(self) -> bool:
         return self.task is not None and not self.task.done()
+
+    @property
+    def pending_override_job_id(self) -> str | None:
+        """The failed calibration job, if any, waiting on an override decision."""
+        return (
+            self._pending_calibration_override["job_id"]
+            if self._pending_calibration_override
+            else None
+        )
 
     def _start(self, coroutine, *, name: str) -> str:
         if self.running:
@@ -92,6 +103,8 @@ class SoilJobManager:
         baseline_mm: float,
         reference_distance_mm: float,
     ) -> str:
+        # A fresh capture invalidates any earlier failure's frames.
+        self._pending_calibration_override = None
         return self._start(
             lambda job_id: self._run_calibration(
                 job_id=job_id,
@@ -104,6 +117,21 @@ class SoilJobManager:
                 reference_distance_mm=reference_distance_mm,
             ),
             name="soil-calibration",
+        )
+
+    def start_calibration_override(self) -> str:
+        """Recompute and accept the last failed calibration's images anyway.
+
+        Uses the frames already captured for the calibration job that most
+        recently failed a numeric quality gate (``SoilCalibrationQualityError``),
+        so accepting the override never triggers another bot movement.
+        """
+        pending = self._pending_calibration_override
+        if pending is None:
+            raise ValueError("no calibration is waiting for an override decision")
+        return self._start(
+            lambda job_id: self._run_calibration_override(job_id=job_id, pending=pending),
+            name="soil-calibration-override",
         )
 
     def start_measurements(
@@ -467,9 +495,90 @@ class SoilJobManager:
                 job_id, status="interrupted", message="app stopped", complete=True
             )
             raise
+        except SoilCalibrationQualityError as err:
+            detail = str(err)
+            message = detail if len(detail) <= 240 else f"{detail[:237]}..."
+            # Keep the frames so the operator can override without another
+            # (safety-critical) 50 mm capture movement toward the soil.
+            self._pending_calibration_override = {
+                "job_id": job_id,
+                "config_entry_id": config_entry_id,
+                "point_id": point_id,
+                "capture_z": capture_z,
+                "baseline_mm": baseline_mm,
+                "reference_distance_mm": reference_distance_mm,
+                "z_direction": inventory.motion.z_direction,
+                "frames": frames,
+                "signature": signature,
+            }
+            LOGGER.warning("Soil calibration %s failed quality gates: %s", job_id, detail)
+            self.current.update(status="failed", message=message, detail=detail)
+            self.db.update_soil_job(
+                job_id,
+                status="failed",
+                failed_count=1,
+                message=message,
+                detail=detail,
+                complete=True,
+            )
         except Exception as err:  # pylint: disable=broad-except
             message = str(err)[:240] or "Soil calibration failed"
             LOGGER.warning("Soil calibration %s failed: %s", job_id, err)
+            self.current.update(status="failed", message=message)
+            self.db.update_soil_job(
+                job_id, status="failed", failed_count=1, message=message, complete=True
+            )
+
+    async def _run_calibration_override(self, *, job_id: str, pending: dict) -> None:
+        self.db.start_soil_job(
+            job_id,
+            pending["config_entry_id"],
+            "calibration",
+            [pending["point_id"]] if pending["point_id"] is not None else [],
+        )
+        try:
+            async with self.shared_lock:
+                self.current.update(
+                    status="running",
+                    message="Recomputing calibration with quality gates overridden",
+                )
+                calibration = await asyncio.to_thread(
+                    fit_calibration,
+                    config_entry_id=pending["config_entry_id"],
+                    point_id=pending["point_id"] if pending["point_id"] is not None else 0,
+                    capture_z=pending["capture_z"],
+                    baseline_mm=pending["baseline_mm"],
+                    reference_distance_mm=pending["reference_distance_mm"],
+                    z_direction=pending["z_direction"],
+                    frames=pending["frames"],
+                    declared_camera_signature=pending["signature"],
+                    force=True,
+                )
+                calibration = self.db.save_soil_calibration(calibration)
+                detail = "; ".join(calibration.quality_warnings)
+                message = (
+                    f"Calibration {calibration.calibration_id} saved with quality gates "
+                    f"overridden; maximum residual {calibration.residual_mm:.1f} mm"
+                )
+                LOGGER.warning("Soil calibration %s accepted by override: %s", job_id, detail)
+                self.current.update(status="complete", message=message, detail=detail)
+                self.db.update_soil_job(
+                    job_id,
+                    status="complete",
+                    completed_count=1,
+                    message=message,
+                    detail=detail,
+                    complete=True,
+                )
+                self._pending_calibration_override = None
+        except asyncio.CancelledError:
+            self.db.update_soil_job(
+                job_id, status="interrupted", message="app stopped", complete=True
+            )
+            raise
+        except Exception as err:  # pylint: disable=broad-except
+            message = str(err)[:240] or "Calibration override failed"
+            LOGGER.warning("Soil calibration override %s failed: %s", job_id, err)
             self.current.update(status="failed", message=message)
             self.db.update_soil_job(
                 job_id, status="failed", failed_count=1, message=message, complete=True
@@ -634,8 +743,18 @@ class SoilJobManager:
                             completed += 1
                         else:
                             failed += 1
+                            LOGGER.warning(
+                                "Soil measurement for point %s failed: %s",
+                                target["point_id"],
+                                analysis.reason,
+                            )
                     except Exception as err:  # pylint: disable=broad-except
                         failed += 1
+                        LOGGER.warning(
+                            "Soil measurement for point %s failed: %s",
+                            target["point_id"],
+                            err,
+                        )
                         measurement = SoilMeasurement(
                             measurement_id=uuid4(),
                             config_entry_id=config_entry_id,

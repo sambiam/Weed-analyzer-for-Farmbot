@@ -7,6 +7,7 @@ from uuid import uuid4
 
 import pytest
 
+import farmbot_vision.soil_jobs as soil_jobs_module
 from farmbot_vision.database import Database
 from farmbot_vision.models import (
     SoilMeasurement,
@@ -15,7 +16,7 @@ from farmbot_vision.models import (
     SoilPointInventory,
     SoilStereoCalibration,
 )
-from farmbot_vision.soil_height import SoilHeightError
+from farmbot_vision.soil_height import SoilCalibrationQualityError, SoilFrame, SoilHeightError
 from farmbot_vision.soil_jobs import SoilJobManager
 from farmbot_vision.zones import ZoneStore
 
@@ -274,3 +275,110 @@ async def test_custom_calibration_does_not_resolve_a_soil_point(tmp_path, monkey
     assert captured["capture_x"] == 320
     assert captured["capture_y"] == 450
     assert manager.current["message"] == "capture path reached"
+
+
+@pytest.mark.asyncio
+async def test_calibration_quality_failure_offers_and_accepts_an_override(tmp_path, monkeypatch):
+    database = Database(tmp_path / "vision.db")
+    manager = SoilJobManager(
+        database, object(), tmp_path, asyncio.Lock(), ZoneStore(tmp_path / "zones.json")
+    )
+    inventory = SoilPointInventory(
+        device_id="42",
+        generated_at=datetime.now(UTC),
+        points=[],
+        motion=SoilMotionState(
+            connected=True,
+            busy=False,
+            locked=False,
+            position={"x": 0, "y": 0, "z": 0},
+            z_direction=-1,
+            axis_bounds={"x": (0, 1000), "y": (0, 1000), "z": (-500, 0)},
+        ),
+    )
+    frames = [
+        SoilFrame(
+            image_id=index,
+            jpeg=b"",
+            x=100,
+            y=200,
+            z=0,
+            lateral_offset_mm=0,
+            z_offset_mm=0,
+            processed_width=640,
+            processed_height=480,
+            source_width=640,
+            source_height=480,
+        )
+        for index in range(1, 4)
+    ]
+    forced_calls = []
+
+    def fake_fit_calibration(**kwargs):
+        forced_calls.append(kwargs.get("force", False))
+        if not kwargs.get("force", False):
+            raise SoilCalibrationQualityError(
+                "calibration imagery failed quality gates at 0 mm (1/3 pairs passed: "
+                "pair 1 passed; pair 2 failed (coverage 0.05 < 0.15); "
+                "pair 3 failed (plane support 0.20 < 0.50))"
+            )
+        return _calibration().model_copy(
+            update={
+                "quality_override": True,
+                "quality_warnings": ["0 mm gate bypassed -- accepted by override"],
+            }
+        )
+
+    async def safe_sites(_entry_id, _baseline, *, clear_soil_margin_mm=75):
+        return inventory, []
+
+    async def capture_frames(**_kwargs):
+        return uuid4(), frames, "sig"
+
+    monkeypatch.setattr(manager, "safe_sites", safe_sites)
+    monkeypatch.setattr(manager, "_capture_frames", capture_frames)
+    monkeypatch.setattr(soil_jobs_module, "fit_calibration", fake_fit_calibration)
+
+    await manager._run_calibration(
+        job_id="cal-job",
+        config_entry_id="bot-soil",
+        point_id=None,
+        capture_x=100,
+        capture_y=200,
+        capture_z=0,
+        baseline_mm=15,
+        reference_distance_mm=300,
+    )
+
+    assert manager.current["status"] == "failed"
+    assert "failed quality gates" in manager.current["message"]
+    assert "coverage 0.05" in manager.current["detail"]
+    assert manager.pending_override_job_id == "cal-job"
+    persisted = database.soil_job("cal-job")
+    assert persisted["status"] == "failed"
+    assert "coverage 0.05" in persisted["detail"]
+    assert database.active_soil_calibration("bot-soil") is None
+
+    override_job_id = manager.start_calibration_override()
+    await manager.task
+
+    assert forced_calls == [False, True]
+    assert manager.current["status"] == "complete"
+    assert manager.pending_override_job_id is None
+    saved = database.active_soil_calibration("bot-soil")
+    assert saved is not None
+    assert saved.quality_override is True
+    assert database.soil_job(override_job_id)["status"] == "complete"
+
+    # A fresh calibration attempt drops the stale override, closing the window.
+    manager.start_calibration(
+        config_entry_id="bot-soil",
+        point_id=None,
+        capture_x=100,
+        capture_y=200,
+        capture_z=0,
+        baseline_mm=15,
+        reference_distance_mm=300,
+    )
+    assert manager.pending_override_job_id is None
+    await manager.close()
