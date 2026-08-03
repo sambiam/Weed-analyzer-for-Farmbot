@@ -431,6 +431,7 @@ class SoilCaptureFrame(StrictModel):
 
 class SoilCaptureStatus(StrictModel):
     capture_id: UUID | None = None
+    batch_id: UUID | None = None
     status: Literal["queued", "running", "waiting_images", "complete", "failed"]
     message: str = Field(max_length=240)
     frames: list[SoilCaptureFrame] = Field(default_factory=list)

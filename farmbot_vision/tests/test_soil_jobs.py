@@ -10,6 +10,7 @@ import pytest
 import farmbot_vision.soil_jobs as soil_jobs_module
 from farmbot_vision.database import Database
 from farmbot_vision.models import (
+    SoilCaptureStatus,
     SoilMeasurement,
     SoilMotionState,
     SoilPoint,
@@ -47,6 +48,20 @@ def test_soil_geometry_accepts_widescreen_calibration_and_rejects_measurement_dr
     SoilJobManager._validate_soil_geometry(widescreen, widescreen)
     with pytest.raises(SoilHeightError, match="soil-height calibration"):
         SoilJobManager._validate_soil_geometry(widescreen, (1280, 960, 1280, 960))
+
+
+def test_soil_capture_status_accepts_integration_batch_id():
+    batch_id = uuid4()
+    status = SoilCaptureStatus.model_validate(
+        {
+            "capture_id": str(uuid4()),
+            "batch_id": str(batch_id),
+            "status": "running",
+            "message": "capturing",
+            "frames": [],
+        }
+    )
+    assert status.batch_id == batch_id
 
 
 @pytest.mark.asyncio
@@ -484,3 +499,26 @@ async def test_measurement_run_uses_one_capture_batch_and_finishes_it_once(tmp_p
     assert batch_ids[0] == batch_ids[1]
     assert finished == [("bot-soil", str(batch_ids[0]))]
     assert manager.current["status"] == "complete"
+
+    batch_ids.clear()
+    finished.clear()
+
+    async def communication_failure(**kwargs):
+        batch_ids.append(kwargs["batch_id"])
+        raise soil_jobs_module.HomeAssistantError("malformed FarmBot integration response")
+
+    monkeypatch.setattr(manager, "_capture_frames", communication_failure)
+    await manager._run_measurements(
+        job_id="failed-communication-job",
+        config_entry_id="bot-soil",
+        point_ids=[1, 2],
+        custom_point_id=None,
+        custom_x=None,
+        custom_y=None,
+        capture_z=0,
+        baseline_mm=15,
+    )
+
+    assert len(batch_ids) == 1
+    assert finished == [("bot-soil", str(batch_ids[0]))]
+    assert manager.current["status"] == "failed"

@@ -12,7 +12,7 @@ from pathlib import Path
 from uuid import UUID, uuid4
 
 from .database import Database
-from .home_assistant import HomeAssistantClient
+from .home_assistant import HomeAssistantClient, HomeAssistantError
 from .models import (
     InventoryRequest,
     SoilCaptureStartRequest,
@@ -433,11 +433,24 @@ class SoilJobManager:
         return started.capture_id, frames, self._declared_camera_signature(images)
 
     async def _finish_capture_batch(self, config_entry_id: str, batch_id: UUID) -> None:
-        response = await self.client.finish_soil_capture_batch(config_entry_id, str(batch_id))
-        if response.get("status") != "complete":
-            raise SoilHeightError(
-                str(response.get("message") or "FarmBot starting position was not restored")
-            )
+        deadline = time.monotonic() + 1200
+        last_message = ""
+        while time.monotonic() < deadline:
+            response = await self.client.finish_soil_capture_batch(config_entry_id, str(batch_id))
+            status = str(response.get("status") or "")
+            message = str(response.get("message") or "")
+            if message and message != last_message:
+                LOGGER.info("Soil capture batch %s: %s", batch_id, message)
+                self.current["message"] = message
+                last_message = message
+            if status == "complete":
+                return
+            if status in {"failed", "rejected"}:
+                raise SoilHeightError(message or "FarmBot starting position was not restored")
+            if status not in {"queued", "running"}:
+                raise SoilHeightError("malformed soil capture batch status")
+            await asyncio.sleep(2)
+        raise SoilHeightError("timed out restoring the FarmBot starting position")
 
     async def _run_calibration(
         self,
@@ -775,6 +788,21 @@ class SoilJobManager:
                                 target["point_id"],
                                 analysis.reason,
                             )
+                    except HomeAssistantError as err:
+                        LOGGER.warning(
+                            "Soil measurement run stopped after a companion communication "
+                            "failure at point %s: %s",
+                            target["point_id"],
+                            err,
+                        )
+                        try:
+                            await self._finish_capture_batch(config_entry_id, measurement_batch_id)
+                        except Exception as cleanup_err:  # pylint: disable=broad-except
+                            LOGGER.warning(
+                                "Could not restore the FarmBot after soil batch failure: %s",
+                                cleanup_err,
+                            )
+                        raise
                     except Exception as err:  # pylint: disable=broad-except
                         failed += 1
                         LOGGER.warning(

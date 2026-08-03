@@ -182,9 +182,11 @@ message, and completed frames as `image_id`, `x`, `y`, `z`,
 `lateral_offset_mm`, and `z_offset_mm`.
 
 `farmbot.finish_vision_soil_capture_batch` accepts `config_entry_id` and
-`batch_id`. It waits for the batch's last atomic capture, restores the position
-saved when its first capture started, and returns `complete` only after the
-acknowledged safe-Z move finishes. Repeating the finish call is idempotent.
+`batch_id`. The first call queues restoration and immediately returns `queued`;
+later calls return `running`, `complete`, or `failed`. The background operation
+waits for the batch's last atomic capture and restores the position saved when
+its first capture started with an acknowledged safe-Z move. Repeating the
+finish call is idempotent.
 
 `farmbot.apply_vision_soil_height` accepts `config_entry_id`, `point_id`,
 `measurement_id`, expected `x/y/z` and `updated_at`, recommended `x/y/z`,

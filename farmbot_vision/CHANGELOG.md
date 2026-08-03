@@ -1,5 +1,16 @@
 # Changelog
 
+## 3.25.1 - 2026-08-03
+
+- Fixed every batched soil status response failing strict validation because
+  the new `batch_id` field was missing from the app's response model.
+- Poll asynchronous batch restoration instead of holding one Supervisor HTTP
+  request open during the return move.
+- Stop a measurement run after a fatal companion contract or transport error,
+  clean up its batch, and avoid rapidly queuing all remaining points behind an
+  unobserved capture.
+- Require FarmBot integration 2.9.1 for asynchronous batch restoration.
+
 ## 3.25.0 - 2026-08-03
 
 - Group all captures in a multi-point soil measurement into one companion
