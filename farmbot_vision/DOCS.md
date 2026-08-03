@@ -119,6 +119,10 @@ soil, enter the manually measured camera-to-soil distance at capture Z, and
 confirm that moving 50 mm toward the soil is safe. The bot takes three lateral
 views at each of three Z levels. Calibration is activated only when the
 inverse-depth fit is monotonic and its maximum residual is at most 5 mm.
+The calibration records the actual soil-photo processed and source dimensions
+(for example `1280x720`) separately from the general Vision analysis preset.
+Measurements request and validate that saved soil-specific format, so a 16:9
+soil camera stream does not need to match a 4:3 general camera calibration.
 Recalibrate after any camera move, rotation, refocus, remount, resolution,
 baseline, source-geometry, Z-direction, or declared camera-setting change.
 

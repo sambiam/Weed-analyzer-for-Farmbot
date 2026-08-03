@@ -1,5 +1,16 @@
 # Changelog
 
+## 3.23.2 - 2026-08-03
+
+- Removed the hard-coded `1280x960` soil-image assertion. Guided calibration
+  now accepts and records the camera's actual processed and source dimensions,
+  including the observed `1280x720` format.
+- Subsequent soil measurements request the saved soil-specific processed size
+  and require their processed and source geometry to match that calibration,
+  independently of the general Vision analysis resolution.
+- The Soil height tab now labels the active calibration's dedicated soil image
+  format, and geometry failures report both expected and received dimensions.
+
 ## 3.23.1 - 2026-08-03
 
 - Soil calibration and measurement captures now surface per-frame movement,

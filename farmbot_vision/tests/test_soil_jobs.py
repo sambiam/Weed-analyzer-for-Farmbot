@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import UTC, datetime
+from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
@@ -37,6 +38,94 @@ def _calibration() -> SoilStereoCalibration:
         source_image_ids=list(range(1, 10)),
         camera_signature="signature",
     )
+
+
+def test_soil_geometry_accepts_widescreen_calibration_and_rejects_measurement_drift():
+    widescreen = (1280, 720, 1280, 720)
+    SoilJobManager._validate_soil_geometry(widescreen, None)
+    SoilJobManager._validate_soil_geometry(widescreen, widescreen)
+    with pytest.raises(SoilHeightError, match="soil-height calibration"):
+        SoilJobManager._validate_soil_geometry(widescreen, (1280, 960, 1280, 960))
+
+
+@pytest.mark.asyncio
+async def test_capture_frames_uses_actual_1280x720_geometry(tmp_path, monkeypatch):
+    capture_id = uuid4()
+    image_requests = []
+    capture_items = [
+        SimpleNamespace(
+            image_id=index,
+            x=100,
+            y=200 + lateral,
+            z=0,
+            lateral_offset_mm=lateral,
+            z_offset_mm=0,
+            capture_attempt=1,
+        )
+        for index, lateral in enumerate((-15, 0, 15), start=1)
+    ]
+
+    class Client:
+        async def start_soil_capture(self, _request):
+            return SimpleNamespace(status="queued", capture_id=capture_id, message="queued")
+
+        async def soil_capture_status(self, _entry_id, _capture_id):
+            return SimpleNamespace(
+                status="complete",
+                message="Captured 3 soil images",
+                frames=capture_items,
+            )
+
+        async def image(self, request, _maximum_bytes):
+            image_requests.append(request)
+            item = capture_items[request.image_id - 1]
+            return SimpleNamespace(
+                image_id=request.image_id,
+                full_metadata=True,
+                width=1280,
+                height=720,
+                source_width=1280,
+                source_height=720,
+                image_base64="anBlZw==",
+                meta=SimpleNamespace(x=item.x, y=item.y, z=item.z),
+                processed_calibration=None,
+            )
+
+    manager = SoilJobManager(
+        Database(tmp_path / "vision.db"),
+        Client(),
+        tmp_path,
+        asyncio.Lock(),
+        ZoneStore(tmp_path / "zones.json"),
+    )
+    monkeypatch.setattr(
+        "farmbot_vision.soil_jobs.inspect_photo_quality",
+        lambda _jpeg: SimpleNamespace(issue="usable"),
+    )
+    _capture_id, frames, _signature = await manager._capture_frames(
+        config_entry_id="bot-soil",
+        point_id=None,
+        capture_x=100,
+        capture_y=200,
+        capture_z=0,
+        baseline_mm=15,
+        z_offsets_mm=[0],
+    )
+    assert {(frame.processed_width, frame.processed_height) for frame in frames} == {(1280, 720)}
+    assert {(request.max_width, request.max_height) for request in image_requests} == {(1280, 960)}
+
+    image_requests.clear()
+    await manager._capture_frames(
+        config_entry_id="bot-soil",
+        point_id=70,
+        capture_x=100,
+        capture_y=200,
+        capture_z=0,
+        baseline_mm=15,
+        z_offsets_mm=[0],
+        expected_geometry=(1280, 720, 1280, 720),
+    )
+    assert {(request.max_width, request.max_height) for request in image_requests} == {(1280, 720)}
 
 
 def test_soil_records_round_trip_and_restart_interrupts_jobs(tmp_path):

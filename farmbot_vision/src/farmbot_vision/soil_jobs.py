@@ -255,6 +255,22 @@ class SoilJobManager:
             raise SoilHeightError("camera calibration metadata changed within the capture")
         return signatures.pop()
 
+    @staticmethod
+    def _validate_soil_geometry(
+        actual: tuple[int, int, int, int],
+        expected: tuple[int, int, int, int] | None,
+    ) -> None:
+        """Accept calibration geometry and bind measurements to that exact format."""
+        if any(value <= 0 for value in actual):
+            raise SoilHeightError("soil image reported invalid geometry")
+        if expected is not None and actual != expected:
+            raise SoilHeightError(
+                "soil image geometry changed from the soil-height calibration: "
+                f"expected {expected[0]}x{expected[1]} processed from "
+                f"{expected[2]}x{expected[3]} source, received "
+                f"{actual[0]}x{actual[1]} processed from {actual[2]}x{actual[3]} source"
+            )
+
     async def _capture_frames(
         self,
         *,
@@ -265,6 +281,7 @@ class SoilJobManager:
         capture_z: float,
         baseline_mm: float,
         z_offsets_mm: list[float],
+        expected_geometry: tuple[int, int, int, int] | None = None,
     ) -> tuple[UUID, list[SoilFrame], str]:
         started = await self.client.start_soil_capture(
             SoilCaptureStartRequest(
@@ -304,22 +321,27 @@ class SoilJobManager:
             )
         images = []
         frames = []
+        request_width = expected_geometry[0] if expected_geometry is not None else 1280
+        request_height = expected_geometry[1] if expected_geometry is not None else 960
         for item in status.frames:
             response = await self.client.image(
                 VisionImageRequest(
                     config_entry_id=config_entry_id,
                     image_id=item.image_id,
-                    max_width=1280,
-                    max_height=960,
+                    max_width=request_width,
+                    max_height=request_height,
                 ),
                 5 * 1024 * 1024,
             )
             if not response.full_metadata:
                 raise SoilHeightError("soil image lacks contract-v2 geometry")
-            if (response.width, response.height) != (1280, 960):
-                raise SoilHeightError(
-                    "soil image does not meet the required 1280×960 processed contract"
-                )
+            actual_geometry = (
+                response.width,
+                response.height,
+                int(response.source_width),
+                int(response.source_height),
+            )
+            self._validate_soil_geometry(actual_geometry, expected_geometry)
             jpeg = base64.b64decode(response.image_base64)
             coordinate_error = math.sqrt(
                 (response.meta.x - item.x) ** 2
@@ -568,6 +590,12 @@ class SoilJobManager:
                             capture_z=capture_z,
                             baseline_mm=baseline_mm,
                             z_offsets_mm=[0],
+                            expected_geometry=(
+                                calibration.processed_width,
+                                calibration.processed_height,
+                                calibration.source_width,
+                                calibration.source_height,
+                            ),
                         )
                         analysis = await asyncio.to_thread(
                             analyse_soil_height,

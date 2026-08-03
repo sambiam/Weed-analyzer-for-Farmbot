@@ -5862,7 +5862,7 @@ async def soil_height_page(request: Request) -> HTMLResponse:
     )
     calibration_summary = (
         f"Active calibration #{calibration.calibration_id}: "
-        f"{calibration.processed_width}×{calibration.processed_height}, "
+        f"soil image format {calibration.processed_width}×{calibration.processed_height}, "
         f"{calibration.baseline_mm:.0f} mm baseline, "
         f"{calibration.residual_mm:.1f} mm residual"
         if calibration
