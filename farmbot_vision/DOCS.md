@@ -132,8 +132,9 @@ lighting peripheral on for the run. For every view, the bot moves once,
 confirms its live position within 5 mm, waits 1.5 seconds, then takes and
 downloads the photo. Missing, coordinate-mismatched, undecodable, washed-out,
 or severely blurred images are retried in place up to five attempts. The bot
-advances only after accepting the current frame and returns to its original
-position once when the run completes or aborts.
+advances only after accepting the current frame. Multi-point measurements keep
+their position between points and return to the position at which the run
+started once after the run completes or is stopped.
 
 The pipeline rectifies roll and vertical offset, uses robust feature flow to
 limit StereoSGBM to the relevant disparity range for both adjacent pairs and

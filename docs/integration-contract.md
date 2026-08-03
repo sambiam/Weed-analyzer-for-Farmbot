@@ -165,18 +165,26 @@ axis bounds. A matching display name alone is never sufficient.
 
 `farmbot.start_vision_soil_capture` accepts `config_entry_id`, `point_id`,
 optional paired `capture_x`/`capture_y`, `capture_z`, `baseline_mm`, and
-`z_offsets_mm`. Use `[0]` for a measurement and `[0,25,50]` for calibration.
+`z_offsets_mm`, plus an optional measurement `batch_id` UUID. Use `[0]` for a
+measurement and `[0,25,50]` for calibration.
 A relocated capture must be less than 200 mm from a point last updated more
 than 14 days ago. It returns a `capture_id` immediately. The
 integration validates the bot and bounds, uses acknowledged safe-Z movement,
 captures `-baseline, 0, +baseline` along Y (or an actual-coordinate one-sided
 triplet at an edge), waits for processed images, claims those image IDs from
 ordinary photo analysis, and restores the initial position when possible.
+Captures sharing a `batch_id` serialize behind one another and defer that
+restoration.
 
 `farmbot.get_vision_soil_capture` accepts `config_entry_id` and `capture_id`.
 It returns `queued|running|waiting_images|complete|failed`, a sanitized
 message, and completed frames as `image_id`, `x`, `y`, `z`,
 `lateral_offset_mm`, and `z_offset_mm`.
+
+`farmbot.finish_vision_soil_capture_batch` accepts `config_entry_id` and
+`batch_id`. It waits for the batch's last atomic capture, restores the position
+saved when its first capture started, and returns `complete` only after the
+acknowledged safe-Z move finishes. Repeating the finish call is idempotent.
 
 `farmbot.apply_vision_soil_height` accepts `config_entry_id`, `point_id`,
 `measurement_id`, expected `x/y/z` and `updated_at`, recommended `x/y/z`,

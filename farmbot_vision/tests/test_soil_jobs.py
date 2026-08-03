@@ -53,6 +53,7 @@ def test_soil_geometry_accepts_widescreen_calibration_and_rejects_measurement_dr
 async def test_capture_frames_uses_actual_1280x720_geometry(tmp_path, monkeypatch):
     capture_id = uuid4()
     image_requests = []
+    start_calls = 0
     capture_items = [
         SimpleNamespace(
             image_id=index,
@@ -68,6 +69,12 @@ async def test_capture_frames_uses_actual_1280x720_geometry(tmp_path, monkeypatc
 
     class Client:
         async def start_soil_capture(self, _request):
+            nonlocal start_calls
+            start_calls += 1
+            if start_calls == 1:
+                return SimpleNamespace(
+                    status="rejected", capture_id=None, message="FarmBot is busy"
+                )
             return SimpleNamespace(status="queued", capture_id=capture_id, message="queued")
 
         async def soil_capture_status(self, _entry_id, _capture_id):
@@ -103,6 +110,11 @@ async def test_capture_frames_uses_actual_1280x720_geometry(tmp_path, monkeypatc
         "farmbot_vision.soil_jobs.inspect_photo_quality",
         lambda _jpeg: SimpleNamespace(issue="usable"),
     )
+
+    async def no_sleep(_delay):
+        return None
+
+    monkeypatch.setattr("farmbot_vision.soil_jobs.asyncio.sleep", no_sleep)
     _capture_id, frames, _signature = await manager._capture_frames(
         config_entry_id="bot-soil",
         point_id=None,
@@ -114,6 +126,7 @@ async def test_capture_frames_uses_actual_1280x720_geometry(tmp_path, monkeypatc
     )
     assert {(frame.processed_width, frame.processed_height) for frame in frames} == {(1280, 720)}
     assert {(request.max_width, request.max_height) for request in image_requests} == {(1280, 960)}
+    assert start_calls == 2
 
     image_requests.clear()
     await manager._capture_frames(
@@ -127,6 +140,7 @@ async def test_capture_frames_uses_actual_1280x720_geometry(tmp_path, monkeypatc
         expected_geometry=(1280, 720, 1280, 720),
     )
     assert {(request.max_width, request.max_height) for request in image_requests} == {(1280, 720)}
+    assert start_calls == 3
 
 
 def test_soil_records_round_trip_and_restart_interrupts_jobs(tmp_path):
@@ -382,3 +396,91 @@ async def test_calibration_quality_failure_offers_and_accepts_an_override(tmp_pa
     )
     assert manager.pending_override_job_id is None
     await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_measurement_run_uses_one_capture_batch_and_finishes_it_once(tmp_path, monkeypatch):
+    database = Database(tmp_path / "vision.db")
+    database.save_soil_calibration(_calibration())
+    finished = []
+
+    class Client:
+        async def finish_soil_capture_batch(self, entry_id, batch_id):
+            finished.append((entry_id, batch_id))
+            return {"status": "complete", "message": "restored"}
+
+    manager = SoilJobManager(
+        database,
+        Client(),
+        tmp_path,
+        asyncio.Lock(),
+        ZoneStore(tmp_path / "zones.json"),
+    )
+    now = datetime.now(UTC)
+    inventory = SoilPointInventory(
+        device_id="42",
+        generated_at=now,
+        points=[],
+        motion=SoilMotionState(
+            connected=True,
+            busy=False,
+            locked=False,
+            position={"x": 0, "y": 0, "z": 0},
+            z_direction=-1,
+            axis_bounds={"x": (0, 1000), "y": (0, 1000), "z": (-500, 0)},
+        ),
+    )
+    sites = [
+        SimpleNamespace(
+            point_id=point_id,
+            point_name=f"Soil {point_id}",
+            expected_x=x,
+            expected_y=100,
+            expected_z=-400,
+            point_updated_at=now,
+            capture_x=x,
+            capture_y=100,
+            relocation_distance_mm=0,
+        )
+        for point_id, x in ((1, 100), (2, 200))
+    ]
+    batch_ids = []
+
+    async def safe_sites(_entry_id, _baseline, *, clear_soil_margin_mm=75):
+        return inventory, sites
+
+    async def capture_frames(**kwargs):
+        batch_ids.append(kwargs["batch_id"])
+        return uuid4(), [], "signature"
+
+    def analyse(_frames, _calibration, **_kwargs):
+        return SimpleNamespace(
+            measurement_id=uuid4(),
+            artifacts={},
+            proposed_z_mm=-399,
+            confidence=0.9,
+            uncertainty_mm=2,
+            valid=True,
+            reason="passed",
+            metrics={},
+        )
+
+    monkeypatch.setattr(manager, "safe_sites", safe_sites)
+    monkeypatch.setattr(manager, "_capture_frames", capture_frames)
+    monkeypatch.setattr(soil_jobs_module, "analyse_soil_height", analyse)
+
+    await manager._run_measurements(
+        job_id="measurement-job",
+        config_entry_id="bot-soil",
+        point_ids=[1, 2],
+        custom_point_id=None,
+        custom_x=None,
+        custom_y=None,
+        capture_z=0,
+        baseline_mm=15,
+    )
+
+    assert len(batch_ids) == 2
+    assert batch_ids[0] == batch_ids[1]
+    assert finished == [("bot-soil", str(batch_ids[0]))]
+    assert manager.current["status"] == "complete"

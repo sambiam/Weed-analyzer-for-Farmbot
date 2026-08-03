@@ -53,7 +53,7 @@ async def test_grid_repair_requires_advertised_v2_capability(monkeypatch):
     try:
         with pytest.raises(
             web.HomeAssistantError,
-            match="requires FarmBot integration V2.8.1",
+            match="requires FarmBot integration V2.9.0",
         ):
             await web._require_grid_repair_capability()
     finally:
@@ -113,7 +113,7 @@ async def test_whole_grid_requires_illuminated_capture_capability(monkeypatch):
 
     monkeypatch.setattr(web.client, "list_bots", list_bots)
     try:
-        with pytest.raises(web.HomeAssistantError, match="V2.8.1"):
+        with pytest.raises(web.HomeAssistantError, match="V2.9.0"):
             await web._require_grid_repair_capability(require_lighting=True)
     finally:
         web.settings.selected_config_entry_id = previous

@@ -313,20 +313,34 @@ class SoilJobManager:
         baseline_mm: float,
         z_offsets_mm: list[float],
         expected_geometry: tuple[int, int, int, int] | None = None,
+        batch_id: UUID | None = None,
     ) -> tuple[UUID, list[SoilFrame], str]:
-        started = await self.client.start_soil_capture(
-            SoilCaptureStartRequest(
-                config_entry_id=config_entry_id,
-                point_id=point_id,
-                capture_x=capture_x,
-                capture_y=capture_y,
-                capture_z=capture_z,
-                baseline_mm=baseline_mm,
-                z_offsets_mm=z_offsets_mm,
+        busy_deadline = time.monotonic() + 600
+        busy_logged = False
+        while True:
+            started = await self.client.start_soil_capture(
+                SoilCaptureStartRequest(
+                    config_entry_id=config_entry_id,
+                    point_id=point_id,
+                    capture_x=capture_x,
+                    capture_y=capture_y,
+                    capture_z=capture_z,
+                    baseline_mm=baseline_mm,
+                    z_offsets_mm=z_offsets_mm,
+                    batch_id=batch_id,
+                )
             )
-        )
-        if started.status != "queued" or started.capture_id is None:
-            raise SoilHeightError(started.message)
+            if started.status == "queued" and started.capture_id is not None:
+                break
+            if "busy" not in started.message.lower():
+                raise SoilHeightError(started.message)
+            if time.monotonic() >= busy_deadline:
+                raise SoilHeightError("FarmBot remained busy for 10 minutes")
+            self.current["message"] = "Waiting for FarmBot to finish its current operation"
+            if not busy_logged:
+                LOGGER.info("FarmBot reported busy; waiting to start the soil capture")
+                busy_logged = True
+            await asyncio.sleep(2)
         # Each frame is verified before the integration advances and can be
         # retried five times. Allow 75 seconds per attempt plus a ten-minute
         # floor for motion/restoration without timing out a valid calibration.
@@ -417,6 +431,13 @@ class SoilJobManager:
                 )
             )
         return started.capture_id, frames, self._declared_camera_signature(images)
+
+    async def _finish_capture_batch(self, config_entry_id: str, batch_id: UUID) -> None:
+        response = await self.client.finish_soil_capture_batch(config_entry_id, str(batch_id))
+        if response.get("status") != "complete":
+            raise SoilHeightError(
+                str(response.get("message") or "FarmBot starting position was not restored")
+            )
 
     async def _run_calibration(
         self,
@@ -675,6 +696,7 @@ class SoilJobManager:
                     raise SoilHeightError(
                         "FarmBot Z direction changed; recalibrate before measuring"
                     )
+                measurement_batch_id = uuid4()
                 for target in ordered:
                     if self.stop_requested:
                         break
@@ -702,6 +724,7 @@ class SoilJobManager:
                             capture_z=capture_z,
                             baseline_mm=baseline_mm,
                             z_offsets_mm=[0],
+                            batch_id=measurement_batch_id,
                             expected_geometry=(
                                 calibration.processed_width,
                                 calibration.processed_height,
@@ -778,6 +801,8 @@ class SoilJobManager:
                         )
                         self.db.save_soil_measurement(measurement)
                     self.current.update(completed_count=completed, failed_count=failed)
+                self.current["message"] = "Restoring the FarmBot starting position"
+                await self._finish_capture_batch(config_entry_id, measurement_batch_id)
                 status = "stopped" if self.stop_requested else "complete"
                 message = (
                     f"Stopped after current point; {completed} valid, {failed} failed"

@@ -1,5 +1,16 @@
 # Changelog
 
+## 3.25.0 - 2026-08-03
+
+- Group all captures in a multi-point soil measurement into one companion
+  integration batch. The FarmBot now travels directly from one measurement to
+  the next and restores the run's original X/Y/Z only once at the end.
+- Retry transient `FarmBot is busy` capture responses for up to ten minutes
+  instead of immediately recording a failed soil measurement. Status and logs
+  now explain that the job is waiting for the current operation to finish.
+- Require FarmBot integration 2.9.0 for serialized soil batches and explicit
+  end-of-run position restoration.
+
 ## 3.24.1 - 2026-08-03
 
 - Made soil-height stereo matching robust to the supplied textured-mulch

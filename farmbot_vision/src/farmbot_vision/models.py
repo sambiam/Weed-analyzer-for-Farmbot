@@ -406,6 +406,7 @@ class SoilCaptureStartRequest(StrictModel):
     capture_z: float = 0
     baseline_mm: float = Field(default=15, ge=5, le=30)
     z_offsets_mm: list[float] = Field(default_factory=lambda: [0.0], min_length=1, max_length=3)
+    batch_id: UUID | None = None
 
 
 class SoilCaptureStartResponse(StrictModel):

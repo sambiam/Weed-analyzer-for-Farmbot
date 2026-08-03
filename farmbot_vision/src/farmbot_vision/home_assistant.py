@@ -298,6 +298,14 @@ class HomeAssistantClient:
             SoilCaptureStatus,
         )  # type: ignore[return-value]
 
+    async def finish_soil_capture_batch(
+        self, config_entry_id: str, batch_id: str
+    ) -> dict[str, Any]:
+        return await self._service(
+            "finish_vision_soil_capture_batch",
+            {"config_entry_id": config_entry_id, "batch_id": batch_id},
+        )  # type: ignore[return-value]
+
     async def start_grid_repair(
         self, config_entry_id: str, targets: list[dict[str, float]]
     ) -> dict[str, Any]:
