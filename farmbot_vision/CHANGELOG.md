@@ -1,5 +1,14 @@
 # Changelog
 
+## 3.28.3 - 2026-08-04
+
+- Fixed the shared FarmBot starting position causing every weed transit to be
+  skipped when the bot began inside a protected-plant buffer. Routing now
+  permits only distance-increasing escape moves until the tool is clear, then
+  resumes ordinary protected-plant avoidance.
+- Changed the run-status list to show each weed's actual skip reason instead
+  of hiding it behind the generic `skipped` status.
+
 ## 3.28.2 - 2026-08-04
 
 - Fixed every valid weed being skipped when its cut endpoint was inside the

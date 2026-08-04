@@ -209,15 +209,27 @@ def safe_transit_waypoints(
         return x_bounds[0] <= point[0] <= x_bounds[1] and y_bounds[0] <= point[1] <= y_bounds[1]
 
     def segment_clear(a: tuple[float, float], b: tuple[float, float]) -> bool:
-        return all(
-            _point_segment_distance(cx, cy, a[0], a[1], b[0], b[1]) >= radius - 1e-6
-            for cx, cy, radius in circles
-        )
+        for cx, cy, radius in circles:
+            start_distance = math.hypot(a[0] - cx, a[1] - cy)
+            if a == start and start_distance < radius - 1e-6:
+                # FarmBot may begin a run over a protected plant (for example
+                # after photography) or the tool slot's pullout point may be
+                # inside a conservative canopy buffer. Rejecting that shared
+                # start makes every weed fail. Permit only a straight escape
+                # whose distance from this plant never decreases; once clear,
+                # ordinary visibility checks apply again.
+                dx, dy = b[0] - a[0], b[1] - a[1]
+                outward = dx * (a[0] - cx) + dy * (a[1] - cy)
+                end_distance = math.hypot(b[0] - cx, b[1] - cy)
+                if outward < -1e-6 or end_distance <= start_distance + 1e-6:
+                    return False
+                continue
+            if _point_segment_distance(cx, cy, a[0], a[1], b[0], b[1]) < radius - 1e-6:
+                return False
+        return True
 
     if not inside_bounds(start) or not inside_bounds(end):
         raise ValueError("mounted-tool transit endpoint is outside the bed")
-    if any(math.hypot(start[0] - cx, start[1] - cy) < radius for cx, cy, radius in circles):
-        raise ValueError("mounted-tool transit starts inside a tall plant clearance")
     if any(math.hypot(end[0] - cx, end[1] - cy) < radius for cx, cy, radius in circles):
         raise ValueError("weed approach lies inside a tall plant clearance")
     if segment_clear(start, end):

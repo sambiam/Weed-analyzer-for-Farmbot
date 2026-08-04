@@ -143,7 +143,7 @@ def test_tall_plant_transit_routes_around_canopy():
 def test_tall_plant_transit_rejects_only_an_endpoint_inside_clearance():
     obstacle = plant(1, 500, 500, radius=80).model_copy(update={"height_mm": 450})
     protected = protected_tall_plants([obstacle], enabled=True, minimum_height_mm=300)
-    with pytest.raises(ValueError, match="endpoint|starts"):
+    with pytest.raises(ValueError, match="weed approach"):
         safe_transit_waypoints(
             (500, 500),
             (500, 500),
@@ -179,6 +179,35 @@ def test_transit_still_rejects_endpoint_inside_cutting_clearance():
             y_bounds=(0, 1000),
             endpoint_margin_mm=25,
         )
+
+
+def test_transit_can_escape_shared_start_inside_protected_clearance():
+    obstacle = plant(1, 500, 500, radius=80).model_copy(update={"height_mm": 450})
+    protected = protected_tall_plants([obstacle], enabled=True, minimum_height_mm=300)
+    route = safe_transit_waypoints(
+        (500, 500),
+        (100, 500),
+        protected,
+        x_bounds=(0, 1000),
+        y_bounds=(0, 1000),
+        endpoint_margin_mm=25,
+    )
+    assert route == []
+
+
+def test_transit_inside_clearance_cannot_move_deeper_before_escaping():
+    obstacle = plant(1, 500, 500, radius=80).model_copy(update={"height_mm": 450})
+    protected = protected_tall_plants([obstacle], enabled=True, minimum_height_mm=300)
+    route = safe_transit_waypoints(
+        (410, 500),
+        (900, 500),
+        protected,
+        x_bounds=(0, 1000),
+        y_bounds=(0, 1000),
+        endpoint_margin_mm=25,
+    )
+    assert route
+    assert route[0]["x"] < 410
 
 
 def test_all_individually_skipped_weeds_complete_without_failing_batch():

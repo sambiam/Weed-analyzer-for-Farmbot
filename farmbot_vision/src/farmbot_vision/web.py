@@ -5615,7 +5615,7 @@ async def weeding_page(request: Request) -> HTMLResponse:
     state = weeding_jobs.current
     results = "".join(
         f"<li>Weed {escape(str(item.get('weed_id')))}: "
-        f"{escape(str(item.get('verification') or item.get('status') or item.get('reason') or 'updated'))}</li>"
+        f"{escape(str(item.get('verification') or item.get('reason') or item.get('status') or 'updated'))}</li>"
         for item in state.get("results", [])[-20:]
     )
     disabled = " disabled" if not capability or weeding_jobs.running or not entry_id else ""
