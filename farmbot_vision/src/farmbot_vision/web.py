@@ -5900,7 +5900,7 @@ async def soil_height_page(request: Request) -> HTMLResponse:
             if measurement and measurement["status"] == "failed":
                 retry_ids.append(site.point_id)
             apply_control = ""
-            if measurement and measurement["status"] == "valid":
+            if _soil_measurement_is_applicable(measurement):
                 measurement_id = escape(measurement["measurement_id"], quote=True)
                 apply_control = (
                     f'<form method=post action="soil/measurements/{measurement_id}/apply">'
@@ -5909,7 +5909,7 @@ async def soil_height_page(request: Request) -> HTMLResponse:
                     "<button type=submit>Reject</button></form>"
                 )
             point_rows += (
-                "<tr>"
+                f'<tr data-row-key="point-{site.point_id}">'
                 f"<td><input form=measure-points type=checkbox name=point_ids "
                 f'value="{site.point_id}" data-failed="{str(status == "failed").lower()}"></td>'
                 f"<td>{site.point_id}</td><td>{escape(site.point_name)}</td>"
@@ -5927,16 +5927,9 @@ async def soil_height_page(request: Request) -> HTMLResponse:
                 f"({site.capture_x:.0f}, {site.capture_y:.0f})</option>"
             )
 
-    valid_measurements = [
-        item
-        for item in measurements
-        if item["status"] == "valid"
-        and item.get("capture_x") is not None
-        and item.get("capture_y") is not None
-        and item.get("point_updated_at")
-    ]
+    valid_measurements = [item for item in measurements if _soil_measurement_is_applicable(item)]
     measurement_rows = "".join(
-        "<tr>"
+        f'<tr data-row-key="measurement-{escape(item["measurement_id"], quote=True)}">'
         f"<td><input form=apply-selected type=checkbox name=measurement_ids "
         f'value="{escape(item["measurement_id"], quote=True)}"></td>'
         f"<td>{escape(item['point_name'])}</td>"
@@ -6072,10 +6065,7 @@ async def soil_height_page(request: Request) -> HTMLResponse:
   <button type=submit formaction="soil/legacy-repair/apply">Apply selected corrections</button>
   <button type=submit formaction="soil/legacy-repair/reject">Keep existing values for selected</button>
  </div></form>
- </figure></div>
- <script>(()=>{{const modal=document.getElementById('legacy-soil-repair-modal');
- document.getElementById('legacy-soil-repair-close').addEventListener('click',()=>{{modal.hidden=true;}});
- modal.querySelector('.modal-close').focus();}})();</script>"""
+ </figure></div>"""
 
     refresh_active = soil_jobs.running or soil_planning_loading or legacy_soil_repair.running
     live_refresh = f"""<div id=soil-refresh-state data-active="{str(refresh_active).lower()}"
@@ -6083,8 +6073,39 @@ async def soil_height_page(request: Request) -> HTMLResponse:
 <script>
 (() => {{
   const swapIds=['soil-bot-card','soil-job-card','soil-warning','soil-site-count',
-    'soil-point-rows','soil-measurement-rows','legacy-soil-repair-card'];
-  const legacyRepairWasActive={str(legacy_soil_repair.running).lower()};
+    'soil-point-rows','soil-measurement-rows','legacy-soil-repair-card-region',
+    'legacy-soil-repair-region'];
+  function checkboxKey(input){{
+    return [input.getAttribute('form') || input.form?.id || '',input.name,input.value].join('\u001f');
+  }}
+  function replaceContents(current,next){{
+    if(current.innerHTML===next.innerHTML) return false;
+    const controls=new Map();
+    current.querySelectorAll('input[type=checkbox],input[type=radio]').forEach(input => {{
+      controls.set(checkboxKey(input),input);
+    }});
+    next.querySelectorAll('input[type=checkbox],input[type=radio]').forEach(input => {{
+      const key=checkboxKey(input);
+      if(controls.has(key)) input.replaceWith(controls.get(key));
+    }});
+    if(current.tagName==='TBODY'){{
+      const rows=new Map(Array.from(current.children).map(row=>[row.dataset.rowKey,row]));
+      Array.from(next.children).forEach(row=>{{
+        const existing=rows.get(row.dataset.rowKey);
+        if(existing && existing.outerHTML===row.outerHTML) row.replaceWith(existing);
+      }});
+    }}
+    current.replaceChildren(...Array.from(next.childNodes));
+    return true;
+  }}
+  function bindLegacyRepairModal(){{
+    const modal=document.getElementById('legacy-soil-repair-modal');
+    const close=document.getElementById('legacy-soil-repair-close');
+    if(modal && close && !close.dataset.bound){{
+      close.dataset.bound='true';
+      close.addEventListener('click',()=>{{modal.hidden=true;}});
+    }}
+  }}
   function isActive(){{
     const marker=document.getElementById('soil-refresh-state');
     return !!marker && marker.dataset.active==='true';
@@ -6094,15 +6115,19 @@ async def soil_height_page(request: Request) -> HTMLResponse:
       const response=await fetch(location.href,{{cache:'no-store'}});
       if(response.ok){{
         const doc=new DOMParser().parseFromString(await response.text(),'text/html');
+        const scrollX=window.scrollX;
+        const scrollY=window.scrollY;
+        let changed=false;
         swapIds.forEach(id => {{
           const next=doc.getElementById(id);
           const current=document.getElementById(id);
-          if(next && current) current.innerHTML=next.innerHTML;
+          if(next && current) changed=replaceContents(current,next) || changed;
         }});
-        const marker=doc.getElementById('soil-refresh-state');
-        if(legacyRepairWasActive && marker && marker.dataset.legacyRepair!=='true'){{
-          location.reload(); return;
+        if(changed){{
+          bindLegacyRepairModal();
+          window.scrollTo(scrollX,scrollY);
         }}
+        const marker=doc.getElementById('soil-refresh-state');
         if(!marker || marker.dataset.active!=='true') return;
       }}
     }}catch(_error){{
@@ -6110,6 +6135,7 @@ async def soil_height_page(request: Request) -> HTMLResponse:
     }}
     setTimeout(poll,3000);
   }}
+  bindLegacyRepairModal();
   if(isActive()) setTimeout(poll,3000);
 }})();
 </script>"""
@@ -6118,7 +6144,7 @@ async def soil_height_page(request: Request) -> HTMLResponse:
 <p>Finds plant- and weed-free soil within 200 mm of FarmBot soil points that have
 not been updated for more than 14 days. Measurements are captured at those clear
 locations and, after review, replace the assigned stale point.</p>
-{legacy_repair_card}
+<div id=legacy-soil-repair-card-region>{legacy_repair_card}</div>
 <div id=soil-warning>{warning}</div>
 <section class=grid>
  <div class=card><h3>Bot</h3><div id=soil-bot-card><p>{escape(entry_id or "No FarmBot selected")}</p>
@@ -6249,7 +6275,7 @@ capture location.</p>
  <th>Clear X, Y</th><th>Move</th><th>Last updated</th><th>Current Z</th>
  <th>Proposed Z</th><th>Uncertainty</th><th>Confidence</th>
  <th>Status</th><th>Message</th><th>Diagnostics</th><th>Review</th></tr></thead>
- <tbody id=soil-point-rows>{point_rows or "<tr><td colspan=15>No stale point has a safe clear-soil site within 200 mm.</td></tr>"}</tbody></table>
+ <tbody id=soil-point-rows>{point_rows or '<tr data-row-key="empty"><td colspan=15>No stale point has a safe clear-soil site within 200 mm.</td></tr>'}</tbody></table>
  <script>
  (() => {{
   const boxes=()=>Array.from(document.querySelectorAll('#soil-point-rows input[name=point_ids]'));
@@ -6266,9 +6292,9 @@ capture location.</p>
  <table><thead><tr><th>Select</th><th>Point</th><th>Old X, Y</th><th>New X, Y</th>
  <th>Old Z</th><th>Proposed Z</th>
  <th>Confidence</th><th>Quality result</th></tr></thead>
- <tbody id=soil-measurement-rows>{measurement_rows or "<tr><td colspan=8>No unapplied valid results.</td></tr>"}</tbody></table>
+ <tbody id=soil-measurement-rows>{measurement_rows or '<tr data-row-key="empty"><td colspan=8>No unapplied valid results.</td></tr>'}</tbody></table>
 </section>
- {legacy_repair_modal}
+ <div id=legacy-soil-repair-region>{legacy_repair_modal}</div>
  {live_refresh}"""  # noqa: S608 - HTML template; no SQL is constructed here.
     return layout(request, body, "Soil height · FarmBot Vision")
 
@@ -6487,17 +6513,21 @@ async def stop_soil_measurement() -> RedirectResponse:
     return RedirectResponse("../soil-height", status_code=303)
 
 
+def _soil_measurement_is_applicable(measurement: dict | None) -> bool:
+    return bool(
+        measurement is not None
+        and measurement["status"] == "valid"
+        and measurement.get("algorithm_version") != "soil-stereo-v2"
+        and measurement["proposed_z_mm"] is not None
+        and measurement.get("capture_x") is not None
+        and measurement.get("capture_y") is not None
+        and measurement.get("point_updated_at")
+    )
+
+
 async def _apply_soil_measurement(measurement_id: str) -> dict:
     measurement = database.soil_measurement(measurement_id)
-    if (
-        measurement is None
-        or measurement["status"] != "valid"
-        or measurement["algorithm_version"] == "soil-stereo-v2"
-        or measurement["proposed_z_mm"] is None
-        or measurement.get("capture_x") is None
-        or measurement.get("capture_y") is None
-        or not measurement.get("point_updated_at")
-    ):
+    if measurement is None or not _soil_measurement_is_applicable(measurement):
         raise HTTPException(404, "Applicable soil result not found")
     apply_request = ApplySoilHeightRequest(
         config_entry_id=measurement["config_entry_id"],
@@ -6541,12 +6571,18 @@ async def apply_soil_measurement(measurement_id: UUID) -> RedirectResponse:
 async def apply_selected_soil_measurements(
     measurement_ids: Annotated[list[str] | None, Form()] = None,
 ) -> RedirectResponse:
+    validated_ids = []
     for measurement_id in measurement_ids or []:
         try:
-            UUID(measurement_id)
+            validated_ids.append(str(UUID(measurement_id)))
         except ValueError as exc:
             raise HTTPException(422, "Malformed soil measurement ID") from exc
-        await _apply_soil_measurement(measurement_id)
+    for measurement_id in validated_ids:
+        # A result can be applied automatically or otherwise resolved between a
+        # polling refresh and this submission. Treat that row as already handled
+        # instead of aborting the rest of the user's selected batch with a 404.
+        if _soil_measurement_is_applicable(database.soil_measurement(measurement_id)):
+            await _apply_soil_measurement(measurement_id)
     return RedirectResponse("../soil-height", status_code=303)
 
 

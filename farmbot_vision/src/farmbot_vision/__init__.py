@@ -1,6 +1,6 @@
 """FarmBot Vision application."""
 
-__version__ = "3.27.0"
+__version__ = "3.27.1"
 ALGORITHM_VERSION = "classical-boundary-recall-0.10.1"
 
 # Version of the typed companion-integration contract this app speaks. v2 adds

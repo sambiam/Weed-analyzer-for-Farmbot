@@ -1402,6 +1402,87 @@ async def test_ordinary_apply_route_refuses_legacy_v2_measurement(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_soil_height_page_does_not_offer_legacy_v2_result_for_ordinary_apply(
+    monkeypatch,
+):
+    monkeypatch.setattr(web.settings, "selected_config_entry_id", "soil-entry")
+
+    async def safe_sites(*_args, **_kwargs):
+        return None, []
+
+    legacy_id = str(uuid4())
+    current_id = str(uuid4())
+    base = {
+        "point_id": 70,
+        "point_name": "Soil 70",
+        "expected_x": 100,
+        "expected_y": 200,
+        "old_z_mm": -400,
+        "proposed_z_mm": -395,
+        "confidence": 0.9,
+        "status": "valid",
+        "reason": "passed",
+        "capture_x": 125,
+        "capture_y": 225,
+        "point_updated_at": datetime.now(UTC).isoformat(),
+    }
+    monkeypatch.setattr(web.soil_jobs, "safe_sites", safe_sites)
+    monkeypatch.setattr(
+        web.database,
+        "recent_soil_measurements",
+        lambda *_args: [
+            {**base, "measurement_id": legacy_id, "algorithm_version": "soil-stereo-v2"},
+            {**base, "measurement_id": current_id, "algorithm_version": "soil-stereo-v3"},
+        ],
+    )
+
+    status, _, body = await asgi_request("/soil-height")
+
+    assert status == 200
+    assert current_id.encode() in body
+    assert legacy_id.encode() not in body
+
+
+@pytest.mark.asyncio
+async def test_apply_selected_skips_results_resolved_since_the_page_refresh(monkeypatch):
+    stale_id = str(uuid4())
+    current_id = str(uuid4())
+    records = {
+        stale_id: {"measurement_id": stale_id, "status": "applied"},
+        current_id: {
+            "measurement_id": current_id,
+            "status": "valid",
+            "algorithm_version": "soil-stereo-v3",
+            "proposed_z_mm": -395,
+            "capture_x": 125,
+            "capture_y": 225,
+            "point_updated_at": datetime.now(UTC).isoformat(),
+        },
+    }
+    applied = []
+    monkeypatch.setattr(web.database, "soil_measurement", records.get)
+
+    async def apply(measurement_id):
+        applied.append(measurement_id)
+        return {"status": "applied"}
+
+    monkeypatch.setattr(web, "_apply_soil_measurement", apply)
+
+    status, headers, _ = await asgi_request(
+        "/soil/apply-selected",
+        method="POST",
+        raw_body=urlencode(
+            [("measurement_ids", stale_id), ("measurement_ids", current_id)]
+        ).encode(),
+        content_type="application/x-www-form-urlencoded",
+    )
+
+    assert status == 303
+    assert headers[b"location"] == b"../soil-height"
+    assert applied == [current_id]
+
+
+@pytest.mark.asyncio
 async def test_soil_settings_route_persists_all_tab_controls(tmp_path, monkeypatch):
     store = web.SoilSettingsStore(tmp_path / "soil-settings.json")
     monkeypatch.setattr(web, "soil_settings_store", store)
@@ -1553,6 +1634,11 @@ async def test_soil_height_page_uses_last_plan_during_slow_refresh(monkeypatch):
     assert b"showing the last successful result" in body
     assert b">unavailable<" not in body
     assert b'id=soil-refresh-state data-active="true"' in body
+    assert b"if(current.innerHTML===next.innerHTML) return false" in body
+    assert b"input.replaceWith(controls.get(key))" in body
+    assert b"if(existing && existing.outerHTML===row.outerHTML)" in body
+    assert b"window.scrollTo(scrollX,scrollY)" in body
+    assert b"location.reload()" not in body
 
 
 @pytest.mark.asyncio

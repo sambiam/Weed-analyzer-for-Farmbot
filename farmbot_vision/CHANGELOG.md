@@ -1,5 +1,15 @@
 # Changelog
 
+## 3.27.1 - 2026-08-04
+
+- Fixed selected soil-height application by removing legacy v2 results from the
+  ordinary pending-results table and safely skipping results that were already
+  resolved between a live refresh and batch submission.
+- Made live soil-height updates preserve selected coordinates, active checkbox
+  elements, unchanged table rows, and the exact scroll position. Polling now
+  updates only changed status regions and no longer reloads the whole page when
+  a legacy repair scan completes.
+
 ## 3.27.0 - 2026-08-04
 
 - Added a one-time repair workflow for valid or previously applied
