@@ -7,7 +7,7 @@ the app. Close the old FarmBot Vision browser tab and reopen the Web UI so
 Home Assistant creates a fresh Ingress session. See
 [`CHANGELOG.md`](CHANGELOG.md) for what changed in each release; the
 companion integration only needs to change when a release raises the minimum
-compatible companion integration version (currently **1.8.0**).
+compatible companion integration version (currently **2.10.0**).
 
 Since 0.2.1 the app removes the explicit root Ingress entry and normalizes
 duplicate leading slashes at the ASGI boundary. Dashboard and calibration URLs
@@ -32,7 +32,7 @@ running job rather than being dropped.
 
 ## Before enabling it
 
-FarmBot Vision requires Home Assistant Core 2026.7 or newer and companion FarmBot integration 1.8.0 or newer. Start in **Observe** mode. Do not use early experimental output as the sole input to destructive weeding.
+FarmBot Vision requires Home Assistant Core 2026.7 or newer and companion FarmBot integration 2.10.0 or newer. Start in **Observe** mode. Do not use early experimental output as the sole input to destructive weeding.
 
 ## Modes
 

@@ -1,5 +1,6 @@
 """Risk-aware path and soil planning for the rotary weeding tab."""
 
+import math
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -39,6 +40,14 @@ def test_soil_estimate_uses_only_recent_samples_within_500_mm():
     assert estimate is not None
     assert estimate.z == pytest.approx(-400)
     assert len(estimate.samples) == 1
+
+
+def test_soil_sample_age_is_user_configurable_and_can_be_disabled():
+    now = datetime.now(UTC)
+    old = SoilPoint(id=1, name="old", x=0, y=0, z=-400, updated_at=now - timedelta(days=45))
+    assert recent_soil_samples([old], [], now=now, max_age_days=60)
+    assert recent_soil_samples([old], [], now=now, max_age_days=30) == []
+    assert recent_soil_samples([old], [], now=now, max_age_days=None)
 
 
 def test_multiple_soil_samples_are_inverse_distance_interpolated():
@@ -89,6 +98,31 @@ def test_path_is_clipped_to_the_bed_but_still_crosses_the_weed():
     assert 0 <= path.start_y <= 100
     assert 0 <= path.end_y <= 100
     assert path.length_mm >= 20
+
+
+def test_path_can_stop_at_weed_centre_when_every_full_cut_is_blocked():
+    weed = WeedPoint(id=7, x=500, y=500, radius=20)
+    soil = estimate_soil_height(500, 500, [SoilSample(500, 500, -430, datetime.now(UTC), "test")])
+    assert soil is not None
+    obstacles = [
+        plant(
+            index + 1,
+            500 + 70 * math.cos(math.radians(angle)),
+            500 + 70 * math.sin(math.radians(angle)),
+            radius=10,
+        )
+        for index, angle in enumerate(range(0, 360, 30))
+        if angle != 180
+    ]
+    path = plan_cut_path(
+        weed,
+        obstacles,
+        soil,
+        x_bounds=(0, 1000),
+        y_bounds=(0, 1000),
+    )
+    assert path.length_mm < 100
+    assert (path.end_x, path.end_y) == pytest.approx((500, 500))
 
 
 def test_tall_plant_transit_routes_around_canopy():

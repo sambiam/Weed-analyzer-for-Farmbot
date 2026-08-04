@@ -21,7 +21,6 @@ from .models import (
 )
 from .soil_jobs import SoilJobManager
 from .weeding import (
-    TRANSIT_MARGIN_MM,
     CutPath,
     confirmed_weeds,
     estimate_soil_height,
@@ -286,29 +285,53 @@ class WeedingJobManager:
             if x_bounds is None or y_bounds is None or z_bounds is None:
                 raise RuntimeError("FarmBot axis bounds are unavailable")
             paths: list[CutPath] = []
+            check_soil = bool(options.get("check_soil_heights", False))
+            max_soil_age_days = float(options.get("soil_height_max_age_days", 30))
+            cut_after_measurement_failure = bool(
+                options.get("attempt_cut_if_soil_measurement_fails", False)
+            )
             for weed in selected:
                 if self.stop_requested:
                     break
+                measurements = self.db.recent_soil_measurements(entry_id, 500)
+                all_samples = recent_soil_samples(
+                    soil_inventory.points, measurements, max_age_days=None
+                )
                 samples = recent_soil_samples(
-                    soil_inventory.points, self.db.recent_soil_measurements(entry_id, 500)
+                    soil_inventory.points,
+                    measurements,
+                    max_age_days=max_soil_age_days if check_soil else None,
                 )
                 estimate = estimate_soil_height(weed.x, weed.y, samples)
-                if estimate is None:
-                    measured = await self._measure_missing_soil(
-                        entry_id, weed, soil_inventory, garden
-                    )
+                fallback_estimate = estimate_soil_height(weed.x, weed.y, all_samples)
+                if estimate is None and check_soil:
+                    try:
+                        measured = await self._measure_missing_soil(
+                            entry_id, weed, soil_inventory, garden
+                        )
+                    except Exception as err:  # continue when the user explicitly permits it
+                        LOGGER.warning("Soil measurement near weed %s failed: %s", weed.id, err)
+                        measured = False
                     if measured:
                         samples = recent_soil_samples(
-                            soil_inventory.points, self.db.recent_soil_measurements(entry_id, 500)
+                            soil_inventory.points,
+                            self.db.recent_soil_measurements(entry_id, 500),
+                            max_age_days=max_soil_age_days,
                         )
                         estimate = estimate_soil_height(weed.x, weed.y, samples)
+                    if estimate is None and cut_after_measurement_failure:
+                        estimate = fallback_estimate
                 if estimate is None:
                     self.current["weeds_skipped"] += 1
                     self.current["results"].append(
                         {
                             "weed_id": weed.id,
                             "status": "skipped",
-                            "reason": "no trustworthy soil height",
+                            "reason": (
+                                "soil height check failed and no older nearby height is available"
+                                if check_soil
+                                else "no nearby soil height is available"
+                            ),
                         }
                     )
                     continue
@@ -320,11 +343,7 @@ class WeedingJobManager:
                             estimate,
                             x_bounds=x_bounds,
                             y_bounds=y_bounds,
-                            plant_margin_mm=(
-                                TRANSIT_MARGIN_MM
-                                if options.get("avoid_tall_plants", True)
-                                else 25.0
-                            ),
+                            plant_margin_mm=25.0,
                         )
                     )
                 except ValueError as err:
@@ -374,6 +393,7 @@ class WeedingJobManager:
                 targets.append(
                     WeedingTarget(
                         weed_id=path.weed_id,
+                        transit_start={"x": current_xy[0], "y": current_xy[1]},
                         start={"x": path.start_x, "y": path.start_y},
                         end={"x": path.end_x, "y": path.end_y},
                         soil_z=path.soil_z,
@@ -387,8 +407,18 @@ class WeedingJobManager:
                 raise RuntimeError("no mounted-tool route safely avoids protected plants")
             ordered = routed
             self.current.update(status="weeding", paths=[asdict(path) for path in ordered])
+            integration_options = {
+                key: value
+                for key, value in options.items()
+                if key
+                not in {
+                    "check_soil_heights",
+                    "soil_height_max_age_days",
+                    "attempt_cut_if_soil_measurement_fails",
+                }
+            }
             started = await self.client.start_weeding(
-                WeedingRunRequest(config_entry_id=entry_id, weeds=targets, **options)
+                WeedingRunRequest(config_entry_id=entry_id, weeds=targets, **integration_options)
             )
             if started.status != "queued" or started.run_id is None:
                 raise RuntimeError(started.message or "adaptive weeding was rejected")

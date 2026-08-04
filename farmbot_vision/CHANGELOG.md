@@ -1,5 +1,18 @@
 # Changelog
 
+## 3.28.0 - 2026-08-04
+
+- Added independent, opt-in tool verification controls for rotary-tool loading
+  and unloading; unreliable tool sensing no longer blocks either operation by
+  default.
+- Changed adaptive weeding to carry the current X/Y through every safe-height
+  retract and travel directly along the nearest-neighbour route between weeds.
+- Made fresh soil-height checks opt-in, added a configurable maximum age, and
+  added an option to continue with an older nearby height after measurement
+  failure.
+- Added one-sided fallback cuts that approach from open ground and stop at the
+  weed centre when a complete through-cut would violate plant clearance.
+
 ## 3.27.1 - 2026-08-04
 
 - Fixed selected soil-height application by removing legacy v2 results from the

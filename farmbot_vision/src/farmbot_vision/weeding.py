@@ -11,7 +11,7 @@ from datetime import UTC, datetime, timedelta
 from .models import Plant, SoilPoint, WeedPoint
 
 SOIL_SEARCH_RADIUS_MM = 500.0
-SOIL_MAX_AGE = timedelta(days=30)
+DEFAULT_SOIL_MAX_AGE_DAYS = 30.0
 PATH_ANGLE_STEP_DEGREES = 5
 MIN_PATH_LENGTH_MM = 100.0
 PATH_OVERHANG_MM = 30.0
@@ -67,6 +67,7 @@ def recent_soil_samples(
     measurements: Iterable[dict],
     *,
     now: datetime | None = None,
+    max_age_days: float | None = DEFAULT_SOIL_MAX_AGE_DAYS,
 ) -> list[SoilSample]:
     """Merge FarmBot points and valid in-app captures without double counting.
 
@@ -74,7 +75,11 @@ def recent_soil_samples(
     valid measurement is useful to weeding even when the user has not chosen
     to write it back to the FarmBot soil point yet.
     """
-    cutoff = _utc(now or datetime.now(UTC)) - SOIL_MAX_AGE
+    cutoff = (
+        _utc(now or datetime.now(UTC)) - timedelta(days=max_age_days)
+        if max_age_days is not None
+        else None
+    )
     samples: list[SoilSample] = []
     measured_point_ids: set[int] = set()
     for row in measurements:
@@ -91,7 +96,9 @@ def recent_soil_samples(
             z = float(row["proposed_z_mm"])
         except (KeyError, TypeError, ValueError):
             continue
-        if created < cutoff or not all(math.isfinite(value) for value in (x, y, z)):
+        if (cutoff is not None and created < cutoff) or not all(
+            math.isfinite(value) for value in (x, y, z)
+        ):
             continue
         samples.append(SoilSample(x, y, z, created, "vision measurement"))
         measured_point_ids.add(int(row["point_id"]))
@@ -99,7 +106,7 @@ def recent_soil_samples(
         if point.id in measured_point_ids or point.updated_at is None:
             continue
         updated = _utc(point.updated_at)
-        if updated >= cutoff:
+        if cutoff is None or updated >= cutoff:
             samples.append(SoilSample(point.x, point.y, point.z, updated, "FarmBot soil point"))
     return samples
 
@@ -320,7 +327,49 @@ def plan_cut_path(
         if minimum >= 0 and (best is None or score > best[0]):
             best = (score, segment, float(degrees))
     if best is None:
-        raise ValueError(f"weed {weed.id} has no in-bounds straight path")
+        # A full cut can be blocked even though the centre remains safely
+        # reachable. Approach from the open side and stop at the weed centre;
+        # this avoids sending the cutter through the crop-facing half.
+        partial_length = max(20.0, weed.radius + PATH_OVERHANG_MM)
+        partial_best: (
+            tuple[tuple[float, float, float], tuple[float, float, float, float], float] | None
+        ) = None
+        for degrees in range(0, 360, PATH_ANGLE_STEP_DEGREES):
+            angle = math.radians(degrees)
+            ux, uy = math.cos(angle), math.sin(angle)
+            available = partial_length
+            for coordinate, direction, bounds in (
+                (weed.x, ux, x_bounds),
+                (weed.y, uy, y_bounds),
+            ):
+                if abs(direction) < 1e-9:
+                    continue
+                distance = (
+                    (coordinate - bounds[0]) / direction
+                    if direction > 0
+                    else (bounds[1] - coordinate) / -direction
+                )
+                available = min(available, distance)
+            if available < 20.0:
+                continue
+            ax, ay = weed.x - ux * available, weed.y - uy * available
+            bx, by = weed.x, weed.y
+            clearances = [
+                _point_segment_distance(plant.x, plant.y, ax, ay, bx, by)
+                - plant.radius
+                - plant_margin_mm
+                for plant in plants
+            ]
+            minimum = min(clearances, default=10_000.0)
+            if minimum < 0:
+                continue
+            penalty = sum(max(0.0, 150.0 - clearance) ** 2 for clearance in clearances)
+            score = (minimum, -penalty, available)
+            if partial_best is None or score > partial_best[0]:
+                partial_best = (score, (ax, ay, bx, by), float(degrees % 180))
+        if partial_best is None:
+            raise ValueError(f"weed {weed.id} cannot be reached without entering plant clearance")
+        best = partial_best
     score, (ax, ay, bx, by), degrees = best
     return CutPath(
         weed_id=weed.id,

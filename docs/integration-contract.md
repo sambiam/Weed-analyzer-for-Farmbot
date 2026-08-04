@@ -281,4 +281,4 @@ processes only the named image. Manual requests retain the payload above.
 3. `resize_scale_x/y` equal to processed÷oriented in each axis.
 4. `processed_calibration` (basis `processed_image`) when calibration is known, plus reference dimensions on `camera_calibration`.
 
-The minimum compatible companion integration version is **2.2.0**.
+The minimum compatible companion integration version is **2.10.0**.

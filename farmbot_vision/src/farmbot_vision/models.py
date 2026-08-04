@@ -330,6 +330,7 @@ class GcodeRunStatus(StrictModel):
 
 class WeedingTarget(StrictModel):
     weed_id: int = Field(gt=0)
+    transit_start: dict[Literal["x", "y"], float]
     start: dict[Literal["x", "y"], float]
     end: dict[Literal["x", "y"], float]
     soil_z: float
@@ -351,6 +352,8 @@ class WeedingRunRequest(StrictModel):
     approach_speed_percent: int = Field(default=100, ge=1, le=100)
     height_step_mm: float = Field(default=10, ge=1, le=50)
     manage_tool: bool = False
+    verify_tool_on_mount: bool = False
+    verify_tool_on_unmount: bool = False
     tool_name: str = Field(default="Rotary Tool", min_length=1, max_length=100)
     tool_id: int | None = Field(default=None, gt=0)
     tool_slot_x: float = 4.2

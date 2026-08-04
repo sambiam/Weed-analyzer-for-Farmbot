@@ -5560,14 +5560,16 @@ async def weeding_page(request: Request) -> HTMLResponse:
                 tool_direction = rotary_slot.pullout_direction or 1
                 tool_slot_from_bot = rotary_slot.pullout_direction in {1, 2, 3, 4}
             samples = recent_soil_samples(
-                soil.points, database.recent_soil_measurements(entry_id, 500)
+                soil.points,
+                database.recent_soil_measurements(entry_id, 500),
+                max_age_days=None,
             )
             x_bounds = soil.motion.axis_bounds.get("x")
             y_bounds = soil.motion.axis_bounds.get("y")
             candidate_weeds = confirmed_weeds(inventory.weeds)
             for weed in candidate_weeds:
                 estimate = estimate_soil_height(weed.x, weed.y, samples)
-                plan_text, clearance = "Will measure clear soil before mowing", "—"
+                plan_text, clearance = "No nearby recorded soil height", "—"
                 if estimate is not None and x_bounds is not None and y_bounds is not None:
                     try:
                         path = plan_cut_path(
@@ -5603,7 +5605,8 @@ async def weeding_page(request: Request) -> HTMLResponse:
         if capability
         else (
             "<p class=warn>The selected FarmBot integration does not advertise adaptive rotary "
-            "weeding. Install/update the companion integration to V2.8.0 and restart Home Assistant.</p>"
+            f"weeding. Install/update the companion integration to V{MINIMUM_INTEGRATION_VERSION} "
+            "and restart Home Assistant.</p>"
         )
     )
     running_script = (
@@ -5617,9 +5620,8 @@ async def weeding_page(request: Request) -> HTMLResponse:
     )
     disabled = " disabled" if not capability or weeding_jobs.running or not entry_id else ""
     body = f"""<section class=card><h2>Adaptive rotary weeding</h2>
-<p>Plans a straight cut through each weed against every plant protection circle. It uses
-soil heights recorded in the last 30 days and within 500 mm, measuring a nearby clear patch
-when no trustworthy height exists.</p>
+<p>Plans the safest complete cut through each weed, or a shorter one-sided cut to its centre
+when a full cut would enter plant clearance. Weeds are ordered into a continuous route.</p>
 <p class=warn><b>This operates a cutting tool.</b> Inspect the proposed paths, clear people
 and animals from the machine, keep the emergency stop within reach, and supervise the run.</p>
 {capability_warning}<p class=warn>{warning}</p></section>
@@ -5652,6 +5654,10 @@ weeding and return it to its slot after cutting, before photo verification</labe
 FarmBot slot record” to use the editable fallback coordinates.</p>
 <label><input type=checkbox name=tool_slot_from_bot value=true{" checked" if tool_slot_from_bot else ""}>
 Use the FarmBot slot record</label>
+<label><input type=checkbox name=verify_tool_on_mount value=true> Verify the tool after loading</label>
+<label><input type=checkbox name=verify_tool_on_unmount value=true> Verify the tool after unloading</label>
+<p class=muted>Tool verification is optional because the FarmBot tool sensor can be unreliable.
+Loading and unloading continue without verification unless the corresponding option is checked.</p>
 <div class=grid>
 <label>Tool name <input type=text name=tool_name maxlength=100 value="{escape(tool_name, quote=True)}" required></label>
 <label>Tool ID (optional) <input type=number name=tool_id min=1 value="{tool_id}"></label>
@@ -5671,6 +5677,17 @@ plants while the rotary tool is mounted</label>
 max=5000 step=1 value=300 required></label>
 <p class=muted>Plants above this height are treated as obstacles during travel. Plants
 without recorded height data are also protected rather than assumed to be short.</p></fieldset>
+<fieldset><legend>Soil height checks</legend>
+<label><input type=checkbox id=check-soil-heights name=check_soil_heights value=true>
+Check soil heights before mowing and measure a clear nearby patch when needed</label>
+<div class=grid><label>Maximum soil-height age (days)
+<input id=soil-height-max-age type=number name=soil_height_max_age_days min=0.04 max=3650
+step=0.1 value=30 required></label></div>
+<label><input id=cut-after-soil-failure type=checkbox
+name=attempt_cut_if_soil_measurement_fails value=true> Attempt cutting with an older nearby
+soil height if the new measurement fails</label>
+<p class=muted>When checks are off, the newest available nearby soil height is used without
+triggering a measurement. A weed is skipped only when no nearby height is available.</p></fieldset>
 <p class=muted>On overload the motor switches off immediately. The next pass reverses
 at half speed; continued overload raises the cut. Contact while lowering raises the next
 attempt immediately. A failed weed does not stop the remaining batch.</p>
@@ -5688,6 +5705,9 @@ cleared the machine, and will supervise this rotary-tool run.</label><br><br>
   const minimum = document.getElementById('weed-radius-min');
   const maximum = document.getElementById('weed-radius-max');
   const count = document.getElementById('weed-filter-count');
+  const checkSoil = document.getElementById('check-soil-heights');
+  const soilAge = document.getElementById('soil-height-max-age');
+  const cutAfterSoilFailure = document.getElementById('cut-after-soil-failure');
   const visibleCheckboxes = () => rows.filter(row => !row.hidden)
     .map(row => row.querySelector('.weed-select'));
   const updateMaster = () => {
@@ -5718,6 +5738,12 @@ cleared the machine, and will supervise this rotary-tool run.</label><br><br>
   rows.forEach(row => row.querySelector('.weed-select').addEventListener('change', updateMaster));
   minimum.addEventListener('input', applyFilter);
   maximum.addEventListener('input', applyFilter);
+  const updateSoilOptions = () => {
+    soilAge.disabled = !checkSoil.checked;
+    cutAfterSoilFailure.disabled = !checkSoil.checked;
+  };
+  checkSoil.addEventListener('change', updateSoilOptions);
+  updateSoilOptions();
   applyFilter();
 })();
 </script>"""
@@ -5735,6 +5761,8 @@ async def start_weeding(
     cut_speed_percent: int = Form(50),
     height_step_mm: float = Form(10),
     manage_tool: bool = Form(False),
+    verify_tool_on_mount: bool = Form(False),
+    verify_tool_on_unmount: bool = Form(False),
     tool_name: str = Form("Rotary Tool"),
     tool_id: int | None = Form(None),
     tool_slot_x: float = Form(4.2),
@@ -5744,6 +5772,9 @@ async def start_weeding(
     tool_slot_from_bot: bool = Form(False),
     avoid_tall_plants: bool = Form(False),
     tall_plant_height_mm: float = Form(300),
+    check_soil_heights: bool = Form(False),
+    soil_height_max_age_days: float = Form(30),
+    attempt_cut_if_soil_measurement_fails: bool = Form(False),
     acknowledge: bool = Form(False),
 ) -> RedirectResponse:
     entry_id = settings.selected_config_entry_id
@@ -5767,6 +5798,8 @@ async def start_weeding(
                 "approach_speed_percent": 100,
                 "height_step_mm": height_step_mm,
                 "manage_tool": manage_tool,
+                "verify_tool_on_mount": verify_tool_on_mount,
+                "verify_tool_on_unmount": verify_tool_on_unmount,
                 "tool_name": tool_name,
                 "tool_id": tool_id,
                 "tool_slot_x": tool_slot_x,
@@ -5776,6 +5809,11 @@ async def start_weeding(
                 "tool_slot_from_bot": tool_slot_from_bot,
                 "avoid_tall_plants": avoid_tall_plants,
                 "tall_plant_height_mm": tall_plant_height_mm,
+                "check_soil_heights": check_soil_heights,
+                "soil_height_max_age_days": max(0.04, min(3650, soil_height_max_age_days)),
+                "attempt_cut_if_soil_measurement_fails": (
+                    attempt_cut_if_soil_measurement_fails and check_soil_heights
+                ),
                 "acknowledge_rotary_tool": True,
             },
         )
