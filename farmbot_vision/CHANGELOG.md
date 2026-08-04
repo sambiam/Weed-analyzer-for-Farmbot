@@ -1,5 +1,14 @@
 # Changelog
 
+## 3.28.2 - 2026-08-04
+
+- Fixed every valid weed being skipped when its cut endpoint was inside the
+  conservative 40 mm mounted-tool transit buffer. Routes now keep that buffer
+  around ordinary travel while allowing endpoints that satisfy the validated
+  25 mm cutting clearance.
+- Retained strict rejection for endpoints inside the actual cutting clearance
+  and for routes that cannot avoid other protected plants.
+
 ## 3.28.1 - 2026-08-04
 
 - Fixed protected-plant routing so a cut that would finish inside mounted-tool

@@ -21,6 +21,7 @@ from .models import (
 )
 from .soil_jobs import SoilJobManager
 from .weeding import (
+    PLANT_MARGIN_MM,
     CutPath,
     confirmed_weeds,
     estimate_soil_height,
@@ -389,24 +390,13 @@ class WeedingJobManager:
             routed: list[CutPath] = []
             for path in ordered:
                 try:
-                    # A cut endpoint that is inside mounted-tool clearance can
-                    # trap the route after this weed and make every later weed
-                    # appear unreachable. Reject only this weed before adding
-                    # it to the batch, while the previous safe position is
-                    # still available for planning the remaining candidates.
-                    safe_transit_waypoints(
-                        (path.end_x, path.end_y),
-                        (path.end_x, path.end_y),
-                        protected,
-                        x_bounds=x_bounds,
-                        y_bounds=y_bounds,
-                    )
                     waypoints = safe_transit_waypoints(
                         current_xy,
                         (path.start_x, path.start_y),
                         protected,
                         x_bounds=x_bounds,
                         y_bounds=y_bounds,
+                        endpoint_margin_mm=PLANT_MARGIN_MM,
                     )
                 except ValueError as err:
                     self.current["weeds_skipped"] += 1

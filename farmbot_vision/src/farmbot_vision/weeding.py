@@ -184,9 +184,26 @@ def safe_transit_waypoints(
     x_bounds: tuple[float, float],
     y_bounds: tuple[float, float],
     margin_mm: float = TRANSIT_MARGIN_MM,
+    endpoint_margin_mm: float | None = None,
 ) -> list[dict[str, float]]:
-    """Find the shortest visible route around protected plant circles."""
-    circles = [(plant.x, plant.y, plant.radius + margin_mm) for plant in plants]
+    """Find the shortest visible route around protected plant circles.
+
+    Transit normally uses the larger mounted-tool margin. A cut endpoint may
+    legitimately sit inside that conservative travel buffer while still
+    satisfying the cutting clearance used by ``plan_cut_path``. For a plant
+    whose buffer contains either endpoint, reduce only that plant's routing
+    circle to ``endpoint_margin_mm``; all other plants keep the full transit
+    margin. Endpoints inside the reduced cutting clearance remain forbidden.
+    """
+    circles = []
+    for plant in plants:
+        radius = plant.radius + margin_mm
+        if endpoint_margin_mm is not None and (
+            math.hypot(start[0] - plant.x, start[1] - plant.y) < radius
+            or math.hypot(end[0] - plant.x, end[1] - plant.y) < radius
+        ):
+            radius = plant.radius + endpoint_margin_mm
+        circles.append((plant.x, plant.y, radius))
 
     def inside_bounds(point: tuple[float, float]) -> bool:
         return x_bounds[0] <= point[0] <= x_bounds[1] and y_bounds[0] <= point[1] <= y_bounds[1]

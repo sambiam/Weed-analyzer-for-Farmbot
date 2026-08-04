@@ -153,6 +153,34 @@ def test_tall_plant_transit_rejects_only_an_endpoint_inside_clearance():
         )
 
 
+def test_transit_accepts_cut_safe_endpoint_inside_larger_travel_margin():
+    obstacle = plant(1, 500, 500, radius=80).model_copy(update={"height_mm": 450})
+    protected = protected_tall_plants([obstacle], enabled=True, minimum_height_mm=300)
+    route = safe_transit_waypoints(
+        (100, 500),
+        (390, 500),  # 110 mm from centre: outside 80 + 25, inside 80 + 40.
+        protected,
+        x_bounds=(0, 1000),
+        y_bounds=(0, 1000),
+        endpoint_margin_mm=25,
+    )
+    assert isinstance(route, list)
+
+
+def test_transit_still_rejects_endpoint_inside_cutting_clearance():
+    obstacle = plant(1, 500, 500, radius=80).model_copy(update={"height_mm": 450})
+    protected = protected_tall_plants([obstacle], enabled=True, minimum_height_mm=300)
+    with pytest.raises(ValueError, match="weed approach"):
+        safe_transit_waypoints(
+            (100, 500),
+            (400, 500),  # 100 mm from centre: inside 80 + 25.
+            protected,
+            x_bounds=(0, 1000),
+            y_bounds=(0, 1000),
+            endpoint_margin_mm=25,
+        )
+
+
 def test_all_individually_skipped_weeds_complete_without_failing_batch():
     manager = object.__new__(WeedingJobManager)
     manager.current = {"status": "planning", "weeds_skipped": 3}
