@@ -14,6 +14,7 @@ from uuid import UUID, uuid4
 from .database import Database
 from .home_assistant import HomeAssistantClient, HomeAssistantError
 from .models import (
+    ApplySoilHeightRequest,
     InventoryRequest,
     SoilCaptureStartRequest,
     SoilMeasurement,
@@ -147,6 +148,7 @@ class SoilJobManager:
         custom_y: float | None = None,
         capture_z: float,
         baseline_mm: float,
+        job_kind: str = "measurement",
     ) -> str:
         if custom_point_id is None and not point_ids:
             raise ValueError("select at least one soil point")
@@ -164,6 +166,7 @@ class SoilJobManager:
                 custom_y=custom_y,
                 capture_z=capture_z,
                 baseline_mm=baseline_mm,
+                job_kind=job_kind,
             ),
             name="soil-measurement",
         )
@@ -419,9 +422,12 @@ class SoilJobManager:
                 SoilFrame(
                     image_id=response.image_id,
                     jpeg=jpeg,
-                    x=item.x,
-                    y=item.y,
-                    z=item.z,
+                    # These are the coordinates recorded on the exposure by
+                    # the companion, rather than the requested target. The
+                    # stereo engine uses them to normalize the real baseline.
+                    x=response.meta.x,
+                    y=response.meta.y,
+                    z=response.meta.z,
                     lateral_offset_mm=item.lateral_offset_mm,
                     z_offset_mm=item.z_offset_mm,
                     processed_width=response.width,
@@ -632,8 +638,9 @@ class SoilJobManager:
         custom_y: float | None,
         capture_z: float,
         baseline_mm: float,
+        job_kind: str = "measurement",
     ) -> None:
-        self.db.start_soil_job(job_id, config_entry_id, "measurement", point_ids)
+        self.db.start_soil_job(job_id, config_entry_id, job_kind, point_ids)
         completed = failed = 0
         try:
             async with self.shared_lock:
@@ -750,6 +757,11 @@ class SoilJobManager:
                             frames,
                             calibration,
                             declared_camera_signature=signature,
+                            pair_disagreement_limit_mm=(
+                                self.soil_settings_store.load().pair_disagreement_limit_mm
+                                if self.soil_settings_store is not None
+                                else 8
+                            ),
                         )
                         artifact_paths = self._save_artifacts(
                             analysis.measurement_id, analysis.artifacts
@@ -781,6 +793,7 @@ class SoilJobManager:
                         self.db.save_soil_measurement(measurement)
                         if analysis.valid:
                             completed += 1
+                            await self._automatically_apply(measurement)
                         else:
                             failed += 1
                             LOGGER.warning(
@@ -863,6 +876,56 @@ class SoilJobManager:
                 message=message,
                 complete=True,
             )
+
+    async def _automatically_apply(self, measurement: SoilMeasurement) -> None:
+        """Apply a valid result only when both user-managed safety gates pass."""
+        if self.soil_settings_store is None or measurement.proposed_z_mm is None:
+            return
+        values = self.soil_settings_store.load()
+        if (
+            not values.automatic_acceptance_enabled
+            or measurement.confidence * 100 < values.automatic_acceptance_confidence_percent
+            or abs(measurement.proposed_z_mm - measurement.old_z_mm)
+            > values.automatic_acceptance_margin_mm
+            or measurement.capture_x is None
+            or measurement.capture_y is None
+            or measurement.point_updated_at is None
+        ):
+            return
+        request = ApplySoilHeightRequest(
+            config_entry_id=measurement.config_entry_id,
+            point_id=measurement.point_id,
+            measurement_id=measurement.measurement_id,
+            expected_x=measurement.expected_x,
+            expected_y=measurement.expected_y,
+            expected_z=measurement.old_z_mm,
+            expected_updated_at=measurement.point_updated_at,
+            recommended_x=measurement.capture_x,
+            recommended_y=measurement.capture_y,
+            recommended_z_mm=measurement.proposed_z_mm,
+            confidence=measurement.confidence,
+            apply=True,
+            human_approved=False,
+        )
+        try:
+            response = await self.client.apply_soil_height(request)
+        except HomeAssistantError as err:
+            self.db.record_soil_decision(
+                str(measurement.measurement_id),
+                "automatic_apply_failed",
+                {"status": "unavailable", "message": str(err)[:240]},
+            )
+            return
+        response_status = str(response.get("status") or "rejected")
+        if response_status == "applied":
+            status, action = "applied", "automatic_approve"
+        elif response_status == "conflict":
+            status, action = "conflict", "automatic_stale_conflict"
+        else:
+            status, action = "rejected", "automatic_rejected_write"
+        reason = str(response.get("message") or response_status)[:240]
+        self.db.update_soil_measurement_status(str(measurement.measurement_id), status, reason)
+        self.db.record_soil_decision(str(measurement.measurement_id), action, response)
 
     def _save_artifacts(self, measurement_id: UUID, artifacts: dict[str, bytes]) -> list[str]:
         directory = self.data_dir / "artifacts"

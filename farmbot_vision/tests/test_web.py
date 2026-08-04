@@ -4,6 +4,7 @@ import asyncio
 import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from urllib.parse import unquote, urlencode, urljoin, urlsplit
 from uuid import uuid4
 
@@ -1286,9 +1287,239 @@ async def test_soil_height_page_lists_points_and_warns_below_three(monkeypatch):
     assert b"Custom coordinates" in body
     assert b"Safety anchor soil point" not in body
     assert b"Clear-soil margin" in body
+    assert b"Automatically measure every available soil point each day" in body
+    assert b"Minimum confidence (%)" in body
+    assert b"Maximum stereo-pair disagreement (mm)" in body
+    assert b">Select all<" in body
+    assert b">Select all failed<" in body
+    assert b'data-failed="false"' in body
     assert b"Measure custom coordinate" in body
     assert b"Fewer than three stale soil points" in body
     assert b"replace the assigned stale point" in body
+
+
+@pytest.mark.asyncio
+async def test_soil_height_page_opens_legacy_repair_confirmation_modal(monkeypatch):
+    monkeypatch.setattr(web.settings, "selected_config_entry_id", "legacy-entry")
+
+    async def safe_sites(*_args, **_kwargs):
+        return (
+            SoilPointInventory(
+                device_id="42",
+                generated_at=datetime.now(UTC),
+                points=[],
+                motion=SoilMotionState(
+                    connected=True,
+                    busy=False,
+                    locked=False,
+                    position={"x": 0, "y": 0, "z": 0},
+                    z_direction=-1,
+                    axis_bounds={"x": (0, 1000), "y": (0, 1000), "z": (-600, 0)},
+                ),
+            ),
+            [],
+        )
+
+    measurement_id = str(uuid4())
+    monkeypatch.setattr(web.soil_jobs, "safe_sites", safe_sites)
+    monkeypatch.setattr(
+        web.database,
+        "legacy_soil_repair_summary",
+        lambda _entry_id: {
+            "eligible": 2,
+            "unprocessed": 0,
+            "pending": 1,
+            "unavailable": 1,
+            "unchanged": 0,
+            "applied": 0,
+            "rejected": 0,
+            "conflict": 0,
+            "retired": False,
+        },
+    )
+    monkeypatch.setattr(
+        web.database,
+        "pending_legacy_soil_repairs",
+        lambda _entry_id: [
+            {
+                "legacy_measurement_id": measurement_id,
+                "point_name": "Legacy soil",
+                "old_proposed_z_mm": 469,
+                "repaired_z_mm": 505,
+                "delta_mm": 36,
+                "confidence": 0.91,
+                "source_status": "applied",
+            }
+        ],
+    )
+
+    status, _, body = await asgi_request("/soil-height")
+
+    assert status == 200
+    assert b"id=legacy-soil-repair-modal" in body
+    assert b"Legacy soil" in body
+    assert b"469 mm" in body and b"505 mm" in body and b"+36 mm" in body
+    assert b"Nothing below has been written to FarmBot" in body
+    assert b"Apply selected corrections" in body
+    assert b"Keep existing values for selected" in body
+    assert measurement_id.encode() in body
+
+
+@pytest.mark.asyncio
+async def test_legacy_repair_scan_route_starts_one_shot_manager(monkeypatch):
+    monkeypatch.setattr(web.settings, "selected_config_entry_id", "legacy-entry")
+    started = []
+    monkeypatch.setattr(web.legacy_soil_repair, "start", lambda entry: started.append(entry))
+
+    status, headers, _ = await asgi_request("/soil/legacy-repair/scan", method="POST")
+
+    assert status == 303
+    assert started == ["legacy-entry"]
+    assert dict(headers)[b"location"] == b"../../soil-height"
+
+
+@pytest.mark.asyncio
+async def test_ordinary_apply_route_refuses_legacy_v2_measurement(monkeypatch):
+    measurement_id = str(uuid4())
+    monkeypatch.setattr(
+        web.database,
+        "soil_measurement",
+        lambda _measurement_id: {
+            "measurement_id": measurement_id,
+            "status": "valid",
+            "algorithm_version": "soil-stereo-v2",
+            "proposed_z_mm": 469,
+            "capture_x": 100,
+            "capture_y": 200,
+            "point_updated_at": datetime.now(UTC).isoformat(),
+        },
+    )
+
+    with pytest.raises(web.HTTPException) as exc:
+        await web._apply_soil_measurement(measurement_id)
+
+    assert exc.value.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_soil_settings_route_persists_all_tab_controls(tmp_path, monkeypatch):
+    store = web.SoilSettingsStore(tmp_path / "soil-settings.json")
+    monkeypatch.setattr(web, "soil_settings_store", store)
+    monkeypatch.setattr(web.soil_jobs, "soil_settings_store", store)
+    status, _, _ = await asgi_request(
+        "/soil/settings",
+        method="POST",
+        form={
+            "clear_soil_margin_mm": "60",
+            "pair_disagreement_limit_mm": "12.5",
+            "scheduled_run_enabled": "true",
+            "scheduled_run_time": "04:30",
+            "automatic_acceptance_enabled": "true",
+            "automatic_acceptance_confidence_percent": "94",
+            "automatic_acceptance_margin_mm": "15",
+            "automatic_retry_enabled": "true",
+            "automatic_retry_delay": "2",
+            "automatic_retry_unit": "hours",
+        },
+    )
+    values = store.load()
+    assert status == 303
+    assert values.scheduled_run_enabled
+    assert values.scheduled_run_time == "04:30"
+    assert values.automatic_acceptance_confidence_percent == 94
+    assert values.automatic_acceptance_margin_mm == 15
+    assert values.automatic_retry_delay_seconds == 7200
+    assert values.pair_disagreement_limit_mm == 12.5
+
+
+@pytest.mark.asyncio
+async def test_soil_scheduler_starts_all_available_points_once_per_day(tmp_path, monkeypatch):
+    store = web.SoilSettingsStore(tmp_path / "soil-settings.json")
+    store.save(web.SoilSettings(scheduled_run_enabled=True, scheduled_run_time="04:30"))
+    monkeypatch.setattr(web, "soil_settings_store", store)
+    monkeypatch.setattr(web.settings, "selected_config_entry_id", "soil-entry")
+    monkeypatch.setattr(web.soil_jobs, "task", None)
+    monkeypatch.setattr(
+        web.database,
+        "active_soil_calibration",
+        lambda _entry_id: SimpleNamespace(capture_z=0, baseline_mm=15),
+    )
+
+    async def safe_sites(*_args, **_kwargs):
+        return None, [SimpleNamespace(point_id=70), SimpleNamespace(point_id=71)]
+
+    started = []
+    monkeypatch.setattr(web.soil_jobs, "safe_sites", safe_sites)
+    monkeypatch.setattr(
+        web.soil_jobs, "start_measurements", lambda **kwargs: started.append(kwargs)
+    )
+    monkeypatch.setattr(
+        web,
+        "_soil_automation_state",
+        {"last_scheduled_date": None, "handled_retry_jobs": set()},
+    )
+    now = datetime.now().astimezone().replace(hour=4, minute=30, second=0, microsecond=0)
+    await web._run_soil_automation(now)
+    await web._run_soil_automation(now.replace(second=30))
+    assert len(started) == 1
+    assert started[0]["point_ids"] == [70, 71]
+    assert started[0]["job_kind"] == "measurement_scheduled"
+
+
+@pytest.mark.asyncio
+async def test_soil_scheduler_retries_only_failed_points_after_delay(tmp_path, monkeypatch):
+    store = web.SoilSettingsStore(tmp_path / "soil-settings.json")
+    store.save(
+        web.SoilSettings(
+            automatic_retry_enabled=True,
+            automatic_retry_delay=15,
+            automatic_retry_unit="minutes",
+        )
+    )
+    monkeypatch.setattr(web, "soil_settings_store", store)
+    monkeypatch.setattr(web.settings, "selected_config_entry_id", "soil-entry")
+    monkeypatch.setattr(web.soil_jobs, "task", None)
+    now = datetime.now(UTC)
+    latest = {
+        "id": "measurement-run",
+        "kind": "measurement",
+        "status": "complete",
+        "failed_count": 1,
+        "point_ids": [70, 71],
+        "started_at": (now - timedelta(minutes=30)).isoformat(),
+        "completed_at": (now - timedelta(minutes=20)).isoformat(),
+    }
+    monkeypatch.setattr(web.database, "latest_soil_job", lambda _entry_id: latest)
+    monkeypatch.setattr(
+        web.database,
+        "recent_soil_measurements",
+        lambda *_args: [
+            {
+                "point_id": 70,
+                "status": "failed",
+                "created_at": (now - timedelta(minutes=25)).isoformat(),
+            },
+            {
+                "point_id": 71,
+                "status": "valid",
+                "created_at": (now - timedelta(minutes=24)).isoformat(),
+            },
+        ],
+    )
+    started = []
+
+    async def start(**kwargs):
+        started.append(kwargs)
+        return True
+
+    monkeypatch.setattr(web, "_start_automated_soil_measurements", start)
+    monkeypatch.setattr(
+        web,
+        "_soil_automation_state",
+        {"last_scheduled_date": None, "handled_retry_jobs": set()},
+    )
+    await web._run_soil_automation(now)
+    assert started == [{"point_ids": [70], "job_kind": "measurement_retry"}]
 
 
 @pytest.mark.asyncio
@@ -1321,7 +1552,7 @@ async def test_soil_height_page_uses_last_plan_during_slow_refresh(monkeypatch):
     assert b"connected=True" in body
     assert b"showing the last successful result" in body
     assert b">unavailable<" not in body
-    assert b"setTimeout(()=>location.reload(),3000)" in body
+    assert b'id=soil-refresh-state data-active="true"' in body
 
 
 @pytest.mark.asyncio

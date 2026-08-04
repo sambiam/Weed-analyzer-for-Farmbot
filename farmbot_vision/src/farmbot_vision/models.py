@@ -633,7 +633,7 @@ class SoilMeasurement(StrictModel):
     frame_ids: list[int] = Field(default_factory=list)
     metrics: dict[str, float | int | str | bool | None] = Field(default_factory=dict)
     artifact_paths: list[str] = Field(default_factory=list)
-    algorithm_version: str = "soil-stereo-v2"
+    algorithm_version: str = "soil-stereo-v3"
     created_at: datetime = Field(default_factory=lambda: datetime.now().astimezone())
 
 

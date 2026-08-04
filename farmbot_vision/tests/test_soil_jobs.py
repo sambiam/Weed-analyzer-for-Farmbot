@@ -19,6 +19,7 @@ from farmbot_vision.models import (
 )
 from farmbot_vision.soil_height import SoilCalibrationQualityError, SoilFrame, SoilHeightError
 from farmbot_vision.soil_jobs import SoilJobManager
+from farmbot_vision.soil_settings import SoilSettings, SoilSettingsStore
 from farmbot_vision.zones import ZoneStore
 
 
@@ -65,6 +66,67 @@ def test_soil_capture_status_accepts_integration_batch_id():
 
 
 @pytest.mark.asyncio
+async def test_automatic_acceptance_requires_confidence_and_height_margin(tmp_path):
+    database = Database(tmp_path / "vision.db")
+    store = SoilSettingsStore(tmp_path / "soil_settings.json")
+    store.save(
+        SoilSettings(
+            automatic_acceptance_enabled=True,
+            automatic_acceptance_confidence_percent=90,
+            automatic_acceptance_margin_mm=10,
+        )
+    )
+    applied = []
+
+    class Client:
+        async def apply_soil_height(self, request):
+            applied.append(request)
+            return {"status": "applied", "message": "updated automatically"}
+
+    manager = SoilJobManager(
+        database,
+        Client(),
+        tmp_path,
+        asyncio.Lock(),
+        ZoneStore(tmp_path / "zones.json"),
+        store,
+    )
+    now = datetime.now(UTC)
+
+    def measurement(*, confidence=0.95, proposed=-395):
+        return SoilMeasurement(
+            measurement_id=uuid4(),
+            config_entry_id="bot-soil",
+            point_id=70,
+            point_name="Soil 70",
+            expected_x=100,
+            expected_y=200,
+            old_z_mm=-400,
+            point_updated_at=now,
+            capture_x=110,
+            capture_y=210,
+            relocation_distance_mm=14.1,
+            proposed_z_mm=proposed,
+            confidence=confidence,
+            uncertainty_mm=2,
+            status="valid",
+            reason="passed",
+        )
+
+    accepted = measurement()
+    low_confidence = measurement(confidence=0.89)
+    large_change = measurement(proposed=-380)
+    for item in (accepted, low_confidence, large_change):
+        database.save_soil_measurement(item)
+        await manager._automatically_apply(item)
+
+    assert [item.measurement_id for item in applied] == [accepted.measurement_id]
+    assert database.soil_measurement(str(accepted.measurement_id))["status"] == "applied"
+    assert database.soil_measurement(str(low_confidence.measurement_id))["status"] == "valid"
+    assert database.soil_measurement(str(large_change.measurement_id))["status"] == "valid"
+
+
+@pytest.mark.asyncio
 async def test_capture_frames_uses_actual_1280x720_geometry(tmp_path, monkeypatch):
     capture_id = uuid4()
     image_requests = []
@@ -102,6 +164,9 @@ async def test_capture_frames_uses_actual_1280x720_geometry(tmp_path, monkeypatc
         async def image(self, request, _maximum_bytes):
             image_requests.append(request)
             item = capture_items[request.image_id - 1]
+            # The downloaded image metadata is authoritative and may differ
+            # slightly from the requested capture target.
+            recorded_y = {1: 184.0, 2: 200.0, 3: 216.0}[request.image_id]
             return SimpleNamespace(
                 image_id=request.image_id,
                 full_metadata=True,
@@ -110,7 +175,7 @@ async def test_capture_frames_uses_actual_1280x720_geometry(tmp_path, monkeypatc
                 source_width=1280,
                 source_height=720,
                 image_base64="anBlZw==",
-                meta=SimpleNamespace(x=item.x, y=item.y, z=item.z),
+                meta=SimpleNamespace(x=item.x, y=recorded_y, z=item.z),
                 processed_calibration=None,
             )
 
@@ -140,6 +205,7 @@ async def test_capture_frames_uses_actual_1280x720_geometry(tmp_path, monkeypatc
         z_offsets_mm=[0],
     )
     assert {(frame.processed_width, frame.processed_height) for frame in frames} == {(1280, 720)}
+    assert [frame.y for frame in frames] == [184.0, 200.0, 216.0]
     assert {(request.max_width, request.max_height) for request in image_requests} == {(1280, 960)}
     assert start_calls == 2
 

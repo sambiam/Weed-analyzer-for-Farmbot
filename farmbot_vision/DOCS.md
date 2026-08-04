@@ -126,6 +126,19 @@ soil camera stream does not need to match a 4:3 general camera calibration.
 Recalibrate after any camera move, rotation, refocus, remount, resolution,
 baseline, source-geometry, Z-direction, or declared camera-setting change.
 
+Installations with valid or applied `soil-stereo-v2` measurements receive a
+one-time legacy repair card. Starting the check reads the nine retained source
+images for each old calibration and the three images for each old measurement,
+then recalculates them from the X/Y/Z metadata recorded on those exposures. It
+does not activate the reconstructed historical calibration and does not write
+FarmBot points. Detected changes open in a comparison modal with old height,
+corrected height, signed difference, confidence, and prior application state.
+Only explicitly selected, human-confirmed corrections are sent to FarmBot, and
+each point's current state is checked immediately before the write. Keeping an
+existing value, a missing source image, an unchanged result, or a stale-point
+conflict is recorded as a terminal outcome. The selector is hard-coded to v2;
+after every eligible row has an outcome, the card and modal retire permanently.
+
 Measurements capture three views 15 mm apart, or a validated one-sided triplet
 near a Y-axis edge. Calibration and measurement captures switch the standard
 lighting peripheral on for the run. For every view, the bot moves once,
@@ -139,19 +152,29 @@ started once after the run completes or is stopped.
 The pipeline rectifies roll and vertical offset, uses robust feature flow to
 limit StereoSGBM to the relevant disparity range for both adjacent pairs and
 the outer pair, masks green vegetation and inconsistent pixels, and fits the
-dominant soil plane with RANSAC. Coverage is measured over clear, overlapping,
+dominant soil plane with RANSAC. Disparity is normalized with the X/Y travel
+recorded on each exposure rather than the requested nominal baseline, and the
+calibration depths use the recorded Z travel. A triplet fails if its exposures
+span more than 1 mm in Z. Coverage is measured over clear, overlapping,
 geometrically matchable soil rather than rotation borders or matcher search
 margins. A result remains diagnostic-only unless coverage, plane support,
 left/right consistency, plane residual, cross-pair agreement, and propagated
 uncertainty all pass their quality gates.
 
-Use **Measure selected**, **Measure all**, or **Retry failed**. Points are
+Use **Measure selected**, **Measure all**, or **Retry failed**. **Select all**
+and **Select all failed** make it easier to build a point selection. Points are
 visited in nearest-neighbour order. **Stop after current point** allows the
 companion's current atomic capture to finish and never sends an emergency stop.
-All valid results require explicit individual or selected approval. Apply
-re-fetches the same point and refuses stale coordinates; only its Z coordinate
-is updated. Restarted jobs are recorded as interrupted and never resume bot
-motion or apply results automatically.
+
+The same tab can schedule one daily run across every currently available site
+and retry a manual or scheduled run's failed points once after a configurable
+minutes-or-hours delay. Automatic acceptance is optional and applies a valid
+result only when it meets both the configured confidence percentage and the
+maximum allowed change from the point's original Z. Other valid results remain
+available for individual or selected approval. Every apply re-fetches the same
+point and refuses stale coordinates; only its Z coordinate is updated. The tab
+also controls the clear-soil margin and the stereo-pair disagreement failure
+limit. Restarted jobs are recorded as interrupted and never resume bot motion.
 
 ## Image selection and analysis
 

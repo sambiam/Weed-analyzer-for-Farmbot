@@ -360,6 +360,28 @@ MIGRATIONS = [
     ALTER TABLE soil_calibrations ADD COLUMN quality_override INTEGER NOT NULL DEFAULT 0;
     ALTER TABLE soil_calibrations ADD COLUMN quality_warnings_json TEXT NOT NULL DEFAULT '[]';
     """,
+    # Migration 23: one-shot audit state for repairing soil-stereo-v2 results.
+    # A unique legacy measurement can be staged only once. Once every legacy
+    # row has a terminal record this workflow has no eligible input and retires.
+    """
+    CREATE TABLE IF NOT EXISTS soil_legacy_repairs(
+      legacy_measurement_id TEXT PRIMARY KEY,
+      config_entry_id TEXT NOT NULL,
+      source_status TEXT NOT NULL,
+      state TEXT NOT NULL,
+      old_proposed_z_mm REAL NOT NULL,
+      repaired_z_mm REAL,
+      delta_mm REAL,
+      confidence REAL,
+      uncertainty_mm REAL,
+      reason TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      resolved_at TEXT,
+      FOREIGN KEY(legacy_measurement_id) REFERENCES soil_measurements(measurement_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_soil_legacy_repairs_entry_state
+      ON soil_legacy_repairs(config_entry_id,state,created_at);
+    """,
 ]
 
 
@@ -2225,6 +2247,22 @@ class Database:
         data["quality_warnings"] = json.loads(data.pop("quality_warnings_json", "[]") or "[]")
         return SoilStereoCalibration.model_validate(data)
 
+    def soil_calibration(self, calibration_id: int) -> SoilStereoCalibration | None:
+        """Return a calibration by ID, including an inactive legacy version."""
+
+        row = self.connection.execute(
+            "SELECT * FROM soil_calibrations WHERE id=?", (calibration_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        data = dict(row)
+        data["calibration_id"] = data.pop("id")
+        data["source_image_ids"] = json.loads(data.pop("source_image_ids_json"))
+        data["active"] = bool(data["active"])
+        data["quality_override"] = bool(data.get("quality_override", 0))
+        data["quality_warnings"] = json.loads(data.pop("quality_warnings_json", "[]") or "[]")
+        return SoilStereoCalibration.model_validate(data)
+
     def save_soil_measurement(self, measurement: SoilMeasurement) -> None:
         with self.connection:
             self.connection.execute(
@@ -2302,6 +2340,118 @@ class Database:
                 (limit,),
             ).fetchall()
         return [self._decode_soil_measurement(row) for row in rows]
+
+    def unprocessed_legacy_soil_measurements(self, config_entry_id: str) -> list[dict]:
+        """Return only actionable v2 heights not yet classified by the one-shot repair."""
+
+        rows = self.connection.execute(
+            """SELECT m.* FROM soil_measurements m
+            LEFT JOIN soil_legacy_repairs r ON r.legacy_measurement_id=m.measurement_id
+            WHERE m.config_entry_id=? AND m.algorithm_version='soil-stereo-v2'
+              AND m.proposed_z_mm IS NOT NULL AND m.status IN ('valid','applied')
+              AND r.legacy_measurement_id IS NULL
+            ORDER BY m.created_at,m.measurement_id""",
+            (config_entry_id,),
+        ).fetchall()
+        return [self._decode_soil_measurement(row) for row in rows]
+
+    def save_legacy_soil_repair(
+        self,
+        *,
+        legacy_measurement_id: str,
+        config_entry_id: str,
+        source_status: str,
+        state: str,
+        old_proposed_z_mm: float,
+        repaired_z_mm: float | None,
+        confidence: float | None,
+        uncertainty_mm: float | None,
+        reason: str,
+    ) -> None:
+        delta = None if repaired_z_mm is None else repaired_z_mm - old_proposed_z_mm
+        terminal = state != "pending"
+        with self.connection:
+            self.connection.execute(
+                """INSERT OR IGNORE INTO soil_legacy_repairs(
+                legacy_measurement_id,config_entry_id,source_status,state,
+                old_proposed_z_mm,repaired_z_mm,delta_mm,confidence,uncertainty_mm,
+                reason,resolved_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    legacy_measurement_id,
+                    config_entry_id,
+                    source_status,
+                    state,
+                    old_proposed_z_mm,
+                    repaired_z_mm,
+                    delta,
+                    confidence,
+                    uncertainty_mm,
+                    reason[:500],
+                    datetime.now(UTC).isoformat() if terminal else None,
+                ),
+            )
+
+    def legacy_soil_repair(self, legacy_measurement_id: str) -> dict | None:
+        row = self.connection.execute(
+            "SELECT * FROM soil_legacy_repairs WHERE legacy_measurement_id=?",
+            (legacy_measurement_id,),
+        ).fetchone()
+        return None if row is None else dict(row)
+
+    def pending_legacy_soil_repairs(self, config_entry_id: str) -> list[dict]:
+        return [
+            dict(row)
+            for row in self.connection.execute(
+                """SELECT r.*,m.point_id,m.point_name,m.capture_x,m.capture_y,
+                m.expected_x,m.expected_y,m.calibration_id
+                FROM soil_legacy_repairs r
+                JOIN soil_measurements m ON m.measurement_id=r.legacy_measurement_id
+                WHERE r.config_entry_id=? AND r.state='pending'
+                ORDER BY ABS(r.delta_mm) DESC,r.created_at""",
+                (config_entry_id,),
+            )
+        ]
+
+    def legacy_soil_repair_summary(self, config_entry_id: str) -> dict[str, int | bool]:
+        eligible = int(
+            self.connection.execute(
+                """SELECT COUNT(*) FROM soil_measurements
+                WHERE config_entry_id=? AND algorithm_version='soil-stereo-v2'
+                  AND proposed_z_mm IS NOT NULL AND status IN ('valid','applied')""",
+                (config_entry_id,),
+            ).fetchone()[0]
+        )
+        counts = {
+            str(row["state"]): int(row["count"])
+            for row in self.connection.execute(
+                """SELECT state,COUNT(*) AS count FROM soil_legacy_repairs
+                WHERE config_entry_id=? GROUP BY state""",
+                (config_entry_id,),
+            )
+        }
+        processed = sum(counts.values())
+        pending = counts.get("pending", 0)
+        return {
+            "eligible": eligible,
+            "unprocessed": max(0, eligible - processed),
+            "pending": pending,
+            "unavailable": counts.get("unavailable", 0),
+            "unchanged": counts.get("unchanged", 0),
+            "applied": counts.get("applied", 0),
+            "rejected": counts.get("rejected", 0),
+            "conflict": counts.get("conflict", 0),
+            "retired": eligible > 0 and processed >= eligible and pending == 0,
+        }
+
+    def resolve_legacy_soil_repair(
+        self, legacy_measurement_id: str, state: str, reason: str
+    ) -> None:
+        with self.connection:
+            self.connection.execute(
+                """UPDATE soil_legacy_repairs SET state=?,reason=?,resolved_at=?
+                WHERE legacy_measurement_id=? AND state='pending'""",
+                (state, reason[:500], datetime.now(UTC).isoformat(), legacy_measurement_id),
+            )
 
     def update_soil_measurement_status(self, measurement_id: str, status: str, reason: str) -> None:
         with self.connection:

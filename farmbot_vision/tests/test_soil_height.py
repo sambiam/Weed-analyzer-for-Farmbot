@@ -30,6 +30,7 @@ def _triplet(
     green_cover: bool = False,
     vertical_shift_px: float = 0,
     brightness_step: float = 0,
+    actual_baseline_mm: float = 15,
 ) -> list[SoilFrame]:
     rng = np.random.default_rng(47)
     texture = rng.integers(25, 230, (480, 640), dtype=np.uint8)
@@ -39,7 +40,8 @@ def _triplet(
         cv2.rectangle(color, (0, 0), (639, 479), (20, 210, 30), -1)
     frames = []
     for image_id, offset in enumerate((-15.0, 0.0, 15.0), start=1):
-        shift = normalized_disparity * (offset + 15)
+        actual_offset = offset * actual_baseline_mm / 15
+        shift = normalized_disparity * (actual_offset + actual_baseline_mm)
         view_index = (offset + 15) / 15
         image = cv2.warpAffine(
             color,
@@ -54,7 +56,7 @@ def _triplet(
                 image_id=image_id + round(z_offset) * 10,
                 jpeg=_encode(image),
                 x=100,
-                y=200 + offset,
+                y=200 + actual_offset,
                 z=camera_z,
                 lateral_offset_mm=offset,
                 z_offset_mm=z_offset,
@@ -74,6 +76,90 @@ def test_three_pair_stereo_recovers_normalized_disparity():
     assert np.median([item.normalized_disparity for item in estimates]) == pytest.approx(
         1.2, abs=0.03
     )
+
+
+def test_stereo_uses_recorded_motion_instead_of_requested_baseline():
+    """A 16.15 mm real step treated as 15 mm turns 505 mm into about 469 mm."""
+
+    actual_baseline = 15 * 505 / 469
+    estimates = estimate_triplet(_triplet(600 / 505, actual_baseline_mm=actual_baseline))
+
+    assert all(estimate.passes_geometry for estimate in estimates)
+    assert np.median([item.baseline_mm for item in estimates[:2]]) == pytest.approx(actual_baseline)
+    assert np.median([item.normalized_disparity for item in estimates]) == pytest.approx(
+        600 / 505, abs=0.03
+    )
+
+
+def test_measurement_corrects_sample_sized_baseline_error():
+    frames = []
+    for offset, distance in ((0, 550), (25, 525), (50, 500)):
+        frames.extend(_triplet(600 / distance, z_offset=offset, camera_z=-offset))
+    calibration = fit_calibration(
+        config_entry_id="bot",
+        point_id=70,
+        capture_z=0,
+        baseline_mm=15,
+        reference_distance_mm=550,
+        z_direction=-1,
+        frames=frames,
+    )
+
+    actual_baseline = 15 * 505 / 469
+    result = analyse_soil_height(
+        _triplet(600 / 505, actual_baseline_mm=actual_baseline), calibration
+    )
+
+    assert result.valid
+    assert result.proposed_z_mm == pytest.approx(-505, abs=2)
+    assert result.metrics["baseline_min_mm"] == pytest.approx(actual_baseline)
+
+
+def test_calibration_uses_recorded_z_motion_instead_of_requested_offset():
+    frames = []
+    for requested_offset, actual_z in ((0, 0), (25, -23), (50, -47)):
+        actual_distance = 550 + actual_z
+        frames.extend(
+            _triplet(
+                600 / actual_distance,
+                z_offset=requested_offset,
+                camera_z=actual_z,
+            )
+        )
+    calibration = fit_calibration(
+        config_entry_id="bot",
+        point_id=70,
+        capture_z=0,
+        baseline_mm=15,
+        reference_distance_mm=550,
+        z_direction=-1,
+        frames=frames,
+    )
+
+    result = analyse_soil_height(_triplet(600 / 505), calibration)
+    assert result.valid
+    assert result.proposed_z_mm == pytest.approx(-505, abs=2)
+
+
+def test_measurement_rejects_z_motion_within_triplet():
+    frames = []
+    for offset, distance in ((0, 550), (25, 525), (50, 500)):
+        frames.extend(_triplet(600 / distance, z_offset=offset, camera_z=-offset))
+    calibration = fit_calibration(
+        config_entry_id="bot",
+        point_id=70,
+        capture_z=0,
+        baseline_mm=15,
+        reference_distance_mm=550,
+        z_direction=-1,
+        frames=frames,
+    )
+    measurement = _triplet(600 / 505)
+    measurement[-1].z = 2
+
+    result = analyse_soil_height(measurement, calibration)
+    assert not result.valid
+    assert "span 2.0 mm in Z" in result.reason
 
 
 def test_guided_calibration_and_measurement_recover_soil_z():
@@ -177,6 +263,47 @@ def test_measurement_rejects_changed_source_geometry():
     result = analyse_soil_height(changed, calibration)
     assert not result.valid
     assert "recalibration" in result.reason
+
+
+def test_pair_disagreement_limit_is_user_configurable(monkeypatch):
+    calibration_frames = sum(
+        (
+            _triplet(600 / distance, z_offset=offset, camera_z=-offset)
+            for offset, distance in ((0, 300), (25, 275), (50, 250))
+        ),
+        [],
+    )
+    calibration = fit_calibration(
+        config_entry_id="bot",
+        point_id=70,
+        capture_z=0,
+        baseline_mm=15,
+        reference_distance_mm=300,
+        z_direction=-1,
+        frames=calibration_frames,
+    )
+
+    def estimate_for_distance(distance):
+        normalized = (
+            (1 / distance) - calibration.inverse_depth_intercept
+        ) / calibration.inverse_depth_slope
+        return _fake_pair(normalized, 0.35, 0.8)
+
+    monkeypatch.setattr(
+        soil_height,
+        "estimate_triplet",
+        lambda _frames: [
+            estimate_for_distance(280),
+            estimate_for_distance(290),
+            estimate_for_distance(400),
+        ],
+    )
+    frames = _triplet(2)
+    strict = analyse_soil_height(frames, calibration, pair_disagreement_limit_mm=8)
+    relaxed = analyse_soil_height(frames, calibration, pair_disagreement_limit_mm=12)
+    assert not strict.valid
+    assert "limit 8 mm" in strict.reason
+    assert relaxed.valid
 
 
 def _minimal_frame(z_offset: float, image_id: int) -> SoilFrame:

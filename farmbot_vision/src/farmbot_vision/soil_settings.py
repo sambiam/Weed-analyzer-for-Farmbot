@@ -8,9 +8,23 @@ from pydantic import BaseModel, Field
 
 
 class SoilSettings(BaseModel):
-    """User-managed clear-soil site planning controls."""
+    """User-managed soil-height planning and automation controls."""
 
     clear_soil_margin_mm: float = Field(default=75, ge=0, le=250)
+    pair_disagreement_limit_mm: float = Field(default=8, ge=1, le=50)
+    scheduled_run_enabled: bool = False
+    scheduled_run_time: str = Field(default="03:00", pattern=r"^(?:[01]\d|2[0-3]):[0-5]\d$")
+    automatic_acceptance_enabled: bool = False
+    automatic_acceptance_confidence_percent: float = Field(default=90, ge=0, le=100)
+    automatic_acceptance_margin_mm: float = Field(default=20, ge=0, le=500)
+    automatic_retry_enabled: bool = False
+    automatic_retry_delay: float = Field(default=15, gt=0, le=168)
+    automatic_retry_unit: str = Field(default="minutes", pattern=r"^(minutes|hours)$")
+
+    @property
+    def automatic_retry_delay_seconds(self) -> float:
+        multiplier = 3600 if self.automatic_retry_unit == "hours" else 60
+        return self.automatic_retry_delay * multiplier
 
 
 class SoilSettingsStore:

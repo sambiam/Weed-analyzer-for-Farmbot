@@ -101,6 +101,7 @@ from .photo_quality import (
 from .radius_change_settings import RadiusChangeSettings, RadiusChangeSettingsStore
 from .settings import Settings
 from .soil_jobs import SoilJobManager
+from .soil_legacy_repair import LegacySoilRepairManager
 from .soil_settings import SoilSettings, SoilSettingsStore
 from .vision import (
     CANDIDATE_EXCLUSION_REACH_CEILING_MM,
@@ -187,6 +188,11 @@ jobs = JobManager(settings, database, client, weed_settings_store, zone_store)
 soil_jobs = SoilJobManager(
     database, client, settings.data_dir, jobs.lock, zone_store, soil_settings_store
 )
+legacy_soil_repair = LegacySoilRepairManager(database, client)
+_soil_automation_state: dict[str, object] = {
+    "last_scheduled_date": None,
+    "handled_retry_jobs": set(),
+}
 weeding_jobs = WeedingJobManager(database, client, jobs, soil_jobs)
 image_file_cache = ImageFileCache(settings.data_dir / "image_cache")
 _vision_image_locks: dict[tuple[str, int, int, int], asyncio.Lock] = {}
@@ -4062,7 +4068,98 @@ async def scheduler() -> None:
         ):
             last_run_date = now.date()
             await jobs.run(trigger="schedule")
+        await _run_soil_automation(now)
         await asyncio.sleep(30)
+
+
+async def _start_automated_soil_measurements(
+    *, point_ids: list[int] | None = None, job_kind: str
+) -> bool:
+    entry_id = settings.selected_config_entry_id
+    if not entry_id or soil_jobs.running:
+        return False
+    calibration = database.active_soil_calibration(entry_id)
+    if calibration is None:
+        LOGGER.info("Skipping automated soil-height run because calibration is missing")
+        return False
+    if point_ids is None:
+        values = soil_settings_store.load()
+        try:
+            _inventory, sites = await soil_jobs.safe_sites(
+                entry_id,
+                calibration.baseline_mm,
+                clear_soil_margin_mm=values.clear_soil_margin_mm,
+            )
+        except HomeAssistantError as err:
+            LOGGER.warning("Could not plan automated soil-height run: %s", err)
+            return False
+        point_ids = [site.point_id for site in sites]
+    if not point_ids:
+        LOGGER.info("Skipping automated soil-height run because no points are available")
+        return False
+    try:
+        soil_jobs.start_measurements(
+            config_entry_id=entry_id,
+            point_ids=point_ids,
+            capture_z=calibration.capture_z,
+            baseline_mm=calibration.baseline_mm,
+            job_kind=job_kind,
+        )
+    except ValueError as err:
+        LOGGER.info("Automated soil-height run was not started: %s", err)
+        return False
+    return True
+
+
+async def _run_soil_automation(now: datetime) -> None:
+    """Start at most one due soil workflow during a scheduler tick."""
+    values = soil_settings_store.load()
+    entry_id = settings.selected_config_entry_id
+    if not entry_id or soil_jobs.running:
+        return
+    local_now = now.astimezone()
+    if (
+        values.scheduled_run_enabled
+        and local_now.strftime("%H:%M") == values.scheduled_run_time
+        and _soil_automation_state["last_scheduled_date"] != local_now.date()
+    ):
+        _soil_automation_state["last_scheduled_date"] = local_now.date()
+        if await _start_automated_soil_measurements(job_kind="measurement_scheduled"):
+            return
+    if not values.automatic_retry_enabled:
+        return
+    latest = database.latest_soil_job(entry_id)
+    handled = _soil_automation_state["handled_retry_jobs"]
+    if (
+        not latest
+        or latest.get("kind") not in {"measurement", "measurement_scheduled"}
+        or latest.get("status") != "complete"
+        or int(latest.get("failed_count") or 0) == 0
+        or not latest.get("completed_at")
+        or latest["id"] in handled
+    ):
+        return
+    completed_at = datetime.fromisoformat(str(latest["completed_at"]))
+    if local_now.astimezone(UTC) < completed_at.astimezone(UTC) + timedelta(
+        seconds=values.automatic_retry_delay_seconds
+    ):
+        return
+    handled.add(latest["id"])
+    started_at = datetime.fromisoformat(str(latest["started_at"]))
+    wanted = set(int(point_id) for point_id in latest.get("point_ids", []))
+    failed_ids: list[int] = []
+    seen: set[int] = set()
+    for measurement in database.recent_soil_measurements(entry_id, 200):
+        point_id = int(measurement["point_id"])
+        if point_id in seen or point_id not in wanted:
+            continue
+        created_at = datetime.fromisoformat(str(measurement["created_at"]))
+        if created_at.astimezone(UTC) < started_at.astimezone(UTC):
+            continue
+        seen.add(point_id)
+        if measurement["status"] == "failed":
+            failed_ids.append(point_id)
+    await _start_automated_soil_measurements(point_ids=failed_ids, job_kind="measurement_retry")
 
 
 async def retention_cleanup() -> None:
@@ -5760,6 +5857,12 @@ async def soil_height_page(request: Request) -> HTMLResponse:
             else:
                 inventory_error = str(exc)
     measurements = database.recent_soil_measurements(entry_id, 200)
+    legacy_summary = (
+        database.legacy_soil_repair_summary(entry_id)
+        if entry_id
+        else {"eligible": 0, "unprocessed": 0, "pending": 0, "unavailable": 0}
+    )
+    pending_legacy_repairs = database.pending_legacy_soil_repairs(entry_id) if entry_id else []
     persisted_job = database.latest_soil_job(entry_id)
     current_job = soil_jobs.current if soil_jobs.running else (persisted_job or soil_jobs.current)
 
@@ -5807,7 +5910,8 @@ async def soil_height_page(request: Request) -> HTMLResponse:
                 )
             point_rows += (
                 "<tr>"
-                f'<td><input form=measure-points type=checkbox name=point_ids value="{site.point_id}"></td>'
+                f"<td><input form=measure-points type=checkbox name=point_ids "
+                f'value="{site.point_id}" data-failed="{str(status == "failed").lower()}"></td>'
                 f"<td>{site.point_id}</td><td>{escape(site.point_name)}</td>"
                 f"<td>{site.expected_x:.1f}, {site.expected_y:.1f}</td>"
                 f"<td>{site.capture_x:.1f}, {site.capture_y:.1f}</td>"
@@ -5914,26 +6018,117 @@ async def soil_height_page(request: Request) -> HTMLResponse:
     retry_values = "".join(
         f'<input type=hidden name=point_ids value="{point_id}">' for point_id in retry_ids
     )
-    live_refresh = (
-        "<script>setTimeout(()=>location.reload(),3000)</script>"
-        if soil_jobs.running or soil_planning_loading
-        else ""
-    )
+    legacy_repair_card = ""
+    if legacy_summary["unprocessed"] or legacy_soil_repair.running:
+        repair_status = escape(str(legacy_soil_repair.current.get("message") or ""))
+        scan_control = (
+            "<p>Checking retained images now. No FarmBot point will be changed during this scan.</p>"
+            if legacy_soil_repair.running
+            else (
+                '<form method=post action="soil/legacy-repair/scan">'
+                f"<button type=submit>Check {legacy_summary['unprocessed']} legacy "
+                "measurement(s)</button></form>"
+            )
+        )
+        legacy_repair_card = f"""<section id=legacy-soil-repair-card class=card>
+ <h3>One-time legacy soil-height repair</h3>
+ <p>Version 2 measurements used the requested stereo movement instead of each
+ exposure's recorded movement. This one-time check reconstructs only those old
+ results and stages differences for confirmation; it never processes v3 results.</p>
+ <p class=muted>{repair_status}</p>{scan_control}</section>"""
+
+    legacy_repair_modal = ""
+    if pending_legacy_repairs:
+        repair_rows = "".join(
+            "<tr>"
+            f'<td><input type=checkbox name=measurement_ids value="{escape(str(item["legacy_measurement_id"]), quote=True)}" checked></td>'
+            f"<td>{escape(str(item['point_name']))}</td>"
+            f"<td>{float(item['old_proposed_z_mm']):.0f} mm</td>"
+            f"<td>{float(item['repaired_z_mm']):.0f} mm</td>"
+            f"<td>{float(item['delta_mm']):+.0f} mm</td>"
+            f"<td>{100 * float(item['confidence'] or 0):.0f}%</td>"
+            f"<td>{'Previously applied' if item['source_status'] == 'applied' else 'Not yet applied'}</td>"
+            "</tr>"
+            for item in pending_legacy_repairs
+        )
+        unavailable_note = (
+            f"<p class=warn>{legacy_summary['unavailable']} other legacy result(s) could not "
+            "be reconstructed because their retained images or metadata were unavailable.</p>"
+            if legacy_summary["unavailable"]
+            else ""
+        )
+        legacy_repair_modal = f"""<div id=legacy-soil-repair-modal class=overlay-modal
+ role=dialog aria-modal=true aria-labelledby=legacy-soil-repair-title><figure class=queue-dialog>
+ <button id=legacy-soil-repair-close class=modal-close type=button aria-label=Close>&times;</button>
+ <h3 id=legacy-soil-repair-title>Confirm corrected legacy soil heights</h3>
+ <p>The source images were recalculated with their recorded camera positions.
+ Nothing below has been written to FarmBot. Applying a correction rechecks that
+ the soil point still matches the legacy result before changing it.</p>{unavailable_note}
+ <form method=post>
+ <table><thead><tr><th>Select</th><th>Point</th><th>Legacy height</th>
+ <th>Corrected height</th><th>Change</th><th>New confidence</th><th>Legacy state</th>
+ </tr></thead><tbody>{repair_rows}</tbody></table>
+ <div class=button-row>
+  <button type=submit formaction="soil/legacy-repair/apply">Apply selected corrections</button>
+  <button type=submit formaction="soil/legacy-repair/reject">Keep existing values for selected</button>
+ </div></form>
+ </figure></div>
+ <script>(()=>{{const modal=document.getElementById('legacy-soil-repair-modal');
+ document.getElementById('legacy-soil-repair-close').addEventListener('click',()=>{{modal.hidden=true;}});
+ modal.querySelector('.modal-close').focus();}})();</script>"""
+
+    refresh_active = soil_jobs.running or soil_planning_loading or legacy_soil_repair.running
+    live_refresh = f"""<div id=soil-refresh-state data-active="{str(refresh_active).lower()}"
+ data-legacy-repair="{str(legacy_soil_repair.running).lower()}" hidden></div>
+<script>
+(() => {{
+  const swapIds=['soil-bot-card','soil-job-card','soil-warning','soil-site-count',
+    'soil-point-rows','soil-measurement-rows','legacy-soil-repair-card'];
+  const legacyRepairWasActive={str(legacy_soil_repair.running).lower()};
+  function isActive(){{
+    const marker=document.getElementById('soil-refresh-state');
+    return !!marker && marker.dataset.active==='true';
+  }}
+  async function poll(){{
+    try{{
+      const response=await fetch(location.href,{{cache:'no-store'}});
+      if(response.ok){{
+        const doc=new DOMParser().parseFromString(await response.text(),'text/html');
+        swapIds.forEach(id => {{
+          const next=doc.getElementById(id);
+          const current=document.getElementById(id);
+          if(next && current) current.innerHTML=next.innerHTML;
+        }});
+        const marker=doc.getElementById('soil-refresh-state');
+        if(legacyRepairWasActive && marker && marker.dataset.legacyRepair!=='true'){{
+          location.reload(); return;
+        }}
+        if(!marker || marker.dataset.active!=='true') return;
+      }}
+    }}catch(_error){{
+      /* Keep the last known state visible during a temporary connection loss. */
+    }}
+    setTimeout(poll,3000);
+  }}
+  if(isActive()) setTimeout(poll,3000);
+}})();
+</script>"""
     body = f"""
 <h2>Supplemental soil-height measurement</h2>
 <p>Finds plant- and weed-free soil within 200 mm of FarmBot soil points that have
 not been updated for more than 14 days. Measurements are captured at those clear
 locations and, after review, replace the assigned stale point.</p>
-{warning}
+{legacy_repair_card}
+<div id=soil-warning>{warning}</div>
 <section class=grid>
- <div class=card><h3>Bot</h3><p>{escape(entry_id or "No FarmBot selected")}</p>
- <p class=muted>{motion_summary}</p><p>{escape(inventory_error)}</p></div>
+ <div class=card><h3>Bot</h3><div id=soil-bot-card><p>{escape(entry_id or "No FarmBot selected")}</p>
+ <p class=muted>{motion_summary}</p><p>{escape(inventory_error)}</p></div></div>
  <div class=card><h3>Calibration</h3><p>{escape(calibration_summary)}</p>
  <p class=warn>Recalibrate after moving, rotating, or refocusing the camera.</p></div>
- <div class=card><h3>Current job</h3><p><strong>{job_status}</strong>: {job_message}</p>
+ <div class=card><h3>Current job</h3><div id=soil-job-card><p><strong>{job_status}</strong>: {job_message}</p>
  {job_detail_html}
  {override_form}
- <form method=post action=soil/stop><button type=submit>Stop after current point</button></form></div>
+ <form method=post action=soil/stop><button type=submit>Stop after current point</button></form></div></div>
 </section>
 <section class=card>
  <h3>Guided calibration</h3>
@@ -5977,12 +6172,43 @@ axis limits and do not need an existing soil point.</p>
  </script>
 </section>
 <section class=card>
- <h3>Clear-soil replacements ({site_count} from {point_count} existing points)</h3>
+ <h3>Automation and quality settings</h3>
  <form method=post action=soil/settings>
-  <label>Clear-soil margin (mm) <input type=number name=clear_soil_margin_mm
-   min=0 max=250 step=1 value="{soil_values.clear_soil_margin_mm:g}" required></label>
-  <button type=submit>Save margin</button>
+  <fieldset><legend>Daily measurement run</legend>
+   <label><input type=checkbox name=scheduled_run_enabled value=true{" checked" if soil_values.scheduled_run_enabled else ""}>
+    Automatically measure every available soil point each day</label><br>
+   <label>Run time <input type=time name=scheduled_run_time value="{soil_values.scheduled_run_time}" required></label>
+   <span class=muted>Uses the add-on's local time ({escape(datetime.now().astimezone().tzname() or "local")}).</span>
+  </fieldset>
+  <fieldset><legend>Automatic acceptance</legend>
+   <label><input type=checkbox name=automatic_acceptance_enabled value=true{" checked" if soil_values.automatic_acceptance_enabled else ""}>
+    Automatically apply results that pass both limits</label><br>
+   <label>Minimum confidence (%) <input type=number name=automatic_acceptance_confidence_percent
+    min=0 max=100 step=1 value="{soil_values.automatic_acceptance_confidence_percent:g}" required></label>
+   <label>Maximum change from original height (mm) <input type=number name=automatic_acceptance_margin_mm
+    min=0 max=500 step=1 value="{soil_values.automatic_acceptance_margin_mm:g}" required></label>
+  </fieldset>
+  <fieldset><legend>Failed measurement retry</legend>
+   <label><input type=checkbox name=automatic_retry_enabled value=true{" checked" if soil_values.automatic_retry_enabled else ""}>
+    Retry failed measurements once after each completed run</label><br>
+   <label>Retry after <input type=number name=automatic_retry_delay min=0.1 max=168 step=0.1
+    value="{soil_values.automatic_retry_delay:g}" required></label>
+   <select name=automatic_retry_unit aria-label="Retry delay unit">
+    <option value=minutes{" selected" if soil_values.automatic_retry_unit == "minutes" else ""}>minutes</option>
+    <option value=hours{" selected" if soil_values.automatic_retry_unit == "hours" else ""}>hours</option>
+   </select>
+  </fieldset>
+  <fieldset><legend>Measurement quality</legend>
+   <label>Clear-soil margin (mm) <input type=number name=clear_soil_margin_mm
+    min=0 max=250 step=1 value="{soil_values.clear_soil_margin_mm:g}" required></label>
+   <label>Maximum stereo-pair disagreement (mm) <input type=number name=pair_disagreement_limit_mm
+    min=1 max=50 step=0.5 value="{soil_values.pair_disagreement_limit_mm:g}" required></label>
+  </fieldset>
+  <button type=submit>Save soil-height settings</button>
  </form>
+</section>
+<section class=card>
+ <h3>Clear-soil replacements (<span id=soil-site-count>{site_count} from {point_count} existing points</span>)</h3>
  <p class=muted>Each candidate has a {soil_values.clear_soil_margin_mm:g} mm clear-soil margin, expanded for the
 stereo movement, around all current FarmBot plants and weeds, the latest
 detected plant canopies, and pending or created Vision weeds. Fresh points and
@@ -5991,8 +6217,10 @@ can expose lower-confidence sites when little clear soil is available.</p>
  <form id=measure-points method=post action=soil/measure>
   <label>Capture Z (mm){capture_z_hint} <input type=number step=0.1 name=capture_z
    value="{default_capture_z:g}" required></label>
-  <label>Baseline (mm){baseline_hint} <input type=number min=5 max=30 step=0.1 name=baseline_mm
+ <label>Baseline (mm){baseline_hint} <input type=number min=5 max=30 step=0.1 name=baseline_mm
    value="{default_baseline:g}" required></label>
+  <button type=button id=select-all-soil>Select all</button>
+  <button type=button id=select-failed-soil>Select all failed</button>
   <button type=submit name=mode value=selected>Measure selected</button>
   <button type=submit name=mode value=all>Measure all</button>
  </form>
@@ -6021,7 +6249,14 @@ capture location.</p>
  <th>Clear X, Y</th><th>Move</th><th>Last updated</th><th>Current Z</th>
  <th>Proposed Z</th><th>Uncertainty</th><th>Confidence</th>
  <th>Status</th><th>Message</th><th>Diagnostics</th><th>Review</th></tr></thead>
- <tbody>{point_rows or "<tr><td colspan=15>No stale point has a safe clear-soil site within 200 mm.</td></tr>"}</tbody></table>
+ <tbody id=soil-point-rows>{point_rows or "<tr><td colspan=15>No stale point has a safe clear-soil site within 200 mm.</td></tr>"}</tbody></table>
+ <script>
+ (() => {{
+  const boxes=()=>Array.from(document.querySelectorAll('#soil-point-rows input[name=point_ids]'));
+  document.getElementById('select-all-soil').addEventListener('click',()=>boxes().forEach(box=>box.checked=true));
+  document.getElementById('select-failed-soil').addEventListener('click',()=>boxes().forEach(box=>box.checked=box.dataset.failed==='true'));
+ }})();
+ </script>
 </section>
 <section class=card>
  <h3>Pending valid results</h3>
@@ -6031,8 +6266,9 @@ capture location.</p>
  <table><thead><tr><th>Select</th><th>Point</th><th>Old X, Y</th><th>New X, Y</th>
  <th>Old Z</th><th>Proposed Z</th>
  <th>Confidence</th><th>Quality result</th></tr></thead>
- <tbody>{measurement_rows or "<tr><td colspan=8>No unapplied valid results.</td></tr>"}</tbody></table>
+ <tbody id=soil-measurement-rows>{measurement_rows or "<tr><td colspan=8>No unapplied valid results.</td></tr>"}</tbody></table>
 </section>
+ {legacy_repair_modal}
  {live_refresh}"""  # noqa: S608 - HTML template; no SQL is constructed here.
     return layout(request, body, "Soil height · FarmBot Vision")
 
@@ -6123,12 +6359,80 @@ async def override_soil_calibration(job_id: str = Form(...)) -> RedirectResponse
     return RedirectResponse("../soil-height", status_code=303)
 
 
+@app.post("/soil/legacy-repair/scan")
+async def start_legacy_soil_repair() -> RedirectResponse:
+    entry_id = settings.selected_config_entry_id
+    if not entry_id:
+        raise HTTPException(409, "No FarmBot config entry is selected")
+    try:
+        legacy_soil_repair.start(entry_id)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return RedirectResponse("../../soil-height", status_code=303)
+
+
+def _validated_legacy_measurement_ids(values: list[str] | None) -> list[str]:
+    result = []
+    for value in values or []:
+        try:
+            result.append(str(UUID(value)))
+        except ValueError as exc:
+            raise HTTPException(422, "Malformed legacy soil measurement ID") from exc
+    if not result:
+        raise HTTPException(422, "Select at least one legacy correction")
+    return result
+
+
+@app.post("/soil/legacy-repair/apply")
+async def apply_legacy_soil_repairs(
+    measurement_ids: Annotated[list[str] | None, Form()] = None,
+) -> RedirectResponse:
+    entry_id = settings.selected_config_entry_id
+    if not entry_id:
+        raise HTTPException(409, "No FarmBot config entry is selected")
+    await legacy_soil_repair.apply_selected(
+        entry_id, _validated_legacy_measurement_ids(measurement_ids)
+    )
+    return RedirectResponse("../../soil-height", status_code=303)
+
+
+@app.post("/soil/legacy-repair/reject")
+async def reject_legacy_soil_repairs(
+    measurement_ids: Annotated[list[str] | None, Form()] = None,
+) -> RedirectResponse:
+    entry_id = settings.selected_config_entry_id
+    if not entry_id:
+        raise HTTPException(409, "No FarmBot config entry is selected")
+    legacy_soil_repair.reject_selected(entry_id, _validated_legacy_measurement_ids(measurement_ids))
+    return RedirectResponse("../../soil-height", status_code=303)
+
+
 @app.post("/soil/settings")
 async def save_soil_settings(
     clear_soil_margin_mm: float = Form(...),
+    pair_disagreement_limit_mm: float = Form(8),
+    scheduled_run_enabled: bool = Form(False),
+    scheduled_run_time: str = Form("03:00"),
+    automatic_acceptance_enabled: bool = Form(False),
+    automatic_acceptance_confidence_percent: float = Form(90),
+    automatic_acceptance_margin_mm: float = Form(20),
+    automatic_retry_enabled: bool = Form(False),
+    automatic_retry_delay: float = Form(15),
+    automatic_retry_unit: str = Form("minutes"),
 ) -> RedirectResponse:
     try:
-        values = SoilSettings(clear_soil_margin_mm=clear_soil_margin_mm)
+        values = SoilSettings(
+            clear_soil_margin_mm=clear_soil_margin_mm,
+            pair_disagreement_limit_mm=pair_disagreement_limit_mm,
+            scheduled_run_enabled=scheduled_run_enabled,
+            scheduled_run_time=scheduled_run_time,
+            automatic_acceptance_enabled=automatic_acceptance_enabled,
+            automatic_acceptance_confidence_percent=automatic_acceptance_confidence_percent,
+            automatic_acceptance_margin_mm=automatic_acceptance_margin_mm,
+            automatic_retry_enabled=automatic_retry_enabled,
+            automatic_retry_delay=automatic_retry_delay,
+            automatic_retry_unit=automatic_retry_unit,
+        )
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from exc
     soil_settings_store.save(values)
@@ -6169,6 +6473,7 @@ async def start_soil_measurement(
             custom_y=custom_y if mode == "custom" else None,
             capture_z=capture_z,
             baseline_mm=baseline_mm,
+            job_kind="measurement_retry" if mode == "retry" else "measurement",
         )
     except ValueError as exc:
         raise HTTPException(409, str(exc)) from exc
@@ -6187,6 +6492,7 @@ async def _apply_soil_measurement(measurement_id: str) -> dict:
     if (
         measurement is None
         or measurement["status"] != "valid"
+        or measurement["algorithm_version"] == "soil-stereo-v2"
         or measurement["proposed_z_mm"] is None
         or measurement.get("capture_x") is None
         or measurement.get("capture_y") is None

@@ -1,5 +1,54 @@
 # Changelog
 
+## 3.27.0 - 2026-08-04
+
+- Added a one-time repair workflow for valid or previously applied
+  `soil-stereo-v2` height measurements. It re-downloads the retained calibration
+  and measurement images, reconstructs their recorded X/Y/Z positions, and
+  stages v3 results without changing FarmBot.
+- Added an automatically shown comparison modal listing each detected legacy
+  height change, its signed difference, confidence, and whether the old result
+  had already been applied. Corrections require explicit selection and human
+  confirmation; users can instead keep the existing values.
+- Persist each legacy repair outcome so unchanged, unavailable, applied,
+  rejected, or conflicted rows cannot be processed again. Once every eligible
+  v2 row is resolved, the workflow and its controls disappear permanently.
+- Blocked legacy v2 results from the ordinary soil-result apply routes so the
+  confirmation modal is the only application path for a staged correction.
+
+## 3.26.1 - 2026-08-04
+
+- Fixed a systematic soil-height scale error caused by normalizing disparity
+  with the requested camera baseline. Stereo pairs now use the X/Y positions
+  recorded on each exposure, so a real 16.15 mm move is no longer treated as
+  the nominal 15 mm move (the supplied 505 mm example otherwise reads about
+  469 mm while all three pairs misleadingly agree).
+- Guided calibration now derives each known depth from the recorded Z position
+  instead of the requested 0/25/50 mm movement. Calibration and measurement
+  also fail closed if the three exposures drift by more than 1 mm in Z.
+- Bumped the soil stereo algorithm to v3. Existing soil calibrations require a
+  one-time recalibration so v2 baseline normalization cannot be reused.
+
+## 3.26.0 - 2026-08-04
+
+- Added daily automated runs for all available soil-height measurement sites,
+  configured by local run time from the Soil height tab.
+- Added optional automatic acceptance using both a minimum confidence and a
+  maximum change from the point's original height.
+- Added a minutes-or-hours delay for one automatic retry of failed points after
+  each manual or scheduled run.
+- Added Select all and Select all failed controls to the soil-point table.
+- Made the stereo-pair disagreement failure limit configurable instead of
+  fixing it at 8 mm.
+
+## 3.25.2 - 2026-08-04
+
+- Stopped the Soil height page from reloading the whole page every few
+  seconds while a calibration or measurement job runs. It now patches just
+  the job status, review table and pending-results table in place over
+  AJAX, so scroll position, open dropdowns and in-progress form input are no
+  longer reset out from under the user.
+
 ## 3.25.1 - 2026-08-03
 
 - Fixed every batched soil status response failing strict validation because

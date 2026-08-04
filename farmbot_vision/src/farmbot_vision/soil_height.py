@@ -20,7 +20,7 @@ import numpy as np
 from .models import SoilStereoCalibration
 from .vision import ScaleParams, vegetation_mask
 
-ALGORITHM_VERSION = "soil-stereo-v2"
+ALGORITHM_VERSION = "soil-stereo-v3"
 # A few percent of a megapixel image still provides tens of thousands of
 # independently checked disparities.  The old 15% whole-frame threshold was
 # dominated by portrait rotation borders and SGBM's deliberately unmatchable
@@ -31,6 +31,7 @@ MAX_LR_ERROR_PX = 1.5
 MAX_PLANE_MAD_PX = 2.0
 MAX_PAIR_SPREAD_MM = 8.0
 MAX_UNCERTAINTY_MM = 10.0
+MAX_TRIPLET_Z_SPREAD_MM = 1.0
 
 
 class SoilHeightError(RuntimeError):
@@ -328,7 +329,15 @@ def estimate_pair(
     *,
     expected_disparity: float | None = None,
 ) -> PairEstimate:
-    baseline = abs(second.lateral_offset_mm - first.lateral_offset_mm)
+    # Disparity scales with the distance the camera actually travelled, not
+    # the requested lateral offsets. FarmBot image metadata records the
+    # position of every exposure and can legitimately differ from a 15 mm
+    # request by enough to create a large, systematic depth error. Because
+    # the same scale error affects all three pairs, cross-pair agreement does
+    # not detect it.
+    baseline = math.hypot(second.x - first.x, second.y - first.y)
+    if not math.isfinite(baseline):
+        raise SoilHeightError("stereo frame positions are invalid")
     if baseline < 4.99:
         raise SoilHeightError("stereo baseline is too small")
     first_color, second_color = _decode(first), _decode(second)
@@ -415,7 +424,7 @@ def estimate_triplet(frames: list[SoilFrame]) -> list[PairEstimate]:
     if estimates:
         expected_outer = float(
             np.median([item.normalized_disparity for item in estimates])
-            * abs(outer_second.lateral_offset_mm - outer_first.lateral_offset_mm)
+            * math.hypot(outer_second.x - outer_first.x, outer_second.y - outer_first.y)
         )
     try:
         estimates.append(
@@ -461,7 +470,20 @@ def fit_calibration(
     samples = []
     warnings: list[str] = []
     for z_offset, group in sorted(groups.items()):
-        distance = reference_distance_mm - z_offset
+        z_positions = np.array([frame.z for frame in group], dtype=np.float64)
+        if not np.all(np.isfinite(z_positions)):
+            raise SoilHeightError("calibration frame Z positions are invalid")
+        z_spread = float(np.ptp(z_positions))
+        if z_spread > MAX_TRIPLET_Z_SPREAD_MM:
+            raise SoilHeightError(
+                f"calibration frames at {z_offset:g} mm span {z_spread:.1f} mm in Z"
+            )
+        # z_offset_mm is the requested motion and is retained only for grouping
+        # each triplet. Use the positions recorded on the images for the known
+        # calibration distance, just as pair normalization uses actual X/Y.
+        actual_z = float(np.median(z_positions))
+        movement_toward_soil = (-1 if z_direction < 0 else 1) * (actual_z - capture_z)
+        distance = reference_distance_mm - movement_toward_soil
         if distance <= 0:
             raise SoilHeightError("calibration movement reaches or passes the soil")
         triplet_estimates = estimate_triplet(group)
@@ -554,6 +576,7 @@ def analyse_soil_height(
     calibration: SoilStereoCalibration,
     *,
     declared_camera_signature: str = "",
+    pair_disagreement_limit_mm: float = MAX_PAIR_SPREAD_MM,
 ) -> SoilAnalysis:
     result = SoilAnalysis()
     try:
@@ -566,6 +589,12 @@ def analyse_soil_height(
             raise SoilHeightError("camera geometry changed; recalibration is required")
         estimates = estimate_triplet(frames)
         result.artifacts.update(_pair_artifacts(estimates))
+        z_positions = np.array([frame.z for frame in frames], dtype=np.float64)
+        if not np.all(np.isfinite(z_positions)):
+            raise SoilHeightError("measurement frame Z positions are invalid")
+        z_spread = float(np.ptp(z_positions))
+        if z_spread > MAX_TRIPLET_Z_SPREAD_MM:
+            raise SoilHeightError(f"measurement frames span {z_spread:.1f} mm in Z")
         passing = [estimate for estimate in estimates if estimate.passes_geometry]
         if len(passing) < 2:
             summary = _pair_gate_summary(estimates)
@@ -592,15 +621,18 @@ def analyse_soil_height(
             key=lambda pair: pair[1][0] - pair[0][0],
         )
         agreeing = [first, second]
-        if len(converted) == 3 and converted[-1][0] - converted[0][0] <= MAX_PAIR_SPREAD_MM:
+        if len(converted) == 3 and converted[-1][0] - converted[0][0] <= pair_disagreement_limit_mm:
             agreeing = converted
         distances = [item[0] for item in agreeing]
         agreeing_estimates = [item[1] for item in agreeing]
         spread = float(max(distances) - min(distances))
         distance = float(np.median(distances))
         uncertainty = max(calibration.residual_mm, spread / 2)
-        if spread > MAX_PAIR_SPREAD_MM:
-            raise SoilHeightError(f"stereo pairs disagree by {spread:.1f} mm")
+        if spread > pair_disagreement_limit_mm:
+            raise SoilHeightError(
+                f"stereo pairs disagree by {spread:.1f} mm "
+                f"(limit {pair_disagreement_limit_mm:g} mm)"
+            )
         if uncertainty > MAX_UNCERTAINTY_MM:
             raise SoilHeightError(f"measurement uncertainty is {uncertainty:.1f} mm")
         camera_z = float(np.median([frame.z for frame in frames]))
@@ -615,7 +647,7 @@ def analyse_soil_height(
                 + 0.20 * min(1.0, support / 0.8)
                 + 0.15 * max(0.0, 1 - lr_error / MAX_LR_ERROR_PX)
                 + 0.15 * max(0.0, 1 - plane_mad / MAX_PLANE_MAD_PX)
-                + 0.15 * max(0.0, 1 - spread / MAX_PAIR_SPREAD_MM)
+                + 0.15 * max(0.0, 1 - spread / pair_disagreement_limit_mm)
                 + 0.15 * max(0.0, 1 - calibration.residual_mm / 5.0),
                 0,
                 0.99,
@@ -633,6 +665,9 @@ def analyse_soil_height(
             "plane_mad_px": plane_mad,
             "pair_spread_mm": spread,
             "distance_mm": distance,
+            "baseline_min_mm": min(item.baseline_mm for item in agreeing_estimates),
+            "baseline_max_mm": max(item.baseline_mm for item in agreeing_estimates),
+            "frame_z_spread_mm": z_spread,
             "passing_pairs": len(passing),
             "agreeing_pairs": len(agreeing),
         }
