@@ -1,5 +1,13 @@
 # Changelog
 
+## 3.28.1 - 2026-08-04
+
+- Fixed protected-plant routing so a cut that would finish inside mounted-tool
+  clearance is skipped before it can trap the route and make later weeds
+  unreachable.
+- Changed an all-skipped weeding plan to complete normally with per-weed skip
+  reasons instead of failing the entire batch.
+
 ## 3.28.0 - 2026-08-04
 
 - Added independent, opt-in tool verification controls for rotary-tool loading

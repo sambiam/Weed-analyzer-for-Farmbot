@@ -15,6 +15,7 @@ from farmbot_vision.weeding import (
     recent_soil_samples,
     safe_transit_waypoints,
 )
+from farmbot_vision.weeding_jobs import WeedingJobManager
 
 
 def plant(plant_id: int, x: float, y: float, radius: float = 30) -> Plant:
@@ -137,6 +138,28 @@ def test_tall_plant_transit_routes_around_canopy():
     )
     assert route
     assert any(abs(point["y"] - 500) > 80 for point in route)
+
+
+def test_tall_plant_transit_rejects_only_an_endpoint_inside_clearance():
+    obstacle = plant(1, 500, 500, radius=80).model_copy(update={"height_mm": 450})
+    protected = protected_tall_plants([obstacle], enabled=True, minimum_height_mm=300)
+    with pytest.raises(ValueError, match="endpoint|starts"):
+        safe_transit_waypoints(
+            (500, 500),
+            (500, 500),
+            protected,
+            x_bounds=(0, 1000),
+            y_bounds=(0, 1000),
+        )
+
+
+def test_all_individually_skipped_weeds_complete_without_failing_batch():
+    manager = object.__new__(WeedingJobManager)
+    manager.current = {"status": "planning", "weeds_skipped": 3}
+    manager._complete_all_skipped()
+    assert manager.current["status"] == "complete"
+    assert manager.current["message"] == "No weeds were mown; 3 weed(s) were safely skipped"
+    assert manager.current["completed_at"]
 
 
 def test_unknown_height_is_protected_but_option_can_be_disabled():

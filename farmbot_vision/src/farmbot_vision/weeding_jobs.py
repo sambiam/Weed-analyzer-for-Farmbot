@@ -264,6 +264,15 @@ class WeedingJobManager:
                     }
                 )
 
+    def _complete_all_skipped(self) -> None:
+        """Finish normally when planning found no safely mowable weed."""
+        skipped = int(self.current.get("weeds_skipped", 0))
+        self.current.update(
+            status="complete",
+            message=f"No weeds were mown; {skipped} weed(s) were safely skipped",
+            completed_at=datetime.now(UTC).isoformat(),
+        )
+
     async def _run(self, *, entry_id: str, weed_ids: list[int], options: dict) -> None:
         try:
             self.current.update(
@@ -351,7 +360,10 @@ class WeedingJobManager:
                     self.current["results"].append(
                         {"weed_id": weed.id, "status": "skipped", "reason": str(err)}
                     )
-            if not paths or self.stop_requested:
+            if not paths and not self.stop_requested:
+                self._complete_all_skipped()
+                return
+            if self.stop_requested:
                 raise RuntimeError("no weed has both a safe path and a trustworthy soil height")
             position = soil_inventory.motion.position
             ordered = nearest_neighbour_order(
@@ -377,6 +389,18 @@ class WeedingJobManager:
             routed: list[CutPath] = []
             for path in ordered:
                 try:
+                    # A cut endpoint that is inside mounted-tool clearance can
+                    # trap the route after this weed and make every later weed
+                    # appear unreachable. Reject only this weed before adding
+                    # it to the batch, while the previous safe position is
+                    # still available for planning the remaining candidates.
+                    safe_transit_waypoints(
+                        (path.end_x, path.end_y),
+                        (path.end_x, path.end_y),
+                        protected,
+                        x_bounds=x_bounds,
+                        y_bounds=y_bounds,
+                    )
                     waypoints = safe_transit_waypoints(
                         current_xy,
                         (path.start_x, path.start_y),
@@ -404,7 +428,8 @@ class WeedingJobManager:
                 routed.append(path)
                 current_xy = (path.end_x, path.end_y)
             if not targets:
-                raise RuntimeError("no mounted-tool route safely avoids protected plants")
+                self._complete_all_skipped()
+                return
             ordered = routed
             self.current.update(status="weeding", paths=[asdict(path) for path in ordered])
             integration_options = {
@@ -438,7 +463,8 @@ class WeedingJobManager:
                 status="complete",
                 message=(
                     f"Weeding complete: {self.current['weeds_removed']} removed after photo "
-                    f"verification, {self.current['weeds_remaining']} retained"
+                    f"verification, {self.current['weeds_remaining']} retained, "
+                    f"{self.current['weeds_skipped']} safely skipped"
                 ),
                 completed_at=datetime.now(UTC).isoformat(),
             )
