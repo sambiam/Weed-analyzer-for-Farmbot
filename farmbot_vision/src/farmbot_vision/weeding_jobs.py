@@ -29,7 +29,7 @@ from .weeding import (
     plan_cut_path,
     protected_tall_plants,
     recent_soil_samples,
-    safe_transit_waypoints,
+    route_cut_path,
 )
 
 LOGGER = logging.getLogger(__name__)
@@ -390,9 +390,9 @@ class WeedingJobManager:
             routed: list[CutPath] = []
             for path in ordered:
                 try:
-                    waypoints = safe_transit_waypoints(
+                    path, waypoints = route_cut_path(
                         current_xy,
-                        (path.start_x, path.start_y),
+                        path,
                         protected,
                         x_bounds=x_bounds,
                         y_bounds=y_bounds,

@@ -1,5 +1,16 @@
 # Changelog
 
+## 3.29.0 - 2026-08-05
+
+- Changed tall-plant transit planning to sample obstacle boundaries at twice
+  the previous resolution and to retry the opposite end of every safe cut.
+  The rotary tool remains at FarmBot's maximum Z travel height while routing,
+  but can now approach a reachable weed from the other side of a canopy
+  cluster instead of skipping it after one failed approach.
+- Requires companion integration 2.11.0, which accelerates the safe portion
+  of Z descent and reserves slow movement for Z = -300 mm and below, avoiding
+  movement timeouts caused by a 25% descent across the full Z range.
+
 ## 3.28.3 - 2026-08-04
 
 - Fixed the shared FarmBot starting position causing every weed transit to be

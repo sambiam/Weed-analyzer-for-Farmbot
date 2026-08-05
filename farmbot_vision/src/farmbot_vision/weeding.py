@@ -18,7 +18,7 @@ PATH_OVERHANG_MM = 30.0
 MAX_PATH_LENGTH_MM = 220.0
 PLANT_MARGIN_MM = 25.0
 TRANSIT_MARGIN_MM = 40.0
-TRANSIT_CIRCLE_POINTS = 16
+TRANSIT_CIRCLE_POINTS = 32
 
 
 @dataclass(frozen=True, slots=True)
@@ -280,6 +280,52 @@ def safe_transit_waypoints(
         node = previous[node]
     route.reverse()
     return [{"x": nodes[index][0], "y": nodes[index][1]} for index in route[1:-1]]
+
+
+def route_cut_path(
+    start: tuple[float, float],
+    path: CutPath,
+    plants: Iterable[Plant],
+    *,
+    x_bounds: tuple[float, float],
+    y_bounds: tuple[float, float],
+    margin_mm: float = TRANSIT_MARGIN_MM,
+    endpoint_margin_mm: float | None = None,
+) -> tuple[CutPath, list[dict[str, float]]]:
+    """Route to either end of a cut, preferring its planned orientation.
+
+    A straight cut is safe in both directions. Trying its far end before
+    giving up lets a maximum-height transit approach an otherwise reachable
+    weed from the other side of a tall-plant cluster.
+    """
+    reverse = CutPath(
+        weed_id=path.weed_id,
+        start_x=path.end_x,
+        start_y=path.end_y,
+        end_x=path.start_x,
+        end_y=path.start_y,
+        angle_degrees=path.angle_degrees,
+        length_mm=path.length_mm,
+        minimum_plant_clearance_mm=path.minimum_plant_clearance_mm,
+        soil_z=path.soil_z,
+        soil_method=path.soil_method,
+    )
+    failures: list[str] = []
+    plants = list(plants)
+    for candidate in (path, reverse):
+        try:
+            return candidate, safe_transit_waypoints(
+                start,
+                (candidate.start_x, candidate.start_y),
+                plants,
+                x_bounds=x_bounds,
+                y_bounds=y_bounds,
+                margin_mm=margin_mm,
+                endpoint_margin_mm=endpoint_margin_mm,
+            )
+        except ValueError as err:
+            failures.append(str(err))
+    raise ValueError(f"neither cut approach is reachable: {'; '.join(dict.fromkeys(failures))}")
 
 
 def _bounded_segment(

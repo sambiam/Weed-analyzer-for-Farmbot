@@ -7,12 +7,14 @@ import pytest
 
 from farmbot_vision.models import Plant, SoilPoint, WeedPoint
 from farmbot_vision.weeding import (
+    CutPath,
     SoilSample,
     confirmed_weeds,
     estimate_soil_height,
     plan_cut_path,
     protected_tall_plants,
     recent_soil_samples,
+    route_cut_path,
     safe_transit_waypoints,
 )
 from farmbot_vision.weeding_jobs import WeedingJobManager
@@ -208,6 +210,33 @@ def test_transit_inside_clearance_cannot_move_deeper_before_escaping():
     )
     assert route
     assert route[0]["x"] < 410
+
+
+def test_cut_route_retries_the_opposite_approach_end():
+    obstacle = plant(1, 500, 500, radius=80).model_copy(update={"height_mm": 450})
+    path = CutPath(
+        weed_id=7,
+        start_x=500,
+        start_y=500,
+        end_x=100,
+        end_y=500,
+        angle_degrees=0,
+        length_mm=400,
+        minimum_plant_clearance_mm=25,
+        soil_z=-430,
+        soil_method="test",
+    )
+    routed, waypoints = route_cut_path(
+        (900, 500),
+        path,
+        [obstacle],
+        x_bounds=(0, 1000),
+        y_bounds=(0, 1000),
+        endpoint_margin_mm=25,
+    )
+    assert (routed.start_x, routed.start_y) == (100, 500)
+    assert (routed.end_x, routed.end_y) == (500, 500)
+    assert waypoints
 
 
 def test_all_individually_skipped_weeds_complete_without_failing_batch():
