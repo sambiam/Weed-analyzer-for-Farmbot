@@ -210,6 +210,69 @@ def _distance_to_segment(
     return math.hypot(x - (x1 + t * dx), y - (y1 + t * dy))
 
 
+def segment_intersects_zone(
+    zone: Zone, start: tuple[float, float], end: tuple[float, float]
+) -> bool:
+    """Return whether a closed line segment touches a zone."""
+    if zone.contains_point(*start) or zone.contains_point(*end):
+        return True
+    if zone.shape is ZoneShape.CIRCLE:
+        return _distance_to_segment(zone.center_x, zone.center_y, start, end) <= zone.radius_mm
+    if zone.shape is ZoneShape.RECTANGLE:
+        points = [
+            (zone.min_x, zone.min_y),
+            (zone.max_x, zone.min_y),
+            (zone.max_x, zone.max_y),
+            (zone.min_x, zone.max_y),
+        ]
+    else:
+        points = zone.points
+    return any(
+        _segments_intersect(start, end, edge_start, edge_end)
+        for edge_start, edge_end in zip(points, points[1:] + points[:1], strict=True)
+    )
+
+
+def _segments_intersect(
+    a: tuple[float, float],
+    b: tuple[float, float],
+    c: tuple[float, float],
+    d: tuple[float, float],
+) -> bool:
+    """Closed-segment intersection, including collinear edge contact."""
+
+    def orientation(
+        first: tuple[float, float], second: tuple[float, float], third: tuple[float, float]
+    ) -> float:
+        return (second[0] - first[0]) * (third[1] - first[1]) - (second[1] - first[1]) * (
+            third[0] - first[0]
+        )
+
+    def on_segment(
+        first: tuple[float, float], point: tuple[float, float], second: tuple[float, float]
+    ) -> bool:
+        return (
+            min(first[0], second[0]) - 1e-9 <= point[0] <= max(first[0], second[0]) + 1e-9
+            and min(first[1], second[1]) - 1e-9 <= point[1] <= max(first[1], second[1]) + 1e-9
+        )
+
+    o1, o2 = orientation(a, b, c), orientation(a, b, d)
+    o3, o4 = orientation(c, d, a), orientation(c, d, b)
+    if (o1 > 1e-9 and o2 < -1e-9 or o1 < -1e-9 and o2 > 1e-9) and (
+        o3 > 1e-9 and o4 < -1e-9 or o3 < -1e-9 and o4 > 1e-9
+    ):
+        return True
+    return any(
+        abs(value) <= 1e-9 and on_segment(first, point, second)
+        for value, first, point, second in (
+            (o1, a, c, b),
+            (o2, a, d, b),
+            (o3, c, a, d),
+            (o4, c, b, d),
+        )
+    )
+
+
 def evaluate(
     zones: list[Zone],
     aspect: ZoneAspect,

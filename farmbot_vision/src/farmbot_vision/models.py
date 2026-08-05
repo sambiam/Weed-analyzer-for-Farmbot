@@ -401,6 +401,38 @@ class SoilSite(StrictModel):
     clearance_mm: float = Field(ge=0)
 
 
+class SoilGridPoint(StrictModel):
+    """One nominal grid location and the capture decision made for it."""
+
+    grid_x: float
+    grid_y: float
+    point_id: int | None = Field(default=None, gt=0)
+    point_name: str | None = None
+    expected_x: float | None = None
+    expected_y: float | None = None
+    expected_z: float | None = None
+    point_updated_at: datetime | None = None
+    capture_x: float | None = None
+    capture_y: float | None = None
+    deviation_mm: float | None = Field(default=None, ge=0, lt=200)
+    clearance_mm: float | None = None
+    status: Literal["clear", "replaced", "skipped"]
+    explanation: str
+
+
+class SoilGridPlan(StrictModel):
+    """Previewable clear-soil-aware plan for a complete measurement grid."""
+
+    spacing_mm: float = Field(gt=0)
+    maximum_deviation_mm: float = Field(ge=0, lt=200)
+    clear_soil_margin_mm: float = Field(ge=0)
+    points: list[SoilGridPoint]
+
+    @property
+    def accepted_points(self) -> list[SoilGridPoint]:
+        return [point for point in self.points if point.status != "skipped"]
+
+
 class SoilCaptureStartRequest(StrictModel):
     config_entry_id: str
     point_id: int | None = Field(default=None, gt=0)

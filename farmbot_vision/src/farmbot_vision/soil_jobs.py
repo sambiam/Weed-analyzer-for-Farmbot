@@ -17,6 +17,7 @@ from .models import (
     ApplySoilHeightRequest,
     InventoryRequest,
     SoilCaptureStartRequest,
+    SoilGridPlan,
     SoilMeasurement,
     SoilPoint,
     SoilPointInventory,
@@ -34,7 +35,7 @@ from .soil_height import (
     analyse_soil_height,
     fit_calibration,
 )
-from .soil_sites import plan_safe_soil_sites
+from .soil_sites import plan_safe_soil_sites, plan_soil_measurement_grid
 from .zones import ZoneStore
 
 LOGGER = logging.getLogger(__name__)
@@ -171,6 +172,38 @@ class SoilJobManager:
             name="soil-measurement",
         )
 
+    def start_grid_measurements(
+        self,
+        *,
+        config_entry_id: str,
+        spacing_mm: float,
+        maximum_deviation_mm: float,
+        capture_z: float,
+        baseline_mm: float,
+    ) -> str:
+        """Start a confirmed grid, which is replanned again under the job lock."""
+
+        if not math.isfinite(spacing_mm) or not 50 <= spacing_mm <= 5000:
+            raise ValueError("soil grid spacing must be from 50 to 5000 mm")
+        if not math.isfinite(maximum_deviation_mm) or not 0 <= maximum_deviation_mm < 200:
+            raise ValueError("maximum grid deviation must be from 0 up to 199 mm")
+        return self._start(
+            lambda job_id: self._run_measurements(
+                job_id=job_id,
+                config_entry_id=config_entry_id,
+                point_ids=[],
+                custom_point_id=None,
+                custom_x=None,
+                custom_y=None,
+                capture_z=capture_z,
+                baseline_mm=baseline_mm,
+                job_kind="measurement_grid",
+                grid_spacing_mm=spacing_mm,
+                grid_maximum_deviation_mm=maximum_deviation_mm,
+            ),
+            name="soil-grid-measurement",
+        )
+
     def request_stop(self) -> None:
         """Stop before the next point; never interrupt the bot's atomic RPC."""
         self.stop_requested = True
@@ -245,6 +278,33 @@ class SoilJobManager:
             )
             self._safe_site_cache[key] = (time.monotonic(), result)
             return result
+
+    async def measurement_grid(
+        self,
+        config_entry_id: str,
+        baseline_mm: float,
+        *,
+        spacing_mm: float,
+        maximum_deviation_mm: float,
+        clear_soil_margin_mm: float = 75,
+    ) -> tuple[SoilPointInventory, SoilGridPlan]:
+        """Fetch live obstacles and produce a complete, explainable grid preview."""
+
+        soil, garden = await asyncio.gather(
+            self.client.soil_points(config_entry_id),
+            self.client.inventory(InventoryRequest(config_entry_id=config_entry_id)),
+        )
+        return soil, plan_soil_measurement_grid(
+            soil,
+            garden,
+            self.db.current_vision_plants(config_entry_id),
+            self.db.current_vision_weeds(config_entry_id),
+            self.zone_store.zones(),
+            spacing_mm=spacing_mm,
+            maximum_deviation_mm=maximum_deviation_mm,
+            baseline_mm=baseline_mm,
+            clear_soil_margin_mm=clear_soil_margin_mm,
+        )
 
     def cached_safe_sites(
         self,
@@ -639,66 +699,102 @@ class SoilJobManager:
         capture_z: float,
         baseline_mm: float,
         job_kind: str = "measurement",
+        grid_spacing_mm: float | None = None,
+        grid_maximum_deviation_mm: float | None = None,
     ) -> None:
         self.db.start_soil_job(job_id, config_entry_id, job_kind, point_ids)
         completed = failed = 0
         try:
             async with self.shared_lock:
-                self.invalidate_safe_sites(config_entry_id, baseline_mm)
                 margin = (
                     self.soil_settings_store.load().clear_soil_margin_mm
                     if self.soil_settings_store is not None
                     else 75
                 )
-                inventory, sites = await self.safe_sites(
-                    config_entry_id, baseline_mm, clear_soil_margin_mm=margin
-                )
-                if custom_point_id is not None:
-                    point = next(
-                        (item for item in inventory.points if item.id == custom_point_id), None
+                if grid_spacing_mm is not None:
+                    if grid_maximum_deviation_mm is None:
+                        raise SoilHeightError("confirmed soil grid is missing its deviation")
+                    inventory, grid_plan = await self.measurement_grid(
+                        config_entry_id,
+                        baseline_mm,
+                        spacing_mm=grid_spacing_mm,
+                        maximum_deviation_mm=grid_maximum_deviation_mm,
+                        clear_soil_margin_mm=margin,
                     )
-                    if point is None or custom_x is None or custom_y is None:
+                    accepted = grid_plan.accepted_points
+                    if not accepted:
                         raise SoilHeightError(
-                            "custom measurement soil point or coordinates are invalid"
-                        )
-                    relocation_distance = math.hypot(custom_x - point.x, custom_y - point.y)
-                    if relocation_distance >= 200:
-                        raise SoilHeightError(
-                            "custom measurement coordinates must be less than 200 mm from the soil point"
+                            "the confirmed grid has no eligible clear-soil measurement points"
                         )
                     capture_targets = [
                         {
-                            "point_id": point.id,
-                            "point_name": point.name,
-                            "expected_x": point.x,
-                            "expected_y": point.y,
-                            "expected_z": point.z,
-                            "point_updated_at": point.updated_at,
-                            "capture_x": custom_x,
-                            "capture_y": custom_y,
-                            "relocation_distance_mm": relocation_distance,
+                            "point_id": point.point_id,
+                            "point_name": point.point_name,
+                            "expected_x": point.expected_x,
+                            "expected_y": point.expected_y,
+                            "expected_z": point.expected_z,
+                            "point_updated_at": point.point_updated_at,
+                            "capture_x": point.capture_x,
+                            "capture_y": point.capture_y,
+                            "relocation_distance_mm": math.hypot(
+                                float(point.capture_x) - float(point.expected_x),
+                                float(point.capture_y) - float(point.expected_y),
+                            ),
                         }
+                        for point in accepted
                     ]
                 else:
-                    wanted = [site for site in sites if site.point_id in set(point_ids)]
-                    if len(wanted) != len(set(point_ids)):
-                        raise SoilHeightError(
-                            "one or more selected points are no longer stale or clear"
+                    self.invalidate_safe_sites(config_entry_id, baseline_mm)
+                    inventory, sites = await self.safe_sites(
+                        config_entry_id, baseline_mm, clear_soil_margin_mm=margin
+                    )
+                if grid_spacing_mm is None:
+                    if custom_point_id is not None:
+                        point = next(
+                            (item for item in inventory.points if item.id == custom_point_id), None
                         )
-                    capture_targets = [
-                        {
-                            "point_id": site.point_id,
-                            "point_name": site.point_name,
-                            "expected_x": site.expected_x,
-                            "expected_y": site.expected_y,
-                            "expected_z": site.expected_z,
-                            "point_updated_at": site.point_updated_at,
-                            "capture_x": site.capture_x,
-                            "capture_y": site.capture_y,
-                            "relocation_distance_mm": site.relocation_distance_mm,
-                        }
-                        for site in wanted
-                    ]
+                        if point is None or custom_x is None or custom_y is None:
+                            raise SoilHeightError(
+                                "custom measurement soil point or coordinates are invalid"
+                            )
+                        relocation_distance = math.hypot(custom_x - point.x, custom_y - point.y)
+                        if relocation_distance >= 200:
+                            raise SoilHeightError(
+                                "custom measurement coordinates must be less than 200 mm from the soil point"
+                            )
+                        capture_targets = [
+                            {
+                                "point_id": point.id,
+                                "point_name": point.name,
+                                "expected_x": point.x,
+                                "expected_y": point.y,
+                                "expected_z": point.z,
+                                "point_updated_at": point.updated_at,
+                                "capture_x": custom_x,
+                                "capture_y": custom_y,
+                                "relocation_distance_mm": relocation_distance,
+                            }
+                        ]
+                    else:
+                        wanted = [site for site in sites if site.point_id in set(point_ids)]
+                        if len(wanted) != len(set(point_ids)):
+                            raise SoilHeightError(
+                                "one or more selected points are no longer stale or clear"
+                            )
+                        capture_targets = [
+                            {
+                                "point_id": site.point_id,
+                                "point_name": site.point_name,
+                                "expected_x": site.expected_x,
+                                "expected_y": site.expected_y,
+                                "expected_z": site.expected_z,
+                                "point_updated_at": site.point_updated_at,
+                                "capture_x": site.capture_x,
+                                "capture_y": site.capture_y,
+                                "relocation_distance_mm": site.relocation_distance_mm,
+                            }
+                            for site in wanted
+                        ]
                 position = inventory.motion.position
                 ordered = sorted(
                     capture_targets,
@@ -922,9 +1018,14 @@ class SoilJobManager:
         elif response_status == "conflict":
             status, action = "conflict", "automatic_stale_conflict"
         else:
-            status, action = "rejected", "automatic_rejected_write"
+            # A companion that requires explicit human approval rejects an
+            # automatic write even though the vision result itself is still
+            # valid. Keep it pending so custom-coordinate results do not
+            # disappear before the user can review and approve them.
+            status, action = "valid", "automatic_apply_deferred"
         reason = str(response.get("message") or response_status)[:240]
-        self.db.update_soil_measurement_status(str(measurement.measurement_id), status, reason)
+        if status != "valid":
+            self.db.update_soil_measurement_status(str(measurement.measurement_id), status, reason)
         self.db.record_soil_decision(str(measurement.measurement_id), action, response)
 
     def _save_artifacts(self, measurement_id: UUID, artifacts: dict[str, bytes]) -> list[str]:

@@ -18,6 +18,8 @@ from farmbot_vision.models import (
     Decision,
     Inventory,
     Measurement,
+    SoilGridPlan,
+    SoilGridPoint,
     SoilMeasurement,
     SoilMotionState,
     SoilPoint,
@@ -54,7 +56,7 @@ async def test_grid_repair_requires_advertised_v2_capability(monkeypatch):
     try:
         with pytest.raises(
             web.HomeAssistantError,
-            match="requires FarmBot integration V2.11.0",
+            match="requires FarmBot integration V2.12.0",
         ):
             await web._require_grid_repair_capability()
     finally:
@@ -114,7 +116,7 @@ async def test_whole_grid_requires_illuminated_capture_capability(monkeypatch):
 
     monkeypatch.setattr(web.client, "list_bots", list_bots)
     try:
-        with pytest.raises(web.HomeAssistantError, match="V2.11.0"):
+        with pytest.raises(web.HomeAssistantError, match="V2.12.0"):
             await web._require_grid_repair_capability(require_lighting=True)
     finally:
         web.settings.selected_config_entry_id = previous
@@ -1296,6 +1298,98 @@ async def test_soil_height_page_lists_points_and_warns_below_three(monkeypatch):
     assert b"Measure custom coordinate" in body
     assert b"Fewer than three stale soil points" in body
     assert b"replace the assigned stale point" in body
+    assert b"Calculate all points for grid" in body
+    assert b"id=soil-grid-modal" in body
+    assert b"Maximum deviation from grid (mm)" in body
+
+
+@pytest.mark.asyncio
+async def test_soil_grid_preview_api_returns_all_outcomes(monkeypatch):
+    monkeypatch.setattr(web.settings, "selected_config_entry_id", "soil-entry")
+    plan = SoilGridPlan(
+        spacing_mm=500,
+        maximum_deviation_mm=100,
+        clear_soil_margin_mm=75,
+        points=[
+            SoilGridPoint(
+                grid_x=250,
+                grid_y=250,
+                point_id=70,
+                point_name="Soil 70",
+                expected_x=250,
+                expected_y=250,
+                expected_z=-400,
+                point_updated_at=datetime(2026, 7, 1, tzinfo=UTC),
+                capture_x=250,
+                capture_y=250,
+                deviation_mm=0,
+                clearance_mm=10,
+                status="clear",
+                explanation="Nominal grid point has clear soil.",
+            ),
+            SoilGridPoint(
+                grid_x=750,
+                grid_y=250,
+                status="skipped",
+                explanation="Nearest clear point is 125 mm away.",
+            ),
+        ],
+    )
+
+    async def measurement_grid(*_args, **_kwargs):
+        return None, plan
+
+    monkeypatch.setattr(web.soil_jobs, "measurement_grid", measurement_grid)
+    status, _, body = await asgi_request(
+        "/api/soil/grid-plan",
+        query_string=b"spacing_mm=500&maximum_deviation_mm=100&baseline_mm=15",
+    )
+    payload = json.loads(body)
+
+    assert status == 200
+    assert payload["total"] == 2
+    assert payload["accepted"] == 1
+    assert payload["clear"] == 1
+    assert payload["replaced"] == 0
+    assert payload["skipped"] == 1
+    assert payload["points"][1]["explanation"].startswith("Nearest clear point")
+
+
+@pytest.mark.asyncio
+async def test_accept_soil_grid_persists_selection_and_starts_guarded_job(tmp_path, monkeypatch):
+    store = web.SoilSettingsStore(tmp_path / "soil-settings.json")
+    monkeypatch.setattr(web, "soil_settings_store", store)
+    monkeypatch.setattr(web.soil_jobs, "soil_settings_store", store)
+    monkeypatch.setattr(web.settings, "selected_config_entry_id", "soil-entry")
+    started = {}
+    monkeypatch.setattr(
+        web.soil_jobs,
+        "start_grid_measurements",
+        lambda **kwargs: started.update(kwargs),
+    )
+
+    status, headers, _ = await asgi_request(
+        "/soil/grid/accept",
+        method="POST",
+        form={
+            "spacing_mm": "400",
+            "maximum_deviation_mm": "80",
+            "capture_z": "-10",
+            "baseline_mm": "15",
+        },
+    )
+
+    assert status == 303
+    assert headers[b"location"] == b"../../soil-height"
+    assert store.load().grid_spacing_mm == 400
+    assert store.load().grid_maximum_deviation_mm == 80
+    assert started == {
+        "config_entry_id": "soil-entry",
+        "spacing_mm": 400,
+        "maximum_deviation_mm": 80,
+        "capture_z": -10,
+        "baseline_mm": 15,
+    }
 
 
 @pytest.mark.asyncio
@@ -1441,6 +1535,89 @@ async def test_soil_height_page_does_not_offer_legacy_v2_result_for_ordinary_app
     assert status == 200
     assert current_id.encode() in body
     assert legacy_id.encode() not in body
+
+
+@pytest.mark.asyncio
+async def test_valid_custom_coordinate_result_is_shown_for_approval(monkeypatch):
+    monkeypatch.setattr(web.settings, "selected_config_entry_id", "soil-entry")
+
+    async def safe_sites(*_args, **_kwargs):
+        return None, []
+
+    measurement_id = str(uuid4())
+    monkeypatch.setattr(web.soil_jobs, "safe_sites", safe_sites)
+    monkeypatch.setattr(
+        web.database,
+        "recent_soil_measurements",
+        lambda *_args: [
+            {
+                "measurement_id": measurement_id,
+                "point_id": 70,
+                "point_name": "Custom soil point",
+                "expected_x": 4000,
+                "expected_y": 600,
+                "old_z_mm": -400,
+                "proposed_z_mm": -395,
+                "confidence": 0.95,
+                "uncertainty_mm": 2,
+                "status": "valid",
+                "reason": "passed",
+                "capture_x": 4100,
+                "capture_y": 600,
+                "point_updated_at": datetime(2026, 7, 1, tzinfo=UTC).isoformat(),
+                "algorithm_version": "soil-stereo-v3",
+                "artifact_paths": [],
+            }
+        ],
+    )
+
+    status, _, body = await asgi_request("/soil-height")
+
+    assert status == 200
+    assert b"Custom soil point" in body
+    assert b"4100.0, 600.0" in body
+    assert f'name=measurement_ids value="{measurement_id}"'.encode() in body
+
+
+@pytest.mark.asyncio
+async def test_valid_custom_result_without_point_date_remains_visible(monkeypatch):
+    monkeypatch.setattr(web.settings, "selected_config_entry_id", "soil-entry")
+
+    async def safe_sites(*_args, **_kwargs):
+        return None, []
+
+    measurement_id = str(uuid4())
+    monkeypatch.setattr(web.soil_jobs, "safe_sites", safe_sites)
+    monkeypatch.setattr(
+        web.database,
+        "recent_soil_measurements",
+        lambda *_args: [
+            {
+                "measurement_id": measurement_id,
+                "point_id": 70,
+                "point_name": "Undated custom point",
+                "expected_x": 4000,
+                "expected_y": 600,
+                "old_z_mm": -400,
+                "proposed_z_mm": -395,
+                "confidence": 0.95,
+                "status": "valid",
+                "reason": "passed",
+                "capture_x": 4100,
+                "capture_y": 600,
+                "point_updated_at": None,
+                "algorithm_version": "soil-stereo-v3",
+                "artifact_paths": [],
+            }
+        ],
+    )
+
+    status, _, body = await asgi_request("/soil-height")
+
+    assert status == 200
+    assert measurement_id.encode() in body
+    assert b"Cannot apply: the FarmBot point has no trustworthy update date" in body
+    assert f'name=measurement_ids value="{measurement_id}"'.encode() not in body
 
 
 @pytest.mark.asyncio

@@ -25,12 +25,14 @@ from .weeding import (
     CutPath,
     confirmed_weeds,
     estimate_soil_height,
+    exclusion_zone_obstacles,
     nearest_neighbour_order,
     plan_cut_path,
     protected_tall_plants,
     recent_soil_samples,
     route_cut_path,
 )
+from .zones import ZoneKind, ZoneStore
 
 LOGGER = logging.getLogger(__name__)
 CLEAR_SOIL_RADIUS_MM = 75.0
@@ -46,11 +48,13 @@ class WeedingJobManager:
         client: HomeAssistantClient,
         analysis_jobs: JobManager,
         soil_jobs: SoilJobManager,
+        zone_store: ZoneStore,
     ):
         self.db = database
         self.client = client
         self.analysis_jobs = analysis_jobs
         self.soil_jobs = soil_jobs
+        self.zone_store = zone_store
         self.task: asyncio.Task | None = None
         self.stop_requested = False
         self.current: dict = {"status": "idle", "message": "Not run"}
@@ -295,6 +299,11 @@ class WeedingJobManager:
             if x_bounds is None or y_bounds is None or z_bounds is None:
                 raise RuntimeError("FarmBot axis bounds are unavailable")
             paths: list[CutPath] = []
+            exclusion_zones = [
+                zone
+                for zone in self.zone_store.zones()
+                if zone.enabled and zone.kind is ZoneKind.EXCLUSION
+            ]
             check_soil = bool(options.get("check_soil_heights", False))
             max_soil_age_days = float(options.get("soil_height_max_age_days", 30))
             cut_after_measurement_failure = bool(
@@ -303,6 +312,20 @@ class WeedingJobManager:
             for weed in selected:
                 if self.stop_requested:
                     break
+                containing_zone = next(
+                    (zone for zone in exclusion_zones if zone.contains_point(weed.x, weed.y)),
+                    None,
+                )
+                if containing_zone is not None:
+                    self.current["weeds_skipped"] += 1
+                    self.current["results"].append(
+                        {
+                            "weed_id": weed.id,
+                            "status": "skipped",
+                            "reason": (f'weed is inside exclusion zone "{containing_zone.name}"'),
+                        }
+                    )
+                    continue
                 measurements = self.db.recent_soil_measurements(entry_id, 500)
                 all_samples = recent_soil_samples(
                     soil_inventory.points, measurements, max_age_days=None
@@ -354,6 +377,7 @@ class WeedingJobManager:
                             x_bounds=x_bounds,
                             y_bounds=y_bounds,
                             plant_margin_mm=25.0,
+                            exclusion_zones=exclusion_zones,
                         )
                     )
                 except ValueError as err:
@@ -371,11 +395,17 @@ class WeedingJobManager:
                 paths, float(position.get("x") or 0), float(position.get("y") or 0)
             )
             safe_z = z_bounds[1] if soil_inventory.motion.z_direction == -1 else z_bounds[0]
+            transit_z = max(float(safe_z), -100.0)
+            if not z_bounds[0] <= transit_z <= z_bounds[1]:
+                raise RuntimeError(
+                    "FarmBot cannot reach the required exclusion-zone transit height of Z -100"
+                )
             protected = protected_tall_plants(
                 garden.plants,
                 enabled=bool(options.get("avoid_tall_plants", True)),
                 minimum_height_mm=float(options.get("tall_plant_height_mm", 300)),
             )
+            zone_obstacles = exclusion_zone_obstacles(exclusion_zones)
             current_xy = (float(position.get("x") or 0), float(position.get("y") or 0))
             if options.get("manage_tool"):
                 slot_x = float(options.get("tool_slot_x", 4.2))
@@ -393,17 +423,30 @@ class WeedingJobManager:
                     path, waypoints = route_cut_path(
                         current_xy,
                         path,
-                        protected,
+                        [*protected, *zone_obstacles],
                         x_bounds=x_bounds,
                         y_bounds=y_bounds,
                         endpoint_margin_mm=PLANT_MARGIN_MM,
                     )
-                except ValueError as err:
-                    self.current["weeds_skipped"] += 1
-                    self.current["results"].append(
-                        {"weed_id": path.weed_id, "status": "skipped", "reason": str(err)}
-                    )
-                    continue
+                except ValueError:
+                    # Exclusion zones are preferably avoided in X/Y. If their
+                    # conservative circular envelopes leave no route, crossing
+                    # is permitted only at the separately enforced transit Z.
+                    try:
+                        path, waypoints = route_cut_path(
+                            current_xy,
+                            path,
+                            protected,
+                            x_bounds=x_bounds,
+                            y_bounds=y_bounds,
+                            endpoint_margin_mm=PLANT_MARGIN_MM,
+                        )
+                    except ValueError as err:
+                        self.current["weeds_skipped"] += 1
+                        self.current["results"].append(
+                            {"weed_id": path.weed_id, "status": "skipped", "reason": str(err)}
+                        )
+                        continue
                 targets.append(
                     WeedingTarget(
                         weed_id=path.weed_id,
@@ -411,7 +454,7 @@ class WeedingJobManager:
                         start={"x": path.start_x, "y": path.start_y},
                         end={"x": path.end_x, "y": path.end_y},
                         soil_z=path.soil_z,
-                        travel_z=safe_z,
+                        travel_z=transit_z,
                         approach_waypoints=waypoints,
                     )
                 )

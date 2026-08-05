@@ -11,6 +11,8 @@ class SoilSettings(BaseModel):
     """User-managed soil-height planning and automation controls."""
 
     clear_soil_margin_mm: float = Field(default=75, ge=0, le=250)
+    grid_spacing_mm: float = Field(default=500, ge=50, le=5000)
+    grid_maximum_deviation_mm: float = Field(default=100, ge=0, lt=200)
     pair_disagreement_limit_mm: float = Field(default=8, ge=1, le=50)
     scheduled_run_enabled: bool = False
     scheduled_run_time: str = Field(default="03:00", pattern=r"^(?:[01]\d|2[0-3]):[0-5]\d$")

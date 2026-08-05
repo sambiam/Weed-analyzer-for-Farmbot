@@ -11,6 +11,7 @@ from farmbot_vision.weeding import (
     SoilSample,
     confirmed_weeds,
     estimate_soil_height,
+    exclusion_zone_obstacles,
     plan_cut_path,
     protected_tall_plants,
     recent_soil_samples,
@@ -18,6 +19,7 @@ from farmbot_vision.weeding import (
     safe_transit_waypoints,
 )
 from farmbot_vision.weeding_jobs import WeedingJobManager
+from farmbot_vision.zones import Zone, ZoneKind, ZoneShape, segment_intersects_zone
 
 
 def plant(plant_id: int, x: float, y: float, radius: float = 30) -> Plant:
@@ -128,6 +130,53 @@ def test_path_can_stop_at_weed_centre_when_every_full_cut_is_blocked():
     assert (path.end_x, path.end_y) == pytest.approx((500, 500))
 
 
+def test_cut_path_changes_angle_instead_of_entering_an_exclusion_zone():
+    weed = WeedPoint(id=8, x=500, y=500, radius=20)
+    soil = estimate_soil_height(500, 500, [SoilSample(500, 500, -430, datetime.now(UTC), "test")])
+    assert soil is not None
+    zone = Zone(
+        name="Tool changer",
+        kind=ZoneKind.EXCLUSION,
+        shape=ZoneShape.RECTANGLE,
+        min_x=545,
+        min_y=450,
+        max_x=700,
+        max_y=550,
+    )
+    path = plan_cut_path(
+        weed,
+        [],
+        soil,
+        x_bounds=(0, 1000),
+        y_bounds=(0, 1000),
+        exclusion_zones=[zone],
+    )
+    assert not segment_intersects_zone(zone, (path.start_x, path.start_y), (path.end_x, path.end_y))
+
+
+def test_weed_inside_exclusion_zone_has_no_cut_path():
+    weed = WeedPoint(id=8, x=500, y=500, radius=20)
+    soil = estimate_soil_height(500, 500, [SoilSample(500, 500, -430, datetime.now(UTC), "test")])
+    assert soil is not None
+    zone = Zone(
+        name="Tool changer",
+        kind=ZoneKind.EXCLUSION,
+        shape=ZoneShape.CIRCLE,
+        center_x=500,
+        center_y=500,
+        radius_mm=50,
+    )
+    with pytest.raises(ValueError):
+        plan_cut_path(
+            weed,
+            [],
+            soil,
+            x_bounds=(0, 1000),
+            y_bounds=(0, 1000),
+            exclusion_zones=[zone],
+        )
+
+
 def test_tall_plant_transit_routes_around_canopy():
     obstacle = plant(1, 500, 500, radius=80).model_copy(update={"height_mm": 450})
     protected = protected_tall_plants([obstacle], enabled=True, minimum_height_mm=300)
@@ -140,6 +189,27 @@ def test_tall_plant_transit_routes_around_canopy():
     )
     assert route
     assert any(abs(point["y"] - 500) > 80 for point in route)
+
+
+def test_transit_prefers_to_route_around_an_exclusion_zone():
+    zone = Zone(
+        name="Tool changer",
+        kind=ZoneKind.EXCLUSION,
+        shape=ZoneShape.RECTANGLE,
+        min_x=450,
+        min_y=450,
+        max_x=550,
+        max_y=550,
+    )
+    route = safe_transit_waypoints(
+        (100, 500),
+        (900, 500),
+        exclusion_zone_obstacles([zone]),
+        x_bounds=(0, 1000),
+        y_bounds=(0, 1000),
+    )
+    assert route
+    assert any(abs(point["y"] - 500) > 100 for point in route)
 
 
 def test_tall_plant_transit_rejects_only_an_endpoint_inside_clearance():

@@ -193,7 +193,7 @@ _soil_automation_state: dict[str, object] = {
     "last_scheduled_date": None,
     "handled_retry_jobs": set(),
 }
-weeding_jobs = WeedingJobManager(database, client, jobs, soil_jobs)
+weeding_jobs = WeedingJobManager(database, client, jobs, soil_jobs, zone_store)
 image_file_cache = ImageFileCache(settings.data_dir / "image_cache")
 _vision_image_locks: dict[tuple[str, int, int, int], asyncio.Lock] = {}
 grid_repair_state: dict[str, object] = {
@@ -5965,20 +5965,8 @@ async def soil_height_page(request: Request) -> HTMLResponse:
                 f"({site.capture_x:.0f}, {site.capture_y:.0f})</option>"
             )
 
-    valid_measurements = [item for item in measurements if _soil_measurement_is_applicable(item)]
-    measurement_rows = "".join(
-        f'<tr data-row-key="measurement-{escape(item["measurement_id"], quote=True)}">'
-        f"<td><input form=apply-selected type=checkbox name=measurement_ids "
-        f'value="{escape(item["measurement_id"], quote=True)}"></td>'
-        f"<td>{escape(item['point_name'])}</td>"
-        f"<td>{item['expected_x']:.1f}, {item['expected_y']:.1f}</td>"
-        f"<td>{item['capture_x']:.1f}, {item['capture_y']:.1f}</td>"
-        f"<td>{item['old_z_mm']:.1f} mm</td>"
-        f"<td>{item['proposed_z_mm']:.0f} mm</td>"
-        f"<td>{100 * item['confidence']:.0f}%</td>"
-        f"<td>{escape(item['reason'])}</td></tr>"
-        for item in valid_measurements
-    )
+    valid_measurements = [item for item in measurements if _soil_measurement_is_pending_valid(item)]
+    measurement_rows = "".join(_soil_measurement_pending_row(item) for item in valid_measurements)
     point_count = len(inventory.points) if inventory else 0
     site_count = len(sites)
     warning = (
@@ -6272,6 +6260,95 @@ axis limits and do not need an existing soil point.</p>
  </form>
 </section>
 <section class=card>
+ <h3>Complete a clear-soil-aware measurement grid</h3>
+ <p>Grid centres start at half the selected spacing from X=0 and Y=0. Each
+ nominal centre is used when it has the configured clear-soil margin; otherwise
+ the nearest clear location within the allowed deviation is substituted. A
+ skipped point is never sent to the bot.</p>
+ <p class=muted>This uses the saved clear-soil margin of
+ {soil_values.clear_soil_margin_mm:g} mm and existing FarmBot soil-height points
+ as update records. Save a changed clear-soil margin before calculating.</p>
+ <form id=soil-grid-form>
+  <label>Standard grid spacing (mm) <input type=number name=spacing_mm min=50 max=5000
+   step=1 value="{soil_values.grid_spacing_mm:g}" required></label>
+  <label>Maximum deviation from grid (mm) <input type=number name=maximum_deviation_mm
+   min=0 max=199 step=1 value="{soil_values.grid_maximum_deviation_mm:g}" required></label>
+  <label>Capture Z (mm){capture_z_hint} <input type=number name=capture_z step=0.1
+   value="{default_capture_z:g}" required></label>
+  <label>Baseline (mm){baseline_hint} <input type=number name=baseline_mm min=5 max=30
+   step=0.1 value="{default_baseline:g}" required></label>
+  <button type=button id=calculate-soil-grid>Calculate all points for grid</button>
+ </form>
+ <dialog id=soil-grid-modal aria-labelledby=soil-grid-modal-title
+  style="width:min(1100px,96vw);max-height:90vh;overflow:auto">
+  <h3 id=soil-grid-modal-title>Confirm soil measurement grid</h3>
+  <p id=soil-grid-summary></p>
+  <table><thead><tr><th>Grid X, Y</th><th>FarmBot point</th><th>Outcome</th>
+   <th>Capture X, Y</th><th>Deviation</th><th>Explanation</th></tr></thead>
+   <tbody id=soil-grid-preview-rows></tbody></table>
+  <form method=post action=soil/grid/accept id=accept-soil-grid>
+   <input type=hidden name=spacing_mm>
+   <input type=hidden name=maximum_deviation_mm>
+   <input type=hidden name=capture_z>
+   <input type=hidden name=baseline_mm>
+   <p class=warn>The app recalculates this plan with live plants, weeds, zones,
+   point timestamps, and the saved clear-soil margin before any movement.</p>
+   <button type=submit id=accept-soil-grid-button>Accept and measure clear points</button>
+   <button type=button id=close-soil-grid>Cancel</button>
+  </form>
+ </dialog>
+ <script>
+ (() => {{
+  const form=document.getElementById('soil-grid-form');
+  const modal=document.getElementById('soil-grid-modal');
+  const rows=document.getElementById('soil-grid-preview-rows');
+  const summary=document.getElementById('soil-grid-summary');
+  const accept=document.getElementById('accept-soil-grid');
+  const acceptButton=document.getElementById('accept-soil-grid-button');
+  const calculate=document.getElementById('calculate-soil-grid');
+  const fmt=value=>value===null || value===undefined ? '—' : Number(value).toFixed(1);
+  calculate.addEventListener('click',async()=>{{
+   if(!form.reportValidity()) return;
+   calculate.disabled=true; calculate.textContent='Calculating…';
+   try{{
+    const values=new FormData(form);
+    const query=new URLSearchParams({{
+     spacing_mm:values.get('spacing_mm'),
+     maximum_deviation_mm:values.get('maximum_deviation_mm'),
+     baseline_mm:values.get('baseline_mm')
+    }});
+    const response=await fetch('api/soil/grid-plan?'+query.toString(),{{cache:'no-store'}});
+    const data=await response.json();
+    if(!response.ok) throw new Error(data.detail || 'Grid calculation failed');
+    rows.replaceChildren();
+    data.points.forEach(point=>{{
+     const row=document.createElement('tr');
+     const values=[
+      fmt(point.grid_x)+', '+fmt(point.grid_y),
+      point.point_id ? (point.point_name+' (#'+point.point_id+')') : 'No point available',
+      point.status,
+      point.capture_x===null ? '—' : fmt(point.capture_x)+', '+fmt(point.capture_y),
+      point.deviation_mm===null ? '—' : fmt(point.deviation_mm)+' mm',
+      point.explanation
+     ];
+     values.forEach(value=>{{const cell=document.createElement('td');cell.textContent=value;row.appendChild(cell);}});
+     rows.appendChild(row);
+    }});
+    summary.textContent=data.total+' grid points: '+data.clear+' unchanged, '+
+     data.replaced+' replaced, '+data.skipped+' skipped.';
+    ['spacing_mm','maximum_deviation_mm','capture_z','baseline_mm'].forEach(name=>{{
+     accept.elements[name].value=values.get(name);
+    }});
+    acceptButton.disabled=data.accepted===0;
+    modal.showModal();
+   }}catch(error){{alert(error.message);}}
+   finally{{calculate.disabled=false;calculate.textContent='Calculate all points for grid';}}
+  }});
+  document.getElementById('close-soil-grid').addEventListener('click',()=>modal.close());
+ }})();
+ </script>
+</section>
+<section class=card>
  <h3>Clear-soil replacements (<span id=soil-site-count>{site_count} from {point_count} existing points</span>)</h3>
  <p class=muted>Each candidate has a {soil_values.clear_soil_margin_mm:g} mm clear-soil margin, expanded for the
 stereo movement, around all current FarmBot plants and weeds, the latest
@@ -6360,6 +6437,40 @@ async def soil_points_api() -> JSONResponse:
 @app.get("/api/soil/job")
 async def soil_job_api() -> JSONResponse:
     return JSONResponse(soil_jobs.current)
+
+
+@app.get("/api/soil/grid-plan")
+async def soil_grid_plan_api(
+    spacing_mm: float,
+    maximum_deviation_mm: float,
+    baseline_mm: float = 15,
+) -> JSONResponse:
+    entry_id = settings.selected_config_entry_id
+    if not entry_id:
+        raise HTTPException(409, "No FarmBot config entry is selected")
+    soil_values = soil_settings_store.load()
+    try:
+        _inventory, plan = await soil_jobs.measurement_grid(
+            entry_id,
+            baseline_mm,
+            spacing_mm=spacing_mm,
+            maximum_deviation_mm=maximum_deviation_mm,
+            clear_soil_margin_mm=soil_values.clear_soil_margin_mm,
+        )
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    counts = {
+        status: sum(point.status == status for point in plan.points)
+        for status in ("clear", "replaced", "skipped")
+    }
+    return JSONResponse(
+        {
+            **plan.model_dump(mode="json"),
+            **counts,
+            "total": len(plan.points),
+            "accepted": len(plan.accepted_points),
+        }
+    )
 
 
 @app.post("/soil/calibrate")
@@ -6474,6 +6585,8 @@ async def reject_legacy_soil_repairs(
 @app.post("/soil/settings")
 async def save_soil_settings(
     clear_soil_margin_mm: float = Form(...),
+    grid_spacing_mm: float | None = Form(None),
+    grid_maximum_deviation_mm: float | None = Form(None),
     pair_disagreement_limit_mm: float = Form(8),
     scheduled_run_enabled: bool = Form(False),
     scheduled_run_time: str = Form("03:00"),
@@ -6484,9 +6597,18 @@ async def save_soil_settings(
     automatic_retry_delay: float = Form(15),
     automatic_retry_unit: str = Form("minutes"),
 ) -> RedirectResponse:
+    current = soil_settings_store.load()
     try:
         values = SoilSettings(
             clear_soil_margin_mm=clear_soil_margin_mm,
+            grid_spacing_mm=(
+                current.grid_spacing_mm if grid_spacing_mm is None else grid_spacing_mm
+            ),
+            grid_maximum_deviation_mm=(
+                current.grid_maximum_deviation_mm
+                if grid_maximum_deviation_mm is None
+                else grid_maximum_deviation_mm
+            ),
             pair_disagreement_limit_mm=pair_disagreement_limit_mm,
             scheduled_run_enabled=scheduled_run_enabled,
             scheduled_run_time=scheduled_run_time,
@@ -6502,6 +6624,38 @@ async def save_soil_settings(
     soil_settings_store.save(values)
     soil_jobs._safe_site_cache.clear()
     return RedirectResponse("../soil-height", status_code=303)
+
+
+@app.post("/soil/grid/accept")
+async def accept_soil_measurement_grid(
+    spacing_mm: float = Form(...),
+    maximum_deviation_mm: float = Form(...),
+    capture_z: float = Form(0),
+    baseline_mm: float = Form(15),
+) -> RedirectResponse:
+    entry_id = settings.selected_config_entry_id
+    if not entry_id:
+        raise HTTPException(409, "No FarmBot config entry is selected")
+    current = soil_settings_store.load()
+    try:
+        updated = current.model_copy(
+            update={
+                "grid_spacing_mm": spacing_mm,
+                "grid_maximum_deviation_mm": maximum_deviation_mm,
+            }
+        )
+        updated = SoilSettings.model_validate(updated.model_dump())
+        soil_jobs.start_grid_measurements(
+            config_entry_id=entry_id,
+            spacing_mm=spacing_mm,
+            maximum_deviation_mm=maximum_deviation_mm,
+            capture_z=capture_z,
+            baseline_mm=baseline_mm,
+        )
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    soil_settings_store.save(updated)
+    return RedirectResponse("../../soil-height", status_code=303)
 
 
 @app.post("/soil/measure")
@@ -6551,15 +6705,60 @@ async def stop_soil_measurement() -> RedirectResponse:
     return RedirectResponse("../soil-height", status_code=303)
 
 
-def _soil_measurement_is_applicable(measurement: dict | None) -> bool:
+def _soil_measurement_is_pending_valid(measurement: dict | None) -> bool:
     return bool(
         measurement is not None
         and measurement["status"] == "valid"
         and measurement.get("algorithm_version") != "soil-stereo-v2"
         and measurement["proposed_z_mm"] is not None
+    )
+
+
+def _soil_measurement_is_applicable(measurement: dict | None) -> bool:
+    return bool(
+        _soil_measurement_is_pending_valid(measurement)
         and measurement.get("capture_x") is not None
         and measurement.get("capture_y") is not None
         and measurement.get("point_updated_at")
+    )
+
+
+def _soil_measurement_coordinates(measurement: dict) -> str:
+    if measurement.get("capture_x") is None or measurement.get("capture_y") is None:
+        return "—"
+    return f"{measurement['capture_x']:.1f}, {measurement['capture_y']:.1f}"
+
+
+def _soil_measurement_review_note(measurement: dict) -> str:
+    if _soil_measurement_is_applicable(measurement):
+        return ""
+    if not measurement.get("point_updated_at"):
+        message = "Cannot apply: the FarmBot point has no trustworthy update date."
+    elif measurement.get("capture_x") is None or measurement.get("capture_y") is None:
+        message = "Cannot apply: the saved capture coordinates are incomplete."
+    else:
+        message = "Cannot apply this result with the current point data."
+    return f'<br><span class="warn">{escape(message)}</span>'
+
+
+def _soil_measurement_pending_row(measurement: dict) -> str:
+    measurement_id = escape(measurement["measurement_id"], quote=True)
+    selection = (
+        f"<td><input form=apply-selected type=checkbox name=measurement_ids "
+        f'value="{measurement_id}"></td>'
+        if _soil_measurement_is_applicable(measurement)
+        else "<td>—</td>"
+    )
+    return (
+        f'<tr data-row-key="measurement-{measurement_id}">{selection}'
+        f"<td>{escape(measurement['point_name'])}</td>"
+        f"<td>{measurement['expected_x']:.1f}, {measurement['expected_y']:.1f}</td>"
+        f"<td>{_soil_measurement_coordinates(measurement)}</td>"
+        f"<td>{measurement['old_z_mm']:.1f} mm</td>"
+        f"<td>{measurement['proposed_z_mm']:.0f} mm</td>"
+        f"<td>{100 * measurement['confidence']:.0f}%</td>"
+        f"<td>{escape(measurement['reason'])}"
+        f"{_soil_measurement_review_note(measurement)}</td></tr>"
     )
 
 

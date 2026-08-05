@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
 from .models import Plant, SoilPoint, WeedPoint
+from .zones import Zone, ZoneKind, ZoneShape, segment_intersects_zone
 
 SOIL_SEARCH_RADIUS_MM = 500.0
 DEFAULT_SOIL_MAX_AGE_DAYS = 30.0
@@ -51,6 +52,15 @@ class CutPath:
     minimum_plant_clearance_mm: float
     soil_z: float
     soil_method: str
+
+
+@dataclass(frozen=True, slots=True)
+class TransitObstacle:
+    """Circular conservative envelope used to route around an exclusion zone."""
+
+    x: float
+    y: float
+    radius: float
 
 
 def confirmed_weeds(points: Iterable[WeedPoint]) -> list[WeedPoint]:
@@ -176,10 +186,31 @@ def protected_tall_plants(
     ]
 
 
+def exclusion_zone_obstacles(zones: Iterable[Zone]) -> list[TransitObstacle]:
+    """Approximate active exclusion zones for preferred high-transit avoidance."""
+    obstacles: list[TransitObstacle] = []
+    for zone in zones:
+        if not zone.enabled or zone.kind is not ZoneKind.EXCLUSION:
+            continue
+        if zone.shape is ZoneShape.CIRCLE:
+            obstacles.append(TransitObstacle(zone.center_x, zone.center_y, zone.radius_mm))
+            continue
+        if zone.shape is ZoneShape.RECTANGLE:
+            x = (zone.min_x + zone.max_x) / 2
+            y = (zone.min_y + zone.max_y) / 2
+            radius = math.hypot(zone.max_x - zone.min_x, zone.max_y - zone.min_y) / 2
+        else:
+            x = sum(point[0] for point in zone.points) / len(zone.points)
+            y = sum(point[1] for point in zone.points) / len(zone.points)
+            radius = max(math.hypot(point[0] - x, point[1] - y) for point in zone.points)
+        obstacles.append(TransitObstacle(x, y, radius))
+    return obstacles
+
+
 def safe_transit_waypoints(
     start: tuple[float, float],
     end: tuple[float, float],
-    plants: Iterable[Plant],
+    plants: Iterable[Plant | TransitObstacle],
     *,
     x_bounds: tuple[float, float],
     y_bounds: tuple[float, float],
@@ -285,7 +316,7 @@ def safe_transit_waypoints(
 def route_cut_path(
     start: tuple[float, float],
     path: CutPath,
-    plants: Iterable[Plant],
+    plants: Iterable[Plant | TransitObstacle],
     *,
     x_bounds: tuple[float, float],
     y_bounds: tuple[float, float],
@@ -371,6 +402,7 @@ def plan_cut_path(
     x_bounds: tuple[float, float],
     y_bounds: tuple[float, float],
     plant_margin_mm: float = PLANT_MARGIN_MM,
+    exclusion_zones: Iterable[Zone] = (),
 ) -> CutPath:
     """Choose the lowest-risk straight line through a weed.
 
@@ -380,6 +412,9 @@ def plan_cut_path(
     summed near-plant penalties break ties smoothly.
     """
     plants = list(plants)
+    exclusion_zones = [
+        zone for zone in exclusion_zones if zone.enabled and zone.kind is ZoneKind.EXCLUSION
+    ]
     desired = min(
         MAX_PATH_LENGTH_MM, max(MIN_PATH_LENGTH_MM, weed.radius * 2 + 2 * PATH_OVERHANG_MM)
     )
@@ -389,6 +424,8 @@ def plan_cut_path(
         if segment is None:
             continue
         ax, ay, bx, by = segment
+        if any(segment_intersects_zone(zone, (ax, ay), (bx, by)) for zone in exclusion_zones):
+            continue
         clearances = [
             _point_segment_distance(plant.x, plant.y, ax, ay, bx, by)
             - plant.radius
@@ -429,6 +466,8 @@ def plan_cut_path(
                 continue
             ax, ay = weed.x - ux * available, weed.y - uy * available
             bx, by = weed.x, weed.y
+            if any(segment_intersects_zone(zone, (ax, ay), (bx, by)) for zone in exclusion_zones):
+                continue
             clearances = [
                 _point_segment_distance(plant.x, plant.y, ax, ay, bx, by)
                 - plant.radius

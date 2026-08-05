@@ -11,6 +11,7 @@ import farmbot_vision.soil_jobs as soil_jobs_module
 from farmbot_vision.database import Database
 from farmbot_vision.models import (
     SoilCaptureStatus,
+    SoilGridPlan,
     SoilMeasurement,
     SoilMotionState,
     SoilPoint,
@@ -124,6 +125,55 @@ async def test_automatic_acceptance_requires_confidence_and_height_margin(tmp_pa
     assert database.soil_measurement(str(accepted.measurement_id))["status"] == "applied"
     assert database.soil_measurement(str(low_confidence.measurement_id))["status"] == "valid"
     assert database.soil_measurement(str(large_change.measurement_id))["status"] == "valid"
+
+
+@pytest.mark.asyncio
+async def test_automatic_write_rejection_keeps_result_pending_for_human_review(tmp_path):
+    database = Database(tmp_path / "vision.db")
+    store = SoilSettingsStore(tmp_path / "soil_settings.json")
+    store.save(SoilSettings(automatic_acceptance_enabled=True))
+
+    class Client:
+        async def apply_soil_height(self, _request):
+            return {"status": "rejected", "message": "Human approval is required"}
+
+    manager = SoilJobManager(
+        database,
+        Client(),
+        tmp_path,
+        asyncio.Lock(),
+        ZoneStore(tmp_path / "zones.json"),
+        store,
+    )
+    measurement = SoilMeasurement(
+        measurement_id=uuid4(),
+        config_entry_id="bot-soil",
+        point_id=70,
+        point_name="Custom soil point",
+        expected_x=4000,
+        expected_y=600,
+        old_z_mm=-400,
+        point_updated_at=datetime.now(UTC),
+        capture_x=4100,
+        capture_y=600,
+        relocation_distance_mm=100,
+        proposed_z_mm=-395,
+        confidence=0.95,
+        uncertainty_mm=2,
+        status="valid",
+        reason="passed",
+    )
+    database.save_soil_measurement(measurement)
+
+    await manager._automatically_apply(measurement)
+
+    saved = database.soil_measurement(str(measurement.measurement_id))
+    assert saved["status"] == "valid"
+    decisions = database.connection.execute(
+        "SELECT action FROM soil_decisions WHERE measurement_id=?",
+        (str(measurement.measurement_id),),
+    ).fetchall()
+    assert [row["action"] for row in decisions] == ["automatic_apply_deferred"]
 
 
 @pytest.mark.asyncio
@@ -270,6 +320,66 @@ def test_soil_points_use_nearest_neighbour_order():
     ]
     ordered = SoilJobManager._nearest_order(points, 0, 0)
     assert [point.id for point in ordered] == [2, 3, 1]
+
+
+@pytest.mark.asyncio
+async def test_confirmed_grid_is_replanned_under_measurement_lock(tmp_path, monkeypatch):
+    database = Database(tmp_path / "vision.db")
+    manager = SoilJobManager(
+        database,
+        object(),
+        tmp_path,
+        asyncio.Lock(),
+        ZoneStore(tmp_path / "zones.json"),
+    )
+    inventory = SoilPointInventory(
+        device_id="42",
+        generated_at=datetime.now(UTC),
+        points=[],
+        motion=SoilMotionState(
+            connected=True,
+            busy=False,
+            locked=False,
+            position={"x": 0, "y": 0, "z": 0},
+            z_direction=-1,
+            axis_bounds={"x": (0, 1000), "y": (0, 1000), "z": (-500, 0)},
+        ),
+    )
+    calls = []
+
+    async def measurement_grid(*args, **kwargs):
+        calls.append((args, kwargs))
+        return inventory, SoilGridPlan(
+            spacing_mm=500,
+            maximum_deviation_mm=80,
+            clear_soil_margin_mm=75,
+            points=[],
+        )
+
+    async def stale_preview(*_args, **_kwargs):
+        raise AssertionError("ordinary cached safe sites must not authorize a grid run")
+
+    monkeypatch.setattr(manager, "measurement_grid", measurement_grid)
+    monkeypatch.setattr(manager, "safe_sites", stale_preview)
+    await manager._run_measurements(
+        job_id="grid-job",
+        config_entry_id="bot-soil",
+        point_ids=[],
+        custom_point_id=None,
+        custom_x=None,
+        custom_y=None,
+        capture_z=0,
+        baseline_mm=15,
+        job_kind="measurement_grid",
+        grid_spacing_mm=500,
+        grid_maximum_deviation_mm=80,
+    )
+
+    assert len(calls) == 1
+    assert calls[0][1]["spacing_mm"] == 500
+    assert calls[0][1]["maximum_deviation_mm"] == 80
+    assert manager.current["status"] == "failed"
+    assert "no eligible clear-soil" in manager.current["message"]
 
 
 @pytest.mark.asyncio

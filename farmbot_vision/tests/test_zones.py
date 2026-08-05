@@ -12,8 +12,25 @@ from farmbot_vision.zones import (
     evaluate,
     plant_center_allowed,
     plant_radius_allowed,
+    segment_intersects_zone,
     weeds_allowed,
 )
+
+
+def test_segment_intersection_detects_zone_crossings_and_edge_contact():
+    rectangle = _bed(kind=ZoneKind.EXCLUSION)
+    circle = Zone(
+        name="Post",
+        kind=ZoneKind.EXCLUSION,
+        shape=ZoneShape.CIRCLE,
+        center_x=500,
+        center_y=500,
+        radius_mm=100,
+    )
+    assert segment_intersects_zone(rectangle, (-100, 500), (1100, 500))
+    assert segment_intersects_zone(rectangle, (-100, 0), (1100, 0))
+    assert segment_intersects_zone(circle, (0, 500), (1000, 500))
+    assert not segment_intersects_zone(circle, (0, 300), (1000, 300))
 
 
 def _bed(**updates) -> Zone:

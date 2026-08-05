@@ -11,7 +11,7 @@ from farmbot_vision.models import (
     SoilPointInventory,
     WeedPoint,
 )
-from farmbot_vision.soil_sites import plan_safe_soil_sites
+from farmbot_vision.soil_sites import plan_safe_soil_sites, plan_soil_measurement_grid
 
 NOW = datetime(2026, 7, 26, tzinfo=UTC)
 
@@ -158,3 +158,74 @@ def test_reduced_clear_soil_margin_exposes_a_closer_candidate():
         now=NOW,
     )
     assert relaxed[0].relocation_distance_mm < conservative[0].relocation_distance_mm
+
+
+def test_measurement_grid_starts_at_half_spacing_and_replaces_blocked_point():
+    plant = Plant(
+        id=1,
+        name="Tomato",
+        openfarm_slug="tomato",
+        x=250,
+        y=250,
+        radius=10,
+        plant_stage="planted",
+    )
+    plan = plan_soil_measurement_grid(
+        _soil(
+            _point(70, 250, 250),
+            _point(71, 750, 250),
+            _point(72, 250, 750),
+            _point(73, 750, 750),
+        ),
+        _garden(plants=[plant]),
+        [],
+        [],
+        [],
+        spacing_mm=500,
+        maximum_deviation_mm=150,
+        baseline_mm=15,
+        clear_soil_margin_mm=75,
+        now=NOW,
+    )
+
+    assert [(point.grid_x, point.grid_y) for point in plan.points] == [
+        (250, 250),
+        (750, 250),
+        (250, 750),
+        (750, 750),
+    ]
+    assert plan.points[0].status == "replaced"
+    assert 0 < plan.points[0].deviation_mm <= 150
+    assert all(point.status == "clear" for point in plan.points[1:])
+
+
+def test_skipped_grid_point_explains_margin_needed_for_acceptance():
+    plant = Plant(
+        id=1,
+        name="Large tomato",
+        openfarm_slug="tomato",
+        x=250,
+        y=250,
+        radius=100,
+        plant_stage="planted",
+    )
+    soil = _soil(_point(70, 250, 250))
+    soil.motion.axis_bounds["x"] = (0, 500)
+    soil.motion.axis_bounds["y"] = (0, 500)
+    plan = plan_soil_measurement_grid(
+        soil,
+        _garden(plants=[plant]),
+        [],
+        [],
+        [],
+        spacing_mm=500,
+        maximum_deviation_mm=150,
+        baseline_mm=15,
+        clear_soil_margin_mm=100,
+        now=NOW,
+    )
+
+    assert len(plan.points) == 1
+    assert plan.points[0].status == "skipped"
+    assert "Reduce clear-soil margin" in plan.points[0].explanation
+    assert "20 mm or less" in plan.points[0].explanation

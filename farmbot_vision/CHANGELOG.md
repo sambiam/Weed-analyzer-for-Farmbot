@@ -1,5 +1,34 @@
 # Changelog
 
+## 3.31.1 - 2026-08-05
+
+- Fixed valid custom-coordinate soil measurements disappearing when an
+  automatic write was deferred because explicit human approval was required.
+  They now remain in Pending valid results for approval.
+- Valid custom results that lack the timestamp or coordinate data required for
+  a safe write also remain visible, with an explanation instead of an enabled
+  approval checkbox.
+
+## 3.31.0 - 2026-08-05
+
+- Added a clear-soil-aware soil-height grid planner with persisted standard
+  spacing and maximum-deviation controls. Grid centres begin at half-spacing
+  offsets from X=0 and Y=0.
+- Added two-part grid confirmation: calculation opens a complete point preview
+  showing unchanged, relocated, and skipped points, with actionable nearest
+  clear-site or reduced-margin guidance. Accepting rechecks live obstacles and
+  eligibility under the measurement lock before moving the FarmBot.
+
+## 3.30.0 - 2026-08-05
+
+- Exclusion zones are now hard mowing hazards: weeds centred inside any
+  enabled exclusion zone are skipped, and no lowered cutting path may touch a
+  circular, rectangular, or polygonal exclusion zone.
+- Maximum-height transit now prefers routes around exclusion zones. When a
+  zone cannot be avoided, transit is permitted only at Z = -100 mm or higher.
+  Companion integration 2.12.0 raises vertically before any X/Y movement and
+  independently rejects lower adaptive-weeding travel heights.
+
 ## 3.29.0 - 2026-08-05
 
 - Changed tall-plant transit planning to sample obstacle boundaries at twice
