@@ -2,9 +2,9 @@
 
 ## Unreleased
 
-- Added a scheduled photo grid to the Analysis page. Pick a time and the days
-  of the week, with its own blurry, washed-out, and close-leaf retry choices,
-  and the app starts the calibrated whole-bed grid automatically.
+## 4.2.1 - 2026-08-07
+
+- Fixed release tag mismatch that prevented 4.2.0 from publishing.
 
 ## 4.2.0 - 2026-08-07
 
