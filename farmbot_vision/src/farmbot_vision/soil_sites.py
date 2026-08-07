@@ -1,4 +1,4 @@
-"""Select clear-soil capture sites and assign them to stale FarmBot points."""
+"""Select clear-soil capture sites and assign them to FarmBot soil points."""
 
 from __future__ import annotations
 
@@ -8,10 +8,12 @@ from datetime import UTC, datetime, timedelta
 from .models import Inventory, SoilGridPlan, SoilGridPoint, SoilPoint, SoilPointInventory, SoilSite
 from .zones import Zone, ZoneAspect, evaluate
 
-STALE_AFTER = timedelta(days=14)
+DEFAULT_MINIMUM_POINT_AGE_DAYS = 14
 MAX_RELOCATION_MM = 200.0
 GRID_SPACING_MM = 25.0
 DEFAULT_SOIL_CLEARANCE_MM = 75.0
+MINIMUM_BLOCKING_RADIUS_MM = 15.0
+MINIMUM_BLOCKING_PLANT_AGE_DAYS = 10
 
 
 def _utc(value: datetime) -> datetime:
@@ -45,18 +47,47 @@ def _obstacles(
     garden: Inventory,
     vision_plants: list[dict],
     vision_weeds: list[dict],
+    now: datetime,
 ) -> list[tuple[float, float, float]]:
-    obstacles = [(plant.x, plant.y, max(0.0, plant.radius)) for plant in garden.plants]
-    obstacles.extend((weed.x, weed.y, max(0.0, weed.radius)) for weed in garden.weeds)
-    for detection in [*vision_plants, *vision_weeds]:
+    """Return only established vegetation that can genuinely obscure soil.
+
+    FarmBot often represents newly planted seeds as small plant points. Those
+    do not appear in the camera and must not erase otherwise clear soil from a
+    plan. Small weed markers have the same treatment.
+    """
+
+    obstacles = []
+    for plant in garden.plants:
+        radius = max(0.0, plant.radius)
+        if radius < MINIMUM_BLOCKING_RADIUS_MM:
+            continue
+        if plant.planted_at is not None and now - _utc(plant.planted_at) < timedelta(
+            days=MINIMUM_BLOCKING_PLANT_AGE_DAYS
+        ):
+            continue
+        obstacles.append((plant.x, plant.y, radius))
+    obstacles.extend(
+        (weed.x, weed.y, max(0.0, weed.radius))
+        for weed in garden.weeds
+        if max(0.0, weed.radius) >= MINIMUM_BLOCKING_RADIUS_MM
+    )
+    for detection in vision_plants:
         try:
-            obstacles.append(
-                (
-                    float(detection["x"]),
-                    float(detection["y"]),
-                    max(0.0, float(detection.get("radius_mm") or 0)),
-                )
-            )
+            radius = max(0.0, float(detection.get("radius_mm") or 0))
+            age = detection.get("plant_age_days")
+            if radius < MINIMUM_BLOCKING_RADIUS_MM or (
+                age is not None and float(age) < MINIMUM_BLOCKING_PLANT_AGE_DAYS
+            ):
+                continue
+            obstacles.append((float(detection["x"]), float(detection["y"]), radius))
+        except (KeyError, TypeError, ValueError):
+            continue
+    for detection in vision_weeds:
+        try:
+            radius = max(0.0, float(detection.get("radius_mm") or 0))
+            if radius < MINIMUM_BLOCKING_RADIUS_MM:
+                continue
+            obstacles.append((float(detection["x"]), float(detection["y"]), radius))
         except (KeyError, TypeError, ValueError):
             continue
     return obstacles
@@ -135,13 +166,14 @@ def plan_soil_measurement_grid(
     maximum_deviation_mm: float,
     baseline_mm: float,
     clear_soil_margin_mm: float = DEFAULT_SOIL_CLEARANCE_MM,
+    minimum_point_age_days: int | None = DEFAULT_MINIMUM_POINT_AGE_DAYS,
     now: datetime | None = None,
 ) -> SoilGridPlan:
     """Plan every half-spacing-offset grid point and explain every omission.
 
-    Existing FarmBot soil points are the update records because the companion
-    contract deliberately cannot create points. Each record is assigned once,
-    then the nearest sampled clear location within the user's deviation is used.
+    Existing FarmBot soil points preserve the grid's stable measurement
+    records. Each record is assigned once, then the nearest sampled clear
+    location within the user's deviation is used.
     """
 
     values = (spacing_mm, maximum_deviation_mm, baseline_mm, clear_soil_margin_mm)
@@ -153,6 +185,8 @@ def plan_soil_measurement_grid(
         raise ValueError("maximum grid deviation must be from 0 up to, but not including, 200 mm")
     if baseline_mm <= 0 or clear_soil_margin_mm < 0:
         raise ValueError("baseline and clear-soil margin must be positive")
+    if minimum_point_age_days is not None and not 1 <= minimum_point_age_days <= 3650:
+        raise ValueError("recent-measurement age must be from 1 to 3650 days")
     x_bounds = soil.motion.axis_bounds.get("x")
     y_bounds = soil.motion.axis_bounds.get("y")
     if x_bounds is None or y_bounds is None:
@@ -169,8 +203,10 @@ def plan_soil_measurement_grid(
     if len(grid_x_values) * len(grid_y_values) > 10_000:
         raise ValueError("soil grid is too large; increase spacing to keep it under 10,000 points")
     now = _utc(now or datetime.now(UTC))
-    cutoff = now - STALE_AFTER
-    obstacles = _obstacles(garden, vision_plants, vision_weeds)
+    cutoff = (
+        now - timedelta(days=minimum_point_age_days) if minimum_point_age_days is not None else None
+    )
+    obstacles = _obstacles(garden, vision_plants, vision_weeds, now)
     offsets = _OFFSETS
     assigned: set[int] = set()
     used_sites: set[tuple[float, float]] = set()
@@ -215,14 +251,14 @@ def plan_soil_measurement_grid(
                     )
                 )
                 continue
-            if _utc(anchor.updated_at) >= cutoff:
+            if cutoff is not None and _utc(anchor.updated_at) >= cutoff:
                 result.append(
                     SoilGridPoint(
                         **common,
                         status="skipped",
                         explanation=(
-                            "The nearest soil-height point is less than 14 days old and is not "
-                            "eligible for replacement yet."
+                            "The nearest soil-height point has a measurement newer than the "
+                            f"accepted {minimum_point_age_days}-day age."
                         ),
                     )
                 )
@@ -317,9 +353,10 @@ def plan_safe_soil_sites(
     *,
     baseline_mm: float,
     clear_soil_margin_mm: float = DEFAULT_SOIL_CLEARANCE_MM,
+    minimum_point_age_days: int | None = DEFAULT_MINIMUM_POINT_AGE_DAYS,
     now: datetime | None = None,
 ) -> list[SoilSite]:
-    """Return one nearest clear site for each eligible stale soil point.
+    """Return one nearest clear site for each eligible soil point.
 
     The configured soil patch margin plus the worst-case one-sided stereo baseline must not
     overlap any active FarmBot or Vision plant, FarmBot weed, Vision weed, or
@@ -328,7 +365,11 @@ def plan_safe_soil_sites(
     """
 
     now = _utc(now or datetime.now(UTC))
-    cutoff = now - STALE_AFTER
+    if minimum_point_age_days is not None and not 1 <= minimum_point_age_days <= 3650:
+        raise ValueError("recent-measurement age must be from 1 to 3650 days")
+    cutoff = (
+        now - timedelta(days=minimum_point_age_days) if minimum_point_age_days is not None else None
+    )
     x_bounds = soil.motion.axis_bounds.get("x")
     y_bounds = soil.motion.axis_bounds.get("y")
     if x_bounds is None or y_bounds is None:
@@ -339,31 +380,18 @@ def plan_safe_soil_sites(
         raise ValueError("clear-soil margin must be a finite non-negative number")
     safety_margin = clear_soil_margin_mm + 2 * baseline_mm
 
-    obstacles: list[tuple[float, float, float]] = [
-        (plant.x, plant.y, max(0.0, plant.radius) + safety_margin) for plant in garden.plants
+    obstacles = [
+        (x, y, radius + safety_margin)
+        for x, y, radius in _obstacles(garden, vision_plants, vision_weeds, now)
     ]
-    obstacles.extend(
-        (weed.x, weed.y, max(0.0, weed.radius) + safety_margin) for weed in garden.weeds
-    )
-    for detection in [*vision_plants, *vision_weeds]:
-        try:
-            obstacles.append(
-                (
-                    float(detection["x"]),
-                    float(detection["y"]),
-                    max(0.0, float(detection.get("radius_mm") or 0)) + safety_margin,
-                )
-            )
-        except (KeyError, TypeError, ValueError):
-            continue
 
-    stale = [
+    eligible = [
         point
         for point in soil.points
-        if point.updated_at is not None and _utc(point.updated_at) < cutoff
+        if point.updated_at is not None and (cutoff is None or _utc(point.updated_at) < cutoff)
     ]
     options: list[tuple[float, int, float, float, float]] = []
-    for point in stale:
+    for point in eligible:
         for distance, dx, dy in _OFFSETS:
             x, y = point.x + dx, point.y + dy
             if not (x_min <= x <= x_max and y_min <= y <= y_max):
@@ -383,7 +411,7 @@ def plan_safe_soil_sites(
                 continue
             options.append((distance, point.id, x, y, clearance))
 
-    by_id = {point.id: point for point in stale}
+    by_id = {point.id: point for point in eligible}
     assigned_points: set[int] = set()
     assigned_sites: set[tuple[float, float]] = set()
     result = []

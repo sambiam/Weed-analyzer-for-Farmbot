@@ -56,7 +56,7 @@ async def test_grid_repair_requires_advertised_v2_capability(monkeypatch):
     try:
         with pytest.raises(
             web.HomeAssistantError,
-            match="requires FarmBot integration V2.12.0",
+            match="requires FarmBot integration V2.13.0",
         ):
             await web._require_grid_repair_capability()
     finally:
@@ -116,7 +116,7 @@ async def test_whole_grid_requires_illuminated_capture_capability(monkeypatch):
 
     monkeypatch.setattr(web.client, "list_bots", list_bots)
     try:
-        with pytest.raises(web.HomeAssistantError, match="V2.12.0"):
+        with pytest.raises(web.HomeAssistantError, match="V2.13.0"):
             await web._require_grid_repair_capability(require_lighting=True)
     finally:
         web.settings.selected_config_entry_id = previous
@@ -1237,7 +1237,7 @@ async def asgi_request(
 
 
 @pytest.mark.asyncio
-async def test_soil_height_page_lists_points_and_warns_below_three(monkeypatch):
+async def test_soil_height_page_uses_calibration_grid_and_queue_layout(monkeypatch):
     async def soil_points(_entry_id):
         return SoilPointInventory(
             device_id="42",
@@ -1285,27 +1285,32 @@ async def test_soil_height_page_lists_points_and_warns_below_three(monkeypatch):
     status, _, body = await asgi_request("/soil-height")
     assert status == 200
     assert b"Clear soil" in body
-    assert b"Measure selected" in body
-    assert b"Custom coordinates" in body
-    assert b"Safety anchor soil point" not in body
+    assert b"Soil height measurement" in body
+    assert body.index(b"Guided calibration") < body.index(b"Automation and quality settings")
+    assert b"Measurement queue" in body
+    assert b"Clear-soil replacements" not in body
+    assert b"Measure selected" not in body
     assert b"Clear-soil margin" in body
-    assert b"Automatically measure every available soil point each day" in body
+    assert b"Run soil height measurement every" in body
     assert b"Minimum confidence (%)" in body
     assert b"Maximum stereo-pair disagreement (mm)" in body
-    assert b">Select all<" in body
-    assert b">Select all failed<" in body
-    assert b'data-failed="false"' in body
     assert b"Measure custom coordinate" in body
-    assert b"Fewer than three stale soil points" in body
-    assert b"replace the assigned stale point" in body
     assert b"Calculate all points for grid" in body
     assert b"id=soil-grid-modal" in body
     assert b"Maximum deviation from grid (mm)" in body
+    assert b"Only measure where no recent measurement exists" in body
+    assert body.count(b"name=capture_z") == 1
+    assert body.count(b"name=baseline_mm") == 1
 
 
 @pytest.mark.asyncio
 async def test_soil_grid_preview_api_returns_all_outcomes(monkeypatch):
     monkeypatch.setattr(web.settings, "selected_config_entry_id", "soil-entry")
+    monkeypatch.setattr(
+        web.database,
+        "active_soil_calibration",
+        lambda _entry_id: SimpleNamespace(baseline_mm=15),
+    )
     plan = SoilGridPlan(
         spacing_mm=500,
         maximum_deviation_mm=100,
@@ -1361,6 +1366,11 @@ async def test_accept_soil_grid_persists_selection_and_starts_guarded_job(tmp_pa
     monkeypatch.setattr(web, "soil_settings_store", store)
     monkeypatch.setattr(web.soil_jobs, "soil_settings_store", store)
     monkeypatch.setattr(web.settings, "selected_config_entry_id", "soil-entry")
+    monkeypatch.setattr(
+        web.database,
+        "active_soil_calibration",
+        lambda _entry_id: SimpleNamespace(capture_z=-10, baseline_mm=15),
+    )
     started = {}
     monkeypatch.setattr(
         web.soil_jobs,
@@ -1374,8 +1384,8 @@ async def test_accept_soil_grid_persists_selection_and_starts_guarded_job(tmp_pa
         form={
             "spacing_mm": "400",
             "maximum_deviation_mm": "80",
-            "capture_z": "-10",
-            "baseline_mm": "15",
+            "skip_recent_measurements": "true",
+            "recent_measurement_days": "5",
         },
     )
 
@@ -1383,6 +1393,8 @@ async def test_accept_soil_grid_persists_selection_and_starts_guarded_job(tmp_pa
     assert headers[b"location"] == b"../../soil-height"
     assert store.load().grid_spacing_mm == 400
     assert store.load().grid_maximum_deviation_mm == 80
+    assert store.load().grid_skip_recent_measurements is True
+    assert store.load().grid_recent_measurement_days == 5
     assert started == {
         "config_entry_id": "soil-entry",
         "spacing_mm": 400,
@@ -1672,6 +1684,7 @@ async def test_soil_settings_route_persists_all_tab_controls(tmp_path, monkeypat
             "pair_disagreement_limit_mm": "12.5",
             "scheduled_run_enabled": "true",
             "scheduled_run_time": "04:30",
+            "scheduled_run_interval_days": "3",
             "automatic_acceptance_enabled": "true",
             "automatic_acceptance_confidence_percent": "94",
             "automatic_acceptance_margin_mm": "15",
@@ -1684,6 +1697,7 @@ async def test_soil_settings_route_persists_all_tab_controls(tmp_path, monkeypat
     assert status == 303
     assert values.scheduled_run_enabled
     assert values.scheduled_run_time == "04:30"
+    assert values.scheduled_run_interval_days == 3
     assert values.automatic_acceptance_confidence_percent == 94
     assert values.automatic_acceptance_margin_mm == 15
     assert values.automatic_retry_delay_seconds == 7200
@@ -1691,7 +1705,7 @@ async def test_soil_settings_route_persists_all_tab_controls(tmp_path, monkeypat
 
 
 @pytest.mark.asyncio
-async def test_soil_scheduler_starts_all_available_points_once_per_day(tmp_path, monkeypatch):
+async def test_soil_scheduler_starts_saved_grid_at_configured_day_interval(tmp_path, monkeypatch):
     store = web.SoilSettingsStore(tmp_path / "soil-settings.json")
     store.save(web.SoilSettings(scheduled_run_enabled=True, scheduled_run_time="04:30"))
     monkeypatch.setattr(web, "soil_settings_store", store)
@@ -1703,14 +1717,11 @@ async def test_soil_scheduler_starts_all_available_points_once_per_day(tmp_path,
         lambda _entry_id: SimpleNamespace(capture_z=0, baseline_mm=15),
     )
 
-    async def safe_sites(*_args, **_kwargs):
-        return None, [SimpleNamespace(point_id=70), SimpleNamespace(point_id=71)]
-
     started = []
-    monkeypatch.setattr(web.soil_jobs, "safe_sites", safe_sites)
     monkeypatch.setattr(
-        web.soil_jobs, "start_measurements", lambda **kwargs: started.append(kwargs)
+        web.soil_jobs, "start_grid_measurements", lambda **kwargs: started.append(kwargs)
     )
+    monkeypatch.setattr(web.database, "latest_soil_job_of_kind", lambda *_args: None)
     monkeypatch.setattr(
         web,
         "_soil_automation_state",
@@ -1720,8 +1731,8 @@ async def test_soil_scheduler_starts_all_available_points_once_per_day(tmp_path,
     await web._run_soil_automation(now)
     await web._run_soil_automation(now.replace(second=30))
     assert len(started) == 1
-    assert started[0]["point_ids"] == [70, 71]
     assert started[0]["job_kind"] == "measurement_scheduled"
+    assert started[0]["spacing_mm"] == 500
 
 
 @pytest.mark.asyncio
@@ -1807,7 +1818,7 @@ async def test_soil_height_page_uses_last_plan_during_slow_refresh(monkeypatch):
     )
     status, _, body = await asgi_request("/soil-height")
     assert status == 200
-    assert b"connected=True" in body
+    assert b"connected=True" not in body
     assert b"showing the last successful result" in body
     assert b">unavailable<" not in body
     assert b'id=soil-refresh-state data-active="true"' in body
@@ -1845,6 +1856,33 @@ async def test_custom_soil_calibration_does_not_require_anchor(monkeypatch):
     assert received["point_id"] is None
     assert received["capture_x"] == 321.5
     assert received["capture_y"] == 456.5
+
+
+@pytest.mark.asyncio
+async def test_custom_soil_measurement_only_requires_coordinates(monkeypatch):
+    monkeypatch.setattr(web.settings, "selected_config_entry_id", "soil-entry")
+    monkeypatch.setattr(
+        web.database,
+        "active_soil_calibration",
+        lambda _entry_id: SimpleNamespace(capture_z=-12, baseline_mm=17),
+    )
+    received = {}
+    monkeypatch.setattr(
+        web.soil_jobs, "start_measurements", lambda **kwargs: received.update(kwargs)
+    )
+
+    status, _, _ = await asgi_request(
+        "/soil/measure",
+        method="POST",
+        form={"mode": "custom", "custom_x": "321.5", "custom_y": "456.5"},
+    )
+
+    assert status == 303
+    assert received["custom_point_id"] is None
+    assert received["custom_x"] == 321.5
+    assert received["custom_y"] == 456.5
+    assert received["capture_z"] == -12
+    assert received["baseline_mm"] == 17
 
 
 @pytest.mark.asyncio
@@ -2699,19 +2737,6 @@ async def test_best_guess_names_categories_in_plain_language(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_canopy_settings_page_exposes_fusion_and_automation_controls():
-    status, _, body = await asgi_request("/canopy-settings")
-    html = body.decode()
-
-    assert status == 200
-    assert "Multi-image canopy fusion" in html
-    assert "name=always_fuse_when_available" in html
-    assert "name=minimum_angular_coverage" in html
-    assert "name=automatic_requires_reliable_fusion" in html
-    assert "name=save_diagnostics" in html
-
-
-@pytest.mark.asyncio
 async def test_dashboard_plant_view_uses_only_clean_and_mask_composites(tmp_path, monkeypatch):
     artifact_dir = tmp_path / "artifacts"
     artifact_dir.mkdir()
@@ -3421,3 +3446,108 @@ def test_app_config_uses_default_ingress_entry():
     assert config["panel_title"] == "FarmBot Vision"
     assert config["homeassistant_api"] is True
     assert "ingress_entry" not in config
+
+
+def _schedule_store(tmp_path, monkeypatch):
+    store = web.PhotoGridScheduleStore(tmp_path / "photo_grid_schedule.json")
+    monkeypatch.setattr(web, "photo_grid_schedule_store", store)
+    monkeypatch.setitem(web._photo_grid_schedule_state, "last_started_slot", None)
+    return store
+
+
+@pytest.mark.asyncio
+async def test_photo_grid_schedule_round_trips_days_and_time(tmp_path, monkeypatch):
+    store = _schedule_store(tmp_path, monkeypatch)
+    response = await web.save_photo_grid_schedule(
+        schedule_enabled=True,
+        schedule_time="04:30",
+        schedule_days=["0", "3", "bogus"],
+        schedule_quality_repair_blurry_enabled=True,
+        schedule_quality_repair_washed_out_enabled=None,
+        schedule_quality_repair_close_leaf_enabled=None,
+    )
+    assert response.status_code == 303
+    values = store.load()
+    assert values.enabled is True
+    assert values.time == "04:30"
+    assert values.days == [0, 3]
+    assert values.quality_repair_blurry_enabled is True
+    assert values.quality_repair_washed_out_enabled is False
+    assert "Monday, Thursday at 04:30" in unquote(response.headers["location"])
+
+
+@pytest.mark.asyncio
+async def test_photo_grid_schedule_rejects_invalid_time(tmp_path, monkeypatch):
+    store = _schedule_store(tmp_path, monkeypatch)
+    response = await web.save_photo_grid_schedule(
+        schedule_enabled=True,
+        schedule_time="25:99",
+        schedule_days=["1"],
+        schedule_quality_repair_blurry_enabled=None,
+        schedule_quality_repair_washed_out_enabled=None,
+        schedule_quality_repair_close_leaf_enabled=None,
+    )
+    assert "valid 24-hour time" in unquote(response.headers["location"])
+    assert store.load().enabled is False
+
+
+@pytest.mark.asyncio
+async def test_scheduled_photo_grid_starts_once_on_its_day(tmp_path, monkeypatch):
+    store = _schedule_store(tmp_path, monkeypatch)
+    store.save(
+        web.PhotoGridScheduleSettings(
+            enabled=True,
+            time="04:30",
+            days=[2],
+            quality_repair_blurry_enabled=True,
+            quality_repair_washed_out_enabled=False,
+            quality_repair_close_leaf_enabled=False,
+        )
+    )
+    starts: list[dict] = []
+
+    async def fake_start(*args, **kwargs):
+        starts.append(kwargs)
+        return None
+
+    monkeypatch.setattr(web, "start_calibrated_photo_grid", fake_start)
+    monkeypatch.setattr(web, "photo_grid_task", None)
+    monkeypatch.setattr(web.settings, "selected_config_entry_id", "entry-1")
+
+    # Wednesday 04:30 local time.
+    due = datetime(2026, 8, 5, 4, 30).astimezone()
+    await web._run_photo_grid_schedule(due)
+    await web._run_photo_grid_schedule(due)
+    assert len(starts) == 1
+    assert starts[0] == {
+        "quality_repair_blurry_enabled": True,
+        "quality_repair_washed_out_enabled": False,
+        "quality_repair_close_leaf_enabled": False,
+    }
+
+    # Same time on a day that was not selected must not run.
+    await web._run_photo_grid_schedule(datetime(2026, 8, 6, 4, 30).astimezone())
+    assert len(starts) == 1
+
+
+@pytest.mark.asyncio
+async def test_scheduled_photo_grid_ignores_other_times(tmp_path, monkeypatch):
+    store = _schedule_store(tmp_path, monkeypatch)
+    store.save(web.PhotoGridScheduleSettings(enabled=True, time="04:30", days=[2]))
+    started = False
+
+    async def fake_start(*args, **kwargs):
+        nonlocal started
+        started = True
+
+    monkeypatch.setattr(web, "start_calibrated_photo_grid", fake_start)
+    monkeypatch.setattr(web.settings, "selected_config_entry_id", "entry-1")
+    await web._run_photo_grid_schedule(datetime(2026, 8, 5, 4, 31).astimezone())
+    assert started is False
+
+
+def test_photo_grid_schedule_without_days_never_runs():
+    values = web.PhotoGridScheduleSettings(enabled=True, time="04:30", days=[])
+    assert values.runnable is False
+    assert values.due(2, "04:30") is False
+    assert "at least one day" in values.summary()

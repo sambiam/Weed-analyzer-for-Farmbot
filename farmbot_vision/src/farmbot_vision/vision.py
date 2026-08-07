@@ -12,7 +12,11 @@ import cv2
 import numpy as np
 
 from . import ALGORITHM_VERSION, CONTRACT_VERSION
-from .canopy_radius import estimate_canopy_radius, previous_canopy_edge_mm
+from .canopy_radius import (
+    estimate_canopy_radius,
+    previous_canopy_edge_mm,
+    recommended_protection_radius_mm,
+)
 from .models import (
     AnalysisResult,
     Calibration,
@@ -743,6 +747,19 @@ def _world_offsets_to_pixel(
     return cos_t * vx + sin_t * vy, -sin_t * vx + cos_t * vy
 
 
+def _crop_proximity_confidence_multiplier(distance_mm: float, radius_mm: float) -> float:
+    """Weight classifications inside a known crop radius by centre proximity."""
+
+    radius = max(0.0, float(radius_mm))
+    if radius <= 0:
+        return 1.0
+    ratio = max(0.0, float(distance_mm)) / radius
+    # Confidence rises smoothly from zero at the crop centre to its unmodified
+    # value at the FarmBot radius. The quadratic curve gives the strong crop
+    # prior more influence than a learned verifier close to the plant point.
+    return min(1.0, ratio * ratio)
+
+
 def _canopy_visibility(
     center: tuple[float, float],
     radius_mm: float,
@@ -830,6 +847,7 @@ def _verify_new_boundary(
         "known_weed_pixels_removed": 0,
         "components_checked": 0,
         "crop_accepted": 0,
+        "crop_context_accepted": 0,
         "weed_rejected": 0,
         "noncrop_rejected": 0,
         "uncertain_held": 0,
@@ -939,7 +957,13 @@ def _verify_new_boundary(
             strong_green_minimum_excess_green=(weed_settings.strong_green_minimum_excess_green),
             distance_to_plant_mm=math.hypot(center_dx_mm, center_dy_mm),
         )
-        weed_probability = verifier.predict(features)
+        crop_context_multiplier = _crop_proximity_confidence_multiplier(
+            math.hypot(center_dx_mm, center_dy_mm), seed.current_radius_mm
+        )
+        raw_weed_probability = verifier.predict(features)
+        weed_probability = (
+            None if raw_weed_probability is None else raw_weed_probability * crop_context_multiplier
+        )
         explanations = dict(verifier.explain(features)) if hasattr(verifier, "explain") else {}
         stats["components_checked"] += 1
         if weed_settings.visual_verifier_shadow_mode:
@@ -972,12 +996,16 @@ def _verify_new_boundary(
             and crop_probability >= weed_settings.boundary_crop_minimum_confidence
         ):
             stats["crop_accepted"] += 1
-        elif (
-            top_label != "crop"
-            and top_probability >= weed_settings.boundary_noncrop_minimum_confidence
+        elif top_label != "crop" and (
+            top_probability * crop_context_multiplier
+            >= weed_settings.boundary_noncrop_minimum_confidence
         ):
             accepted[component] = False
             stats["noncrop_rejected"] += 1
+        elif crop_context_multiplier < 1.0:
+            # Inside an established crop radius, plant ownership is stronger
+            # evidence than a sub-threshold learned non-crop classification.
+            stats["crop_context_accepted"] += 1
         else:
             accepted[component] = False
             stats["uncertain_held"] += 1
@@ -987,6 +1015,7 @@ def _verify_new_boundary(
         notes.append(
             "boundary verifier: "
             f"{stats['crop_accepted']} crop accepted, "
+            f"{stats['crop_context_accepted']} crop-context accepted, "
             f"{stats['weed_rejected']} weed and {stats['noncrop_rejected']} non-crop rejected, "
             f"{stats['uncertain_held']} uncertain held"
         )
@@ -1603,6 +1632,7 @@ class ClassicalVisionEngine(ImageAnalysisEngine):
                 maximum = float(np.percentile(distances_mm, 98))
                 clipped_fraction = 0.0
                 broad_overreach = False
+                recommendation = maximum + self.safety_margin_mm + effective_calibration_margin
             else:
                 keep = radius_estimate.keep
                 if not np.all(keep):
@@ -1617,6 +1647,11 @@ class ClassicalVisionEngine(ImageAnalysisEngine):
                 maximum = radius_estimate.outer_radius_mm
                 clipped_fraction = radius_estimate.clipped_point_fraction
                 broad_overreach = radius_estimate.broad_overreach
+                recommendation = recommended_protection_radius_mm(
+                    radius_estimate,
+                    current_radius_mm=seed.current_radius_mm,
+                    protection_margin_mm=(self.safety_margin_mm + effective_calibration_margin),
+                )
             _visible_fraction, visible_boundary_sectors = _canopy_visibility(
                 seed.center_px,
                 max(seed.current_radius_mm, maximum),
@@ -1667,7 +1702,6 @@ class ClassicalVisionEngine(ImageAnalysisEngine):
                 # The same is true when the learned verifier held an uncertain
                 # new boundary region for another observation.
                 confidence = min(confidence, 0.74)
-            recommendation = maximum + self.safety_margin_mm + effective_calibration_margin
             canopy_center = (float(np.median(xs)), float(np.median(ys)))
             center_offset_x_mm, center_offset_y_mm = _pixel_offsets_to_world_mm(
                 canopy_center[0] - seed.center_px[0],
@@ -1801,9 +1835,11 @@ class ClassicalVisionEngine(ImageAnalysisEngine):
                     255,
                     -1,
                 )
+            historical_crop = np.zeros_like(claimed)
             if weed_settings.crop_protection_enabled:
                 prior_margin_px = max(1, round(gates.exclusion_margin_mm * params.mean_ppm))
                 for prior in previous_masks.values():
+                    historical_crop |= prior > 0
                     distance_from_prior = cv2.distanceTransform(
                         (prior == 0).astype(np.uint8), cv2.DIST_L2, 5
                     )
@@ -1821,6 +1857,18 @@ class ClassicalVisionEngine(ImageAnalysisEngine):
             # zone used to protect every weed transitively reachable from it.
             vegetation = candidate_vegetation.astype(np.uint8) * 255
             _, vegetation_groups = _nearby_component_labels(vegetation, group_gap_px)
+            owned_crop_anchor = candidate_vegetation & claimed
+            owned_crop_group_ids = np.unique(vegetation_groups[owned_crop_anchor])
+            owned_crop_group_ids = owned_crop_group_ids[owned_crop_group_ids > 0]
+            if len(owned_crop_group_ids):
+                distance_from_owned_crop = cv2.distanceTransform(
+                    (~owned_crop_anchor).astype(np.uint8), cv2.DIST_L2, 5
+                )
+                plant_mask_supported = np.isin(vegetation_groups, owned_crop_group_ids) & (
+                    distance_from_owned_crop <= max(1.0, CROP_SUPPORT_REACH_MM * params.mean_ppm)
+                )
+            else:
+                plant_mask_supported = np.zeros_like(claimed)
             crop_anchor = candidate_vegetation & (claimed | (exclusion > 0))
             crop_group_ids = np.unique(vegetation_groups[crop_anchor])
             crop_group_ids = crop_group_ids[crop_group_ids > 0]
@@ -1940,15 +1988,21 @@ class ClassicalVisionEngine(ImageAnalysisEngine):
                 # Distance to the nearest known crop separates an interrow weed
                 # from a crop leaf that escaped the exclusion mask, and it is
                 # the one feature the candidate crop cannot supply on its own.
-                distance_to_plant_mm = min(
-                    (
-                        math.hypot(
-                            (wx - seed.center_px[0]) / calibration.pixels_per_mm_x,
-                            (wy - seed.center_px[1]) / calibration.pixels_per_mm_y,
-                        )
-                        for seed in seeds
+                nearest_seed = min(
+                    seeds,
+                    key=lambda seed: math.hypot(
+                        (wx - seed.center_px[0]) / calibration.pixels_per_mm_x,
+                        (wy - seed.center_px[1]) / calibration.pixels_per_mm_y,
                     ),
                     default=None,
+                )
+                distance_to_plant_mm = (
+                    math.hypot(
+                        (wx - nearest_seed.center_px[0]) / calibration.pixels_per_mm_x,
+                        (wy - nearest_seed.center_px[1]) / calibration.pixels_per_mm_y,
+                    )
+                    if nearest_seed is not None
+                    else None
                 )
                 features = extract_visual_features(
                     image,
@@ -1966,6 +2020,21 @@ class ClassicalVisionEngine(ImageAnalysisEngine):
                 # keys); this persists the safety context with the detection so
                 # automatic creation can never act inside crop protection.
                 features["crop_protection_overlap"] = protection_overlap
+                plant_mask_support_overlap = float(
+                    np.mean((plant_mask_supported | historical_crop)[component])
+                )
+                proximity_multiplier = (
+                    _crop_proximity_confidence_multiplier(
+                        distance_to_plant_mm, nearest_seed.current_radius_mm
+                    )
+                    if distance_to_plant_mm is not None and nearest_seed is not None
+                    else 1.0
+                )
+                mask_multiplier = max(0.0, 1.0 - plant_mask_support_overlap)
+                crop_context_multiplier = proximity_multiplier * mask_multiplier
+                features["crop_center_proximity_multiplier"] = proximity_multiplier
+                features["plant_mask_support_overlap"] = plant_mask_support_overlap
+                features["crop_context_confidence_multiplier"] = crop_context_multiplier
                 features["configured_maximum_area_exceeded"] = float(
                     area_mm2 > weed_settings.maximum_area_mm2
                 )
@@ -1996,9 +2065,16 @@ class ClassicalVisionEngine(ImageAnalysisEngine):
                     + min(1.0, features["solidity"] / 0.5) * 0.12
                     + min(1.0, features["circularity"] / 0.25) * 0.08,
                 )
-                verifier_confidence = (
+                raw_verifier_confidence = (
                     self.weed_verifier.predict(features) if verifier_scoring else None
                 )
+                verifier_confidence = (
+                    None
+                    if raw_verifier_confidence is None
+                    else raw_verifier_confidence * crop_context_multiplier
+                )
+                if raw_verifier_confidence is not None:
+                    features["raw_verifier_confidence"] = raw_verifier_confidence
                 for state in associated_states:
                     if not verifier_authoritative or verifier_confidence is None:
                         state["inconclusive"] = True

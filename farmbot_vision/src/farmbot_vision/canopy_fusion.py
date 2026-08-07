@@ -6,7 +6,7 @@ from dataclasses import dataclass
 import cv2
 import numpy as np
 
-from .canopy_radius import estimate_canopy_radius
+from .canopy_radius import estimate_canopy_radius, recommended_protection_radius_mm
 from .canopy_settings import CanopyFusionSettings
 from .plant_measurement import (
     MINIMUM_PARTIAL_BOUNDARY_COVERAGE,
@@ -19,6 +19,7 @@ from .plant_measurement import (
 class FusedCanopyResult:
     typical_radius_mm: float
     maximum_radius_mm: float
+    recommended_radius_mm: float
     confidence: float
     view_count: int
     angular_coverage: float
@@ -39,7 +40,11 @@ def fuse_canopy_masks(
     selection = select_measurement_evidence(measurements)
     if selection.mode in {"single_complete", "no_evidence", "no_center"}:
         return None
-    selected = list(selection.used)
+    # Evidence selection deliberately chooses the smallest set needed for a
+    # scalar estimate. Fusion has a different job: build the complete canopy
+    # supplied to the user. Every useful grid tile must therefore participate,
+    # including a tile whose boundary sectors overlap an earlier view.
+    selected = list(selection.useful)
     if not selected:
         return None
     newest = max(item.image_timestamp for item in selected)
@@ -184,14 +189,16 @@ def fuse_canopy_masks(
     dy = (ys - center_y) / ppm
     distances = np.hypot(dx, dy)
     angles = (np.arctan2(dy, dx) + 2 * math.pi) % (2 * math.pi)
+    current_radius = float(np.median([frame["item"].current_radius_mm for frame in frames]))
+    protection_margin = max(
+        float(frame["item"].safety_margin_mm) + float(frame["item"].calibration_uncertainty_mm)
+        for frame in frames
+    )
     radius_estimate = estimate_canopy_radius(
         distances,
         angles,
-        current_radius_mm=float(np.median([frame["item"].current_radius_mm for frame in frames])),
-        protection_margin_mm=max(
-            float(frame["item"].safety_margin_mm) + float(frame["item"].calibration_uncertainty_mm)
-            for frame in frames
-        ),
+        current_radius_mm=current_radius,
+        protection_margin_mm=protection_margin,
         angular_sectors=settings.angular_sectors,
         radial_percentile=settings.radial_percentile,
     )
@@ -202,6 +209,11 @@ def fuse_canopy_masks(
         accepted = accepted_u8 > 0
     typical = radius_estimate.typical_radius_mm
     maximum = radius_estimate.outer_radius_mm
+    recommendation = recommended_protection_radius_mm(
+        radius_estimate,
+        current_radius_mm=current_radius,
+        protection_margin_mm=protection_margin,
+    )
 
     yy, xx = np.indices(accepted.shape)
     all_dx = (xx - center_x) / ppm
@@ -277,6 +289,7 @@ def fuse_canopy_masks(
     return FusedCanopyResult(
         typical_radius_mm=typical,
         maximum_radius_mm=maximum,
+        recommended_radius_mm=recommendation,
         confidence=confidence,
         view_count=len(frames),
         angular_coverage=coverage,

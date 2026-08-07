@@ -187,6 +187,28 @@ def test_clean_mask_can_reduce_a_previously_overestimated_radius(calibration):
     assert measurement.recommended_protection_radius_mm < 70
 
 
+def test_radius_reduction_never_cuts_inside_a_supported_leaf_mask(calibration):
+    seed = PlantSeed(
+        plant_id=1,
+        crop_slug="lettuce",
+        center_px=(160, 120),
+        current_radius_mm=180,
+    )
+    result = analyse(
+        [
+            ("circle", ((160, 120), 35)),
+            ("line", ((190, 120), (300, 120), 9)),
+        ],
+        seed,
+        calibration,
+    )
+    measurement = result.measurements[0]
+
+    assert measurement.maximum_accepted_canopy_radius_mm > 135
+    assert measurement.recommended_protection_radius_mm >= 165
+    assert measurement.recommended_protection_radius_mm < seed.current_radius_mm
+
+
 def test_known_weed_is_removed_from_new_plant_boundary(calibration):
     from farmbot_vision.weed_settings import WeedSettings
 
@@ -243,7 +265,7 @@ def test_boundary_verifier_accepts_confirmed_crop_growth(seed, calibration):
     assert result.boundary_verifier_stats["crop_accepted"] == 1
 
 
-def test_boundary_verifier_holds_uncertain_growth(seed, calibration):
+def test_crop_context_preserves_uncertain_growth_inside_existing_radius(seed, calibration):
     from farmbot_vision.weed_settings import WeedSettings
 
     verifier = _BoundaryVerifier(0.4, [("crop", 0.55), ("soil", 0.45)])
@@ -263,9 +285,9 @@ def test_boundary_verifier_holds_uncertain_growth(seed, calibration):
     )
     measurement = result.measurements[0]
 
-    assert measurement.maximum_accepted_canopy_radius_mm < 35
-    assert measurement.confidence <= 0.74
-    assert result.boundary_verifier_stats["uncertain_held"] == 1
+    assert 38 <= measurement.maximum_accepted_canopy_radius_mm <= 42
+    assert result.boundary_verifier_stats["crop_context_accepted"] == 1
+    assert result.boundary_verifier_stats["uncertain_held"] == 0
 
 
 def test_boundary_weed_reaches_weed_workflow_despite_crop_exclusion(seed, calibration):
@@ -1064,6 +1086,37 @@ def test_verifier_scores_unclaimed_weed_inside_crop_protection(seed, calibration
     assert len(result.weeds) == 1
     assert result.weed_candidate_stats["protected_scored"] >= 1
     assert result.weeds[0].features["crop_protection_overlap"] > 0
+
+
+def test_crop_mask_support_suppresses_a_crop_fragment_from_weed_review(seed, calibration):
+    """A verifier cannot overrule crop-centre and connected-mask evidence."""
+    from farmbot_vision.weed_settings import WeedSettings
+
+    verifier = _StubVerifier(0.99)
+    settings = WeedSettings(
+        enabled=True,
+        minimum_confidence=0.3,
+        visual_verifier_enabled=True,
+        visual_verifier_shadow_mode=False,
+        visual_verifier_rejection_confidence=0.45,
+        visual_verifier_acceptance_confidence=0.85,
+    )
+    result = ClassicalVisionEngine(weed_verifier=verifier).analyse(
+        jpeg([("circle", ((160, 120), 25)), ("circle", ((210, 120), 8))]),
+        9,
+        NOW,
+        [seed],
+        calibration,
+        {},
+        settings,
+    )
+
+    assert verifier.seen, "the verifier should still produce diagnostic evidence"
+    assert result.weeds == []
+    context = verifier.seen[-1]
+    assert context["crop_center_proximity_multiplier"] < 1
+    assert context["plant_mask_support_overlap"] > 0
+    assert context["crop_context_confidence_multiplier"] < 0.1
 
 
 def test_crop_support_does_not_chain_across_the_frame(calibration):

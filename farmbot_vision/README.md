@@ -1,10 +1,10 @@
-﻿# FarmBot Vision 3.31.1
+﻿# FarmBot Vision 4.2.0
 
 Lightweight, experimental canopy measurement and safe FarmBot plant-radius recommendations. Open the app through Home Assistant Ingress after installation.
 
 Set **Analysis resolution** (`640x480`, `960x720` default, or `1280x960`) in the app options; 960x720 is recommended for a 4 GB Raspberry Pi 4. Changing it requires an app restart.
 
-The companion FarmBot integration must implement the service and event contract (`farmbot-vision-v2`) documented at repository level; the minimum compatible companion integration version is **2.12.0**. No FarmBot credential is accepted or stored by this app.
+The companion FarmBot integration must implement the service and event contract (`farmbot-vision-v2`) documented at repository level; the minimum compatible companion integration version is **2.13.0**. No FarmBot credential is accepted or stored by this app.
 
 Upgrading between app versions only requires installing the new version and restarting the app. See [`CHANGELOG.md`](CHANGELOG.md) for what changed in each release, and close/reopen the Web UI tab after upgrading so Home Assistant creates a fresh Ingress session.
 
@@ -16,7 +16,11 @@ spacing from X=0 and Y=0. The preview lists unchanged, relocated, and skipped
 points, including the nearest clear location or smaller clear-soil margin that
 would make a skipped point usable. Accepting the preview recalculates it from
 live FarmBot and Vision plants, weeds, zones, and point timestamps before any
-movement begins.
+movement begins. An optional age filter skips recent measurements for a chosen
+number of days; leaving it off remeasures the complete grid. Plants and weeds
+smaller than 15 mm, plus plants younger than 10 days, do not block a clear-soil
+site. Custom coordinates update a nearby point automatically or create a new
+soil-height point when no candidate is within 200 mm.
 
 ## Weed detection and local verifier training
 

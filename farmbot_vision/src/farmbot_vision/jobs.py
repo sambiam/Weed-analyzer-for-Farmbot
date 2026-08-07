@@ -1678,10 +1678,6 @@ class JobManager:
                         )
                         and disagreement <= fusion_settings.maximum_automatic_disagreement_mm
                     )
-                    safety_margin = max(item.safety_margin_mm for item in plant_measurements)
-                    calibration_uncertainty = max(
-                        item.calibration_uncertainty_mm for item in plant_measurements
-                    )
                     diagnostic_path = artifacts / f"{job_id}-plant-{plant_id}-fusion.jpg"
                     stored_diagnostic = None
                     if fusion_settings.save_diagnostics and fused.diagnostic_jpeg is not None:
@@ -1691,9 +1687,7 @@ class JobManager:
                         "fused_canopy": True,
                         "fused_typical_radius_mm": fused.typical_radius_mm,
                         "fused_maximum_radius_mm": fused.maximum_radius_mm,
-                        "fused_recommended_radius_mm": (
-                            fused.maximum_radius_mm + safety_margin + calibration_uncertainty
-                        ),
+                        "fused_recommended_radius_mm": fused.recommended_radius_mm,
                         "fused_confidence": fused.confidence,
                         "fusion_view_count": fused.view_count,
                         "fusion_angular_coverage": fused.angular_coverage,

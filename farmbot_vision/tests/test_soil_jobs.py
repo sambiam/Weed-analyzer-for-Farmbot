@@ -73,7 +73,7 @@ async def test_automatic_acceptance_requires_confidence_and_height_margin(tmp_pa
     store.save(
         SoilSettings(
             automatic_acceptance_enabled=True,
-            automatic_acceptance_confidence_percent=90,
+            automatic_acceptance_confidence_percent=85,
             automatic_acceptance_margin_mm=10,
         )
     )
@@ -114,15 +114,40 @@ async def test_automatic_acceptance_requires_confidence_and_height_margin(tmp_pa
             reason="passed",
         )
 
-    accepted = measurement()
-    low_confidence = measurement(confidence=0.89)
+    accepted = measurement(confidence=0.85)
+    low_confidence = measurement(confidence=0.849)
     large_change = measurement(proposed=-380)
-    for item in (accepted, low_confidence, large_change):
+    standalone = SoilMeasurement(
+        measurement_id=uuid4(),
+        config_entry_id="bot-soil",
+        point_id=0,
+        point_name="New soil point",
+        expected_x=800,
+        expected_y=900,
+        old_z_mm=0,
+        point_updated_at=None,
+        capture_x=800,
+        capture_y=900,
+        relocation_distance_mm=0,
+        proposed_z_mm=-390,
+        confidence=0.85,
+        uncertainty_mm=2,
+        status="valid",
+        reason="passed",
+    )
+    for item in (accepted, low_confidence, large_change, standalone):
         database.save_soil_measurement(item)
         await manager._automatically_apply(item)
 
-    assert [item.measurement_id for item in applied] == [accepted.measurement_id]
+    assert [item.measurement_id for item in applied] == [
+        accepted.measurement_id,
+        standalone.measurement_id,
+    ]
+    assert applied[0].human_approved is True
+    assert applied[1].point_id is None
+    assert applied[1].expected_updated_at is None
     assert database.soil_measurement(str(accepted.measurement_id))["status"] == "applied"
+    assert database.soil_measurement(str(standalone.measurement_id))["status"] == "applied"
     assert database.soil_measurement(str(low_confidence.measurement_id))["status"] == "valid"
     assert database.soil_measurement(str(large_change.measurement_id))["status"] == "valid"
 
@@ -320,6 +345,31 @@ def test_soil_points_use_nearest_neighbour_order():
     ]
     ordered = SoilJobManager._nearest_order(points, 0, 0)
     assert [point.id for point in ordered] == [2, 3, 1]
+
+
+def test_custom_measurement_automatically_replaces_nearby_or_creates_new_point():
+    now = datetime.now(UTC)
+    inventory = SoilPointInventory(
+        device_id="42",
+        generated_at=now,
+        points=[SoilPoint(id=70, name="Nearby", x=100, y=100, z=-400, updated_at=now)],
+        motion=SoilMotionState(
+            connected=True,
+            busy=False,
+            locked=False,
+            position={"x": 0, "y": 0, "z": 0},
+            z_direction=-1,
+            axis_bounds={"x": (0, 1000), "y": (0, 1000), "z": (-500, 0)},
+        ),
+    )
+
+    replacement = SoilJobManager._custom_measurement_target(inventory, 250, 100)
+    standalone = SoilJobManager._custom_measurement_target(inventory, 500, 500)
+
+    assert replacement["point_id"] == 70
+    assert replacement["relocation_distance_mm"] == 150
+    assert standalone["point_id"] == 0
+    assert standalone["point_updated_at"] is None
 
 
 @pytest.mark.asyncio

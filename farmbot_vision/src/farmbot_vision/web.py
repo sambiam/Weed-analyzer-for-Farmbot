@@ -22,6 +22,7 @@ from fastapi.responses import (
     RedirectResponse,
     Response,
 )
+from pydantic import ValidationError
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from . import (
@@ -29,11 +30,10 @@ from . import (
     CONTRACT_VERSION,
     MINIMUM_INTEGRATION_VERSION,
     __version__,
-    shape_gcode,
 )
 from .calibration import from_farmbot_calibration
 from .calibration_store import CalibrationStore, FarmbotCalibrationInput
-from .canopy_settings import CanopyFusionSettings, CanopyFusionSettingsStore
+from .canopy_settings import CanopyFusionSettingsStore
 from .curve_edit import propose_curve_point
 from .curves import fit_monotonic_curve
 from .database import Database
@@ -66,9 +66,6 @@ from .models import (
     Bot,
     Calibration,
     CreateWeedRequest,
-    DrawShapePlanRequest,
-    DrawShapeRunRequest,
-    GcodeRunRequest,
     InventoryRequest,
     Measurement,
     OperatingMode,
@@ -90,6 +87,11 @@ from .photo_grid import (
     photo_grid_chunk_size,
     plan_photo_grid,
     plan_targeted_plant_captures,
+)
+from .photo_grid_settings import (
+    WEEKDAY_LABELS,
+    PhotoGridScheduleSettings,
+    PhotoGridScheduleStore,
 )
 from .photo_quality import (
     PhotoIssue,
@@ -116,7 +118,6 @@ from .weed_verifier import (
     LABEL_DESCRIPTIONS,
     WeedVisualVerifier,
 )
-from .weeding import confirmed_weeds, estimate_soil_height, plan_cut_path, recent_soil_samples
 from .weeding_jobs import WeedingJobManager
 from .zones import (
     Zone,
@@ -175,6 +176,10 @@ grid_repair_settings_store = GridRepairSettingsStore(
 )
 repair_capture_store = RepairCaptureStore(settings.data_dir / "grid_repair_captures.json")
 photo_grid_store = PhotoGridStore(settings.data_dir / "photo_grid_latest.json")
+photo_grid_schedule_store = PhotoGridScheduleStore(settings.data_dir / "photo_grid_schedule.json")
+# Guards against a second start inside the same minute, since the scheduler
+# ticks more often than once per minute.
+_photo_grid_schedule_state: dict[str, object] = {"last_started_slot": None}
 # A model shipped inside the image gives a fresh install useful filtering
 # before its owner has labelled anything. It is only consulted when no locally
 # trained model exists (see WeedVisualVerifier.reload).
@@ -2796,10 +2801,13 @@ _DASHBOARD_JS = r"""
        rotate_map) instead of always drawing garden-space (xmin,ymin) top-left. */
     const rotate=!!calibration.rotate_map, mapOrigin=calibration.map_origin;
     const displaySpanX=rotate?spanY:spanX, displaySpanY=rotate?spanX:spanY;
-    const displayWidth=900;
-    photoGridCanvas.width=displayWidth;
-    photoGridCanvas.height=Math.max(240,Math.min(650,
-      Math.round(displayWidth*displaySpanY/displaySpanX)));
+    /* Size the backing store to the bed's true aspect ratio, capped like the
+       calibration composite. Clamping the height distorted the mosaic and, with
+       the viewport's width-driven zoom, made zooming stretch it horizontally. */
+    const MAX_GRID_CANVAS=2400;
+    const gridScale=Math.min(MAX_GRID_CANVAS/displaySpanX,MAX_GRID_CANVAS/displaySpanY);
+    photoGridCanvas.width=Math.max(1,Math.round(displaySpanX*gridScale));
+    photoGridCanvas.height=Math.max(1,Math.round(displaySpanY*gridScale));
     const ctx=photoGridCanvas.getContext('2d');
     const sx=photoGridCanvas.width/displaySpanX, sy=photoGridCanvas.height/displaySpanY;
     const project=function(x,y){
@@ -2821,24 +2829,28 @@ _DASHBOARD_JS = r"""
         const markerRadius=function(point){
           return Math.max(4,(point.radius||0)*(sx+sy)/2);
         };
-        const markerLabel=function(point,fallback){
-          return point.name||fallback||('#'+point.id);
+        /* Keep only the friendly plant name: FarmBot names arrive as
+           "Bok Choy (bok-choy)" and the trailing slug just adds label clutter. */
+        const markerLabel=function(point){
+          const name=String(point.name||'').replace(/\s*\([^()]*\)\s*$/,'').trim();
+          return name||('#'+point.id);
         };
         const drawPhotoGridMarker=function(point,stroke,fill,label){
           const c=project(point.x,point.y),radius=markerRadius(point);
           ctx.fillStyle=fill;ctx.strokeStyle=stroke;ctx.lineWidth=3;
           ctx.beginPath();ctx.arc(c[0],c[1],radius,0,Math.PI*2);ctx.fill();ctx.stroke();
           ctx.fillStyle=stroke;ctx.beginPath();ctx.arc(c[0],c[1],3,0,Math.PI*2);ctx.fill();
-          drawMarkerLabel(ctx,label,c[0]+radius+7,c[1]-radius-7,
+          if(label) drawMarkerLabel(ctx,label,c[0]+radius+7,c[1]-radius-7,
             photoGridCanvas.width,photoGridCanvas.height);
         };
         (data.plants||[]).forEach(function(plant){
           drawPhotoGridMarker(plant,'#39d878','rgba(32,160,82,.18)',
-            markerLabel(plant,'Plant'));
+            markerLabel(plant));
         });
+        /* Weeds are unlabelled — the red circle already identifies them, and a
+           label per weed buried the mosaic underneath them. */
         (data.weeds||[]).forEach(function(weed){
-          drawPhotoGridMarker(weed,'#ff354d','rgba(255,53,77,.18)',
-            markerLabel(weed,'Weed'));
+          drawPhotoGridMarker(weed,'#ff354d','rgba(255,53,77,.18)','');
         });
         const planned=gridCroppedFootprint(
           calibration,calibration.reference_width,calibration.reference_height);
@@ -3610,184 +3622,6 @@ _DASHBOARD_JS = r"""
 })();
 """
 
-# Experimental Draw shape tab. The G-code itself is generated server-side (one
-# implementation, in shape_gcode.py) and returned with the path points, so the
-# preview canvas and the editable program can never disagree about what will
-# run -- and what is sent is literally the text in the box, edits included.
-_DRAW_SHAPE_JS = r"""
-(function(){
-  const form=document.getElementById('shape-form');
-  const canvas=document.getElementById('shape-preview');
-  const ctx=canvas.getContext('2d');
-  const program=document.getElementById('gcode-program');
-  const summary=document.getElementById('shape-summary');
-  const runStatus=document.getElementById('run-status');
-  const shape=document.getElementById('shape');
-  const sidesRow=document.getElementById('sides-row');
-  const segmentsRow=document.getElementById('segments-row');
-  let plan=null;
-  let poll=null;
-
-  let bounds=null;
-  try{bounds=JSON.parse(canvas.dataset.bounds||'null');}catch(_){bounds=null;}
-
-  function showConditionalFields(){
-    sidesRow.hidden=(shape.value!=='polygon');
-    segmentsRow.hidden=(shape.value!=='circle');
-  }
-
-  function values(){
-    const data={};
-    new FormData(form).forEach(function(value,key){data[key]=value;});
-    data.return_to_start=document.getElementById('return_to_start').checked;
-    return data;
-  }
-
-  function project(){
-    // Fit the whole bed when its size is known, so a shape is always shown
-    // where it actually sits rather than filling the canvas by itself.
-    let minX=0,maxX=1000,minY=0,maxY=1000;
-    if(bounds&&bounds.x&&bounds.y){
-      minX=bounds.x[0];maxX=bounds.x[1];minY=bounds.y[0];maxY=bounds.y[1];
-    }else if(plan&&plan.points.length){
-      const xs=plan.points.map(function(p){return p[0];});
-      const ys=plan.points.map(function(p){return p[1];});
-      minX=Math.min.apply(null,xs);maxX=Math.max.apply(null,xs);
-      minY=Math.min.apply(null,ys);maxY=Math.max.apply(null,ys);
-      const padX=Math.max(50,(maxX-minX)*0.2), padY=Math.max(50,(maxY-minY)*0.2);
-      minX-=padX;maxX+=padX;minY-=padY;maxY+=padY;
-    }
-    const spanX=Math.max(1,maxX-minX), spanY=Math.max(1,maxY-minY);
-    const scale=Math.min(canvas.width/spanX, canvas.height/spanY);
-    const offX=(canvas.width-spanX*scale)/2, offY=(canvas.height-spanY*scale)/2;
-    return {
-      scale:scale,
-      // FarmBot Y grows away from the origin; the canvas grows downward, so Y
-      // is flipped here and nowhere else.
-      to:function(x,y){return [offX+(x-minX)*scale, canvas.height-offY-(y-minY)*scale];},
-      box:[minX,minY,maxX,maxY]
-    };
-  }
-
-  function draw(){
-    ctx.clearRect(0,0,canvas.width,canvas.height);
-    ctx.fillStyle='#f3f7f4';
-    ctx.fillRect(0,0,canvas.width,canvas.height);
-    const p=project();
-    if(bounds&&bounds.x&&bounds.y){
-      const a=p.to(bounds.x[0],bounds.y[0]), b=p.to(bounds.x[1],bounds.y[1]);
-      ctx.strokeStyle='#9db3a5';ctx.lineWidth=1;ctx.setLineDash([5,4]);
-      ctx.strokeRect(Math.min(a[0],b[0]),Math.min(a[1],b[1]),
-                     Math.abs(b[0]-a[0]),Math.abs(b[1]-a[1]));
-      ctx.setLineDash([]);
-    }
-    if(!plan||!plan.points.length){
-      ctx.fillStyle='#74817a';ctx.font='14px system-ui';
-      ctx.fillText('Generate a shape to preview its path',14,24);
-      return;
-    }
-    if(plan.start){
-      const s=p.to(plan.start[0],plan.start[1]);
-      ctx.strokeStyle='#b0bdb4';ctx.setLineDash([3,3]);ctx.lineWidth=1;
-      const f=p.to(plan.points[0][0],plan.points[0][1]);
-      ctx.beginPath();ctx.moveTo(s[0],s[1]);ctx.lineTo(f[0],f[1]);ctx.stroke();
-      ctx.setLineDash([]);
-      ctx.fillStyle='#74817a';ctx.beginPath();ctx.arc(s[0],s[1],4,0,Math.PI*2);ctx.fill();
-    }
-    ctx.strokeStyle='#1672c4';ctx.lineWidth=2;ctx.beginPath();
-    plan.points.forEach(function(point,index){
-      const c=p.to(point[0],point[1]);
-      if(index===0){ctx.moveTo(c[0],c[1]);}else{ctx.lineTo(c[0],c[1]);}
-    });
-    ctx.stroke();
-    // Every vertex is one G00. Showing them makes a too-coarse circle obvious
-    // before it is cut, which is the whole point of segmenting by tolerance.
-    if(plan.points.length<=200){
-      ctx.fillStyle='#0b4779';
-      plan.points.slice(0,-1).forEach(function(point){
-        const c=p.to(point[0],point[1]);
-        ctx.beginPath();ctx.arc(c[0],c[1],2,0,Math.PI*2);ctx.fill();
-      });
-    }
-    const centre=p.to(plan.center[0],plan.center[1]);
-    ctx.strokeStyle='#c62828';ctx.lineWidth=1;
-    ctx.beginPath();ctx.moveTo(centre[0]-6,centre[1]);ctx.lineTo(centre[0]+6,centre[1]);
-    ctx.moveTo(centre[0],centre[1]-6);ctx.lineTo(centre[0],centre[1]+6);ctx.stroke();
-  }
-
-  function setMessage(element,text,kind){
-    element.textContent=text;
-    element.className=(kind==='error')?'warn':'muted';
-  }
-
-  async function post(url,body){
-    const response=await fetch(url,{method:'POST',
-      headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
-    const data=await response.json().catch(function(){return {};});
-    if(!response.ok){throw new Error(data.detail||('Request failed ('+response.status+')'));}
-    return data;
-  }
-
-  async function generate(){
-    try{
-      plan=await post('api/draw-shape/plan',values());
-      program.value=plan.lines.join('\n');
-      setMessage(summary,plan.summary,'ok');
-      draw();
-    }catch(err){
-      plan=null;draw();
-      setMessage(summary,err.message,'error');
-    }
-  }
-
-  function runBody(dry){
-    const data=values();
-    return {lines:program.value,feed_mm_per_min:Number(data.feed_mm_per_min),
-            return_to_start:data.return_to_start,dry_run:dry};
-  }
-
-  async function send(dry){
-    if(!dry&&!window.confirm(
-        'Send raw G-code to FarmBot?\n\nThis bypasses FarmBot OS motion planning. '+
-        'Make sure the path is clear.')){return;}
-    setMessage(runStatus,dry?'Validating...':'Sending...','ok');
-    try{
-      const result=await post('api/draw-shape/run',runBody(dry));
-      setMessage(runStatus,result.message||result.status,
-                 (result.status==='rejected'||result.status==='failed')?'error':'ok');
-      if(result.status==='queued'){startPolling();}
-    }catch(err){setMessage(runStatus,err.message,'error');}
-  }
-
-  function startPolling(){
-    if(poll){clearInterval(poll);}
-    poll=setInterval(async function(){
-      try{
-        const response=await fetch('api/draw-shape/status');
-        if(!response.ok){return;}
-        const data=await response.json();
-        let text=data.message||data.status;
-        if(data.chunks_total){text+=' ('+data.chunks_sent+'/'+data.chunks_total+' chunks)';}
-        setMessage(runStatus,text,(data.status==='failed')?'error':'ok');
-        if(data.status==='complete'||data.status==='failed'){
-          clearInterval(poll);poll=null;
-        }
-      }catch(_){/* a transient poll failure is not worth surfacing */}
-    },1500);
-  }
-
-  shape.addEventListener('change',showConditionalFields);
-  form.addEventListener('input',function(){setMessage(summary,
-    'Settings changed - generate again to update the program.','ok');});
-  document.getElementById('generate').addEventListener('click',generate);
-  document.getElementById('validate').addEventListener('click',function(){send(true);});
-  document.getElementById('send').addEventListener('click',function(){send(false);});
-  showConditionalFields();
-  draw();
-  generate();
-})();
-"""
-
 
 # Boundaries and exclusion zones. The add form only shows the geometry fields of
 # the selected shape, permissions start at the sensible polarity for the chosen
@@ -4068,8 +3902,37 @@ async def scheduler() -> None:
         ):
             last_run_date = now.date()
             await jobs.run(trigger="schedule")
+        await _run_photo_grid_schedule(now)
         await _run_soil_automation(now)
         await asyncio.sleep(30)
+
+
+async def _run_photo_grid_schedule(now: datetime) -> None:
+    """Start the calibrated photo grid on its chosen weekday and time."""
+    values = photo_grid_schedule_store.load()
+    local_now = now.astimezone()
+    clock = local_now.strftime("%H:%M")
+    if not values.due(local_now.weekday(), clock):
+        return
+    slot = f"{local_now.date().isoformat()}T{clock}"
+    if _photo_grid_schedule_state["last_started_slot"] == slot:
+        return
+    if not settings.selected_config_entry_id:
+        LOGGER.info("Skipping the scheduled photo grid because no FarmBot is selected")
+        return
+    if photo_grid_task is not None and not photo_grid_task.done():
+        LOGGER.info("Skipping the scheduled photo grid because one is already running")
+        return
+    _photo_grid_schedule_state["last_started_slot"] = slot
+    try:
+        await start_calibrated_photo_grid(
+            quality_repair_blurry_enabled=values.quality_repair_blurry_enabled,
+            quality_repair_washed_out_enabled=values.quality_repair_washed_out_enabled,
+            quality_repair_close_leaf_enabled=values.quality_repair_close_leaf_enabled,
+        )
+        LOGGER.info("Started the scheduled photo grid for %s", slot)
+    except (HomeAssistantError, ValueError) as exc:
+        LOGGER.warning("Could not start the scheduled photo grid: %s", exc)
 
 
 async def _start_automated_soil_measurements(
@@ -4082,29 +3945,28 @@ async def _start_automated_soil_measurements(
     if calibration is None:
         LOGGER.info("Skipping automated soil-height run because calibration is missing")
         return False
-    if point_ids is None:
-        values = soil_settings_store.load()
-        try:
-            _inventory, sites = await soil_jobs.safe_sites(
-                entry_id,
-                calibration.baseline_mm,
-                clear_soil_margin_mm=values.clear_soil_margin_mm,
-            )
-        except HomeAssistantError as err:
-            LOGGER.warning("Could not plan automated soil-height run: %s", err)
-            return False
-        point_ids = [site.point_id for site in sites]
-    if not point_ids:
-        LOGGER.info("Skipping automated soil-height run because no points are available")
-        return False
+    values = soil_settings_store.load()
     try:
-        soil_jobs.start_measurements(
-            config_entry_id=entry_id,
-            point_ids=point_ids,
-            capture_z=calibration.capture_z,
-            baseline_mm=calibration.baseline_mm,
-            job_kind=job_kind,
-        )
+        if point_ids is None:
+            soil_jobs.start_grid_measurements(
+                config_entry_id=entry_id,
+                spacing_mm=values.grid_spacing_mm,
+                maximum_deviation_mm=values.grid_maximum_deviation_mm,
+                capture_z=calibration.capture_z,
+                baseline_mm=calibration.baseline_mm,
+                job_kind=job_kind,
+            )
+        else:
+            if not point_ids:
+                LOGGER.info("Skipping automated soil-height retry because no points failed")
+                return False
+            soil_jobs.start_measurements(
+                config_entry_id=entry_id,
+                point_ids=point_ids,
+                capture_z=calibration.capture_z,
+                baseline_mm=calibration.baseline_mm,
+                job_kind=job_kind,
+            )
     except ValueError as err:
         LOGGER.info("Automated soil-height run was not started: %s", err)
         return False
@@ -4118,10 +3980,23 @@ async def _run_soil_automation(now: datetime) -> None:
     if not entry_id or soil_jobs.running:
         return
     local_now = now.astimezone()
+    last_scheduled_job = database.latest_soil_job_of_kind(entry_id, "measurement_scheduled")
+    last_scheduled_date = _soil_automation_state["last_scheduled_date"]
+    if last_scheduled_date is None and last_scheduled_job:
+        last_scheduled_date = (
+            datetime.fromisoformat(str(last_scheduled_job["started_at"]))
+            .astimezone(local_now.tzinfo)
+            .date()
+        )
+    scheduled_due = (
+        last_scheduled_date is None
+        or local_now.date()
+        >= last_scheduled_date + timedelta(days=values.scheduled_run_interval_days)
+    )
     if (
         values.scheduled_run_enabled
         and local_now.strftime("%H:%M") == values.scheduled_run_time
-        and _soil_automation_state["last_scheduled_date"] != local_now.date()
+        and scheduled_due
     ):
         _soil_automation_state["last_scheduled_date"] = local_now.date()
         if await _start_automated_soil_measurements(job_kind="measurement_scheduled"):
@@ -4132,7 +4007,13 @@ async def _run_soil_automation(now: datetime) -> None:
     handled = _soil_automation_state["handled_retry_jobs"]
     if (
         not latest
-        or latest.get("kind") not in {"measurement", "measurement_scheduled"}
+        or latest.get("kind")
+        not in {
+            "measurement",
+            "measurement_grid",
+            "measurement_scheduled",
+            "measurement_retry",
+        }
         or latest.get("status") != "complete"
         or int(latest.get("failed_count") or 0) == 0
         or not latest.get("completed_at")
@@ -4157,7 +4038,7 @@ async def _run_soil_automation(now: datetime) -> None:
         if created_at.astimezone(UTC) < started_at.astimezone(UTC):
             continue
         seen.add(point_id)
-        if measurement["status"] == "failed":
+        if measurement["status"] == "failed" and point_id > 0:
             failed_ids.append(point_id)
     await _start_automated_soil_measurements(point_ids=failed_ids, job_kind="measurement_retry")
 
@@ -4293,6 +4174,12 @@ label{{display:block;margin-bottom:.6rem}}
 .photo-grid-quality-options{{margin:0 0 .8rem;padding:.55rem .7rem;border:1px solid #dbe5de;border-radius:6px}}
 .photo-grid-quality-options legend{{padding:0 .25rem;font-size:.85rem;color:var(--muted)}}
 .photo-grid-quality-options label{{display:inline-block;margin:0 .9rem .15rem 0}}
+.photo-grid-schedule{{margin-top:.8rem}}
+.photo-grid-schedule fieldset{{padding:.55rem .7rem;border:1px solid #dbe5de;border-radius:6px}}
+.photo-grid-schedule legend{{padding:0 .25rem;font-size:.85rem;color:var(--muted)}}
+.photo-grid-schedule .schedule-toggle,.photo-grid-schedule .schedule-time{{display:inline-block;margin:0 .9rem .4rem 0}}
+.photo-grid-schedule .schedule-days,.photo-grid-schedule .schedule-quality{{display:flex;flex-wrap:wrap;gap:.15rem .9rem;margin-bottom:.5rem}}
+.photo-grid-schedule .schedule-days label,.photo-grid-schedule .schedule-quality label{{white-space:nowrap}}
 .action-message{{display:block;color:#a40000;max-width:24rem}}.action-message.notice{{color:var(--muted)}}.overlay-modal[hidden]{{display:none}}
 .overlay-modal{{position:fixed;inset:0;z-index:1000;background:#000b;display:flex;align-items:center;justify-content:center;padding:1rem}}
 .overlay-modal figure{{position:relative;background:white;border-radius:10px;margin:0;padding:1rem;width:min(95vw,1000px);max-height:95vh;overflow:auto}}
@@ -4304,7 +4191,7 @@ label{{display:block;margin-bottom:.6rem}}
 .photo-grid-dialog{{width:min(96vw,1000px)}}
 .photo-grid-viewport{{width:100%;max-height:72vh;overflow:auto;background:#243a2c;
 border:1px solid #bcc9c0;border-radius:6px}}.photo-grid-viewport canvas{{display:block;
-width:100%;height:auto;max-width:none}}
+width:100%;height:auto;max-width:none;max-height:none}}
 .photo-grid-card form{{margin:0}}
 .grid-status-heading{{display:flex;align-items:baseline;justify-content:space-between;gap:1rem}}
 .grid-status-heading h2{{margin-bottom:.45rem}}#grid-status-percentage{{font-size:1.35rem;color:#176b42}}
@@ -4387,7 +4274,7 @@ background:#f3f7f4;border-radius:6px;padding:.6rem}}
 .shape-figs{{display:flex;gap:.9rem;flex-wrap:wrap;margin-top:.45rem}}
 .shape-figs figure{{margin:0;text-align:center;font-size:.71rem;color:var(--muted);max-width:5.5rem}}
 .shape-figs svg{{display:block;background:#f3f7f4;border-radius:6px;margin-bottom:.2rem}}
-</style></head><body><header><h1>🌱 FarmBot Vision</h1><nav><a href="./">Analysis</a><a href="weeding">Weeding</a><a href="soil-height">Soil height</a><a href="settings">Calibration</a><a href="weed-settings">Settings</a><a href="canopy-settings">Canopy fusion</a><a href="zones">Boundaries &amp; zones</a><a href="draw-shape">Draw shape</a></nav></header>
+</style></head><body><header><h1>🌱 FarmBot Vision</h1><nav><a href="./">Analysis</a><a href="soil-height">Soil height</a><a href="settings">Calibration</a><a href="weed-settings">Settings</a><a href="zones">Boundaries &amp; zones</a></nav></header>
 <main>{body}</main></body></html>"""
     )
 
@@ -4956,6 +4843,41 @@ async def dashboard(request: Request) -> HTMLResponse:
         f"{_quality_retry_checked('leaf_obstruction')}> Close leaf</label></fieldset>"
     )
     photo_grid_message = escape(request.query_params.get("photo_grid", ""))
+    schedule_values = photo_grid_schedule_store.load()
+    photo_grid_schedule_message = escape(
+        request.query_params.get("photo_grid_schedule", "") or schedule_values.summary()
+    )
+    photo_grid_schedule_days = "".join(
+        "<label><input type=checkbox name=schedule_days "
+        f'value="{index}"{" checked" if index in schedule_values.days else ""}> '
+        f"{escape(label[:3])}</label>"
+        for index, label in enumerate(WEEKDAY_LABELS)
+    )
+    photo_grid_schedule_quality = "".join(
+        (
+            f"<label><input type=checkbox name=schedule_quality_repair_{field}_enabled "
+            f"value=true{' checked' if checked else ''}> {escape(label)}</label>"
+        )
+        for field, label, checked in (
+            ("blurry", "Blurry", schedule_values.quality_repair_blurry_enabled),
+            ("washed_out", "Washed out", schedule_values.quality_repair_washed_out_enabled),
+            ("close_leaf", "Close leaf", schedule_values.quality_repair_close_leaf_enabled),
+        )
+    )
+    photo_grid_schedule_form = f"""<form class=photo-grid-schedule method=post action="photo-grid/schedule">
+<fieldset><legend>Scheduled photo grid</legend>
+<label class=schedule-toggle><input type=checkbox name=schedule_enabled value=true{
+        " checked" if schedule_values.enabled else ""
+    }> Run automatically</label>
+<label class=schedule-time>Time <input type=time name=schedule_time required
+value="{escape(schedule_values.time, quote=True)}"></label>
+<div class=schedule-days aria-label="Days of the week">{photo_grid_schedule_days}</div>
+<div class=schedule-quality aria-label="Retry quality issues on scheduled runs">{
+        photo_grid_schedule_quality
+    }</div>
+<button type=submit>Save schedule</button>
+</fieldset></form>
+<small class=action-message id=photo-grid-schedule-message>{photo_grid_schedule_message}</small>"""
     grid_issue_labels = {
         "blurry": "blurry",
         "washed_out": "washed out",
@@ -5277,8 +5199,8 @@ open and moves on to the next weed.</small></p>
 </div>
 <p id=photo-grid-status class=muted>Loading the verified grid…</p>
 <p class=muted><small>The canvas uses the same calibrated garden-coordinate transform as
-analysis. Green circles are FarmBot plants, red circles show each FarmBot weed's radius,
-and the dark labels identify the points.</small></p>
+analysis. Green circles are named FarmBot plants, red circles show each FarmBot weed's
+radius. Zoom in, then use the scrollbars to inspect seams and marker centres.</small></p>
 </figure></div><script>{_DASHBOARD_JS}</script>"""  # noqa: S608 - HTML template
     overview_html = f"""<div class=dashboard-overview>
 <section class="card info-card" aria-labelledby=info-heading>
@@ -5302,6 +5224,7 @@ aria-label="Photo grid status" style="--grid-columns:{grid_columns}">{grid_cells
 <button id=photo-grid-open type=button{photo_grid_view_disabled}>View most recent grid</button>
 </div>
 <small class=action-message>{photo_grid_message}</small>
+{photo_grid_schedule_form}
 </div>
 <div class=analysis-grid-details>
 <h3>Grid details</h3>
@@ -5359,6 +5282,41 @@ async def run_calibrated_photo_grid(
     except (HomeAssistantError, ValueError) as exc:
         message = f"Could not start photo grid: {exc}"
     return RedirectResponse(f"../?photo_grid={quote(message)}", status_code=303)
+
+
+@app.post("/photo-grid/schedule")
+async def save_photo_grid_schedule(
+    schedule_enabled: bool | None = Form(None),
+    schedule_time: str = Form("03:00"),
+    schedule_days: Annotated[list[str] | None, Form()] = None,
+    schedule_quality_repair_blurry_enabled: bool | None = Form(None),
+    schedule_quality_repair_washed_out_enabled: bool | None = Form(None),
+    schedule_quality_repair_close_leaf_enabled: bool | None = Form(None),
+) -> RedirectResponse:
+    days: list[int] = []
+    for raw in schedule_days or []:
+        try:
+            days.append(int(raw))
+        except ValueError:
+            continue
+    try:
+        values = PhotoGridScheduleSettings(
+            enabled=bool(schedule_enabled),
+            time=schedule_time.strip(),
+            days=days,
+            quality_repair_blurry_enabled=bool(schedule_quality_repair_blurry_enabled),
+            quality_repair_washed_out_enabled=bool(schedule_quality_repair_washed_out_enabled),
+            quality_repair_close_leaf_enabled=bool(schedule_quality_repair_close_leaf_enabled),
+        )
+    except ValidationError:
+        return RedirectResponse(
+            "../?photo_grid_schedule=" + quote("Enter a valid 24-hour time such as 03:00"),
+            status_code=303,
+        )
+    photo_grid_schedule_store.save(values)
+    # A changed schedule should be able to fire again inside the current minute.
+    _photo_grid_schedule_state["last_started_slot"] = None
+    return RedirectResponse(f"../?photo_grid_schedule={quote(values.summary())}", status_code=303)
 
 
 @app.get("/api/photo-grid/latest")
@@ -5526,230 +5484,6 @@ def _soil_artifacts(paths: list[str]) -> str:
     return " ".join(links) or "<span class=muted>None</span>"
 
 
-@app.get("/weeding", response_class=HTMLResponse)
-async def weeding_page(request: Request) -> HTMLResponse:
-    """Preview and launch adaptive rotary-tool mowing."""
-    entry_id = settings.selected_config_entry_id
-    rows, warning = "", ""
-    capability = False
-    tool_name, tool_id = "Rotary Tool", ""
-    tool_x, tool_y, tool_z = 4.2, 576.8, -386.0
-    tool_direction, tool_slot_from_bot = 1, False
-    if entry_id:
-        try:
-            bots, inventory, soil = await asyncio.gather(
-                client.list_bots(),
-                client.inventory(
-                    InventoryRequest(config_entry_id=entry_id, image_lookback_hours=720)
-                ),
-                client.soil_points(entry_id),
-            )
-            bot = next((item for item in bots.bots if item.config_entry_id == entry_id), None)
-            capability = bool(bot and bot.supports("adaptive_rotary_weeding"))
-            rotary_slot = next(
-                (
-                    slot
-                    for slot in soil.tool_slots
-                    if "rotary" in slot.tool_name.casefold() and not slot.gantry_mounted
-                ),
-                None,
-            )
-            if rotary_slot is not None:
-                tool_name, tool_id = rotary_slot.tool_name, str(rotary_slot.tool_id)
-                tool_x, tool_y, tool_z = rotary_slot.x, rotary_slot.y, rotary_slot.z
-                tool_direction = rotary_slot.pullout_direction or 1
-                tool_slot_from_bot = rotary_slot.pullout_direction in {1, 2, 3, 4}
-            samples = recent_soil_samples(
-                soil.points,
-                database.recent_soil_measurements(entry_id, 500),
-                max_age_days=None,
-            )
-            x_bounds = soil.motion.axis_bounds.get("x")
-            y_bounds = soil.motion.axis_bounds.get("y")
-            candidate_weeds = confirmed_weeds(inventory.weeds)
-            for weed in candidate_weeds:
-                estimate = estimate_soil_height(weed.x, weed.y, samples)
-                plan_text, clearance = "No nearby recorded soil height", "—"
-                if estimate is not None and x_bounds is not None and y_bounds is not None:
-                    try:
-                        path = plan_cut_path(
-                            weed,
-                            inventory.plants,
-                            estimate,
-                            x_bounds=x_bounds,
-                            y_bounds=y_bounds,
-                        )
-                        plan_text = (
-                            f"{path.length_mm:.0f} mm at {path.angle_degrees:.0f}° · "
-                            f"soil Z {path.soil_z:.1f} ({escape(path.soil_method)})"
-                        )
-                        clearance = f"{path.minimum_plant_clearance_mm:.0f} mm"
-                    except ValueError as err:
-                        plan_text = escape(str(err))
-                rows += (
-                    f'<tr class=weed-candidate data-radius="{weed.radius:g}"><td>'
-                    f"<input class=weed-select type=checkbox form=weeding-form name=weed_ids "
-                    f'value="{weed.id}" checked></td>'
-                    f"<td>{weed.id}</td><td>{escape(weed.name or 'Weed')}</td>"
-                    f"<td>({weed.x:.0f}, {weed.y:.0f})</td><td>{weed.radius:.0f} mm</td>"
-                    f"<td>{plan_text}</td><td>{clearance}</td></tr>"
-                )
-            if not candidate_weeds:
-                rows = "<tr><td colspan=7>No FarmBot weeds are currently recorded.</td></tr>"
-        except HomeAssistantError as err:
-            warning = escape(str(err))
-    else:
-        warning = "Select a FarmBot on the Calibration tab first."
-    capability_warning = (
-        ""
-        if capability
-        else (
-            "<p class=warn>The selected FarmBot integration does not advertise adaptive rotary "
-            f"weeding. Install/update the companion integration to V{MINIMUM_INTEGRATION_VERSION} "
-            "and restart Home Assistant.</p>"
-        )
-    )
-    running_script = (
-        "<script>setTimeout(()=>location.reload(),3000)</script>" if weeding_jobs.running else ""
-    )
-    state = weeding_jobs.current
-    results = "".join(
-        f"<li>Weed {escape(str(item.get('weed_id')))}: "
-        f"{escape(str(item.get('verification') or item.get('reason') or item.get('status') or 'updated'))}</li>"
-        for item in state.get("results", [])[-20:]
-    )
-    disabled = " disabled" if not capability or weeding_jobs.running or not entry_id else ""
-    body = f"""<section class=card><h2>Adaptive rotary weeding</h2>
-<p>Plans the safest complete cut through each weed, or a shorter one-sided cut to its centre
-when a full cut would enter plant clearance. Weeds are ordered into a continuous route.</p>
-<p class=warn><b>This operates a cutting tool.</b> Inspect the proposed paths, clear people
-and animals from the machine, keep the emergency stop within reach, and supervise the run.</p>
-{capability_warning}<p class=warn>{warning}</p></section>
-<section class=card><h2>Weeds and proposed paths</h2>
-<div class=grid id=weed-selection-tools>
-<label><input type=checkbox id=select-all-weeds checked> Select all shown weeds</label>
-<label>Minimum radius (mm) <input type=number id=weed-radius-min min=0 step=0.1
-placeholder="No minimum"></label>
-<label>Maximum radius (mm) <input type=number id=weed-radius-max min=0 step=0.1
-placeholder="No maximum"></label>
-</div>
-<p><button type=button id=clear-weed-selection>Clear selection</button>
-<span class=muted id=weed-filter-count></span></p>
-<table><thead><tr><th>Run</th><th>ID</th><th>Name</th><th>Location</th><th>Radius</th>
-<th>Plan</th><th>Plant clearance</th></tr></thead><tbody>{rows}</tbody></table></section>
-<section class=card><h2>Rotary tool and recovery</h2>
-<form id=weeding-form method=post action=weeding/start><div class=grid>
-<label>Motor pin <input type=number name=motor_pin min=0 max=1000 value=2 required></label>
-<label>Current pin <input type=number name=current_pin min=0 max=1000 value=60 required></label>
-<label>Maximum load <input type=number name=max_load min=1 max=1023 value=115 required></label>
-<label>Tool height above soil (mm) <input type=number name=tool_height_mm min=-200 max=300 value=80 required></label>
-<label>Maximum attempts <input type=number name=max_attempts min=1 max=5 value=3 required></label>
-<label>First-pass speed (%) <input type=number name=cut_speed_percent min=1 max=100 value=50 required></label>
-<label>Retry height step (mm) <input type=number name=height_step_mm min=1 max=50 value=10 required></label>
-</div><fieldset><legend>Optional automatic tool loading</legend>
-<label><input type=checkbox name=manage_tool value=true> Mount the rotary tool before
-weeding and return it to its slot after cutting, before photo verification</label>
-<p class=muted>When a rotary ToolSlot is available, FarmBot OS's standard
-<code>mount_tool()</code> and <code>dismount_tool()</code> helpers use it. Uncheck “Use the
-FarmBot slot record” to use the editable fallback coordinates.</p>
-<label><input type=checkbox name=tool_slot_from_bot value=true{" checked" if tool_slot_from_bot else ""}>
-Use the FarmBot slot record</label>
-<label><input type=checkbox name=verify_tool_on_mount value=true> Verify the tool after loading</label>
-<label><input type=checkbox name=verify_tool_on_unmount value=true> Verify the tool after unloading</label>
-<p class=muted>Tool verification is optional because the FarmBot tool sensor can be unreliable.
-Loading and unloading continue without verification unless the corresponding option is checked.</p>
-<div class=grid>
-<label>Tool name <input type=text name=tool_name maxlength=100 value="{escape(tool_name, quote=True)}" required></label>
-<label>Tool ID (optional) <input type=number name=tool_id min=1 value="{tool_id}"></label>
-<label>Slot X (mm) <input type=number step=0.1 name=tool_slot_x value="{tool_x:g}" required></label>
-<label>Slot Y (mm) <input type=number step=0.1 name=tool_slot_y value="{tool_y:g}" required></label>
-<label>Slot Z (mm) <input type=number step=0.1 name=tool_slot_z value="{tool_z:g}" required></label>
-<label>Pullout direction <select name=tool_pullout_direction>
-<option value=1{" selected" if tool_direction == 1 else ""}>Positive X</option>
-<option value=2{" selected" if tool_direction == 2 else ""}>Negative X</option>
-<option value=3{" selected" if tool_direction == 3 else ""}>Positive Y</option>
-<option value=4{" selected" if tool_direction == 4 else ""}>Negative Y</option>
-</select></label></div></fieldset>
-<fieldset><legend>Mounted-tool plant clearance</legend>
-<label><input type=checkbox name=avoid_tall_plants value=true checked> Route around tall
-plants while the rotary tool is mounted</label>
-<label>Tall plant threshold (mm) <input type=number name=tall_plant_height_mm min=0
-max=5000 step=1 value=300 required></label>
-<p class=muted>Plants above this height are treated as obstacles during travel. Plants
-without recorded height data are also protected rather than assumed to be short.</p></fieldset>
-<fieldset><legend>Soil height checks</legend>
-<label><input type=checkbox id=check-soil-heights name=check_soil_heights value=true>
-Check soil heights before mowing and measure a clear nearby patch when needed</label>
-<div class=grid><label>Maximum soil-height age (days)
-<input id=soil-height-max-age type=number name=soil_height_max_age_days min=0.04 max=3650
-step=0.1 value=30 required></label></div>
-<label><input id=cut-after-soil-failure type=checkbox
-name=attempt_cut_if_soil_measurement_fails value=true> Attempt cutting with an older nearby
-soil height if the new measurement fails</label>
-<p class=muted>When checks are off, the newest available nearby soil height is used without
-triggering a measurement. A weed is skipped only when no nearby height is available.</p></fieldset>
-<p class=muted>On overload the motor switches off immediately. The next pass reverses
-at half speed; continued overload raises the cut. Contact while lowering raises the next
-attempt immediately. A failed weed does not stop the remaining batch.</p>
-<label><input type=checkbox name=acknowledge value=true required> I have inspected the paths,
-cleared the machine, and will supervise this rotary-tool run.</label><br><br>
-<button type=submit class=clear-button{disabled}>Start selected weeds</button></form></section>
-<section class=card><h2>Run status</h2><p><b>{escape(str(state.get("status", "idle")))}</b> —
-{escape(str(state.get("message", "Not run")))}</p><ul>{results}</ul>
-<form method=post action=weeding/stop><button type=submit{" disabled" if not weeding_jobs.running else ""}>Stop before next stage</button></form>
-</section>{running_script}"""
-    body += """<script>
-(() => {
-  const rows = [...document.querySelectorAll('tr.weed-candidate')];
-  const selectAll = document.getElementById('select-all-weeds');
-  const minimum = document.getElementById('weed-radius-min');
-  const maximum = document.getElementById('weed-radius-max');
-  const count = document.getElementById('weed-filter-count');
-  const checkSoil = document.getElementById('check-soil-heights');
-  const soilAge = document.getElementById('soil-height-max-age');
-  const cutAfterSoilFailure = document.getElementById('cut-after-soil-failure');
-  const visibleCheckboxes = () => rows.filter(row => !row.hidden)
-    .map(row => row.querySelector('.weed-select'));
-  const updateMaster = () => {
-    const shown = visibleCheckboxes();
-    const selected = shown.filter(box => box.checked).length;
-    selectAll.checked = shown.length > 0 && selected === shown.length;
-    selectAll.indeterminate = selected > 0 && selected < shown.length;
-    count.textContent = `${shown.length} of ${rows.length} weeds shown; ${selected} selected`;
-  };
-  const applyFilter = () => {
-    const low = minimum.value === '' ? -Infinity : Number(minimum.value);
-    const high = maximum.value === '' ? Infinity : Number(maximum.value);
-    rows.forEach(row => {
-      const visible = Number(row.dataset.radius) >= low && Number(row.dataset.radius) <= high;
-      row.hidden = !visible;
-      if (!visible) row.querySelector('.weed-select').checked = false;
-    });
-    updateMaster();
-  };
-  selectAll.addEventListener('change', () => {
-    visibleCheckboxes().forEach(box => { box.checked = selectAll.checked; });
-    updateMaster();
-  });
-  document.getElementById('clear-weed-selection').addEventListener('click', () => {
-    rows.forEach(row => { row.querySelector('.weed-select').checked = false; });
-    updateMaster();
-  });
-  rows.forEach(row => row.querySelector('.weed-select').addEventListener('change', updateMaster));
-  minimum.addEventListener('input', applyFilter);
-  maximum.addEventListener('input', applyFilter);
-  const updateSoilOptions = () => {
-    soilAge.disabled = !checkSoil.checked;
-    cutAfterSoilFailure.disabled = !checkSoil.checked;
-  };
-  checkSoil.addEventListener('change', updateSoilOptions);
-  updateSoilOptions();
-  applyFilter();
-})();
-</script>"""
-    return layout(request, body, "Weeding · FarmBot Vision")
-
-
 @app.post("/weeding/start")
 async def start_weeding(
     weed_ids: Annotated[list[int], Form()],
@@ -5902,64 +5636,15 @@ async def soil_height_page(request: Request) -> HTMLResponse:
     )
     pending_legacy_repairs = database.pending_legacy_soil_repairs(entry_id) if entry_id else []
     persisted_job = database.latest_soil_job(entry_id)
-    current_job = soil_jobs.current if soil_jobs.running else (persisted_job or soil_jobs.current)
+    current_job = (
+        soil_jobs.current
+        if soil_jobs.running or soil_jobs.pending_override_job_id is not None
+        else (persisted_job or soil_jobs.current)
+    )
 
-    latest_by_point: dict[int, dict] = {}
-    for measurement in measurements:
-        latest_by_point.setdefault(int(measurement["point_id"]), measurement)
-
-    point_rows = ""
     point_options = ""
-    soil_point_options = ""
-    retry_ids: list[int] = []
     if inventory:
-        for point in inventory.points:
-            updated = point.updated_at.date().isoformat() if point.updated_at else "unknown date"
-            soil_point_options += (
-                f'<option value="{point.id}">{escape(point.name)} '
-                f"({point.x:.1f}, {point.y:.1f}; updated {updated})</option>"
-            )
         for site in sites:
-            measurement = latest_by_point.get(site.point_id)
-            status = measurement["status"] if measurement else "not measured"
-            proposed = (
-                f"{measurement['proposed_z_mm']:.0f} mm"
-                if measurement and measurement["proposed_z_mm"] is not None
-                else "—"
-            )
-            uncertainty = (
-                f"±{measurement['uncertainty_mm']:.1f} mm"
-                if measurement and measurement["uncertainty_mm"] is not None
-                else "—"
-            )
-            confidence = f"{100 * measurement['confidence']:.0f}%" if measurement else "—"
-            reason = escape(measurement["reason"] if measurement else "")
-            diagnostics = _soil_artifacts(measurement["artifact_paths"] if measurement else [])
-            if measurement and measurement["status"] == "failed":
-                retry_ids.append(site.point_id)
-            apply_control = ""
-            if _soil_measurement_is_applicable(measurement):
-                measurement_id = escape(measurement["measurement_id"], quote=True)
-                apply_control = (
-                    f'<form method=post action="soil/measurements/{measurement_id}/apply">'
-                    "<button type=submit>Apply</button></form>"
-                    f'<form method=post action="soil/measurements/{measurement_id}/reject">'
-                    "<button type=submit>Reject</button></form>"
-                )
-            point_rows += (
-                f'<tr data-row-key="point-{site.point_id}">'
-                f"<td><input form=measure-points type=checkbox name=point_ids "
-                f'value="{site.point_id}" data-failed="{str(status == "failed").lower()}"></td>'
-                f"<td>{site.point_id}</td><td>{escape(site.point_name)}</td>"
-                f"<td>{site.expected_x:.1f}, {site.expected_y:.1f}</td>"
-                f"<td>{site.capture_x:.1f}, {site.capture_y:.1f}</td>"
-                f"<td>{site.relocation_distance_mm:.1f} mm</td>"
-                f"<td>{site.point_updated_at.date().isoformat()}</td>"
-                f"<td>{site.expected_z:.1f} mm</td>"
-                f"<td>{proposed}</td><td>{uncertainty}</td><td>{confidence}</td>"
-                f"<td>{escape(status)}</td><td>{reason}</td><td>{diagnostics}</td>"
-                f"<td>{apply_control}</td></tr>"
-            )
             point_options += (
                 f'<option value="{site.point_id}">{escape(site.point_name)}: clear soil '
                 f"({site.capture_x:.0f}, {site.capture_y:.0f})</option>"
@@ -5967,22 +5652,56 @@ async def soil_height_page(request: Request) -> HTMLResponse:
 
     valid_measurements = [item for item in measurements if _soil_measurement_is_pending_valid(item)]
     measurement_rows = "".join(_soil_measurement_pending_row(item) for item in valid_measurements)
-    point_count = len(inventory.points) if inventory else 0
-    site_count = len(sites)
-    warning = (
-        "<p class=warn>Fewer than three stale soil points currently have a nearby "
-        "clear-soil replacement. FarmBot soil-height interpolation needs at least "
-        "three measured points.</p>"
-        if site_count < 3
-        else ""
+    queued_targets = list(current_job.get("queued_targets") or []) if soil_jobs.running else []
+
+    def queue_key(item: dict) -> tuple:
+        point_id = int(item.get("point_id") or 0)
+        return (
+            ("point", point_id)
+            if point_id
+            else (
+                "coordinate",
+                round(float(item.get("capture_x") or 0), 3),
+                round(float(item.get("capture_y") or 0), 3),
+            )
+        )
+
+    queued_keys = {queue_key(target) for target in queued_targets}
+    queue_rows = "".join(
+        f'<tr data-row-key="queued-{index}"><td>{escape(str(target["point_name"]))}</td>'
+        f"<td>{float(target['capture_x']):.1f}, {float(target['capture_y']):.1f}</td>"
+        "<td>Queued</td><td>Waiting to be measured</td><td>&mdash;</td></tr>"
+        for index, target in enumerate(queued_targets)
     )
-    motion = inventory.motion if inventory else None
-    motion_summary = (
-        f"connected={motion.connected}, busy={motion.busy}, emergency stop={motion.locked}, "
-        f"position={escape(json.dumps(motion.position))}"
-        if motion
-        else "unavailable"
-    )
+    failed_measurements: list[dict] = []
+    failed_keys: set[tuple] = set()
+    for measurement in measurements:
+        key = queue_key(measurement)
+        if measurement["status"] == "failed" and key not in failed_keys and key not in queued_keys:
+            failed_measurements.append(measurement)
+            failed_keys.add(key)
+    for measurement in failed_measurements:
+        point_id = int(measurement["point_id"])
+        if point_id:
+            retry_fields = (
+                "<input type=hidden name=mode value=retry>"
+                f'<input type=hidden name=point_ids value="{point_id}">'
+            )
+        else:
+            retry_fields = (
+                "<input type=hidden name=mode value=custom>"
+                f'<input type=hidden name=custom_x value="{float(measurement["capture_x"]):g}">'
+                f'<input type=hidden name=custom_y value="{float(measurement["capture_y"]):g}">'
+            )
+        measurement_id = escape(str(measurement["measurement_id"]), quote=True)
+        queue_rows += (
+            f'<tr data-row-key="failed-{measurement_id}">'
+            f"<td>{escape(str(measurement['point_name']))}</td>"
+            f"<td>{_soil_measurement_coordinates(measurement)}</td><td>Failed</td>"
+            f"<td>{escape(str(measurement['reason']))}</td>"
+            f"<td><form method=post action=soil/measure>{retry_fields}"
+            "<button type=submit>Retry</button></form></td></tr>"
+        )
     calibration_summary = (
         f"Active calibration #{calibration.calibration_id}: "
         f"soil image format {calibration.processed_width}×{calibration.processed_height}, "
@@ -5996,8 +5715,6 @@ async def soil_height_page(request: Request) -> HTMLResponse:
         if calibration
         else "No active soil calibration. Complete the guided calibration before measuring."
     )
-    default_capture_z = calibration.capture_z if calibration else 0
-    default_baseline = calibration.baseline_mm if calibration else 15
     capture_z_hint = hint(
         "The FarmBot Z-axis (height) position the gantry moves to before taking soil "
         "photos. During calibration the bot also steps down 25 mm and 50 mm from this "
@@ -6033,9 +5750,6 @@ async def soil_height_page(request: Request) -> HTMLResponse:
   <button type=submit>Accept calibration anyway</button></form>"""
         if override_available
         else ""
-    )
-    retry_values = "".join(
-        f'<input type=hidden name=point_ids value="{point_id}">' for point_id in retry_ids
     )
     legacy_repair_card = ""
     if legacy_summary["unprocessed"] or legacy_soil_repair.running:
@@ -6098,8 +5812,8 @@ async def soil_height_page(request: Request) -> HTMLResponse:
  data-legacy-repair="{str(legacy_soil_repair.running).lower()}" hidden></div>
 <script>
 (() => {{
-  const swapIds=['soil-bot-card','soil-job-card','soil-warning','soil-site-count',
-    'soil-point-rows','soil-measurement-rows','legacy-soil-repair-card-region',
+  const swapIds=['soil-job-card','soil-queue-rows','soil-measurement-rows',
+    'legacy-soil-repair-card-region',
     'legacy-soil-repair-region'];
   function checkboxKey(input){{
     return [input.getAttribute('form') || input.form?.id || '',input.name,input.value].join('\u001f');
@@ -6166,24 +5880,14 @@ async def soil_height_page(request: Request) -> HTMLResponse:
 }})();
 </script>"""
     body = f"""
-<h2>Supplemental soil-height measurement</h2>
-<p>Finds plant- and weed-free soil within 200 mm of FarmBot soil points that have
-not been updated for more than 14 days. Measurements are captured at those clear
-locations and, after review, replace the assigned stale point.</p>
-<div id=legacy-soil-repair-card-region>{legacy_repair_card}</div>
-<div id=soil-warning>{warning}</div>
-<section class=grid>
- <div class=card><h3>Bot</h3><div id=soil-bot-card><p>{escape(entry_id or "No FarmBot selected")}</p>
- <p class=muted>{motion_summary}</p><p>{escape(inventory_error)}</p></div></div>
- <div class=card><h3>Calibration</h3><p>{escape(calibration_summary)}</p>
- <p class=warn>Recalibrate after moving, rotating, or refocusing the camera.</p></div>
- <div class=card><h3>Current job</h3><div id=soil-job-card><p><strong>{job_status}</strong>: {job_message}</p>
- {job_detail_html}
- {override_form}
- <form method=post action=soil/stop><button type=submit>Stop after current point</button></form></div></div>
-</section>
+<h2>Soil height measurement</h2>
 <section class=card>
  <h3>Guided calibration</h3>
+ <p>{escape(calibration_summary)}</p>
+ <p class=warn>Recalibrate after moving, rotating, or refocusing the camera.</p>
+ <p class=muted>{escape(inventory_error)}</p>
+ {job_detail_html}
+ {override_form}
  <p>Choose a calculated clear-soil site, or enter a manually verified clear
 coordinate. Custom calibration coordinates are checked against the FarmBot's
 axis limits and do not need an existing soil point.</p>
@@ -6220,15 +5924,19 @@ axis limits and do not need an existing soil point.</p>
    }};
    form.querySelectorAll('input[name=location_mode]').forEach(input=>input.addEventListener('change',sync));
    sync();
-  }})();
+ }})();
  </script>
 </section>
+<div id=legacy-soil-repair-card-region>{legacy_repair_card}</div>
 <section class=card>
  <h3>Automation and quality settings</h3>
  <form method=post action=soil/settings>
-  <fieldset><legend>Daily measurement run</legend>
+  <fieldset><legend>Regular soil measurement</legend>
    <label><input type=checkbox name=scheduled_run_enabled value=true{" checked" if soil_values.scheduled_run_enabled else ""}>
-    Automatically measure every available soil point each day</label><br>
+    Run a clear-soil-aware measurement grid automatically</label><br>
+   <label>Run soil height measurement every <input type=number
+    name=scheduled_run_interval_days min=1 max=3650 step=1
+    value="{soil_values.scheduled_run_interval_days}" required> days</label>
    <label>Run time <input type=time name=scheduled_run_time value="{soil_values.scheduled_run_time}" required></label>
    <span class=muted>Uses the add-on's local time ({escape(datetime.now().astimezone().tzname() or "local")}).</span>
   </fieldset>
@@ -6273,10 +5981,10 @@ axis limits and do not need an existing soil point.</p>
    step=1 value="{soil_values.grid_spacing_mm:g}" required></label>
   <label>Maximum deviation from grid (mm) <input type=number name=maximum_deviation_mm
    min=0 max=199 step=1 value="{soil_values.grid_maximum_deviation_mm:g}" required></label>
-  <label>Capture Z (mm){capture_z_hint} <input type=number name=capture_z step=0.1
-   value="{default_capture_z:g}" required></label>
-  <label>Baseline (mm){baseline_hint} <input type=number name=baseline_mm min=5 max=30
-   step=0.1 value="{default_baseline:g}" required></label>
+  <label><input type=checkbox name=skip_recent_measurements value=true{" checked" if soil_values.grid_skip_recent_measurements else ""}>
+   Only measure where no recent measurement exists</label>
+  <label>Accept measurements up to <input type=number name=recent_measurement_days
+   min=1 max=3650 step=1 value="{soil_values.grid_recent_measurement_days}" required> days old</label>
   <button type=button id=calculate-soil-grid>Calculate all points for grid</button>
  </form>
  <dialog id=soil-grid-modal aria-labelledby=soil-grid-modal-title
@@ -6289,8 +5997,8 @@ axis limits and do not need an existing soil point.</p>
   <form method=post action=soil/grid/accept id=accept-soil-grid>
    <input type=hidden name=spacing_mm>
    <input type=hidden name=maximum_deviation_mm>
-   <input type=hidden name=capture_z>
-   <input type=hidden name=baseline_mm>
+   <input type=hidden name=skip_recent_measurements>
+   <input type=hidden name=recent_measurement_days>
    <p class=warn>The app recalculates this plan with live plants, weeds, zones,
    point timestamps, and the saved clear-soil margin before any movement.</p>
    <button type=submit id=accept-soil-grid-button>Accept and measure clear points</button>
@@ -6315,7 +6023,8 @@ axis limits and do not need an existing soil point.</p>
     const query=new URLSearchParams({{
      spacing_mm:values.get('spacing_mm'),
      maximum_deviation_mm:values.get('maximum_deviation_mm'),
-     baseline_mm:values.get('baseline_mm')
+     skip_recent_measurements:values.has('skip_recent_measurements'),
+     recent_measurement_days:values.get('recent_measurement_days')
     }});
     const response=await fetch('api/soil/grid-plan?'+query.toString(),{{cache:'no-store'}});
     const data=await response.json();
@@ -6336,9 +6045,11 @@ axis limits and do not need an existing soil point.</p>
     }});
     summary.textContent=data.total+' grid points: '+data.clear+' unchanged, '+
      data.replaced+' replaced, '+data.skipped+' skipped.';
-    ['spacing_mm','maximum_deviation_mm','capture_z','baseline_mm'].forEach(name=>{{
+    ['spacing_mm','maximum_deviation_mm','recent_measurement_days'].forEach(name=>{{
      accept.elements[name].value=values.get(name);
     }});
+    accept.elements.skip_recent_measurements.value=
+     values.has('skip_recent_measurements') ? 'true' : 'false';
     acceptButton.disabled=data.accepted===0;
     modal.showModal();
    }}catch(error){{alert(error.message);}}
@@ -6349,55 +6060,19 @@ axis limits and do not need an existing soil point.</p>
  </script>
 </section>
 <section class=card>
- <h3>Clear-soil replacements (<span id=soil-site-count>{site_count} from {point_count} existing points</span>)</h3>
- <p class=muted>Each candidate has a {soil_values.clear_soil_margin_mm:g} mm clear-soil margin, expanded for the
-stereo movement, around all current FarmBot plants and weeds, the latest
-detected plant canopies, and pending or created Vision weeds. Fresh points and
-points without a trustworthy update date are not replaced. Reducing this margin
-can expose lower-confidence sites when little clear soil is available.</p>
- <form id=measure-points method=post action=soil/measure>
-  <label>Capture Z (mm){capture_z_hint} <input type=number step=0.1 name=capture_z
-   value="{default_capture_z:g}" required></label>
- <label>Baseline (mm){baseline_hint} <input type=number min=5 max=30 step=0.1 name=baseline_mm
-   value="{default_baseline:g}" required></label>
-  <button type=button id=select-all-soil>Select all</button>
-  <button type=button id=select-failed-soil>Select all failed</button>
-  <button type=submit name=mode value=selected>Measure selected</button>
-  <button type=submit name=mode value=all>Measure all</button>
- </form>
- <form method=post action=soil/measure>{retry_values}
-  <input type=hidden name=capture_z value="{default_capture_z:g}">
-  <input type=hidden name=baseline_mm value="{default_baseline:g}">
- <button type=submit name=mode value=retry {"disabled" if not retry_ids else ""}>Retry failed</button>
- </form>
- <hr>
+ <h3>Measurement queue</h3>
+ <div id=soil-job-card><p><strong>{job_status}</strong>: {job_message}</p>
+ <form method=post action=soil/stop><button type=submit>Stop after current point</button></form></div>
  <h4>Measure at custom coordinates</h4>
- <p>Use this when the planner has no valid clear-soil site. Select the soil
-point whose height should be replaced, then enter a manually verified clear
-capture location.</p>
  <form method=post action=soil/measure>
   <input type=hidden name=mode value=custom>
-  <label>Soil point to update <select name=custom_point_id required>{soil_point_options or '<option value="">No soil points available</option>'}</select></label>
   <label>Custom X (mm) <input type=number step=0.1 name=custom_x required></label>
   <label>Custom Y (mm) <input type=number step=0.1 name=custom_y required></label>
-  <label>Capture Z (mm){capture_z_hint} <input type=number step=0.1 name=capture_z
-   value="{default_capture_z:g}" required></label>
-  <label>Baseline (mm){baseline_hint} <input type=number min=5 max=30 step=0.1 name=baseline_mm
-   value="{default_baseline:g}" required></label>
   <button type=submit>Measure custom coordinate</button>
  </form>
- <table><thead><tr><th>Select</th><th>ID</th><th>Replaces</th><th>Old X, Y</th>
- <th>Clear X, Y</th><th>Move</th><th>Last updated</th><th>Current Z</th>
- <th>Proposed Z</th><th>Uncertainty</th><th>Confidence</th>
- <th>Status</th><th>Message</th><th>Diagnostics</th><th>Review</th></tr></thead>
- <tbody id=soil-point-rows>{point_rows or '<tr data-row-key="empty"><td colspan=15>No stale point has a safe clear-soil site within 200 mm.</td></tr>'}</tbody></table>
- <script>
- (() => {{
-  const boxes=()=>Array.from(document.querySelectorAll('#soil-point-rows input[name=point_ids]'));
-  document.getElementById('select-all-soil').addEventListener('click',()=>boxes().forEach(box=>box.checked=true));
-  document.getElementById('select-failed-soil').addEventListener('click',()=>boxes().forEach(box=>box.checked=box.dataset.failed==='true'));
- }})();
- </script>
+ <table><thead><tr><th>Point</th><th>Coordinate</th><th>Status</th><th>Message</th>
+ <th>Action</th></tr></thead>
+ <tbody id=soil-queue-rows>{queue_rows or '<tr data-row-key="empty"><td colspan=5>No measurements are queued or failed.</td></tr>'}</tbody></table>
 </section>
 <section class=card>
  <h3>Pending valid results</h3>
@@ -6443,19 +6118,24 @@ async def soil_job_api() -> JSONResponse:
 async def soil_grid_plan_api(
     spacing_mm: float,
     maximum_deviation_mm: float,
-    baseline_mm: float = 15,
+    skip_recent_measurements: bool = False,
+    recent_measurement_days: int = 14,
 ) -> JSONResponse:
     entry_id = settings.selected_config_entry_id
     if not entry_id:
         raise HTTPException(409, "No FarmBot config entry is selected")
+    calibration = database.active_soil_calibration(entry_id)
+    if calibration is None:
+        raise HTTPException(409, "Complete guided soil calibration first")
     soil_values = soil_settings_store.load()
     try:
         _inventory, plan = await soil_jobs.measurement_grid(
             entry_id,
-            baseline_mm,
+            calibration.baseline_mm,
             spacing_mm=spacing_mm,
             maximum_deviation_mm=maximum_deviation_mm,
             clear_soil_margin_mm=soil_values.clear_soil_margin_mm,
+            minimum_point_age_days=(recent_measurement_days if skip_recent_measurements else None),
         )
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from exc
@@ -6590,6 +6270,7 @@ async def save_soil_settings(
     pair_disagreement_limit_mm: float = Form(8),
     scheduled_run_enabled: bool = Form(False),
     scheduled_run_time: str = Form("03:00"),
+    scheduled_run_interval_days: int = Form(1),
     automatic_acceptance_enabled: bool = Form(False),
     automatic_acceptance_confidence_percent: float = Form(90),
     automatic_acceptance_margin_mm: float = Form(20),
@@ -6612,6 +6293,9 @@ async def save_soil_settings(
             pair_disagreement_limit_mm=pair_disagreement_limit_mm,
             scheduled_run_enabled=scheduled_run_enabled,
             scheduled_run_time=scheduled_run_time,
+            scheduled_run_interval_days=scheduled_run_interval_days,
+            grid_skip_recent_measurements=current.grid_skip_recent_measurements,
+            grid_recent_measurement_days=current.grid_recent_measurement_days,
             automatic_acceptance_enabled=automatic_acceptance_enabled,
             automatic_acceptance_confidence_percent=automatic_acceptance_confidence_percent,
             automatic_acceptance_margin_mm=automatic_acceptance_margin_mm,
@@ -6630,18 +6314,23 @@ async def save_soil_settings(
 async def accept_soil_measurement_grid(
     spacing_mm: float = Form(...),
     maximum_deviation_mm: float = Form(...),
-    capture_z: float = Form(0),
-    baseline_mm: float = Form(15),
+    skip_recent_measurements: bool = Form(False),
+    recent_measurement_days: int = Form(14),
 ) -> RedirectResponse:
     entry_id = settings.selected_config_entry_id
     if not entry_id:
         raise HTTPException(409, "No FarmBot config entry is selected")
+    calibration = database.active_soil_calibration(entry_id)
+    if calibration is None:
+        raise HTTPException(409, "Complete guided soil calibration first")
     current = soil_settings_store.load()
     try:
         updated = current.model_copy(
             update={
                 "grid_spacing_mm": spacing_mm,
                 "grid_maximum_deviation_mm": maximum_deviation_mm,
+                "grid_skip_recent_measurements": skip_recent_measurements,
+                "grid_recent_measurement_days": recent_measurement_days,
             }
         )
         updated = SoilSettings.model_validate(updated.model_dump())
@@ -6649,8 +6338,8 @@ async def accept_soil_measurement_grid(
             config_entry_id=entry_id,
             spacing_mm=spacing_mm,
             maximum_deviation_mm=maximum_deviation_mm,
-            capture_z=capture_z,
-            baseline_mm=baseline_mm,
+            capture_z=calibration.capture_z,
+            baseline_mm=calibration.baseline_mm,
         )
     except ValueError as exc:
         raise HTTPException(409, str(exc)) from exc
@@ -6662,23 +6351,26 @@ async def accept_soil_measurement_grid(
 async def start_soil_measurement(
     point_ids: Annotated[list[int] | None, Form()] = None,
     mode: str = Form("selected"),
-    custom_point_id: int | None = Form(None),
     custom_x: float | None = Form(None),
     custom_y: float | None = Form(None),
-    capture_z: float = Form(0),
-    baseline_mm: float = Form(15),
 ) -> RedirectResponse:
     entry_id = settings.selected_config_entry_id
     if not entry_id:
         raise HTTPException(409, "No FarmBot config entry is selected")
+    calibration = database.active_soil_calibration(entry_id)
+    if calibration is None:
+        raise HTTPException(409, "Complete guided soil calibration first")
     if mode == "custom":
-        if custom_point_id is None or custom_x is None or custom_y is None:
-            raise HTTPException(422, "Choose a soil point and enter both custom coordinates")
+        if custom_x is None or custom_y is None:
+            raise HTTPException(422, "Enter both custom coordinates")
         point_ids = []
     elif mode == "all":
         soil_values = soil_settings_store.load()
         _inventory, sites = await soil_jobs.safe_sites(
-            entry_id, baseline_mm, clear_soil_margin_mm=soil_values.clear_soil_margin_mm
+            entry_id,
+            calibration.baseline_mm,
+            clear_soil_margin_mm=soil_values.clear_soil_margin_mm,
+            minimum_point_age_days=None,
         )
         point_ids = [site.point_id for site in sites]
     point_ids = point_ids or []
@@ -6686,11 +6378,11 @@ async def start_soil_measurement(
         soil_jobs.start_measurements(
             config_entry_id=entry_id,
             point_ids=point_ids,
-            custom_point_id=custom_point_id if mode == "custom" else None,
+            custom_point_id=None,
             custom_x=custom_x if mode == "custom" else None,
             custom_y=custom_y if mode == "custom" else None,
-            capture_z=capture_z,
-            baseline_mm=baseline_mm,
+            capture_z=calibration.capture_z,
+            baseline_mm=calibration.baseline_mm,
             job_kind="measurement_retry" if mode == "retry" else "measurement",
         )
     except ValueError as exc:
@@ -6719,7 +6411,7 @@ def _soil_measurement_is_applicable(measurement: dict | None) -> bool:
         _soil_measurement_is_pending_valid(measurement)
         and measurement.get("capture_x") is not None
         and measurement.get("capture_y") is not None
-        and measurement.get("point_updated_at")
+        and (int(measurement.get("point_id") or 0) == 0 or measurement.get("point_updated_at"))
     )
 
 
@@ -6732,7 +6424,7 @@ def _soil_measurement_coordinates(measurement: dict) -> str:
 def _soil_measurement_review_note(measurement: dict) -> str:
     if _soil_measurement_is_applicable(measurement):
         return ""
-    if not measurement.get("point_updated_at"):
+    if not measurement.get("point_updated_at") and int(measurement.get("point_id") or 0) != 0:
         message = "Cannot apply: the FarmBot point has no trustworthy update date."
     elif measurement.get("capture_x") is None or measurement.get("capture_y") is None:
         message = "Cannot apply: the saved capture coordinates are incomplete."
@@ -6768,12 +6460,12 @@ async def _apply_soil_measurement(measurement_id: str) -> dict:
         raise HTTPException(404, "Applicable soil result not found")
     apply_request = ApplySoilHeightRequest(
         config_entry_id=measurement["config_entry_id"],
-        point_id=measurement["point_id"],
+        point_id=measurement["point_id"] or None,
         measurement_id=measurement["measurement_id"],
-        expected_x=measurement["expected_x"],
-        expected_y=measurement["expected_y"],
-        expected_z=measurement["old_z_mm"],
-        expected_updated_at=measurement["point_updated_at"],
+        expected_x=measurement["expected_x"] if measurement["point_id"] else None,
+        expected_y=measurement["expected_y"] if measurement["point_id"] else None,
+        expected_z=measurement["old_z_mm"] if measurement["point_id"] else None,
+        expected_updated_at=(measurement["point_updated_at"] if measurement["point_id"] else None),
         recommended_x=measurement["capture_x"],
         recommended_y=measurement["capture_y"],
         recommended_z_mm=measurement["proposed_z_mm"],
@@ -6833,97 +6525,6 @@ async def reject_soil_measurement(measurement_id: UUID) -> RedirectResponse:
     )
     database.record_soil_decision(str(measurement_id), "reject", {"status": "rejected"})
     return RedirectResponse("../../../soil-height", status_code=303)
-
-
-@app.get("/canopy-settings", response_class=HTMLResponse)
-async def canopy_settings_page(request: Request) -> HTMLResponse:
-    values = canopy_fusion_settings_store.load()
-
-    def checked(value: bool) -> str:
-        return " checked" if value else ""
-
-    body = f"""<section class=card><h2>Multi-image canopy fusion</h2>
-<p>Plant segmentation still runs on each original image. When a plant reaches an image edge,
-the resulting ownership masks are aligned in calibrated garden coordinates and fused before
-its radius is measured. This avoids seams and duplicate leaves from an RGB panorama.</p>
-<form method=post action="canopy-settings">
-<fieldset><legend>Activation</legend>
-<label><input type=checkbox name=enabled value=true{checked(values.enabled)}> Enable calibrated mask fusion</label><br>
-<label><input type=checkbox name=always_fuse_when_available value=true{checked(values.always_fuse_when_available)}> Fuse whenever enough views are available</label><br>
-<label>Fuse below visible fraction <input type=number name=activation_visible_fraction min=0 max=1 step=.01 value="{values.activation_visible_fraction:g}"></label><br>
-<label>Minimum views <input type=number name=minimum_views min=2 max=20 step=1 value="{values.minimum_views}"></label><br>
-<label>Maximum time gap (hours) <input type=number name=maximum_time_gap_hours min=.1 max=720 step=.1 value="{values.maximum_time_gap_hours:g}"></label>
-</fieldset>
-<fieldset><legend>Evidence acceptance</legend>
-<label>Minimum per-view confidence <input type=number name=minimum_view_confidence min=0 max=1 step=.01 value="{values.minimum_view_confidence:g}"></label><br>
-<label>Supporting views required per pixel <input type=number name=minimum_supporting_views min=1 max=10 step=1 value="{values.minimum_supporting_views}"></label><br>
-<label>Single-view pixel confidence <input type=number name=single_view_acceptance_confidence min=0 max=1 step=.01 value="{values.single_view_acceptance_confidence:g}"></label><br>
-<label>Source-edge evidence margin (mm) <input type=number name=source_edge_margin_mm min=0 max=250 step=1 value="{values.source_edge_margin_mm:g}"></label>
-</fieldset>
-<fieldset><legend>Radius measurement</legend>
-<label>Outer radial percentile <input type=number name=radial_percentile min=80 max=100 step=.1 value="{values.radial_percentile:g}"></label><br>
-<label>Angular sectors <input type=number name=angular_sectors min=12 max=360 step=1 value="{values.angular_sectors}"></label><br>
-<label>Maximum fusion canvas (pixels) <input type=number name=maximum_canvas_pixels min=480 max=6000 step=10 value="{values.maximum_canvas_pixels}"></label>
-</fieldset>
-<fieldset><legend>Automatic-action guardrails</legend>
-<label><input type=checkbox name=automatic_requires_reliable_fusion value=true{checked(values.automatic_requires_reliable_fusion)}> Require reliable fusion when partial views are present</label><br>
-<label>Minimum angular coverage <input type=number name=minimum_angular_coverage min=0 max=1 step=.01 value="{values.minimum_angular_coverage:g}"></label><br>
-<label>Minimum corroborated mask fraction <input type=number name=minimum_corroborated_fraction min=0 max=1 step=.01 value="{values.minimum_corroborated_fraction:g}"></label><br>
-<label>Maximum disagreement with per-image estimate (mm) <input type=number name=maximum_automatic_disagreement_mm min=0 max=500 step=1 value="{values.maximum_automatic_disagreement_mm:g}"></label><br>
-<label><input type=checkbox name=save_diagnostics value=true{checked(values.save_diagnostics)}> Save fusion diagnostics for review</label>
-</fieldset>
-<button>Save canopy fusion settings</button></form>
-<p class=muted>Disabling a guardrail permits more automation but does not remove the normal
-confidence, calibration, zone, or plant-safety checks.</p></section>"""
-    return layout(request, body, "Canopy fusion")
-
-
-@app.post("/canopy-settings")
-async def save_canopy_settings(
-    enabled: bool = Form(False),
-    always_fuse_when_available: bool = Form(False),
-    activation_visible_fraction: float = Form(0.92),
-    minimum_views: int = Form(2),
-    maximum_time_gap_hours: float = Form(6),
-    minimum_view_confidence: float = Form(0.35),
-    minimum_supporting_views: int = Form(2),
-    single_view_acceptance_confidence: float = Form(0.82),
-    source_edge_margin_mm: float = Form(20),
-    radial_percentile: float = Form(97),
-    angular_sectors: int = Form(72),
-    minimum_angular_coverage: float = Form(0.70),
-    minimum_corroborated_fraction: float = Form(0.05),
-    maximum_automatic_disagreement_mm: float = Form(35),
-    automatic_requires_reliable_fusion: bool = Form(False),
-    maximum_canvas_pixels: int = Form(2400),
-    save_diagnostics: bool = Form(False),
-) -> RedirectResponse:
-    try:
-        values = CanopyFusionSettings(
-            enabled=enabled,
-            always_fuse_when_available=always_fuse_when_available,
-            activation_visible_fraction=activation_visible_fraction,
-            minimum_views=minimum_views,
-            maximum_time_gap_hours=maximum_time_gap_hours,
-            minimum_view_confidence=minimum_view_confidence,
-            minimum_supporting_views=minimum_supporting_views,
-            single_view_acceptance_confidence=single_view_acceptance_confidence,
-            source_edge_margin_mm=source_edge_margin_mm,
-            radial_percentile=radial_percentile,
-            angular_sectors=angular_sectors,
-            minimum_angular_coverage=minimum_angular_coverage,
-            minimum_corroborated_fraction=minimum_corroborated_fraction,
-            maximum_automatic_disagreement_mm=maximum_automatic_disagreement_mm,
-            automatic_requires_reliable_fusion=automatic_requires_reliable_fusion,
-            maximum_canvas_pixels=maximum_canvas_pixels,
-            save_diagnostics=save_diagnostics,
-        )
-    except ValueError as exc:
-        raise HTTPException(422, str(exc)) from exc
-    if values.minimum_supporting_views > values.minimum_views:
-        raise HTTPException(422, "Supporting views per pixel cannot exceed the minimum view count")
-    canopy_fusion_settings_store.save(values)
-    return RedirectResponse("canopy-settings", status_code=303)
 
 
 @app.get("/weed-settings", response_class=HTMLResponse)
@@ -8621,248 +8222,6 @@ def _zone_json(zones: list[Zone]) -> str:
         for zone in zones
     ]
     return escape(json.dumps(payload, separators=(",", ":")), quote=True)
-
-
-# --------------------------------------------------------------------------
-# Experimental Draw shape
-#
-# The only feature in this app that moves the bot outside FarmBot OS's motion
-# planning: the program is raw firmware G-code, delivered by the companion
-# integration through FarmBot OS's Lua `gcode()` escape hatch. The app plans
-# coordinates and writes the text; the integration re-validates all of it
-# against live axis bounds and firmware config and is the final authority.
-# --------------------------------------------------------------------------
-
-# The most recent run, so the status panel survives a page reload. Only one run
-# can be in flight anyway -- the integration refuses a second while one is
-# active -- so a single slot is the whole state this needs.
-_last_gcode_run: dict[str, str] = {}
-
-
-async def _require_gcode_capability() -> Bot:
-    bots = (await client.list_bots()).bots
-    bot = next(
-        (item for item in bots if item.config_entry_id == settings.selected_config_entry_id),
-        None,
-    )
-    if bot is None or not bot.supports("experimental_raw_gcode"):
-        version = bot.integration_version if bot is not None else None
-        loaded = f" (loaded version {version})" if version else ""
-        raise HTTPException(
-            409,
-            "Raw G-code requires FarmBot integration V2.6.0 or newer"
-            f"{loaded}. Install/update it and restart Home Assistant.",
-        )
-    return bot
-
-
-async def _bed_bounds() -> dict[str, list[float]] | None:
-    """Axis bounds for the preview, or None when they cannot be read.
-
-    Only used to frame the drawing; the integration bounds-checks the program
-    itself, so a failure here degrades the preview and nothing else.
-    """
-    entry_id = settings.selected_config_entry_id
-    if not entry_id:
-        return None
-    try:
-        inventory = await client.soil_points(entry_id)
-    except HomeAssistantError:
-        return None
-    bounds = inventory.motion.axis_bounds
-    if bounds.get("x") is None or bounds.get("y") is None:
-        return None
-    return {axis: list(value) for axis, value in bounds.items() if value is not None}
-
-
-@app.get("/draw-shape", response_class=HTMLResponse)
-async def draw_shape_page(request: Request) -> HTMLResponse:
-    entry_id = settings.selected_config_entry_id
-    bounds = await _bed_bounds()
-    shape_options = "".join(
-        f'<option value="{escape(key, quote=True)}">{escape(label)}</option>'
-        for key, label in shape_gcode.SHAPES.items()
-    )
-    default_x, default_y = 500.0, 500.0
-    if bounds:
-        default_x = round((bounds["x"][0] + bounds["x"][1]) / 2, 1)
-        default_y = round((bounds["y"][0] + bounds["y"][1]) / 2, 1)
-    bounds_json = escape(json.dumps(bounds or {}), quote=True)
-
-    body = f"""<section class=card><h2>Draw a shape (experimental)</h2>
-<p class=warn><b>This moves FarmBot outside FarmBot OS's motion planning.</b>
-The program below is raw firmware G-code, handed straight to the Farmduino
-through FarmBot OS's Lua <code>gcode()</code> function. FarmBot OS validates
-none of it. Clear the bed of anything the gantry or tool could hit, keep the
-emergency stop within reach, and start with a small shape well clear of your
-plants.</p>
-<p class=muted><b>Requires FarmBot OS v15 or newer.</b> The Lua
-<code>gcode()</code> function this depends on does not exist before v15; on an
-older FarmBot OS the run will fail when the first chunk is executed rather than
-being refused up front, because nothing reports the Lua API's version.</p>
-<p class=muted>The FarmBot firmware does not implement <code>G01</code>, and
-<code>G00</code> is explicitly not guaranteed to travel in a straight line, so
-a circle is drawn as many short <code>G00</code> chords rather than an arc. The
-companion integration scales each axis's speed so they finish together, which
-is what keeps a chord close to straight. Expect the result to be approximate:
-this is a way to find out how well your bot tracks a path, not a plotter.</p>
-<p>FarmBot: <b>{escape(entry_id or "none selected")}</b></p></section>
-
-<section class="card"><h2>Shape</h2>
-<div class=grid>
-<form id=shape-form>
-<label>Shape<br><select id=shape name=shape>{shape_options}</select></label>
-<label id=sides-row hidden>Sides<br><input type=number name=sides min=3 max=24
- value=5></label>
-<label>Centre X (mm)<br><input type=number step=any name=center_x
- value="{default_x:g}"></label>
-<label>Centre Y (mm)<br><input type=number step=any name=center_y
- value="{default_y:g}"></label>
-<label>Circumradius (mm)<span class=hint title="Distance from the centre to a
- vertex. A circle and a hexagon with the same circumradius touch the same
- bounding circle.">?</span><br>
- <input type=number step=any name=circumradius_mm min=5 max=2000 value=100></label>
-<label>Rotation (degrees)<br><input type=number step=any name=rotation_deg value=0></label>
-<label id=segments-row>Segments<span class=hint title="Leave blank to choose
- automatically from the chord tolerance below.">?</span><br>
- <input type=number name=segments min=8 max=720 placeholder="auto"></label>
-<label>Chord tolerance (mm)<span class=hint title="How far a straight chord may
- sag from the true circle. Smaller means more segments.">?</span><br>
- <input type=number step=any name=chord_tolerance_mm min=0.05 max=25 value=0.5></label>
-<label>Draw Z (mm)<span class=hint title="Height the shape is traced at. Nothing
- is actuated; only the gantry moves.">?</span><br>
- <input type=number step=any name=draw_z value=0></label>
-<label>Travel Z (mm)<span class=hint title="Height used to approach the start
- point and to retract afterwards.">?</span><br>
- <input type=number step=any name=travel_z value=0></label>
-<label>Feed rate (mm/min)<br><input type=number step=any name=feed_mm_per_min
- min=1 max=3000 value=400></label>
-</form>
-<div>
-<canvas id=shape-preview width=520 height=420 data-bounds="{bounds_json}"
- style="width:100%;border:1px solid #ccc;border-radius:6px"></canvas>
-<p id=shape-summary class=muted></p>
-<p class=legend>Blue = the path, dots = one <code>G00</code> each, red cross =
-centre, dashed grey = the bed and the approach from FarmBot's current
-position.</p>
-</div>
-</div>
-<div class=button-row><button id=generate type=button>Generate G-code</button></div>
-</section>
-
-<section class=card><h2>G-code</h2>
-<p class=muted>This exact text is what gets sent, edits included. Supported:
-<code>G21</code>, <code>G90</code>, <code>G91</code>, <code>G00</code>
-(X/Y/Z/F/A/B/C) and a standalone <code>F</code>. Anything else is refused by
-name before the bot moves.</p>
-<textarea id=gcode-program rows=14 style="width:100%;font-family:ui-monospace,
-monospace;font-size:.85rem"></textarea>
-<div class=button-row>
-<button id=validate type=button>Validate only (no movement)</button>
-<button id=send type=button class=clear-button>Send to FarmBot</button>
-</div>
-<p id=run-status class=muted></p>
-</section>
-<script>{_DRAW_SHAPE_JS}</script>"""  # noqa: S608 - HTML template; no SQL is constructed here.
-    return layout(request, body, "Draw shape · FarmBot Vision")
-
-
-@app.post("/api/draw-shape/plan")
-async def draw_shape_plan(request: DrawShapePlanRequest) -> JSONResponse:
-    """Plan a shape and render its G-code, without contacting FarmBot."""
-    try:
-        plan = shape_gcode.generate_program(
-            shape=request.shape,
-            center_x=request.center_x,
-            center_y=request.center_y,
-            circumradius_mm=request.circumradius_mm,
-            sides=request.sides,
-            rotation_deg=request.rotation_deg,
-            segments=request.segments,
-            chord_tolerance_mm=request.chord_tolerance_mm,
-            draw_z=request.draw_z,
-            travel_z=request.travel_z,
-            feed_mm_per_min=request.feed_mm_per_min,
-        )
-    except shape_gcode.ShapeError as exc:
-        raise HTTPException(400, str(exc)) from exc
-
-    start = None
-    entry_id = settings.selected_config_entry_id
-    if entry_id:
-        try:
-            motion = (await client.soil_points(entry_id)).motion.position
-            if motion.get("x") is not None and motion.get("y") is not None:
-                start = [motion["x"], motion["y"]]
-        except HomeAssistantError:
-            start = None
-
-    segments = len(plan.points) - 1
-    minutes = plan.perimeter_mm / plan.feed_mm_per_min if plan.feed_mm_per_min else 0
-    return JSONResponse(
-        {
-            "lines": plan.lines,
-            "points": [list(point) for point in plan.points],
-            "center": list(plan.center),
-            "start": start,
-            "segments": segments,
-            "perimeter_mm": round(plan.perimeter_mm, 1),
-            "extent": [round(value, 1) for value in plan.extent()],
-            "summary": (
-                f"{segments} segment(s), {plan.perimeter_mm:.0f} mm of path, "
-                f"about {minutes:.1f} min at {plan.feed_mm_per_min:g} mm/min"
-            ),
-        }
-    )
-
-
-@app.post("/api/draw-shape/run")
-async def draw_shape_run(request: DrawShapeRunRequest) -> JSONResponse:
-    """Validate or execute the G-code exactly as it stands in the editor."""
-    entry_id = settings.selected_config_entry_id
-    if not entry_id:
-        raise HTTPException(409, "No FarmBot config entry is selected")
-    await _require_gcode_capability()
-
-    lines = shape_gcode.program_lines(request.lines)
-    if not lines:
-        raise HTTPException(400, "The G-code program is empty")
-    try:
-        result = await client.start_gcode_run(
-            GcodeRunRequest(
-                config_entry_id=entry_id,
-                lines=lines,
-                feed_mm_per_min=request.feed_mm_per_min,
-                return_to_start=request.return_to_start,
-                dry_run=request.dry_run,
-            )
-        )
-    except HomeAssistantError as exc:
-        raise HTTPException(502, str(exc)) from exc
-
-    if result.run_id is not None:
-        _last_gcode_run[entry_id] = str(result.run_id)
-    LOGGER.info(
-        "Draw shape %s: %s (%d line(s), %s)",
-        "validation" if request.dry_run else "run",
-        result.status,
-        len(lines),
-        result.message or "no message",
-    )
-    return JSONResponse(result.model_dump(mode="json"))
-
-
-@app.get("/api/draw-shape/status")
-async def draw_shape_status() -> JSONResponse:
-    entry_id = settings.selected_config_entry_id
-    run_id = _last_gcode_run.get(entry_id or "")
-    if not entry_id or not run_id:
-        return JSONResponse({"status": "idle", "message": "No run has been started"})
-    try:
-        result = await client.gcode_run_status(entry_id, run_id)
-    except HomeAssistantError as exc:
-        raise HTTPException(502, str(exc)) from exc
-    return JSONResponse(result.model_dump(mode="json"))
 
 
 @app.get("/zones", response_class=HTMLResponse)

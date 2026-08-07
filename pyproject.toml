@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "farmbot-vision"
-version = "3.31.1"
+version = "4.2.0"
 description = "Resource-conscious plant canopy analysis for FarmBot and Home Assistant"
 requires-python = ">=3.12"
 dependencies = [
@@ -37,6 +37,7 @@ asyncio_mode = "auto"
 [tool.ruff]
 target-version = "py312"
 line-length = 100
+extend-exclude = ["farmbot_vision/archive"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "B", "UP", "S", "ASYNC"]

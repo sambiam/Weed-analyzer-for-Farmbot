@@ -167,8 +167,8 @@ axis bounds. A matching display name alone is never sufficient.
 optional paired `capture_x`/`capture_y`, `capture_z`, `baseline_mm`, and
 `z_offsets_mm`, plus an optional measurement `batch_id` UUID. Use `[0]` for a
 measurement and `[0,25,50]` for calibration.
-A relocated capture must be less than 200 mm from a point last updated more
-than 14 days ago. It returns a `capture_id` immediately. The
+A relocated capture must be less than 200 mm from its point. Point age does not
+restrict capture. It returns a `capture_id` immediately. The
 integration validates the bot and bounds, uses acknowledged safe-Z movement,
 captures `-baseline, 0, +baseline` along Y (or an actual-coordinate one-sided
 triplet at an edge), waits for processed images, claims those image IDs from
@@ -188,14 +188,15 @@ waits for the batch's last atomic capture and restores the position saved when
 its first capture started with an acknowledged safe-Z move. Repeating the
 finish call is idempotent.
 
-`farmbot.apply_vision_soil_height` accepts `config_entry_id`, `point_id`,
-`measurement_id`, expected `x/y/z` and `updated_at`, recommended `x/y/z`,
-`confidence`, `apply`, and `human_approved`. Writes require both booleans,
-re-fetch the point, enforce a 0.5 mm coordinate tolerance, unchanged timestamp,
-axis bounds, age over 14 days, and relocation under 200 mm. The existing point
-is relocated and its Z is updated without replacing its metadata. Missing,
-discarded, wrong-type, fresh, changed, non-finite, and unrecognized points fail
-closed.
+`farmbot.apply_vision_soil_height` accepts `config_entry_id`, optional
+`point_id`, `measurement_id`, optional expected `x/y/z` and `updated_at`,
+recommended `x/y/z`, `confidence`, `apply`, and `human_approved`. Writes require
+both booleans. With a point ID it re-fetches the point, enforces a 0.5 mm
+coordinate tolerance, unchanged timestamp, axis bounds, and relocation under
+200 mm; point age is not a restriction. Without a point ID it creates a
+Vision-owned soil-height `GenericPointer` at the recommended coordinate.
+Missing, discarded, wrong-type, changed, out-of-bounds, non-finite, and
+unrecognized points fail closed.
 
 ## `farmbot.apply_vision_radius`
 

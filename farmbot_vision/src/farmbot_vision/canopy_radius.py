@@ -27,6 +27,7 @@ class CanopyRadiusEstimate:
 
     typical_radius_mm: float
     outer_radius_mm: float
+    unclipped_outer_radius_mm: float
     keep: np.ndarray
     observed_sector_fraction: float
     clipped_point_fraction: float
@@ -42,6 +43,28 @@ def previous_canopy_edge_mm(
     margin = max(0.0, float(protection_margin_mm))
     margin_aware = current > margin + 5.0
     return max(5.0, current - margin if margin_aware else current), margin_aware
+
+
+def recommended_protection_radius_mm(
+    estimate: CanopyRadiusEstimate,
+    *,
+    current_radius_mm: float,
+    protection_margin_mm: float,
+) -> float:
+    """Add protection margins without recommending a radius inside the mask.
+
+    Temporal clipping can conservatively reject a broad apparent expansion,
+    but it must not turn those still-visible mask pixels into evidence for a
+    decrease. A decrease is therefore bounded by the robust, pre-clipping mask
+    edge. The existing radius remains the ceiling for rejected growth, so a bad
+    broad mask can hold a radius steady but cannot enlarge it.
+    """
+
+    current = max(0.0, float(current_radius_mm))
+    margin = max(0.0, float(protection_margin_mm))
+    measured = max(0.0, float(estimate.outer_radius_mm)) + margin
+    mask_supported = max(0.0, float(estimate.unclipped_outer_radius_mm)) + margin
+    return max(measured, min(current, mask_supported))
 
 
 def _circular_true_runs(flags: np.ndarray) -> list[np.ndarray]:
@@ -110,6 +133,11 @@ def estimate_canopy_radius(
     observed = np.isfinite(sector_outer)
     if not np.any(observed):
         return None
+    # Each sector edge is already a 98th percentile over at least three mask
+    # pixels. Preserve the farthest such supported leaf tip before temporal
+    # clipping; taking another percentile across sectors can otherwise place a
+    # recommended circle visibly inside a narrow but genuine leaf.
+    unclipped_outer = float(np.max(sector_outer[observed]))
 
     prior_edge, has_margin_aware_prior = previous_canopy_edge_mm(
         current_radius_mm, protection_margin_mm
@@ -167,17 +195,15 @@ def estimate_canopy_radius(
         return None
 
     outer = float(np.percentile(accepted_outer_values, radial_percentile))
-    narrow_protrusions = overextended & ~broad_sectors & np.isfinite(accepted_sector_outer)
-    if np.any(narrow_protrusions):
-        # Sector-to-sector percentiles intentionally suppress scattered outer
-        # noise, but a real narrow leaf can occupy only one 5-degree sector.
-        # Its in-sector 98th percentile is already robust to isolated pixels,
-        # so preserve that supported tip explicitly.
-        outer = max(outer, float(np.max(accepted_sector_outer[narrow_protrusions])))
+    # A real narrow leaf can occupy only one 5-degree sector. Its in-sector
+    # percentile is already robust to isolated pixels, so preserve every
+    # temporally accepted supported tip rather than reducing inside the mask.
+    outer = max(outer, float(np.max(accepted_outer_values)))
     typical = float(np.percentile(accepted_distances, 90))
     return CanopyRadiusEstimate(
         typical_radius_mm=min(typical, outer),
         outer_radius_mm=outer,
+        unclipped_outer_radius_mm=unclipped_outer,
         keep=keep,
         observed_sector_fraction=float(np.mean(observed)),
         clipped_point_fraction=float(1.0 - np.mean(keep[finite])),

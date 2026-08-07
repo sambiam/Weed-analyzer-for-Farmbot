@@ -108,11 +108,11 @@ source and version used.
 
 ## Supplemental soil height
 
-Open **Soil height** to measure the existing FarmBot soil-height
-`GenericPointer` records. The app does not infer soil points from names: the
-companion must recognize FarmBot's `measure-soil-height` or `at_soil_level`
-metadata. Fewer than three usable points triggers a warning because FarmBot's
-`soil_height(x, y)` interpolation needs at least three measurements.
+Open **Soil height** to measure FarmBot soil-height `GenericPointer` records.
+The app does not infer soil points from names: the companion recognizes
+FarmBot's `measure-soil-height` or `at_soil_level` metadata. A custom
+coordinate automatically updates the nearest eligible point within 200 mm, or
+creates a new Vision-owned soil-height point when none is nearby.
 
 Calibration is required once per bot/camera arrangement. Select clear textured
 soil, enter the manually measured camera-to-soil distance at capture Z, and
@@ -161,20 +161,23 @@ margins. A result remains diagnostic-only unless coverage, plane support,
 left/right consistency, plane residual, cross-pair agreement, and propagated
 uncertainty all pass their quality gates.
 
-Use **Measure selected**, **Measure all**, or **Retry failed**. **Select all**
-and **Select all failed** make it easier to build a point selection. Points are
-visited in nearest-neighbour order. **Stop after current point** allows the
+The clear-soil-aware grid is the normal measurement entry point. Its optional
+recent-measurement filter skips points updated within a user-selected number of
+days; with the filter off, all eligible grid points are measured again. The
+Measurement queue shows only work waiting to run and the newest failures,
+which can be retried individually. **Stop after current point** allows the
 companion's current atomic capture to finish and never sends an emergency stop.
 
-The same tab can schedule one daily run across every currently available site
+The same tab can schedule the saved grid every configured number of days
 and retry a manual or scheduled run's failed points once after a configurable
 minutes-or-hours delay. Automatic acceptance is optional and applies a valid
 result only when it meets both the configured confidence percentage and the
 maximum allowed change from the point's original Z. Other valid results remain
-available for individual or selected approval. Every apply re-fetches the same
-point and refuses stale coordinates; only its Z coordinate is updated. The tab
-also controls the clear-soil margin and the stereo-pair disagreement failure
-limit. Restarted jobs are recorded as interrupted and never resume bot motion.
+available for individual or selected approval. Every existing-point apply
+re-fetches the same point and refuses changed coordinates or timestamps. The
+tab also controls the clear-soil margin and the stereo-pair disagreement
+failure limit. Capture Z and baseline come only from the active calibration.
+Restarted jobs are recorded as interrupted and never resume bot motion.
 
 ## Image selection and analysis
 
@@ -202,6 +205,20 @@ and close-leaf photos must have one dominant edge-connected vegetation mass
 with little other visible vegetation. Blur is judged from whole-frame detail
 and strong edges, with adjacent grid cells used as the local sharpness baseline
 when available.
+
+### Scheduled photo grid
+
+The **Scheduled photo grid** controls sit under the Analysis page's start
+button. Tick **Run automatically**, choose a 24-hour time, and select the days
+of the week the grid should run on. The saved schedule has its own blurry,
+washed-out, and close-leaf retry choices, so an unattended run does not depend
+on whatever was last ticked for a manual start.
+
+The scheduler checks every 30 seconds and starts at most one grid per
+scheduled time. A run is skipped, with a log line, when no FarmBot is selected
+or a photo grid is already running; enabling the schedule without selecting
+any day never runs. The schedule is stored in `/data/photo_grid_schedule.json`
+and uses the add-on container's local time.
 
 The latest-grid view draws verified frames into one calibrated birds-eye
 garden mosaic and overlays current FarmBot plants and weeds. The plan and

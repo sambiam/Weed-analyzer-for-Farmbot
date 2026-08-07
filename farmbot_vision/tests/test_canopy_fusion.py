@@ -90,6 +90,45 @@ def test_fuses_plant_masks_before_measuring_radius(tmp_path):
     assert result.diagnostic_jpeg
 
 
+def test_fusion_includes_useful_tiles_after_minimum_boundary_coverage(tmp_path):
+    base = np.zeros((160, 160), dtype=np.uint8)
+    cv2.circle(base, (80, 80), 30, 255, -1)
+    outer_leaf = base.copy()
+    cv2.line(outer_leaf, (105, 80), (148, 80), 255, 7)
+    paths = [tmp_path / f"view-{index}.png" for index in range(3)]
+    cv2.imwrite(str(paths[0]), base)
+    cv2.imwrite(str(paths[1]), base)
+    cv2.imwrite(str(paths[2]), outer_leaf)
+    now = datetime.now(UTC)
+
+    result = fuse_canopy_masks(
+        [
+            _measurement(str(paths[0]), image_id=1, timestamp=now, sectors=list(range(18))),
+            _measurement(
+                str(paths[1]),
+                image_id=2,
+                timestamp=now + timedelta(minutes=1),
+                sectors=list(range(18, 36)),
+                center_visible=False,
+            ),
+            # This view adds no sectors needed to cross the old 50% selection
+            # threshold, but it contains real canopy pixels needed by fusion.
+            _measurement(
+                str(paths[2]),
+                image_id=3,
+                timestamp=now + timedelta(minutes=2),
+                sectors=list(range(18)),
+                center_visible=False,
+            ),
+        ],
+        CanopyFusionSettings(always_fuse_when_available=True),
+    )
+
+    assert result is not None
+    assert result.view_count == 3
+    assert result.maximum_radius_mm > 60
+
+
 def test_fusion_excludes_stale_view_without_lowering_current_partial_estimate(tmp_path):
     mask = np.zeros((160, 160), dtype=np.uint8)
     cv2.circle(mask, (80, 80), 50, 255, -1)

@@ -1,5 +1,71 @@
 # Changelog
 
+## Unreleased
+
+- Added a scheduled photo grid to the Analysis page. Pick a time and the days
+  of the week, with its own blurry, washed-out, and close-leaf retry choices,
+  and the app starts the calibrated whole-bed grid automatically.
+
+## 4.2.0 - 2026-08-07
+
+- Simplified the soil-height page around a full-width calibration section,
+  measurement queue, pending results, regular measurement interval, and
+  clear-soil-aware grid controls.
+- Removed per-run capture-Z and baseline inputs. Every measurement now uses
+  the active calibration, while custom coordinates automatically update a
+  nearby soil point or create a new one when no candidate is close enough.
+- Made the grid's recent-measurement filter optional and configurable instead
+  of always excluding points measured within 14 days.
+- Fixed inclusive automatic acceptance so measurements at or above the chosen
+  confidence threshold, and within tolerance for an existing point, bypass
+  pending review and are applied with the user's standing approval.
+- Excluded weeds smaller than 15 mm and plants smaller than 15 mm or younger
+  than 10 days from clear-soil blocking calculations.
+- Requires companion FarmBot integration 2.13.0, which accepts measurements
+  for points of any age and can create standalone soil-height points.
+
+## 4.1.0 - 2026-08-07
+
+- Prevented radius-reduction recommendations from cutting inside a supported
+  plant mask. Narrow leaf tips now remain part of the accepted outer boundary,
+  while temporally rejected broad growth can hold the existing radius without
+  enlarging it.
+- Changed canopy fusion to include every fresh, useful grid tile rather than
+  stopping once the minimum boundary coverage is reached, preventing missing
+  sections in large-plant composites.
+- Added crop-context weighting to learned weed verification. Confidence now
+  approaches zero toward a known plant centre and is further reduced for
+  vegetation supported by current or historical plant masks.
+- Limited plant-removal recommendations to plants older than 30 days with a
+  current FarmBot radius greater than 50 mm.
+
+## 4.0.0 - 2026-08-07
+
+- "View most recent grid" no longer renders squashed. The mosaic canvas now
+  uses the bed's true aspect ratio (capped like the calibration composite)
+  instead of a clamped 900x240-650 canvas, and the modal's generic
+  `max-height: 70vh` canvas rule no longer applies to it.
+- Zooming the most recent grid now scales both axes together and scrolls
+  inside the viewport, matching the calibration tab, instead of stretching
+  the image horizontally.
+- Removed the per-weed name labels from the grid: the red circle already
+  identifies a weed, and the labels covered the photos underneath.
+- Plant labels now show only the friendly name — the trailing OpenFarm slug
+  in brackets (e.g. "Bok Choy (bok-choy)") is stripped.
+
+## 3.32.0 - 2026-08-07
+
+- Removed the experimental "Draw shape" tab (raw firmware G-code passthrough)
+  from the app. The generator module and its tests are kept in
+  `farmbot_vision/archive/draw_shape/` for reference. The companion Home
+  Assistant integration is unaffected.
+- Removed the "Canopy fusion" settings tab from the app navigation. Canopy
+  fusion itself is unchanged; its settings are just no longer user-editable
+  from the UI.
+- Removed the "Weeding" tab from the app navigation. The adaptive rotary
+  weeding backend (job manager, start/stop/status API, and domain logic)
+  remains active and unchanged, in case the UI is reinstated.
+
 ## 3.31.1 - 2026-08-05
 
 - Fixed valid custom-coordinate soil measurements disappearing when an

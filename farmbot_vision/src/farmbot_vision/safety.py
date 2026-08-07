@@ -3,6 +3,9 @@ from __future__ import annotations
 from .models import Decision, Measurement, OperatingMode
 from .settings import Settings
 
+MINIMUM_PLANT_REMOVAL_AGE_DAYS = 30
+MINIMUM_PLANT_REMOVAL_RADIUS_MM = 50.0
+
 
 def decide(
     measurement: Measurement,
@@ -24,6 +27,34 @@ def decide(
         if not settings.removal_detection_enabled:
             return measurement.model_copy(
                 update={"decision": Decision.OBSERVED, "reason": "removal detection is disabled"}
+            )
+        if (
+            measurement.plant_age_days is None
+            or measurement.plant_age_days <= MINIMUM_PLANT_REMOVAL_AGE_DAYS
+        ):
+            age = (
+                "unknown"
+                if measurement.plant_age_days is None
+                else f"{measurement.plant_age_days} days"
+            )
+            return measurement.model_copy(
+                update={
+                    "decision": Decision.OBSERVED,
+                    "reason": (
+                        f"plant age is {age}; removal requires a plant older than "
+                        f"{MINIMUM_PLANT_REMOVAL_AGE_DAYS} days"
+                    ),
+                }
+            )
+        if measurement.current_radius_mm <= MINIMUM_PLANT_REMOVAL_RADIUS_MM:
+            return measurement.model_copy(
+                update={
+                    "decision": Decision.OBSERVED,
+                    "reason": (
+                        f"plant radius is {measurement.current_radius_mm:g} mm; removal requires "
+                        f"more than {MINIMUM_PLANT_REMOVAL_RADIUS_MM:g} mm"
+                    ),
+                }
             )
         if not previously_observed_canopy:
             return measurement.model_copy(

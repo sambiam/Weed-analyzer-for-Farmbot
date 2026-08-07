@@ -20,8 +20,6 @@ from .models import (
     ApplySoilHeightRequest,
     BotList,
     CreateWeedRequest,
-    GcodeRunRequest,
-    GcodeRunStatus,
     Inventory,
     InventoryRequest,
     RemoveWeedRequest,
@@ -320,17 +318,6 @@ class HomeAssistantClient:
             {"config_entry_id": config_entry_id, "repair_id": repair_id},
         )  # type: ignore[return-value]
 
-    async def start_gcode_run(self, request: GcodeRunRequest) -> GcodeRunStatus:
-        """Send an experimental raw G-code program (or validate it, if dry_run)."""
-        return await self._service("start_vision_gcode", request, GcodeRunStatus)  # type: ignore[return-value]
-
-    async def gcode_run_status(self, config_entry_id: str, run_id: str) -> GcodeRunStatus:
-        return await self._service(
-            "get_vision_gcode",
-            {"config_entry_id": config_entry_id, "run_id": run_id},
-            GcodeRunStatus,
-        )  # type: ignore[return-value]
-
     async def start_weeding(self, request: WeedingRunRequest) -> WeedingRunStatus:
         return await self._service("start_vision_weeding", request, WeedingRunStatus)  # type: ignore[return-value]
 
@@ -383,7 +370,10 @@ class HomeAssistantClient:
         return await self._service("apply_vision_plant_center", request)  # type: ignore[return-value]
 
     async def apply_soil_height(self, request: ApplySoilHeightRequest) -> dict[str, Any]:
-        return await self._service("apply_vision_soil_height", request)  # type: ignore[return-value]
+        return await self._service(
+            "apply_vision_soil_height",
+            request.model_dump(mode="json", exclude_none=True),
+        )  # type: ignore[return-value]
 
     async def create_weed(self, request: CreateWeedRequest) -> dict[str, Any]:
         return await self._service("create_vision_weed", request)  # type: ignore[return-value]

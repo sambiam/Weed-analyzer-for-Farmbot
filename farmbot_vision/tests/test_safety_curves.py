@@ -25,6 +25,7 @@ def measurement(current=100, recommendation=120, confidence=0.95, ambiguous=Fals
         reason="test",
         ambiguous=ambiguous,
         algorithm_version="test",
+        plant_age_days=31,
     )
 
 
@@ -114,6 +115,37 @@ def test_absence_requires_enabled_detection_prior_canopy_and_streak():
     assert (
         decide(
             confirmed, OperatingMode.RECOMMEND, enabled, previously_observed_canopy=True
+        ).decision
+        == Decision.REMOVAL_RECOMMENDED
+    )
+
+
+def test_removal_is_not_recommended_for_seedlings_or_small_plant_points():
+    settings = Settings(removal_detection_enabled=True, removal_min_consecutive_absent=1)
+    absent = measurement(current=100).model_copy(
+        update={"vegetation_absent": True, "absent_observations": 1}
+    )
+
+    unknown_age = absent.model_copy(update={"plant_age_days": None})
+    exactly_thirty_days = absent.model_copy(update={"plant_age_days": 30})
+    exactly_fifty_mm = absent.model_copy(update={"plant_age_days": 31, "current_radius_mm": 50})
+
+    for ineligible in (unknown_age, exactly_thirty_days, exactly_fifty_mm):
+        result = decide(
+            ineligible,
+            OperatingMode.RECOMMEND,
+            settings,
+            previously_observed_canopy=True,
+        )
+        assert result.decision == Decision.OBSERVED
+
+    eligible = absent.model_copy(update={"plant_age_days": 31, "current_radius_mm": 51})
+    assert (
+        decide(
+            eligible,
+            OperatingMode.RECOMMEND,
+            settings,
+            previously_observed_canopy=True,
         ).decision
         == Decision.REMOVAL_RECOMMENDED
     )

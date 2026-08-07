@@ -1344,6 +1344,7 @@ class Database:
             dict(row)
             for row in self.connection.execute(
                 """SELECT m.recorded_center_x AS x,m.recorded_center_y AS y,
+                m.plant_age_days,
                 MAX(m.current_radius_mm,m.maximum_accepted_canopy_radius_mm,
                     m.recommended_protection_radius_mm) AS radius_mm
                 FROM measurements m
@@ -2498,6 +2499,7 @@ class Database:
         self,
         job_id: str,
         *,
+        point_ids: list[int] | None = None,
         status: str | None = None,
         current_point_id: int | None = None,
         completed_count: int | None = None,
@@ -2508,6 +2510,9 @@ class Database:
         complete: bool = False,
     ) -> None:
         updates, values = [], []
+        if point_ids is not None:
+            updates.append("point_ids_json=?")
+            values.append(json.dumps(point_ids, separators=(",", ":")))
         for field, value in (
             ("status", status),
             ("current_point_id", current_point_id),
@@ -2552,6 +2557,19 @@ class Database:
             row = self.connection.execute(
                 "SELECT * FROM soil_jobs ORDER BY started_at DESC LIMIT 1"
             ).fetchone()
+        if row is None:
+            return None
+        data = dict(row)
+        data["point_ids"] = json.loads(data.pop("point_ids_json"))
+        data["stop_requested"] = bool(data["stop_requested"])
+        return data
+
+    def latest_soil_job_of_kind(self, config_entry_id: str, kind: str) -> dict | None:
+        row = self.connection.execute(
+            """SELECT * FROM soil_jobs WHERE config_entry_id=? AND kind=?
+            ORDER BY started_at DESC LIMIT 1""",
+            (config_entry_id, kind),
+        ).fetchone()
         if row is None:
             return None
         data = dict(row)

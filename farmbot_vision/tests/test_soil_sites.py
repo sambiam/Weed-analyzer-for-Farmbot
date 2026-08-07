@@ -160,7 +160,7 @@ def test_reduced_clear_soil_margin_exposes_a_closer_candidate():
     assert relaxed[0].relocation_distance_mm < conservative[0].relocation_distance_mm
 
 
-def test_measurement_grid_starts_at_half_spacing_and_replaces_blocked_point():
+def test_measurement_grid_ignores_a_plant_smaller_than_15_mm():
     plant = Plant(
         id=1,
         name="Tomato",
@@ -194,9 +194,63 @@ def test_measurement_grid_starts_at_half_spacing_and_replaces_blocked_point():
         (250, 750),
         (750, 750),
     ]
-    assert plan.points[0].status == "replaced"
-    assert 0 < plan.points[0].deviation_mm <= 150
-    assert all(point.status == "clear" for point in plan.points[1:])
+    assert all(point.status == "clear" for point in plan.points)
+
+
+def test_grid_freshness_filter_is_optional():
+    fresh = _soil(_point(70, 250, 250, age_days=2))
+    fresh.motion.axis_bounds["x"] = (0, 500)
+    fresh.motion.axis_bounds["y"] = (0, 500)
+    common = dict(
+        soil=fresh,
+        garden=_garden(),
+        vision_plants=[],
+        vision_weeds=[],
+        zones=[],
+        spacing_mm=500,
+        maximum_deviation_mm=100,
+        baseline_mm=15,
+        now=NOW,
+    )
+
+    redo = plan_soil_measurement_grid(**common, minimum_point_age_days=None)
+    skip = plan_soil_measurement_grid(**common, minimum_point_age_days=7)
+
+    assert redo.points[0].status == "clear"
+    assert skip.points[0].status == "skipped"
+    assert "7-day" in skip.points[0].explanation
+
+
+def test_young_large_plant_and_small_weed_do_not_block_clear_soil():
+    young = Plant(
+        id=1,
+        name="Seedling",
+        openfarm_slug="tomato",
+        x=250,
+        y=250,
+        radius=100,
+        plant_stage="planted",
+        planted_at=NOW - timedelta(days=5),
+    )
+    small_weed = WeedPoint(id=9, x=250, y=250, radius=14.9)
+    soil = _soil(_point(70, 250, 250))
+    soil.motion.axis_bounds["x"] = (0, 500)
+    soil.motion.axis_bounds["y"] = (0, 500)
+
+    plan = plan_soil_measurement_grid(
+        soil,
+        _garden(plants=[young], weeds=[small_weed]),
+        [],
+        [],
+        [],
+        spacing_mm=500,
+        maximum_deviation_mm=100,
+        baseline_mm=15,
+        minimum_point_age_days=None,
+        now=NOW,
+    )
+
+    assert plan.points[0].status == "clear"
 
 
 def test_skipped_grid_point_explains_margin_needed_for_acceptance():

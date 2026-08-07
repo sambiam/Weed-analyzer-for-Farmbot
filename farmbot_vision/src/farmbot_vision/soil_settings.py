@@ -16,6 +16,9 @@ class SoilSettings(BaseModel):
     pair_disagreement_limit_mm: float = Field(default=8, ge=1, le=50)
     scheduled_run_enabled: bool = False
     scheduled_run_time: str = Field(default="03:00", pattern=r"^(?:[01]\d|2[0-3]):[0-5]\d$")
+    scheduled_run_interval_days: int = Field(default=1, ge=1, le=3650)
+    grid_skip_recent_measurements: bool = False
+    grid_recent_measurement_days: int = Field(default=14, ge=1, le=3650)
     automatic_acceptance_enabled: bool = False
     automatic_acceptance_confidence_percent: float = Field(default=90, ge=0, le=100)
     automatic_acceptance_margin_mm: float = Field(default=20, ge=0, le=500)
