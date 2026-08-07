@@ -1,8 +1,8 @@
-﻿# FarmBot Vision 4.2.1
+﻿# FarmBot Vision 4.3.0
 
 FarmBot Vision is an experimental Home Assistant app that measures the real canopy of known FarmBot plants and recommends protection radii that include the furthest accepted genuine leaf. It uses classical computer vision and is designed for a Raspberry Pi 4 without PyTorch, TensorFlow, or a frontend build toolchain.
 
-Version: **4.2.1** · Architectures: **aarch64, amd64** · Home Assistant Core: **2026.7+** · Analysis resolution: **640x480 / 960x720 (default) / 1280x960** · Minimum companion integration: **2.13.0** (contract `farmbot-vision-v2`)
+Version: **4.3.0** · Architectures: **aarch64, amd64** · Home Assistant Core: **2026.7+** · Analysis resolution: **640x480 / 960x720 (default) / 1280x960** · Minimum companion integration: **2.13.0** (contract `farmbot-vision-v2`)
 
 > Automatic destructive weeding must not rely solely on early experimental vision results. Review diagnostic overlays and keep FarmBot's other safety controls enabled.
 

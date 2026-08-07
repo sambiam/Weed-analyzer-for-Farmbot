@@ -2473,6 +2473,35 @@ class Database:
                 ),
             )
 
+    def soil_height_change_log(self, config_entry_id: str, limit: int = 100) -> list[dict]:
+        """Return applied soil-height changes newest first, with who approved each."""
+        rows = self.connection.execute(
+            """
+            SELECT * FROM (
+                SELECT d.created_at AS created_at, m.point_name AS point_name,
+                       m.capture_x AS x, m.capture_y AS y,
+                       m.old_z_mm AS old_z_mm, m.proposed_z_mm AS new_z_mm,
+                       m.confidence AS confidence,
+                       CASE WHEN d.action='automatic_approve' THEN 'automatic' ELSE 'user' END
+                         AS method
+                FROM soil_decisions d
+                JOIN soil_measurements m ON m.measurement_id=d.measurement_id
+                WHERE m.config_entry_id=? AND d.action IN ('approve','automatic_approve')
+                UNION ALL
+                SELECT d.created_at, m.point_name, m.capture_x, m.capture_y,
+                       r.old_proposed_z_mm AS old_z_mm, r.repaired_z_mm AS new_z_mm,
+                       r.confidence AS confidence, 'user' AS method
+                FROM soil_decisions d
+                JOIN soil_legacy_repairs r ON r.legacy_measurement_id=d.measurement_id
+                JOIN soil_measurements m ON m.measurement_id=d.measurement_id
+                WHERE r.config_entry_id=? AND d.action='legacy_v2_repair_apply'
+            )
+            ORDER BY created_at DESC LIMIT ?
+            """,
+            (config_entry_id, config_entry_id, limit),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
     def start_soil_job(
         self,
         job_id: str,
