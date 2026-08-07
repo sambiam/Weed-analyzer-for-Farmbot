@@ -2026,6 +2026,204 @@ async def test_soil_apply_is_human_approved_and_audited(monkeypatch):
     assert web.database.soil_measurement(str(measurement.measurement_id))["status"] == "applied"
 
 
+def _failed_soil_measurement(point_id: int, config_entry_id: str = "soil-entry") -> SoilMeasurement:
+    return SoilMeasurement(
+        measurement_id=uuid4(),
+        config_entry_id=config_entry_id,
+        point_id=point_id,
+        point_name=f"Soil {point_id}",
+        expected_x=100,
+        expected_y=200,
+        old_z_mm=-400,
+        capture_x=100,
+        capture_y=200,
+        status="failed",
+        reason="quality gate failed",
+    )
+
+
+@pytest.mark.asyncio
+async def test_soil_measurement_queue_offers_retry_all_for_failed_points(monkeypatch):
+    monkeypatch.setattr(web.settings, "selected_config_entry_id", "soil-entry")
+
+    async def safe_sites(_entry_id, _baseline, **_kwargs):
+        inventory = SoilPointInventory(
+            device_id="42",
+            generated_at=datetime.now(UTC),
+            points=[],
+            motion=SoilMotionState(
+                connected=True,
+                busy=False,
+                locked=False,
+                position={"x": 0, "y": 0, "z": 0},
+                z_direction=-1,
+                axis_bounds={"x": (0, 1000), "y": (0, 1000), "z": (-500, 0)},
+            ),
+        )
+        return inventory, []
+
+    monkeypatch.setattr(web.soil_jobs, "safe_sites", safe_sites)
+    web.database.save_soil_measurement(_failed_soil_measurement(81))
+    web.database.save_soil_measurement(_failed_soil_measurement(82))
+
+    status, _, body = await asgi_request("/soil-height")
+    assert status == 200
+    assert b"Retry all failed" in body
+    assert b"name=mode value=retry_all" in body
+
+
+@pytest.mark.asyncio
+async def test_soil_measurement_queue_hides_retry_all_without_failures(monkeypatch):
+    monkeypatch.setattr(web.settings, "selected_config_entry_id", "soil-entry-empty")
+
+    async def safe_sites(_entry_id, _baseline, **_kwargs):
+        inventory = SoilPointInventory(
+            device_id="42",
+            generated_at=datetime.now(UTC),
+            points=[],
+            motion=SoilMotionState(
+                connected=True,
+                busy=False,
+                locked=False,
+                position={"x": 0, "y": 0, "z": 0},
+                z_direction=-1,
+                axis_bounds={"x": (0, 1000), "y": (0, 1000), "z": (-500, 0)},
+            ),
+        )
+        return inventory, []
+
+    monkeypatch.setattr(web.soil_jobs, "safe_sites", safe_sites)
+    status, _, body = await asgi_request("/soil-height")
+    assert status == 200
+    assert b"Retry all failed" not in body
+
+
+@pytest.mark.asyncio
+async def test_soil_retry_all_starts_measurement_for_currently_failed_points(monkeypatch):
+    monkeypatch.setattr(web.settings, "selected_config_entry_id", "soil-entry-retry-all")
+    monkeypatch.setattr(
+        web.database,
+        "active_soil_calibration",
+        lambda _entry_id: SimpleNamespace(capture_z=-12, baseline_mm=17),
+    )
+    now = datetime.now(UTC)
+    web.database.save_soil_measurement(
+        _failed_soil_measurement(91, config_entry_id="soil-entry-retry-all").model_copy(
+            update={"created_at": now}
+        )
+    )
+    web.database.save_soil_measurement(
+        _failed_soil_measurement(92, config_entry_id="soil-entry-retry-all").model_copy(
+            update={"created_at": now}
+        )
+    )
+    # A point later re-measured successfully should not be retried again.
+    recovered = _failed_soil_measurement(92, config_entry_id="soil-entry-retry-all").model_copy(
+        update={
+            "measurement_id": uuid4(),
+            "status": "valid",
+            "reason": "passed",
+            "proposed_z_mm": -390,
+            "created_at": now + timedelta(seconds=5),
+        }
+    )
+    web.database.save_soil_measurement(recovered)
+
+    received = {}
+    monkeypatch.setattr(
+        web.soil_jobs, "start_measurements", lambda **kwargs: received.update(kwargs)
+    )
+
+    status, _, _ = await asgi_request("/soil/measure", method="POST", form={"mode": "retry_all"})
+
+    assert status == 303
+    assert sorted(received["point_ids"]) == [91]
+    assert received["job_kind"] == "measurement_retry"
+
+
+@pytest.mark.asyncio
+async def test_soil_retry_all_without_failures_returns_409(monkeypatch):
+    monkeypatch.setattr(web.settings, "selected_config_entry_id", "soil-entry-no-failures")
+    monkeypatch.setattr(
+        web.database,
+        "active_soil_calibration",
+        lambda _entry_id: SimpleNamespace(capture_z=-12, baseline_mm=17),
+    )
+    status, _, _ = await asgi_request("/soil/measure", method="POST", form={"mode": "retry_all"})
+    assert status == 409
+
+
+@pytest.mark.asyncio
+async def test_soil_height_change_log_lists_user_and_automatic_applies(monkeypatch):
+    monkeypatch.setattr(web.settings, "selected_config_entry_id", "soil-entry-changelog")
+
+    async def safe_sites(_entry_id, _baseline, **_kwargs):
+        inventory = SoilPointInventory(
+            device_id="42",
+            generated_at=datetime.now(UTC),
+            points=[],
+            motion=SoilMotionState(
+                connected=True,
+                busy=False,
+                locked=False,
+                position={"x": 0, "y": 0, "z": 0},
+                z_direction=-1,
+                axis_bounds={"x": (0, 1000), "y": (0, 1000), "z": (-500, 0)},
+            ),
+        )
+        return inventory, []
+
+    monkeypatch.setattr(web.soil_jobs, "safe_sites", safe_sites)
+
+    user_applied = SoilMeasurement(
+        measurement_id=uuid4(),
+        config_entry_id="soil-entry-changelog",
+        point_id=51,
+        point_name="Bed A",
+        expected_x=100,
+        expected_y=200,
+        old_z_mm=-400,
+        capture_x=100,
+        capture_y=200,
+        proposed_z_mm=-388,
+        confidence=0.91,
+        status="applied",
+        reason="passed",
+    )
+    web.database.save_soil_measurement(user_applied)
+    web.database.record_soil_decision(
+        str(user_applied.measurement_id), "approve", {"status": "applied"}
+    )
+
+    automatic_applied = SoilMeasurement(
+        measurement_id=uuid4(),
+        config_entry_id="soil-entry-changelog",
+        point_id=52,
+        point_name="Bed B",
+        expected_x=300,
+        expected_y=400,
+        old_z_mm=-410,
+        capture_x=300,
+        capture_y=400,
+        proposed_z_mm=-402,
+        confidence=0.97,
+        status="applied",
+        reason="passed",
+    )
+    web.database.save_soil_measurement(automatic_applied)
+    web.database.record_soil_decision(
+        str(automatic_applied.measurement_id), "automatic_approve", {"status": "applied"}
+    )
+
+    status, _, body = await asgi_request("/soil-height")
+    assert status == 200
+    assert b"Soil height change log" in body
+    log_section = body.decode().split("id=soil-change-log-rows", 1)[1]
+    assert "Bed A" in log_section and "Bed B" in log_section
+    assert log_section.index("Bed A") < log_section.index(">User<")
+    assert log_section.index("Bed B") < log_section.index(">Automatic<")
+
+
 @pytest.mark.asyncio
 async def test_root_and_duplicate_leading_slash_routes():
     status, _, body = await asgi_request("/")

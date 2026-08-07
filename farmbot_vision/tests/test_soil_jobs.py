@@ -337,6 +337,78 @@ def test_soil_records_round_trip_and_restart_interrupts_jobs(tmp_path):
     assert job["completed_at"] is not None
 
 
+def test_soil_height_change_log_reports_user_and_automatic_applies(tmp_path):
+    database = Database(tmp_path / "vision.db")
+    calibration = database.save_soil_calibration(_calibration())
+
+    approved = SoilMeasurement(
+        measurement_id=uuid4(),
+        config_entry_id="bot-soil",
+        point_id=10,
+        point_name="Soil 10",
+        expected_x=100,
+        expected_y=200,
+        old_z_mm=-400,
+        capture_x=100,
+        capture_y=200,
+        proposed_z_mm=-397,
+        confidence=0.91,
+        status="applied",
+        reason="passed",
+        calibration_id=calibration.calibration_id,
+    )
+    database.save_soil_measurement(approved)
+    database.record_soil_decision(str(approved.measurement_id), "approve", {"status": "applied"})
+
+    auto_approved = SoilMeasurement(
+        measurement_id=uuid4(),
+        config_entry_id="bot-soil",
+        point_id=11,
+        point_name="Soil 11",
+        expected_x=300,
+        expected_y=400,
+        old_z_mm=-410,
+        capture_x=300,
+        capture_y=400,
+        proposed_z_mm=-402,
+        confidence=0.97,
+        status="applied",
+        reason="passed",
+        calibration_id=calibration.calibration_id,
+    )
+    database.save_soil_measurement(auto_approved)
+    database.record_soil_decision(
+        str(auto_approved.measurement_id), "automatic_approve", {"status": "applied"}
+    )
+
+    # A rejection must not appear in the applied change log.
+    rejected = SoilMeasurement(
+        measurement_id=uuid4(),
+        config_entry_id="bot-soil",
+        point_id=12,
+        point_name="Soil 12",
+        expected_x=500,
+        expected_y=600,
+        old_z_mm=-420,
+        capture_x=500,
+        capture_y=600,
+        proposed_z_mm=-415,
+        confidence=0.6,
+        status="rejected",
+        reason="user declined",
+        calibration_id=calibration.calibration_id,
+    )
+    database.save_soil_measurement(rejected)
+    database.record_soil_decision(str(rejected.measurement_id), "reject", {"status": "rejected"})
+
+    log = database.soil_height_change_log("bot-soil")
+    methods_by_point = {(entry["point_name"], entry["method"]): entry for entry in log}
+    assert ("Soil 10", "user") in methods_by_point
+    assert ("Soil 11", "automatic") in methods_by_point
+    assert "Soil 12" not in {entry["point_name"] for entry in log}
+    assert methods_by_point[("Soil 11", "automatic")]["new_z_mm"] == -402
+
+
 def test_soil_points_use_nearest_neighbour_order():
     points = [
         SoilPoint(id=1, name="far", x=100, y=100, z=0),
