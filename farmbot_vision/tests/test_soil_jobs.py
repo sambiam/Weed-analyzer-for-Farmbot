@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from uuid import uuid4
 
@@ -370,6 +370,125 @@ def test_custom_measurement_automatically_replaces_nearby_or_creates_new_point()
     assert replacement["relocation_distance_mm"] == 150
     assert standalone["point_id"] == 0
     assert standalone["point_updated_at"] is None
+
+    retry_targets = SoilJobManager._retry_measurement_targets(
+        inventory,
+        [
+            SimpleNamespace(
+                point_id=70,
+                point_name="Nearby",
+                expected_x=100,
+                expected_y=100,
+                expected_z=-400,
+                point_updated_at=now,
+                capture_x=120,
+                capture_y=100,
+                relocation_distance_mm=20,
+            )
+        ],
+        [
+            {"point_id": 70, "capture_x": None, "capture_y": None},
+            {"point_id": 0, "capture_x": 500, "capture_y": 500},
+        ],
+    )
+    assert [target["point_id"] for target in retry_targets] == [70, 0]
+
+
+@pytest.mark.asyncio
+async def test_retry_measurements_keeps_existing_and_standalone_failures(tmp_path, monkeypatch):
+    database = Database(tmp_path / "vision.db")
+    manager = SoilJobManager(
+        database,
+        object(),
+        tmp_path,
+        asyncio.Lock(),
+        ZoneStore(tmp_path / "zones.json"),
+    )
+    received = {}
+
+    async def run_measurements(**kwargs):
+        received.update(kwargs)
+
+    monkeypatch.setattr(manager, "_run_measurements", run_measurements)
+    manager.start_retry_measurements(
+        config_entry_id="bot-soil",
+        failed_measurements=[
+            {"point_id": 70, "capture_x": 100, "capture_y": 200},
+            {"point_id": 70, "capture_x": 110, "capture_y": 210},
+            {"point_id": 0, "capture_x": 800, "capture_y": 900},
+            {"point_id": 0, "capture_x": 850, "capture_y": 950},
+        ],
+        capture_z=-10,
+        baseline_mm=15,
+    )
+    await manager.task
+
+    assert received["retry_targets"] == [
+        {"point_id": 70, "capture_x": 100.0, "capture_y": 200.0},
+        {"point_id": 0, "capture_x": 800.0, "capture_y": 900.0},
+        {"point_id": 0, "capture_x": 850.0, "capture_y": 950.0},
+    ]
+
+
+def test_outstanding_failure_query_has_no_display_limit_and_ignores_resolved_targets(tmp_path):
+    database = Database(tmp_path / "vision.db")
+    now = datetime.now(UTC)
+    failure_time = now - timedelta(minutes=30)
+    failure_ids = []
+    for index in range(225):
+        measurement_id = uuid4()
+        failure_ids.append(measurement_id)
+        database.save_soil_measurement(
+            SoilMeasurement(
+                measurement_id=measurement_id,
+                config_entry_id="bot-soil",
+                point_id=index + 1,
+                point_name=f"Soil {index + 1}",
+                expected_x=index,
+                expected_y=index,
+                old_z_mm=-400,
+                point_updated_at=failure_time,
+                capture_x=index,
+                capture_y=index,
+                relocation_distance_mm=0,
+                status="failed",
+                reason="failed analysis",
+                created_at=failure_time,
+            )
+        )
+    database.save_soil_measurement(
+        SoilMeasurement(
+            measurement_id=uuid4(),
+            config_entry_id="bot-soil",
+            point_id=1,
+            point_name="Soil 1",
+            expected_x=0,
+            expected_y=0,
+            old_z_mm=-400,
+            point_updated_at=datetime.now(UTC),
+            capture_x=0,
+            capture_y=0,
+            relocation_distance_mm=0,
+            proposed_z_mm=-399,
+            confidence=0.9,
+            status="valid",
+            reason="passed",
+            created_at=now - timedelta(minutes=20),
+        )
+    )
+    database.record_soil_decision(
+        str(failure_ids[1]),
+        "automatic_retry_started",
+        {"status": "queued"},
+    )
+
+    failures = database.outstanding_failed_soil_measurements(
+        "bot-soil",
+        retry_before=now - timedelta(minutes=15),
+    )
+
+    assert len(failures) == 223
+    assert {failure["point_id"] for failure in failures}.isdisjoint({1, 2})
 
 
 @pytest.mark.asyncio
@@ -748,3 +867,9 @@ async def test_measurement_run_uses_one_capture_batch_and_finishes_it_once(tmp_p
     assert len(batch_ids) == 1
     assert finished == [("bot-soil", str(batch_ids[0]))]
     assert manager.current["status"] == "failed"
+    failures = database.outstanding_failed_soil_measurements(
+        "bot-soil",
+        retry_before=datetime.now(UTC),
+    )
+    assert {measurement["point_id"] for measurement in failures} == {1, 2}
+    assert any("Not measured because the run stopped" in item["reason"] for item in failures)

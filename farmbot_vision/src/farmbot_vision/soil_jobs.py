@@ -205,6 +205,62 @@ class SoilJobManager:
             name="soil-grid-measurement",
         )
 
+    def start_retry_measurements(
+        self,
+        *,
+        config_entry_id: str,
+        failed_measurements: list[dict],
+        capture_z: float,
+        baseline_mm: float,
+        job_kind: str = "measurement_retry",
+    ) -> str:
+        """Retry every failed target, including standalone coordinates."""
+
+        targets: list[dict] = []
+        seen: set[tuple] = set()
+        for measurement in failed_measurements:
+            point_id = int(measurement.get("point_id") or 0)
+            capture_x = measurement.get("capture_x")
+            capture_y = measurement.get("capture_y")
+            if point_id == 0 and (capture_x is None or capture_y is None):
+                continue
+            key = (
+                ("point", point_id)
+                if point_id > 0
+                else (
+                    "coordinate",
+                    round(float(capture_x), 3),
+                    round(float(capture_y), 3),
+                )
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            targets.append(
+                {
+                    "point_id": point_id,
+                    "capture_x": float(capture_x) if capture_x is not None else None,
+                    "capture_y": float(capture_y) if capture_y is not None else None,
+                }
+            )
+        if not targets:
+            raise ValueError("no failed soil measurements have retryable coordinates")
+        return self._start(
+            lambda job_id: self._run_measurements(
+                job_id=job_id,
+                config_entry_id=config_entry_id,
+                point_ids=[],
+                custom_point_id=None,
+                custom_x=None,
+                custom_y=None,
+                capture_z=capture_z,
+                baseline_mm=baseline_mm,
+                job_kind=job_kind,
+                retry_targets=targets,
+            ),
+            name="soil-measurement-retry",
+        )
+
     def request_stop(self) -> None:
         """Stop before the next point; never interrupt the bot's atomic RPC."""
         self.stop_requested = True
@@ -289,6 +345,74 @@ class SoilJobManager:
             "capture_y": custom_y,
             "relocation_distance_mm": 0.0,
         }
+
+    @staticmethod
+    def _failed_measurement(
+        *,
+        config_entry_id: str,
+        target: dict,
+        reason: str,
+        calibration_id: int | None,
+    ) -> SoilMeasurement:
+        return SoilMeasurement(
+            measurement_id=uuid4(),
+            config_entry_id=config_entry_id,
+            point_id=target["point_id"],
+            point_name=target["point_name"],
+            expected_x=target["expected_x"],
+            expected_y=target["expected_y"],
+            old_z_mm=target["expected_z"],
+            point_updated_at=target["point_updated_at"],
+            capture_x=target["capture_x"],
+            capture_y=target["capture_y"],
+            relocation_distance_mm=target["relocation_distance_mm"],
+            status="failed",
+            reason=reason[:240] or "Soil measurement failed",
+            calibration_id=calibration_id,
+            algorithm_version=SOIL_ALGORITHM_VERSION,
+        )
+
+    @classmethod
+    def _retry_measurement_targets(
+        cls,
+        inventory: SoilPointInventory,
+        sites: list[SoilSite],
+        retry_targets: list[dict],
+    ) -> list[dict]:
+        sites_by_id = {site.point_id: site for site in sites}
+        capture_targets = []
+        for retry_target in retry_targets:
+            retry_point_id = int(retry_target.get("point_id") or 0)
+            if retry_point_id > 0:
+                site = sites_by_id.get(retry_point_id)
+                if site is None:
+                    LOGGER.warning(
+                        "Failed soil point %s is not currently safe to retry",
+                        retry_point_id,
+                    )
+                    continue
+                capture_targets.append(
+                    {
+                        "point_id": site.point_id,
+                        "point_name": site.point_name,
+                        "expected_x": site.expected_x,
+                        "expected_y": site.expected_y,
+                        "expected_z": site.expected_z,
+                        "point_updated_at": site.point_updated_at,
+                        "capture_x": site.capture_x,
+                        "capture_y": site.capture_y,
+                        "relocation_distance_mm": site.relocation_distance_mm,
+                    }
+                )
+            else:
+                capture_targets.append(
+                    cls._custom_measurement_target(
+                        inventory,
+                        float(retry_target["capture_x"]),
+                        float(retry_target["capture_y"]),
+                    )
+                )
+        return capture_targets
 
     async def safe_sites(
         self,
@@ -759,8 +883,14 @@ class SoilJobManager:
         job_kind: str = "measurement",
         grid_spacing_mm: float | None = None,
         grid_maximum_deviation_mm: float | None = None,
+        retry_targets: list[dict] | None = None,
     ) -> None:
-        self.db.start_soil_job(job_id, config_entry_id, job_kind, point_ids)
+        initial_point_ids = (
+            [int(target.get("point_id") or 0) for target in retry_targets]
+            if retry_targets is not None
+            else point_ids
+        )
+        self.db.start_soil_job(job_id, config_entry_id, job_kind, initial_point_ids)
         completed = failed = 0
         try:
             async with self.shared_lock:
@@ -813,7 +943,17 @@ class SoilJobManager:
                         config_entry_id, baseline_mm, clear_soil_margin_mm=margin
                     )
                 if grid_spacing_mm is None:
-                    if custom_x is not None and custom_y is not None:
+                    if retry_targets is not None:
+                        capture_targets = self._retry_measurement_targets(
+                            inventory,
+                            sites,
+                            retry_targets,
+                        )
+                        if not capture_targets:
+                            raise SoilHeightError(
+                                "failed soil measurements have no currently safe retry targets"
+                            )
+                    elif custom_x is not None and custom_y is not None:
                         capture_targets = [
                             self._custom_measurement_target(inventory, custom_x, custom_y)
                         ]
@@ -868,7 +1008,7 @@ class SoilJobManager:
                         "FarmBot Z direction changed; recalibrate before measuring"
                     )
                 measurement_batch_id = uuid4()
-                for target in ordered:
+                for target_index, target in enumerate(ordered):
                     if self.stop_requested:
                         break
                     self.current.update(
@@ -961,24 +1101,27 @@ class SoilJobManager:
                             err,
                         )
                         self.db.save_soil_measurement(
-                            SoilMeasurement(
-                                measurement_id=uuid4(),
+                            self._failed_measurement(
                                 config_entry_id=config_entry_id,
-                                point_id=target["point_id"],
-                                point_name=target["point_name"],
-                                expected_x=target["expected_x"],
-                                expected_y=target["expected_y"],
-                                old_z_mm=target["expected_z"],
-                                point_updated_at=target["point_updated_at"],
-                                capture_x=target["capture_x"],
-                                capture_y=target["capture_y"],
-                                relocation_distance_mm=target["relocation_distance_mm"],
-                                status="failed",
-                                reason=str(err)[:240] or "Companion communication failed",
+                                target=target,
+                                reason=str(err) or "Companion communication failed",
                                 calibration_id=calibration.calibration_id,
-                                algorithm_version=SOIL_ALGORITHM_VERSION,
                             )
                         )
+                        for pending_target in ordered[target_index + 1 :]:
+                            failed += 1
+                            self.db.save_soil_measurement(
+                                self._failed_measurement(
+                                    config_entry_id=config_entry_id,
+                                    target=pending_target,
+                                    reason=(
+                                        "Not measured because the run stopped after a companion "
+                                        f"communication failure: {err}"
+                                    ),
+                                    calibration_id=calibration.calibration_id,
+                                )
+                            )
+                        self.current.update(failed_count=failed, queued_targets=[])
                         try:
                             await self._finish_capture_batch(config_entry_id, measurement_batch_id)
                         except Exception as cleanup_err:  # pylint: disable=broad-except
@@ -994,22 +1137,11 @@ class SoilJobManager:
                             target["point_id"],
                             err,
                         )
-                        measurement = SoilMeasurement(
-                            measurement_id=uuid4(),
+                        measurement = self._failed_measurement(
                             config_entry_id=config_entry_id,
-                            point_id=target["point_id"],
-                            point_name=target["point_name"],
-                            expected_x=target["expected_x"],
-                            expected_y=target["expected_y"],
-                            old_z_mm=target["expected_z"],
-                            point_updated_at=target["point_updated_at"],
-                            capture_x=target["capture_x"],
-                            capture_y=target["capture_y"],
-                            relocation_distance_mm=target["relocation_distance_mm"],
-                            status="failed",
-                            reason=str(err)[:240] or "Soil measurement failed",
+                            target=target,
+                            reason=str(err),
                             calibration_id=calibration.calibration_id,
-                            algorithm_version=SOIL_ALGORITHM_VERSION,
                         )
                         self.db.save_soil_measurement(measurement)
                     self.current.update(

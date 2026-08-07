@@ -196,7 +196,6 @@ soil_jobs = SoilJobManager(
 legacy_soil_repair = LegacySoilRepairManager(database, client)
 _soil_automation_state: dict[str, object] = {
     "last_scheduled_date": None,
-    "handled_retry_jobs": set(),
 }
 weeding_jobs = WeedingJobManager(database, client, jobs, soil_jobs, zone_store)
 image_file_cache = ImageFileCache(settings.data_dir / "image_cache")
@@ -3936,7 +3935,7 @@ async def _run_photo_grid_schedule(now: datetime) -> None:
 
 
 async def _start_automated_soil_measurements(
-    *, point_ids: list[int] | None = None, job_kind: str
+    *, failed_measurements: list[dict] | None = None, job_kind: str
 ) -> bool:
     entry_id = settings.selected_config_entry_id
     if not entry_id or soil_jobs.running:
@@ -3947,7 +3946,7 @@ async def _start_automated_soil_measurements(
         return False
     values = soil_settings_store.load()
     try:
-        if point_ids is None:
+        if failed_measurements is None:
             soil_jobs.start_grid_measurements(
                 config_entry_id=entry_id,
                 spacing_mm=values.grid_spacing_mm,
@@ -3957,12 +3956,12 @@ async def _start_automated_soil_measurements(
                 job_kind=job_kind,
             )
         else:
-            if not point_ids:
-                LOGGER.info("Skipping automated soil-height retry because no points failed")
+            if not failed_measurements:
+                LOGGER.info("Skipping automated soil-height retry because no measurements failed")
                 return False
-            soil_jobs.start_measurements(
+            soil_jobs.start_retry_measurements(
                 config_entry_id=entry_id,
-                point_ids=point_ids,
+                failed_measurements=failed_measurements,
                 capture_z=calibration.capture_z,
                 baseline_mm=calibration.baseline_mm,
                 job_kind=job_kind,
@@ -4003,44 +4002,23 @@ async def _run_soil_automation(now: datetime) -> None:
             return
     if not values.automatic_retry_enabled:
         return
-    latest = database.latest_soil_job(entry_id)
-    handled = _soil_automation_state["handled_retry_jobs"]
-    if (
-        not latest
-        or latest.get("kind")
-        not in {
-            "measurement",
-            "measurement_grid",
-            "measurement_scheduled",
-            "measurement_retry",
-        }
-        or latest.get("status") != "complete"
-        or int(latest.get("failed_count") or 0) == 0
-        or not latest.get("completed_at")
-        or latest["id"] in handled
-    ):
-        return
-    completed_at = datetime.fromisoformat(str(latest["completed_at"]))
-    if local_now.astimezone(UTC) < completed_at.astimezone(UTC) + timedelta(
+    retry_before = local_now.astimezone(UTC) - timedelta(
         seconds=values.automatic_retry_delay_seconds
+    )
+    failed_measurements = database.outstanding_failed_soil_measurements(
+        entry_id,
+        retry_before=retry_before,
+    )
+    if await _start_automated_soil_measurements(
+        failed_measurements=failed_measurements,
+        job_kind="measurement_retry",
     ):
-        return
-    handled.add(latest["id"])
-    started_at = datetime.fromisoformat(str(latest["started_at"]))
-    wanted = set(int(point_id) for point_id in latest.get("point_ids", []))
-    failed_ids: list[int] = []
-    seen: set[int] = set()
-    for measurement in database.recent_soil_measurements(entry_id, 200):
-        point_id = int(measurement["point_id"])
-        if point_id in seen or point_id not in wanted:
-            continue
-        created_at = datetime.fromisoformat(str(measurement["created_at"]))
-        if created_at.astimezone(UTC) < started_at.astimezone(UTC):
-            continue
-        seen.add(point_id)
-        if measurement["status"] == "failed" and point_id > 0:
-            failed_ids.append(point_id)
-    await _start_automated_soil_measurements(point_ids=failed_ids, job_kind="measurement_retry")
+        for measurement in failed_measurements:
+            database.record_soil_decision(
+                str(measurement["measurement_id"]),
+                "automatic_retry_started",
+                {"status": "queued"},
+            )
 
 
 async def retention_cleanup() -> None:
@@ -5950,7 +5928,7 @@ axis limits and do not need an existing soil point.</p>
   </fieldset>
   <fieldset><legend>Failed measurement retry</legend>
    <label><input type=checkbox name=automatic_retry_enabled value=true{" checked" if soil_values.automatic_retry_enabled else ""}>
-    Retry failed measurements once after each completed run</label><br>
+    Retry every unresolved failed measurement after the configured delay</label><br>
    <label>Retry after <input type=number name=automatic_retry_delay min=0.1 max=168 step=0.1
     value="{soil_values.automatic_retry_delay:g}" required></label>
    <select name=automatic_retry_unit aria-label="Retry delay unit">

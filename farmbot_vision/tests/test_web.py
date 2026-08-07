@@ -1725,7 +1725,7 @@ async def test_soil_scheduler_starts_saved_grid_at_configured_day_interval(tmp_p
     monkeypatch.setattr(
         web,
         "_soil_automation_state",
-        {"last_scheduled_date": None, "handled_retry_jobs": set()},
+        {"last_scheduled_date": None},
     )
     now = datetime.now().astimezone().replace(hour=4, minute=30, second=0, microsecond=0)
     await web._run_soil_automation(now)
@@ -1736,7 +1736,7 @@ async def test_soil_scheduler_starts_saved_grid_at_configured_day_interval(tmp_p
 
 
 @pytest.mark.asyncio
-async def test_soil_scheduler_retries_only_failed_points_after_delay(tmp_path, monkeypatch):
+async def test_soil_scheduler_retries_every_outstanding_failure_type(tmp_path, monkeypatch):
     store = web.SoilSettingsStore(tmp_path / "soil-settings.json")
     store.save(
         web.SoilSettings(
@@ -1749,33 +1749,37 @@ async def test_soil_scheduler_retries_only_failed_points_after_delay(tmp_path, m
     monkeypatch.setattr(web.settings, "selected_config_entry_id", "soil-entry")
     monkeypatch.setattr(web.soil_jobs, "task", None)
     now = datetime.now(UTC)
-    latest = {
-        "id": "measurement-run",
-        "kind": "measurement",
-        "status": "complete",
-        "failed_count": 1,
-        "point_ids": [70, 71],
-        "started_at": (now - timedelta(minutes=30)).isoformat(),
-        "completed_at": (now - timedelta(minutes=20)).isoformat(),
-    }
-    monkeypatch.setattr(web.database, "latest_soil_job", lambda _entry_id: latest)
+    failures = [
+        {
+            "measurement_id": "existing-failure",
+            "point_id": 70,
+            "status": "failed",
+            "capture_x": 100,
+            "capture_y": 200,
+            "created_at": (now - timedelta(minutes=25)).isoformat(),
+        },
+        {
+            "measurement_id": "standalone-failure",
+            "point_id": 0,
+            "status": "failed",
+            "capture_x": 800,
+            "capture_y": 900,
+            "created_at": (now - timedelta(minutes=24)).isoformat(),
+        },
+    ]
+    queried = {}
+
+    def outstanding(_entry_id, **kwargs):
+        queried.update(kwargs)
+        return failures
+
     monkeypatch.setattr(
         web.database,
-        "recent_soil_measurements",
-        lambda *_args: [
-            {
-                "point_id": 70,
-                "status": "failed",
-                "created_at": (now - timedelta(minutes=25)).isoformat(),
-            },
-            {
-                "point_id": 71,
-                "status": "valid",
-                "created_at": (now - timedelta(minutes=24)).isoformat(),
-            },
-        ],
+        "outstanding_failed_soil_measurements",
+        outstanding,
     )
     started = []
+    decisions = []
 
     async def start(**kwargs):
         started.append(kwargs)
@@ -1783,12 +1787,22 @@ async def test_soil_scheduler_retries_only_failed_points_after_delay(tmp_path, m
 
     monkeypatch.setattr(web, "_start_automated_soil_measurements", start)
     monkeypatch.setattr(
+        web.database,
+        "record_soil_decision",
+        lambda measurement_id, action, details: decisions.append((measurement_id, action, details)),
+    )
+    monkeypatch.setattr(
         web,
         "_soil_automation_state",
-        {"last_scheduled_date": None, "handled_retry_jobs": set()},
+        {"last_scheduled_date": None},
     )
     await web._run_soil_automation(now)
-    assert started == [{"point_ids": [70], "job_kind": "measurement_retry"}]
+    assert started == [{"failed_measurements": failures, "job_kind": "measurement_retry"}]
+    assert queried["retry_before"] == now - timedelta(minutes=15)
+    assert decisions == [
+        ("existing-failure", "automatic_retry_started", {"status": "queued"}),
+        ("standalone-failure", "automatic_retry_started", {"status": "queued"}),
+    ]
 
 
 @pytest.mark.asyncio

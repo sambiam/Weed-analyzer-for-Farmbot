@@ -22,6 +22,12 @@ from .plant_measurement import select_measurement_evidence, selection_diagnostic
 LOGGER = logging.getLogger(__name__)
 CREATED_WEED_SYNC_GUARD_HOURS = 24
 
+
+def _utc_iso(value: datetime) -> str:
+    value = value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
+    return value.isoformat()
+
+
 MIGRATIONS = [
     """
     CREATE TABLE IF NOT EXISTS schema_version(version INTEGER PRIMARY KEY);
@@ -2340,6 +2346,56 @@ class Database:
                 "SELECT * FROM soil_measurements ORDER BY created_at DESC LIMIT ?",
                 (limit,),
             ).fetchall()
+        return [self._decode_soil_measurement(row) for row in rows]
+
+    def outstanding_failed_soil_measurements(
+        self,
+        config_entry_id: str,
+        *,
+        retry_before: datetime,
+    ) -> list[dict]:
+        """Return the latest unresolved failure for every measurement target.
+
+        Later measurements supersede earlier failures. A recorded retry start
+        also delays another attempt until the configured interval has elapsed.
+        This deliberately has no display-oriented row limit, so large grids do
+        not silently omit failures beyond the newest 200 rows.
+        """
+
+        rows = self.connection.execute(
+            """SELECT m.* FROM soil_measurements m
+            WHERE m.config_entry_id=? AND m.status='failed'
+              AND julianday(m.created_at)<=julianday(?)
+              AND NOT EXISTS (
+                SELECT 1 FROM soil_measurements newer
+                WHERE newer.config_entry_id=m.config_entry_id
+                  AND (
+                    (m.point_id>0 AND newer.point_id=m.point_id)
+                    OR (
+                      m.point_id=0
+                      AND m.capture_x IS NOT NULL AND m.capture_y IS NOT NULL
+                      AND newer.capture_x IS NOT NULL AND newer.capture_y IS NOT NULL
+                      AND ABS(newer.capture_x-m.capture_x)<=0.001
+                      AND ABS(newer.capture_y-m.capture_y)<=0.001
+                    )
+                  )
+                  AND (
+                    julianday(newer.created_at)>julianday(m.created_at)
+                    OR (
+                      julianday(newer.created_at)=julianday(m.created_at)
+                      AND newer.rowid>m.rowid
+                    )
+                  )
+              )
+              AND NOT EXISTS (
+                SELECT 1 FROM soil_decisions decision
+                WHERE decision.measurement_id=m.measurement_id
+                  AND decision.action='automatic_retry_started'
+                  AND julianday(decision.created_at)>julianday(?)
+              )
+            ORDER BY julianday(m.created_at),m.rowid""",
+            (config_entry_id, _utc_iso(retry_before), _utc_iso(retry_before)),
+        ).fetchall()
         return [self._decode_soil_measurement(row) for row in rows]
 
     def unprocessed_legacy_soil_measurements(self, config_entry_id: str) -> list[dict]:

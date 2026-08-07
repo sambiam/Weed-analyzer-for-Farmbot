@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+## 4.2.2 - 2026-08-07
+
+- Fixed automatic soil-height retries to include every unresolved failed
+  measurement rather than only failures from the newest completed job and the
+  newest 200 result rows.
+- Retries now include standalone custom coordinates, jobs stopped by companion
+  communication errors, and targets that were still queued when such an error
+  aborted the run. A failed retry remains eligible after the configured delay
+  until a later measurement resolves it.
+
 ## 4.2.1 - 2026-08-07
 
 - Fixed release tag mismatch that prevented 4.2.0 from publishing.

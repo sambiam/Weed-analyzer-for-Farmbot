@@ -168,16 +168,21 @@ Measurement queue shows only work waiting to run and the newest failures,
 which can be retried individually. **Stop after current point** allows the
 companion's current atomic capture to finish and never sends an emergency stop.
 
-The same tab can schedule the saved grid every configured number of days
-and retry a manual or scheduled run's failed points once after a configurable
-minutes-or-hours delay. Automatic acceptance is optional and applies a valid
-result only when it meets both the configured confidence percentage and the
-maximum allowed change from the point's original Z. Other valid results remain
-available for individual or selected approval. Every existing-point apply
-re-fetches the same point and refuses changed coordinates or timestamps. The
-tab also controls the clear-soil margin and the stereo-pair disagreement
-failure limit. Capture Z and baseline come only from the active calibration.
-Restarted jobs are recorded as interrupted and never resume bot motion.
+The same tab can schedule the saved grid every configured number of days and
+retry every unresolved failed measurement after a configurable
+minutes-or-hours delay. Retry selection is not limited to the newest job or
+the newest 200 results: analysis failures, companion communication failures,
+remaining targets aborted by such a failure, existing points, and standalone
+custom coordinates are all retained. A later successful result resolves the
+older failure; a new failed retry becomes eligible again after the delay.
+Automatic acceptance is optional and applies a valid result only when it meets
+both the configured confidence percentage and the maximum allowed change from
+the point's original Z. Other valid results remain available for individual or
+selected approval. Every existing-point apply re-fetches the same point and
+refuses changed coordinates or timestamps. The tab also controls the
+clear-soil margin and the stereo-pair disagreement failure limit. Capture Z and
+baseline come only from the active calibration. Restarted jobs are recorded as
+interrupted and never resume bot motion.
 
 ## Image selection and analysis
 
