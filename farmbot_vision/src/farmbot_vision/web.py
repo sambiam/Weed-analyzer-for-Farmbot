@@ -5607,6 +5607,7 @@ async def soil_height_page(request: Request) -> HTMLResponse:
             else:
                 inventory_error = str(exc)
     measurements = database.recent_soil_measurements(entry_id, 200)
+    soil_change_log = database.soil_height_change_log(entry_id, 100) if entry_id else []
     legacy_summary = (
         database.legacy_soil_repair_summary(entry_id)
         if entry_id
@@ -5630,21 +5631,12 @@ async def soil_height_page(request: Request) -> HTMLResponse:
 
     valid_measurements = [item for item in measurements if _soil_measurement_is_pending_valid(item)]
     measurement_rows = "".join(_soil_measurement_pending_row(item) for item in valid_measurements)
+    soil_change_rows = "".join(
+        _soil_change_log_row(item, index) for index, item in enumerate(soil_change_log)
+    )
     queued_targets = list(current_job.get("queued_targets") or []) if soil_jobs.running else []
 
-    def queue_key(item: dict) -> tuple:
-        point_id = int(item.get("point_id") or 0)
-        return (
-            ("point", point_id)
-            if point_id
-            else (
-                "coordinate",
-                round(float(item.get("capture_x") or 0), 3),
-                round(float(item.get("capture_y") or 0), 3),
-            )
-        )
-
-    queued_keys = {queue_key(target) for target in queued_targets}
+    queued_keys = {_soil_measurement_queue_key(target) for target in queued_targets}
     queue_rows = "".join(
         f'<tr data-row-key="queued-{index}"><td>{escape(str(target["point_name"]))}</td>'
         f"<td>{float(target['capture_x']):.1f}, {float(target['capture_y']):.1f}</td>"
@@ -5654,10 +5646,17 @@ async def soil_height_page(request: Request) -> HTMLResponse:
     failed_measurements: list[dict] = []
     failed_keys: set[tuple] = set()
     for measurement in measurements:
-        key = queue_key(measurement)
+        key = _soil_measurement_queue_key(measurement)
         if measurement["status"] == "failed" and key not in failed_keys and key not in queued_keys:
             failed_measurements.append(measurement)
             failed_keys.add(key)
+    retry_all_point_ids = sorted(
+        {
+            int(measurement["point_id"])
+            for measurement in failed_measurements
+            if measurement["point_id"]
+        }
+    )
     for measurement in failed_measurements:
         point_id = int(measurement["point_id"])
         if point_id:
@@ -5680,6 +5679,14 @@ async def soil_height_page(request: Request) -> HTMLResponse:
             f"<td><form method=post action=soil/measure>{retry_fields}"
             "<button type=submit>Retry</button></form></td></tr>"
         )
+    retry_all_button = (
+        f"""<form method=post action=soil/measure
+   onsubmit="return confirm('Retry {len(retry_all_point_ids)} failed measurement(s)?')">
+  <input type=hidden name=mode value=retry_all>
+  <button type=submit>Retry all failed</button></form>"""
+        if retry_all_point_ids
+        else ""
+    )
     calibration_summary = (
         f"Active calibration #{calibration.calibration_id}: "
         f"soil image format {calibration.processed_width}×{calibration.processed_height}, "
@@ -5791,7 +5798,7 @@ async def soil_height_page(request: Request) -> HTMLResponse:
 <script>
 (() => {{
   const swapIds=['soil-job-card','soil-queue-rows','soil-measurement-rows',
-    'legacy-soil-repair-card-region',
+    'soil-change-log-rows','legacy-soil-repair-card-region',
     'legacy-soil-repair-region'];
   function checkboxKey(input){{
     return [input.getAttribute('form') || input.form?.id || '',input.name,input.value].join('\u001f');
@@ -6048,6 +6055,7 @@ axis limits and do not need an existing soil point.</p>
   <label>Custom Y (mm) <input type=number step=0.1 name=custom_y required></label>
   <button type=submit>Measure custom coordinate</button>
  </form>
+ <div class=button-row>{retry_all_button}</div>
  <table><thead><tr><th>Point</th><th>Coordinate</th><th>Status</th><th>Message</th>
  <th>Action</th></tr></thead>
  <tbody id=soil-queue-rows>{queue_rows or '<tr data-row-key="empty"><td colspan=5>No measurements are queued or failed.</td></tr>'}</tbody></table>
@@ -6063,6 +6071,13 @@ axis limits and do not need an existing soil point.</p>
  <tbody id=soil-measurement-rows>{measurement_rows or '<tr data-row-key="empty"><td colspan=8>No unapplied valid results.</td></tr>'}</tbody></table>
 </section>
  <div id=legacy-soil-repair-region>{legacy_repair_modal}</div>
+<section class=card>
+ <h3>Soil height change log</h3>
+ <p class=muted>Applied soil-height changes, newest first.</p>
+ <table><thead><tr><th>Time</th><th>Point</th><th>Coordinates</th><th>Old Z</th>
+ <th>New Z</th><th>Change</th><th>Confidence</th><th>Applied by</th></tr></thead>
+ <tbody id=soil-change-log-rows>{soil_change_rows or '<tr data-row-key="empty"><td colspan=8>No soil height changes have been applied yet.</td></tr>'}</tbody></table>
+</section>
  {live_refresh}"""  # noqa: S608 - HTML template; no SQL is constructed here.
     return layout(request, body, "Soil height · FarmBot Vision")
 
@@ -6351,6 +6366,10 @@ async def start_soil_measurement(
             minimum_point_age_days=None,
         )
         point_ids = [site.point_id for site in sites]
+    elif mode == "retry_all":
+        point_ids = _current_failed_soil_point_ids(entry_id)
+        if not point_ids:
+            raise HTTPException(409, "No failed point measurements to retry")
     point_ids = point_ids or []
     try:
         soil_jobs.start_measurements(
@@ -6361,7 +6380,7 @@ async def start_soil_measurement(
             custom_y=custom_y if mode == "custom" else None,
             capture_z=calibration.capture_z,
             baseline_mm=calibration.baseline_mm,
-            job_kind="measurement_retry" if mode == "retry" else "measurement",
+            job_kind="measurement_retry" if mode in {"retry", "retry_all"} else "measurement",
         )
     except ValueError as exc:
         raise HTTPException(409, str(exc)) from exc
@@ -6373,6 +6392,34 @@ async def stop_soil_measurement() -> RedirectResponse:
     if soil_jobs.running:
         soil_jobs.request_stop()
     return RedirectResponse("../soil-height", status_code=303)
+
+
+def _soil_measurement_queue_key(item: dict) -> tuple:
+    """Identify a measurement's target so retries can dedupe against it."""
+    point_id = int(item.get("point_id") or 0)
+    return (
+        ("point", point_id)
+        if point_id
+        else (
+            "coordinate",
+            round(float(item.get("capture_x") or 0), 3),
+            round(float(item.get("capture_y") or 0), 3),
+        )
+    )
+
+
+def _current_failed_soil_point_ids(config_entry_id: str) -> list[int]:
+    """FarmBot point IDs whose most recent measurement is currently failed."""
+    seen: set[int] = set()
+    failed_ids: list[int] = []
+    for measurement in database.recent_soil_measurements(config_entry_id, 200):
+        point_id = int(measurement["point_id"] or 0)
+        if point_id <= 0 or point_id in seen:
+            continue
+        seen.add(point_id)
+        if measurement["status"] == "failed":
+            failed_ids.append(point_id)
+    return failed_ids
 
 
 def _soil_measurement_is_pending_valid(measurement: dict | None) -> bool:
@@ -6429,6 +6476,30 @@ def _soil_measurement_pending_row(measurement: dict) -> str:
         f"<td>{100 * measurement['confidence']:.0f}%</td>"
         f"<td>{escape(measurement['reason'])}"
         f"{_soil_measurement_review_note(measurement)}</td></tr>"
+    )
+
+
+def _soil_change_log_row(item: dict, index: int) -> str:
+    old_z, new_z = item.get("old_z_mm"), item.get("new_z_mm")
+    coordinates = (
+        f"{float(item['x']):.1f}, {float(item['y']):.1f}"
+        if item.get("x") is not None and item.get("y") is not None
+        else "—"
+    )
+    old_z_cell = f"{float(old_z):.1f} mm" if old_z is not None else "—"
+    new_z_cell = f"{float(new_z):.1f} mm" if new_z is not None else "—"
+    delta_cell = (
+        f"{float(new_z) - float(old_z):+.1f} mm" if old_z is not None and new_z is not None else "—"
+    )
+    confidence = item.get("confidence")
+    confidence_cell = f"{100 * float(confidence):.0f}%" if confidence is not None else "—"
+    method = "Automatic" if item.get("method") == "automatic" else "User"
+    return (
+        f'<tr data-row-key="change-{index}"><td>{escape(str(item["created_at"]))}</td>'
+        f"<td>{escape(str(item['point_name']))}</td>"
+        f"<td>{coordinates}</td>"
+        f"<td>{old_z_cell}</td><td>{new_z_cell}</td><td>{delta_cell}</td>"
+        f"<td>{confidence_cell}</td><td>{escape(method)}</td></tr>"
     )
 
 

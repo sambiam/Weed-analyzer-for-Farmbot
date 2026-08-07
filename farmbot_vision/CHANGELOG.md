@@ -4,11 +4,6 @@
 
 ## 4.3.1 - 2026-08-07
 
-- Corrected version numbering: the soil-height retry fix below was released
-  as `4.3.0`, not `4.2.2` as this changelog previously stated.
-
-## 4.3.0 - 2026-08-07
-
 - Fixed automatic soil-height retries to include every unresolved failed
   measurement rather than only failures from the newest completed job and the
   newest 200 result rows.
@@ -16,6 +11,15 @@
   communication errors, and targets that were still queued when such an error
   aborted the run. A failed retry remains eligible after the configured delay
   until a later measurement resolves it.
+
+## 4.3.0 - 2026-08-07
+
+- Added a "Retry all failed" button to the soil-height measurement queue that
+  re-measures every FarmBot point currently showing a failed measurement in
+  one job.
+- Added a soil height change log to the bottom of the soil-height tab listing
+  every applied height change, its old and new Z, and whether it was applied
+  by a user or automatically.
 
 ## 4.2.1 - 2026-08-07
 
