@@ -2,7 +2,12 @@
 
 ## Unreleased
 
-## 4.2.2 - 2026-08-07
+## 4.3.1 - 2026-08-07
+
+- Corrected version numbering: the soil-height retry fix below was released
+  as `4.3.0`, not `4.2.2` as this changelog previously stated.
+
+## 4.3.0 - 2026-08-07
 
 - Fixed automatic soil-height retries to include every unresolved failed
   measurement rather than only failures from the newest completed job and the
