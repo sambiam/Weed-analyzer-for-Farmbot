@@ -2353,17 +2353,37 @@ class Database:
         config_entry_id: str,
         *,
         retry_before: datetime,
+        exclude_recent_retry_starts: bool = True,
     ) -> list[dict]:
         """Return the latest unresolved failure for every measurement target.
 
         Later measurements supersede earlier failures. A recorded retry start
-        also delays another attempt until the configured interval has elapsed.
+        also delays another attempt until the configured interval has elapsed;
+        ``exclude_recent_retry_starts=False`` drops that delay so a user asking
+        for a retry (or looking at the failure list) sees every outstanding
+        failure regardless of what the automation has already attempted.
         This deliberately has no display-oriented row limit, so large grids do
         not silently omit failures beyond the newest 200 rows.
         """
 
+        retry_start_clause = (
+            """
+              AND NOT EXISTS (
+                SELECT 1 FROM soil_decisions decision
+                WHERE decision.measurement_id=m.measurement_id
+                  AND decision.action='automatic_retry_started'
+                  AND julianday(decision.created_at)>julianday(?)
+              )"""
+            if exclude_recent_retry_starts
+            else ""
+        )
+        parameters: tuple = (
+            (config_entry_id, _utc_iso(retry_before), _utc_iso(retry_before))
+            if exclude_recent_retry_starts
+            else (config_entry_id, _utc_iso(retry_before))
+        )
         rows = self.connection.execute(
-            """SELECT m.* FROM soil_measurements m
+            f"""SELECT m.* FROM soil_measurements m
             WHERE m.config_entry_id=? AND m.status='failed'
               AND julianday(m.created_at)<=julianday(?)
               AND NOT EXISTS (
@@ -2386,15 +2406,9 @@ class Database:
                       AND newer.rowid>m.rowid
                     )
                   )
-              )
-              AND NOT EXISTS (
-                SELECT 1 FROM soil_decisions decision
-                WHERE decision.measurement_id=m.measurement_id
-                  AND decision.action='automatic_retry_started'
-                  AND julianday(decision.created_at)>julianday(?)
-              )
-            ORDER BY julianday(m.created_at),m.rowid""",
-            (config_entry_id, _utc_iso(retry_before), _utc_iso(retry_before)),
+              ){retry_start_clause}
+            ORDER BY julianday(m.created_at),m.rowid""",  # noqa: S608 - fixed clause, bound params
+            parameters,
         ).fetchall()
         return [self._decode_soil_measurement(row) for row in rows]
 
