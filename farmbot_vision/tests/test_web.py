@@ -2143,16 +2143,35 @@ async def test_soil_retry_all_starts_measurement_for_currently_failed_points(mon
     )
     web.database.save_soil_measurement(recovered)
 
+    # A grid failure recorded as a bare coordinate must be retried too.
+    coordinate_failure = _failed_soil_measurement(
+        91, config_entry_id="soil-entry-retry-all"
+    ).model_copy(
+        update={
+            "measurement_id": uuid4(),
+            "point_id": 0,
+            "point_name": "Grid (140, 260)",
+            "capture_x": 140,
+            "capture_y": 260,
+            "created_at": now,
+        }
+    )
+    web.database.save_soil_measurement(coordinate_failure)
+
     received = {}
     monkeypatch.setattr(
-        web.soil_jobs, "start_measurements", lambda **kwargs: received.update(kwargs)
+        web.soil_jobs, "start_retry_measurements", lambda **kwargs: received.update(kwargs)
     )
 
     status, _, _ = await asgi_request("/soil/measure", method="POST", form={"mode": "retry_all"})
 
     assert status == 303
-    assert sorted(received["point_ids"]) == [91]
-    assert received["job_kind"] == "measurement_retry"
+    targets = {
+        (int(item["point_id"]), item["capture_x"], item["capture_y"])
+        for item in received["failed_measurements"]
+    }
+    # Point 92 was re-measured successfully, so it is no longer outstanding.
+    assert targets == {(91, 100, 200), (0, 140, 260)}
 
 
 @pytest.mark.asyncio

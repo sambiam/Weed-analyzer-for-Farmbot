@@ -5645,18 +5645,12 @@ async def soil_height_page(request: Request) -> HTMLResponse:
     )
     failed_measurements: list[dict] = []
     failed_keys: set[tuple] = set()
-    for measurement in measurements:
+    for measurement in _outstanding_failed_soil_measurements(entry_id) if entry_id else []:
         key = _soil_measurement_queue_key(measurement)
-        if measurement["status"] == "failed" and key not in failed_keys and key not in queued_keys:
-            failed_measurements.append(measurement)
-            failed_keys.add(key)
-    retry_all_point_ids = sorted(
-        {
-            int(measurement["point_id"])
-            for measurement in failed_measurements
-            if measurement["point_id"]
-        }
-    )
+        if key in failed_keys or key in queued_keys:
+            continue
+        failed_measurements.append(measurement)
+        failed_keys.add(key)
     for measurement in failed_measurements:
         point_id = int(measurement["point_id"])
         if point_id:
@@ -5681,10 +5675,10 @@ async def soil_height_page(request: Request) -> HTMLResponse:
         )
     retry_all_button = (
         f"""<form method=post action=soil/measure
-   onsubmit="return confirm('Retry {len(retry_all_point_ids)} failed measurement(s)?')">
+   onsubmit="return confirm('Retry {len(failed_measurements)} failed measurement(s)?')">
   <input type=hidden name=mode value=retry_all>
   <button type=submit>Retry all failed</button></form>"""
-        if retry_all_point_ids
+        if failed_measurements and not soil_jobs.running
         else ""
     )
     calibration_summary = (
@@ -6367,9 +6361,21 @@ async def start_soil_measurement(
         )
         point_ids = [site.point_id for site in sites]
     elif mode == "retry_all":
-        point_ids = _current_failed_soil_point_ids(entry_id)
-        if not point_ids:
-            raise HTTPException(409, "No failed point measurements to retry")
+        # Retry every outstanding failure in one job, including grid failures
+        # recorded as bare coordinates, which have no FarmBot point to select.
+        failed_measurements = _outstanding_failed_soil_measurements(entry_id)
+        if not failed_measurements:
+            raise HTTPException(409, "No failed measurements to retry")
+        try:
+            soil_jobs.start_retry_measurements(
+                config_entry_id=entry_id,
+                failed_measurements=failed_measurements,
+                capture_z=calibration.capture_z,
+                baseline_mm=calibration.baseline_mm,
+            )
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        return RedirectResponse("../soil-height", status_code=303)
     point_ids = point_ids or []
     try:
         soil_jobs.start_measurements(
@@ -6408,18 +6414,18 @@ def _soil_measurement_queue_key(item: dict) -> tuple:
     )
 
 
-def _current_failed_soil_point_ids(config_entry_id: str) -> list[int]:
-    """FarmBot point IDs whose most recent measurement is currently failed."""
-    seen: set[int] = set()
-    failed_ids: list[int] = []
-    for measurement in database.recent_soil_measurements(config_entry_id, 200):
-        point_id = int(measurement["point_id"] or 0)
-        if point_id <= 0 or point_id in seen:
-            continue
-        seen.add(point_id)
-        if measurement["status"] == "failed":
-            failed_ids.append(point_id)
-    return failed_ids
+def _outstanding_failed_soil_measurements(config_entry_id: str) -> list[dict]:
+    """Every failure still awaiting a result, newest attempt per target.
+
+    Unlike the display query this has no row limit, keeps coordinate-only grid
+    failures, drops failures a later measurement already superseded, and
+    ignores the automatic-retry backoff so a user-driven retry covers them all.
+    """
+    return database.outstanding_failed_soil_measurements(
+        config_entry_id,
+        retry_before=datetime.now(UTC),
+        exclude_recent_retry_starts=False,
+    )
 
 
 def _soil_measurement_is_pending_valid(measurement: dict | None) -> bool:
