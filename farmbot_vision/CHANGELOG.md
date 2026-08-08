@@ -1,6 +1,22 @@
 # Changelog
 
-## Unreleased
+## 4.4.0 - 2026-08-08
+
+- A recommended protection radius is the measured leaf edge plus the fixed
+  safety and calibration margins (30 mm by default), so a few misclassified
+  pixels on bare soil could propose a large increase on their own. Recently
+  sown beds saw radius increases recommended for seeds that had not yet
+  germinated, with the margins supplying almost the whole increase.
+- A proposed increase now has to be backed by at least 150 mm2 of measured
+  vegetation. The gate is an absolute area rather than a fraction of the
+  measured circle, so a genuine long, narrow leaf still qualifies while
+  algae, moss and green-tinted stones do not.
+- Plants under 10 days old no longer grow their own protection radius. They
+  are still measured and still available for review; the stored radius is
+  simply held until there is a real canopy to measure.
+- When either guard holds a radius, the measurement records why, so the
+  review screen explains the held recommendation instead of showing an
+  unexplained no-change result. Decreases are unaffected.
 
 ## 4.3.1 - 2026-08-07
 

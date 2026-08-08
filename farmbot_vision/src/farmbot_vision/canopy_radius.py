@@ -20,6 +20,47 @@ from dataclasses import dataclass
 
 import numpy as np
 
+# A recommendation is the measured leaf edge plus the fixed safety and
+# calibration margins, so a mask of a few stray pixels can still propose a
+# radius far larger than the stored one — the margins alone supply most of the
+# increase. Growth must therefore be backed by an absolute amount of
+# vegetation. The threshold is an area rather than a fill fraction on purpose:
+# a genuine long, narrow leaf fills very little of its own bounding circle but
+# comfortably exceeds this area, whereas segmentation noise on bare soil
+# (algae, a green-tinted stone, moss between gravel) does not.
+MINIMUM_GROWTH_EVIDENCE_AREA_MM2 = 150.0
+
+# Freshly sown ground is where the fixed margins dominate most strongly and
+# where soil-coloured false positives are the only thing in frame. Below this
+# age a plant may still be measured and reviewed, but it cannot grow its own
+# protection radius unattended.
+MINIMUM_GROWTH_AGE_DAYS = 10
+
+
+def growth_evidence_hold_reason(
+    canopy_area_mm2: float | None,
+    plant_age_days: int | None,
+) -> str | None:
+    """Explain why a proposed radius increase lacks supporting evidence.
+
+    Returns ``None`` when an increase is adequately supported. Callers apply
+    this only to proposals that would actually enlarge the stored radius; a
+    decrease or an unchanged radius never needs growth evidence.
+    """
+
+    if canopy_area_mm2 is not None and float(canopy_area_mm2) < MINIMUM_GROWTH_EVIDENCE_AREA_MM2:
+        return (
+            f"measured canopy covers only {float(canopy_area_mm2):.0f} mm2, below the "
+            f"{MINIMUM_GROWTH_EVIDENCE_AREA_MM2:.0f} mm2 of vegetation needed to support an "
+            "increase, so the existing radius was held"
+        )
+    if plant_age_days is not None and int(plant_age_days) < MINIMUM_GROWTH_AGE_DAYS:
+        return (
+            f"plant is {int(plant_age_days)} days old, below the {MINIMUM_GROWTH_AGE_DAYS}-day "
+            "germination guard, so the existing radius was held"
+        )
+    return None
+
 
 @dataclass(frozen=True)
 class CanopyRadiusEstimate:

@@ -14,6 +14,7 @@ import numpy as np
 from . import ALGORITHM_VERSION, CONTRACT_VERSION
 from .canopy_radius import (
     estimate_canopy_radius,
+    growth_evidence_hold_reason,
     previous_canopy_edge_mm,
     recommended_protection_radius_mm,
 )
@@ -1652,6 +1653,18 @@ class ClassicalVisionEngine(ImageAnalysisEngine):
                     current_radius_mm=seed.current_radius_mm,
                     protection_margin_mm=(self.safety_margin_mm + effective_calibration_margin),
                 )
+            # The margins are a fixed additive term, so a speck of misclassified
+            # soil can propose a large increase on its own. Require real
+            # vegetation behind any growth and otherwise hold the stored radius,
+            # which leaves the measurement reviewable without writing it.
+            canopy_area_mm2 = len(xs) / max(1e-6, params.mean_ppm**2)
+            growth_hold_reason = (
+                growth_evidence_hold_reason(canopy_area_mm2, age)
+                if recommendation > seed.current_radius_mm
+                else None
+            )
+            if growth_hold_reason:
+                recommendation = seed.current_radius_mm
             _visible_fraction, visible_boundary_sectors = _canopy_visibility(
                 seed.center_px,
                 max(seed.current_radius_mm, maximum),
@@ -1720,6 +1733,8 @@ class ClassicalVisionEngine(ImageAnalysisEngine):
                 if plant_ambiguous
                 else "maximum accepted leaf extent plus safety and calibration margins"
             )
+            if growth_hold_reason:
+                reason = growth_hold_reason
             if broad_overreach:
                 reason += (
                     f"; broad outer-mask expansion was rejected as implausible "

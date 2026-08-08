@@ -6,7 +6,11 @@ from dataclasses import dataclass
 import cv2
 import numpy as np
 
-from .canopy_radius import estimate_canopy_radius, recommended_protection_radius_mm
+from .canopy_radius import (
+    estimate_canopy_radius,
+    growth_evidence_hold_reason,
+    recommended_protection_radius_mm,
+)
 from .canopy_settings import CanopyFusionSettings
 from .plant_measurement import (
     MINIMUM_PARTIAL_BOUNDARY_COVERAGE,
@@ -214,6 +218,23 @@ def fuse_canopy_masks(
         current_radius_mm=current_radius,
         protection_margin_mm=protection_margin,
     )
+    # Fusion rebuilds the recommendation from the merged mask, so it needs the
+    # same growth evidence gate the single-image path applies.
+    fused_ages = [
+        int(frame["item"].plant_age_days)
+        for frame in frames
+        if frame["item"].plant_age_days is not None
+    ]
+    growth_hold_reason = (
+        growth_evidence_hold_reason(
+            float(np.count_nonzero(accepted)) / max(1e-6, ppm**2),
+            max(fused_ages) if fused_ages else None,
+        )
+        if recommendation > current_radius
+        else None
+    )
+    if growth_hold_reason:
+        recommendation = current_radius
 
     yy, xx = np.indices(accepted.shape)
     all_dx = (xx - center_x) / ppm
@@ -272,6 +293,7 @@ def fuse_canopy_masks(
         f"{len(frames)} views | {maximum:.1f} mm | coverage {coverage:.0%} | "
         f"corroborated {corroborated:.0%}"
         f"{' | broad growth clipped' if radius_estimate.broad_overreach else ''}"
+        f"{' | growth held: no evidence' if growth_hold_reason else ''}"
     )
     cv2.putText(
         diagnostic,
