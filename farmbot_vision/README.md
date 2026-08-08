@@ -1,4 +1,4 @@
-﻿# FarmBot Vision 4.3.1
+﻿# FarmBot Vision 4.3.2
 
 Lightweight, experimental canopy measurement and safe FarmBot plant-radius recommendations. Open the app through Home Assistant Ingress after installation.
 

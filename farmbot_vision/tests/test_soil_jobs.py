@@ -460,6 +460,8 @@ def test_custom_measurement_automatically_replaces_nearby_or_creates_new_point()
         ],
         [
             {"point_id": 70, "capture_x": None, "capture_y": None},
+            # Out of bounds now: skipped rather than abandoning the whole retry.
+            {"point_id": 0, "capture_x": 5000, "capture_y": 5000},
             {"point_id": 0, "capture_x": 500, "capture_y": 500},
         ],
     )
@@ -561,6 +563,18 @@ def test_outstanding_failure_query_has_no_display_limit_and_ignores_resolved_tar
 
     assert len(failures) == 223
     assert {failure["point_id"] for failure in failures}.isdisjoint({1, 2})
+
+    # A user-driven "retry all" ignores the automatic-retry backoff, so point 2
+    # comes back; only the target with a newer valid result stays resolved.
+    user_failures = database.outstanding_failed_soil_measurements(
+        "bot-soil",
+        retry_before=now,
+        exclude_recent_retry_starts=False,
+    )
+
+    assert len(user_failures) == 224
+    assert 2 in {failure["point_id"] for failure in user_failures}
+    assert 1 not in {failure["point_id"] for failure in user_failures}
 
 
 @pytest.mark.asyncio

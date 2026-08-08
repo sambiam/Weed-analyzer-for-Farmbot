@@ -1,6 +1,23 @@
 # Changelog
 
-## Unreleased
+## 4.3.2 - 2026-08-08
+
+- Fixed "Retry all failed" on the soil height tab retrying only a handful of
+  the listed failures. It now starts one retry job covering every outstanding
+  failure, including grid failures recorded as bare coordinates (which have no
+  FarmBot point to select) and failures older than the newest 200 result rows,
+  and it ignores the automatic-retry backoff so a user-driven retry is never
+  silently narrowed. Repeated clicking is what produced the
+  "a soil-height job is already running" error, because the first job covered
+  only part of the list.
+- The failed-measurement list itself now uses the same unresolved-failure
+  query, so a failure a later successful measurement already superseded no
+  longer lingers in the queue table, and the button's confirmation count
+  matches what the retry actually measures.
+- "Retry all failed" is hidden while a soil-height job is running instead of
+  offering a click that can only fail with a conflict.
+- A retried coordinate that is now outside the FarmBot's axis bounds is skipped
+  with a warning rather than aborting the whole retry job.
 
 ## 4.3.1 - 2026-08-07
 

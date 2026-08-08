@@ -405,13 +405,22 @@ class SoilJobManager:
                     }
                 )
             else:
-                capture_targets.append(
-                    cls._custom_measurement_target(
-                        inventory,
-                        float(retry_target["capture_x"]),
-                        float(retry_target["capture_y"]),
+                # One unreachable coordinate must not abandon the other retries.
+                try:
+                    capture_targets.append(
+                        cls._custom_measurement_target(
+                            inventory,
+                            float(retry_target["capture_x"]),
+                            float(retry_target["capture_y"]),
+                        )
                     )
-                )
+                except SoilHeightError as err:
+                    LOGGER.warning(
+                        "Failed soil coordinate (%s, %s) is not currently safe to retry: %s",
+                        retry_target.get("capture_x"),
+                        retry_target.get("capture_y"),
+                        err,
+                    )
         return capture_targets
 
     async def safe_sites(
